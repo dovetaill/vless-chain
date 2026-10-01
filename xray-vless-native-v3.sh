@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Native VLESS / Xray chain installer for Debian / Ubuntu.
+# Native VLESS / Xray instance manager for Debian, CentOS and Alpine.
 # No Docker. Reuses an existing Nginx installation when available.
 
 APP_DIR="${APP_DIR:-/etc/xray-chain}"
 WEB_ROOT="${WEB_ROOT:-/var/www/xray-chain}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 SERVICE_NAME="${SERVICE_NAME:-xray-chain}"
-XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}"
+MANAGER_DIR="${MANAGER_DIR:-/etc/xray-chain-manager}"
+MANAGER_WEB_ROOT="${MANAGER_WEB_ROOT:-/var/www/xray-chain-manager}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+RENEW_HOOK_DIR="${RENEW_HOOK_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
+OPENRC_DIR="${OPENRC_DIR:-/etc/init.d}"
+INIT_SYSTEM="${INIT_SYSTEM:-}"
+PACKAGE_MANAGER=""
+INSTANCE_ID="${INSTANCE_ID:-}"
+INSTANCE_NAME="${INSTANCE_NAME:-}"
+INSTANCE_IMPORTED="${INSTANCE_IMPORTED:-false}"
 
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
@@ -44,12 +54,20 @@ UPSTREAM_PORT="${UPSTREAM_PORT:-}"
 UPSTREAM_UUID="${UPSTREAM_UUID:-}"
 UPSTREAM_SECURITY="${UPSTREAM_SECURITY:-}"
 UPSTREAM_SNI="${UPSTREAM_SNI:-}"
-UPSTREAM_FLOW="${UPSTREAM_FLOW:-xtls-rprx-vision}"
+UPSTREAM_FLOW="${UPSTREAM_FLOW:-}"
 UPSTREAM_FINGERPRINT="${UPSTREAM_FINGERPRINT:-chrome}"
 UPSTREAM_ALLOW_INSECURE="${UPSTREAM_ALLOW_INSECURE:-false}"
 UPSTREAM_REALITY_PUBLIC_KEY="${UPSTREAM_REALITY_PUBLIC_KEY:-}"
 UPSTREAM_REALITY_SHORT_ID="${UPSTREAM_REALITY_SHORT_ID:-}"
 UPSTREAM_REALITY_MLDSA65_VERIFY="${UPSTREAM_REALITY_MLDSA65_VERIFY:-}"
+UPSTREAM_TRANSPORT="${UPSTREAM_TRANSPORT:-}"
+UPSTREAM_NAME="${UPSTREAM_NAME:-}"
+UPSTREAM_XHTTP_PATH="${UPSTREAM_XHTTP_PATH:-}"
+UPSTREAM_XHTTP_HOST="${UPSTREAM_XHTTP_HOST:-}"
+UPSTREAM_XHTTP_MODE="${UPSTREAM_XHTTP_MODE:-auto}"
+UPSTREAM_XHTTP_EXTRA="${UPSTREAM_XHTTP_EXTRA:-}"
+[[ -n "$UPSTREAM_XHTTP_EXTRA" ]] || UPSTREAM_XHTTP_EXTRA='{}'
+UPSTREAM_ALPN="${UPSTREAM_ALPN:-}"
 
 INTERNAL_HTTP_PORT="${INTERNAL_HTTP_PORT:-18080}"
 INTERNAL_HTTPS_PORT="${INTERNAL_HTTPS_PORT:-18443}"
@@ -57,6 +75,28 @@ INTERNAL_HTTPS_PORT="${INTERNAL_HTTPS_PORT:-18443}"
 INTERACTIVE=1
 [[ -t 0 ]] || INTERACTIVE=0
 NGINX_DOMAIN_PREEXISTED=0
+WORK_DIR=""
+INSTALL_PENDING=0
+INSTALL_APP_CREATED=0
+INSTALL_SERVICE_CREATED=0
+INSTALL_NGINX_CREATED=0
+INSTALL_HOOK_CREATED=0
+INSTALL_HTTP_CREATED=0
+INSTALL_CF_CHANGED=0
+INSTALL_CF_PATH=""
+UPDATE_PENDING=0
+UPDATE_WAS_ACTIVE=0
+
+# Only named fields cross the Bash/Python boundary. Never source imported data.
+STATE_FIELDS=(INSTANCE_ID INSTANCE_NAME INSTANCE_IMPORTED APP_DIR WEB_ROOT SERVICE_NAME INIT_SYSTEM
+  XRAY_BIN DOMAIN UUID NODE_MODE SECURITY_MODE CERT_MODE CERT_FILE KEY_FILE TLS_PORT
+  REALITY_PORT REALITY_TARGET_MODE REALITY_TARGET REALITY_SERVER_NAME REALITY_PRIVATE_KEY
+  REALITY_PUBLIC_KEY REALITY_SHORT_ID REALITY_FINGERPRINT INTERNAL_HTTP_PORT INTERNAL_HTTPS_PORT)
+UPSTREAM_FIELDS=(UPSTREAM_ADDRESS UPSTREAM_PORT UPSTREAM_UUID UPSTREAM_SECURITY UPSTREAM_SNI
+  UPSTREAM_FLOW UPSTREAM_FINGERPRINT UPSTREAM_ALLOW_INSECURE UPSTREAM_REALITY_PUBLIC_KEY
+  UPSTREAM_REALITY_SHORT_ID UPSTREAM_REALITY_MLDSA65_VERIFY UPSTREAM_TRANSPORT UPSTREAM_NAME
+  UPSTREAM_XHTTP_PATH UPSTREAM_XHTTP_HOST UPSTREAM_XHTTP_MODE UPSTREAM_XHTTP_EXTRA UPSTREAM_ALPN)
+export "${STATE_FIELDS[@]}" "${UPSTREAM_FIELDS[@]}" MANAGER_DIR
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -67,64 +107,448 @@ die() { red "错误：$*"; exit 1; }
 usage() {
   cat <<USAGE
 用法：
-  bash $0
+  bash $0                           交互管理菜单
+  bash $0 install direct 租户编号     新增落地 VLESS
+  bash $0 install relay 租户编号      新增入口并绑定远端落地
+  bash $0 list                       列出实例
+  bash $0 manage 租户编号             单实例运维菜单
+  bash $0 status|logs|follow|start|stop|restart|enable|disable|links 租户编号
+  bash $0 upstream 租户编号           更换入口绑定的落地
+  bash $0 import 租户编号 [旧目录] [旧服务名]
 
-本脚本不使用 Docker，适配 Debian / Ubuntu + systemd。
+支持 Debian/Ubuntu（apt）、CentOS/RHEL 系（dnf/yum）、Alpine（apk）。
+服务使用 systemd 或 OpenRC。Alpine 首次运行前：apk add bash
+不使用 Docker。每个租户独立 UUID、端口、配置和服务，可同机共存。
 
-节点角色：
-  NODE_MODE=direct   普通/落地节点：VLESS 入站 -> freedom -> Internet
-  NODE_MODE=relay    中转节点：VLESS 入站 -> 下一跳 VLESS -> Internet
+入口安全模式：SECURITY_MODE=tls/reality/dual，均为 TCP + Vision。
+dual 使用两个端口、同一个 UUID，绑定同一个落地。
+落地导入：TLS/REALITY + TCP/raw 或 XHTTP；支持 vless://、单个 YAML/JSON。
+多行节点最后输入 END；缺少字段进入补填向导。
+停止只改变当前运行状态；关闭开机自启只改变自启设置。
+默认管理目录：$MANAGER_DIR。旧部署导入保留配置、UUID、目录和服务。
 
-入口模式：
-  SECURITY_MODE=tls      VLESS + TLS + Vision
-  SECURITY_MODE=reality  VLESS + REALITY + Vision
-  SECURITY_MODE=dual     REALITY + Vision 主入口 + TLS + Vision 备用入口
+证书方式：CERT_MODE=http/cloudflare/existing/none
+  http：Certbot webroot HTTP-01，要求域名解析到本机、公网 80 可达。
+  cloudflare：DNS-01，需要 CF_API_TOKEN。
+  existing：提供 CERT_FILE、KEY_FILE。
+  none：仅限 REALITY + 外部伪装目标。
 
-证书方式（仅需要本地证书时）：
-  CERT_MODE=http         Certbot HTTP-01，经 Nginx 验证；不依赖 DNS 服务商；公网 80 必须可访问
-  CERT_MODE=cloudflare   Certbot Cloudflare DNS-01；需要 CF_API_TOKEN；不要求公网 80
-  CERT_MODE=existing     使用已有证书；填写 CERT_FILE / KEY_FILE
-  CERT_MODE=none         仅 REALITY + remote target 等不需要本地证书的场景
+非交互示例：
+  DOMAIN=node.example.com SECURITY_MODE=reality REALITY_TARGET_MODE=remote \\
+  REALITY_TARGET=www.example.com:443 REALITY_PORT=8443 \\
+  bash $0 install direct landing01
 
-默认端口：
-  tls:      443
-  reality:  443
-  dual:     REALITY=443，TLS=8443
+  DOMAIN=edge.example.com SECURITY_MODE=reality REALITY_TARGET_MODE=remote \\
+  REALITY_TARGET=www.example.com:443 REALITY_PORT=9443 \\
+  UPSTREAM_URI='vless://...' bash $0 install relay tenant01
 
-说明：
-  - 选择 CERT_MODE=http 时，脚本仍默认优先使用 443 作为代理公网端口；
-    但 Let's Encrypt HTTP-01 真正要求的是公网 80 可达。
-  - 已安装 Nginx 时直接复用；未安装时 apt-get install -y nginx。
-  - 如果 443 已被已有 Nginx/其它服务占用，脚本不会自动破坏现有网站，
-    交互模式会要求换一个代理端口；非交互模式直接报错。
-  - REALITY local target 使用本机 Nginx 内部 HTTPS 站点。
-  - relay 推荐直接填写 UPSTREAM_URI，可自动解析 TLS / REALITY VLESS 分享链接。
-
-示例：
-  # B：普通落地节点，非 Cloudflare DNS，Certbot HTTP-01，REALITY 主入口
-  NODE_MODE=direct SECURITY_MODE=reality CERT_MODE=http \\
-  DOMAIN=node-01.docker.click EMAIL=you@example.com bash $0
-
-  # A：中转节点，入口 REALITY，把流量交给 B
-  NODE_MODE=relay SECURITY_MODE=reality CERT_MODE=http \\
-  DOMAIN=edge-01.docker.click EMAIL=you@example.com \\
-  UPSTREAM_URI='vless://...' bash $0
-
-  # Cloudflare DNS-01
-  NODE_MODE=direct SECURITY_MODE=dual CERT_MODE=cloudflare \\
-  DOMAIN=node-01.docker.click EMAIL=you@example.com \\
-  CF_API_TOKEN='TOKEN' bash $0
+新建实例不覆盖旧配置。导入示例：
+  bash $0 import legacy /etc/xray-chain xray-chain
 USAGE
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
-fi
-
-[[ "$(id -u)" -eq 0 ]] || die "请使用 root 用户执行"
-
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+native_helper() {
+  python3 - "$@" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit, urlencode, quote
+
+STATE = """INSTANCE_ID INSTANCE_NAME INSTANCE_IMPORTED APP_DIR WEB_ROOT SERVICE_NAME INIT_SYSTEM
+XRAY_BIN DOMAIN UUID NODE_MODE SECURITY_MODE CERT_MODE CERT_FILE KEY_FILE TLS_PORT
+REALITY_PORT REALITY_TARGET_MODE REALITY_TARGET REALITY_SERVER_NAME REALITY_PRIVATE_KEY
+REALITY_PUBLIC_KEY REALITY_SHORT_ID REALITY_FINGERPRINT INTERNAL_HTTP_PORT INTERNAL_HTTPS_PORT""".split()
+UP = """UPSTREAM_ADDRESS UPSTREAM_PORT UPSTREAM_UUID UPSTREAM_SECURITY UPSTREAM_SNI
+UPSTREAM_FLOW UPSTREAM_FINGERPRINT UPSTREAM_ALLOW_INSECURE UPSTREAM_REALITY_PUBLIC_KEY
+UPSTREAM_REALITY_SHORT_ID UPSTREAM_REALITY_MLDSA65_VERIFY UPSTREAM_TRANSPORT UPSTREAM_NAME
+UPSTREAM_XHTTP_PATH UPSTREAM_XHTTP_HOST UPSTREAM_XHTTP_MODE UPSTREAM_XHTTP_EXTRA UPSTREAM_ALPN""".split()
+
+def fail(message):
+    raise ValueError(message)
+
+def clean(value):
+    text = str(value if value is not None else "")
+    if any(ord(c) < 32 for c in text):
+        fail("节点字段不能包含换行或控制字符")
+    return text
+
+def boolean(value):
+    if isinstance(value, bool):
+        return value
+    if str(value).lower() in ("true", "1"):
+        return True
+    if str(value).lower() in ("false", "0", ""):
+        return False
+    fail("布尔字段必须为 true/false")
+
+def dump(data):
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+def atomic(path, data):
+    path = Path(path)
+    fd, temp = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+def values(data, fields):
+    for key in fields:
+        value = clean(data.get(key, ""))
+        sys.stdout.buffer.write((key + "\0" + value + "\0").encode())
+
+def environment(fields):
+    return {key: os.environ.get(key, "") for key in fields}
+
+def parse_node(text):
+    data = dict.fromkeys(UP, "")
+    data.update(UPSTREAM_FINGERPRINT="chrome", UPSTREAM_ALLOW_INSECURE="false",
+                UPSTREAM_XHTTP_MODE="auto", UPSTREAM_XHTTP_EXTRA="{}")
+    if text.startswith("vless://"):
+        node = urlsplit(text)
+        if node.password:
+            fail("VLESS 链接不能包含密码段")
+        data.update(UPSTREAM_UUID=unquote(node.username or ""),
+                    UPSTREAM_ADDRESS=node.hostname or "",
+                    UPSTREAM_PORT=str(node.port or ""),
+                    UPSTREAM_NAME=unquote(node.fragment),
+                    UPSTREAM_TRANSPORT="raw")
+        query = parse_qs(node.query, keep_blank_values=True)
+        mapping = {"security": "SECURITY", "type": "TRANSPORT", "sni": "SNI",
+                   "flow": "FLOW", "fp": "FINGERPRINT", "pbk": "REALITY_PUBLIC_KEY",
+                   "sid": "REALITY_SHORT_ID", "pqv": "REALITY_MLDSA65_VERIFY",
+                   "path": "XHTTP_PATH", "host": "XHTTP_HOST", "mode": "XHTTP_MODE",
+                   "extra": "XHTTP_EXTRA", "alpn": "ALPN"}
+        for key, suffix in mapping.items():
+            if key in query:
+                if len(query[key]) != 1:
+                    fail("链接包含重复参数：" + key)
+                data["UPSTREAM_" + suffix] = query[key][0]
+        if query.get("encryption", ["none"])[0] not in ("", "none"):
+            fail("当前仅支持 encryption=none 的落地")
+        insecure = query.get("allowInsecure", query.get("insecure", ["false"]))[0]
+        data["UPSTREAM_ALLOW_INSECURE"] = str(boolean(insecure)).lower()
+    else:
+        try:
+            node = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                import yaml
+            except ImportError:
+                fail("结构化节点需要 python3-yaml，请先安装该依赖")
+            try:
+                node = yaml.safe_load(text)
+            except yaml.YAMLError:
+                fail("YAML/JSON 格式不正确；请粘贴完整的单个节点")
+        if isinstance(node, dict) and "proxies" in node:
+            node = node["proxies"]
+        if isinstance(node, list):
+            if len(node) != 1:
+                fail("一次只能导入一个节点，请粘贴目标节点")
+            node = node[0]
+        if not isinstance(node, dict):
+            fail("请输入 vless:// 链接或单个 YAML/JSON 节点")
+        if node.get("type", "vless") != "vless":
+            fail("只支持 type: vless 的节点")
+        if node.get("encryption", "none") not in ("", "none", None):
+            fail("当前仅支持 encryption=none 的落地")
+        for option in ("shadow-tls-opts", "restls-opts", "jls-opts", "ech-opts",
+                       "certificate", "private-key", "name-cert-verify"):
+            if node.get(option):
+                fail("当前不能转换节点参数：" + option)
+        if isinstance(node.get("smux"), dict) and node["smux"].get("enabled"):
+            fail("当前不能转换 smux，请使用不依赖 smux 的落地配置")
+        reality = node.get("reality-opts") or {}
+        if not isinstance(reality, dict):
+            fail("reality-opts 必须是对象")
+        data.update(UPSTREAM_NAME=node.get("name", ""), UPSTREAM_ADDRESS=node.get("server", ""),
+                    UPSTREAM_PORT=node.get("port", ""), UPSTREAM_UUID=node.get("uuid", ""),
+                    UPSTREAM_SECURITY="reality" if reality else (
+                        "tls" if boolean(node.get("tls", False)) else ""),
+                    UPSTREAM_TRANSPORT=node.get("network", ""),
+                    UPSTREAM_FLOW=node.get("flow", ""),
+                    UPSTREAM_SNI=node.get("servername", node.get("sni", "")),
+                    UPSTREAM_FINGERPRINT=node.get("client-fingerprint") or "chrome",
+                    UPSTREAM_ALLOW_INSECURE=str(boolean(node.get("skip-cert-verify", False))).lower(),
+                    UPSTREAM_REALITY_PUBLIC_KEY=reality.get("public-key", ""),
+                    UPSTREAM_REALITY_SHORT_ID=reality.get("short-id", ""),
+                    UPSTREAM_REALITY_MLDSA65_VERIFY=reality.get("mldsa65-verify", ""))
+        alpn = node.get("alpn", [])
+        data["UPSTREAM_ALPN"] = ",".join(alpn) if isinstance(alpn, list) else alpn
+        xhttp = node.get("xhttp-opts") or {}
+        if not isinstance(xhttp, dict):
+            fail("xhttp-opts 必须是对象")
+        if xhttp:
+            data["UPSTREAM_TRANSPORT"] = node.get("network", "xhttp")
+            data.update(UPSTREAM_XHTTP_PATH=xhttp.get("path", ""),
+                        UPSTREAM_XHTTP_HOST=xhttp.get("host", ""),
+                        UPSTREAM_XHTTP_MODE=xhttp.get("mode", "auto"))
+            extra = {}
+            translated = {"headers": "headers", "no-grpc-header": "noGRPCHeader",
+                          "no-sse-header": "noSSEHeader", "x-padding-bytes": "xPaddingBytes",
+                          "sc-max-each-post-bytes": "scMaxEachPostBytes",
+                          "sc-min-posts-interval-ms": "scMinPostsIntervalMs"}
+            for key, value in xhttp.items():
+                if key in ("path", "host", "mode"):
+                    continue
+                if key in translated:
+                    extra[translated[key]] = value
+                elif key == "reuse-settings":
+                    if not isinstance(value, dict):
+                        fail("reuse-settings 必须是对象")
+                    xmux = {"max-concurrency": "maxConcurrency", "max-connections": "maxConnections",
+                            "c-max-reuse-times": "cMaxReuseTimes", "h-max-request-times": "hMaxRequestTimes",
+                            "h-max-reusable-secs": "hMaxReusableSecs", "h-keep-alive-period": "hKeepAlivePeriod"}
+                    if any(k not in xmux for k in value):
+                        fail("存在不能转换的 reuse-settings 参数")
+                    extra["xmux"] = {xmux[k]: v for k, v in value.items()}
+                elif key == "extra" and isinstance(value, dict):
+                    extra.update(value)
+                else:
+                    fail("当前不能转换 xhttp-opts 参数：" + key + "；可改用带原生 extra 的分享链接")
+            data["UPSTREAM_XHTTP_EXTRA"] = json.dumps(extra, ensure_ascii=False)
+    data = {key: clean(value) for key, value in data.items()}
+    if data["UPSTREAM_TRANSPORT"] == "tcp":
+        data["UPSTREAM_TRANSPORT"] = "raw"
+    if data["UPSTREAM_TRANSPORT"] not in ("", "raw", "xhttp"):
+        fail("仅支持 TCP/raw 和 XHTTP 落地")
+    if data["UPSTREAM_SECURITY"] not in ("", "tls", "reality"):
+        fail("仅支持 TLS / REALITY 落地")
+    return data
+
+def validate(data):
+    host = data["UPSTREAM_ADDRESS"]
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or not re.fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", host):
+            fail("落地地址格式不正确")
+        if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+               for label in host.split(".")):
+            fail("落地地址格式不正确")
+    if not data["UPSTREAM_PORT"].isdigit() or not 1 <= int(data["UPSTREAM_PORT"]) <= 65535:
+        fail("落地端口必须为 1–65535")
+    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+                        data["UPSTREAM_UUID"]):
+        fail("落地 UUID 格式不正确")
+    if data["UPSTREAM_TRANSPORT"] not in ("raw", "xhttp"):
+        fail("请选择落地传输方式 raw 或 xhttp")
+    if data["UPSTREAM_SECURITY"] not in ("tls", "reality"):
+        fail("请选择落地安全方式 tls 或 reality")
+    flow = data["UPSTREAM_FLOW"]
+    if flow not in ("", "xtls-rprx-vision", "xtls-rprx-vision-udp443"):
+        fail("不支持该落地 flow")
+    if data["UPSTREAM_TRANSPORT"] == "xhttp" and flow:
+        fail("XHTTP + encryption=none 不能设置 Vision flow，请核对落地配置")
+    boolean(data["UPSTREAM_ALLOW_INSECURE"])
+    if data["UPSTREAM_SECURITY"] == "reality":
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", data["UPSTREAM_REALITY_PUBLIC_KEY"]):
+            fail("REALITY 落地需要有效的 public-key/pbk（43 位）")
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{2}){0,8}", data["UPSTREAM_REALITY_SHORT_ID"]):
+            fail("REALITY short-id/sid 必须是最多 16 位、偶数长度的十六进制")
+    if data["UPSTREAM_TRANSPORT"] == "xhttp":
+        if not data["UPSTREAM_XHTTP_PATH"].startswith("/"):
+            fail("XHTTP path 必须以 / 开头")
+        if data["UPSTREAM_XHTTP_MODE"] not in ("auto", "stream-one", "stream-up", "packet-up"):
+            fail("XHTTP mode 不正确")
+        if not isinstance(json.loads(data["UPSTREAM_XHTTP_EXTRA"]), dict):
+            fail("XHTTP extra 必须是 JSON 对象")
+
+def upstream_outbound(data):
+    validate(data)
+    settings = {"address": data["UPSTREAM_ADDRESS"], "port": int(data["UPSTREAM_PORT"]),
+                "id": data["UPSTREAM_UUID"], "encryption": "none"}
+    if data["UPSTREAM_FLOW"]:
+        settings["flow"] = data["UPSTREAM_FLOW"]
+    stream = {"network": data["UPSTREAM_TRANSPORT"], "security": data["UPSTREAM_SECURITY"]}
+    if stream["security"] == "tls":
+        tls = {"serverName": data["UPSTREAM_SNI"] or data["UPSTREAM_ADDRESS"],
+               "allowInsecure": boolean(data["UPSTREAM_ALLOW_INSECURE"]),
+               "fingerprint": data["UPSTREAM_FINGERPRINT"] or "chrome"}
+        if data["UPSTREAM_ALPN"]:
+            tls["alpn"] = data["UPSTREAM_ALPN"].split(",")
+        stream["tlsSettings"] = tls
+    else:
+        reality = {"serverName": data["UPSTREAM_SNI"] or data["UPSTREAM_ADDRESS"],
+                   "fingerprint": data["UPSTREAM_FINGERPRINT"] or "chrome",
+                   "publicKey": data["UPSTREAM_REALITY_PUBLIC_KEY"],
+                   "shortId": data["UPSTREAM_REALITY_SHORT_ID"]}
+        if data["UPSTREAM_REALITY_MLDSA65_VERIFY"]:
+            reality["mldsa65Verify"] = data["UPSTREAM_REALITY_MLDSA65_VERIFY"]
+        stream["realitySettings"] = reality
+    if stream["network"] == "xhttp":
+        stream["xhttpSettings"] = {"path": data["UPSTREAM_XHTTP_PATH"],
+                                 "host": data["UPSTREAM_XHTTP_HOST"],
+                                 "mode": data["UPSTREAM_XHTTP_MODE"],
+                                 "extra": json.loads(data["UPSTREAM_XHTTP_EXTRA"])}
+    return {"tag": "upstream-vless", "protocol": "vless", "settings": settings, "streamSettings": stream}
+
+def records():
+    root = Path(os.environ["MANAGER_DIR"]) / "instances"
+    for path in sorted(root.glob("*/state.json")):
+        try:
+            state = read_json(path)
+            if state.get("INSTANCE_ID") != path.parent.name:
+                fail("实例编号与目录不匹配")
+            yield state
+        except (ValueError, OSError):
+            print("无法读取实例登记：" + str(path), file=sys.stderr)
+
+def legacy(app):
+    config = read_json(Path(app) / "config.json")
+    data = environment(STATE + UP)
+    data.update(APP_DIR=str(Path(app).resolve()), INSTANCE_IMPORTED="true",
+                NODE_MODE="direct", CERT_MODE="existing")
+    for filename in ("install.env", "reality.env"):
+        path = Path(app) / filename
+        if path.exists():
+            for line in path.read_text().splitlines():
+                key, sep, value = line.partition("=")
+                if sep and key in STATE and key not in (
+                        "INSTANCE_ID", "INSTANCE_NAME", "INSTANCE_IMPORTED", "APP_DIR",
+                        "SERVICE_NAME", "XRAY_BIN", "INIT_SYSTEM"):
+                    data[key] = value
+    ids = set()
+    modes = set()
+    for inbound in config.get("inbounds", []):
+        if inbound.get("protocol") != "vless":
+            fail("旧配置含非 VLESS 入站，暂不能导入")
+        clients = inbound.get("settings", {}).get("clients", [])
+        ids.update(c.get("id") for c in clients)
+        stream = inbound.get("streamSettings", {})
+        if stream.get("network", stream.get("method", "raw")) not in ("raw", "tcp"):
+            fail("旧配置仅能导入 TCP/raw 入站")
+        security = stream.get("security")
+        modes.add(security)
+        if security == "tls":
+            data["TLS_PORT"] = str(inbound["port"])
+            cert = stream.get("tlsSettings", {}).get("certificates", [{}])[0]
+            data["CERT_FILE"] = cert.get("certificateFile", "")
+            data["KEY_FILE"] = cert.get("keyFile", "")
+        elif security == "reality":
+            data["REALITY_PORT"] = str(inbound["port"])
+            reality = stream.get("realitySettings", {})
+            data.update(REALITY_PRIVATE_KEY=reality.get("privateKey", ""),
+                        REALITY_SHORT_ID=(reality.get("shortIds") or [""])[0],
+                        REALITY_SERVER_NAME=(reality.get("serverNames") or [""])[0],
+                        REALITY_TARGET=reality.get("target", reality.get("dest", "")))
+        else:
+            fail("旧配置仅能导入 TLS / REALITY 入站")
+    if len(ids) != 1 or None in ids:
+        fail("旧配置必须只有一个 UUID；dual 两个入站可以共用同一 UUID")
+    data["UUID"] = ids.pop()
+    data["SECURITY_MODE"] = "dual" if modes == {"tls", "reality"} else next(iter(modes))
+    routes = {rule.get("outboundTag") for rule in config.get("routing", {}).get("rules", [])
+              if rule.get("inboundTag")}
+    if len(routes) != 1 or not routes <= {"direct", "upstream-vless"}:
+        fail("旧配置路由结构不能安全导入")
+    if routes == {"upstream-vless"}:
+        outbound = next(o for o in config["outbounds"] if o.get("tag") == "upstream-vless")
+        settings = outbound["settings"]
+        if "vnext" in settings:
+            server = settings["vnext"][0]
+            settings = dict(server["users"][0], address=server["address"], port=server["port"])
+        stream = outbound["streamSettings"]
+        reality = stream.get("realitySettings", {})
+        tls = stream.get("tlsSettings", {})
+        xhttp = stream.get("xhttpSettings", {})
+        data.update(NODE_MODE="relay", UPSTREAM_ADDRESS=settings["address"],
+                    UPSTREAM_PORT=str(settings["port"]), UPSTREAM_UUID=settings["id"],
+                    UPSTREAM_FLOW=settings.get("flow", ""), UPSTREAM_SECURITY=stream["security"],
+                    UPSTREAM_TRANSPORT=stream.get("network", stream.get("method", "raw")),
+                    UPSTREAM_SNI=reality.get("serverName", tls.get("serverName", "")),
+                    UPSTREAM_FINGERPRINT=reality.get("fingerprint", tls.get("fingerprint", "chrome")),
+                    UPSTREAM_ALLOW_INSECURE=str(tls.get("allowInsecure", False)).lower(),
+                    UPSTREAM_REALITY_PUBLIC_KEY=reality.get("publicKey", reality.get("password", "")),
+                    UPSTREAM_REALITY_SHORT_ID=reality.get("shortId", ""),
+                    UPSTREAM_REALITY_MLDSA65_VERIFY=reality.get("mldsa65Verify", ""),
+                    UPSTREAM_XHTTP_PATH=xhttp.get("path", ""), UPSTREAM_XHTTP_HOST=xhttp.get("host", ""),
+                    UPSTREAM_XHTTP_MODE=xhttp.get("mode", "auto"),
+                    UPSTREAM_XHTTP_EXTRA=json.dumps(xhttp.get("extra", {})),
+                    UPSTREAM_ALPN=",".join(tls.get("alpn", [])))
+        validate(data)
+    return data
+
+try:
+    action = sys.argv[1]
+    if action == "parse":
+        dump(parse_node(Path(sys.argv[2]).read_text().strip()))
+    elif action == "upstream-values":
+        values(read_json(sys.argv[2]), UP)
+    elif action == "validate":
+        validate(environment(UP))
+    elif action == "outbound":
+        dump(upstream_outbound(environment(UP)))
+    elif action == "state-save":
+        atomic(sys.argv[2], environment(STATE + UP))
+    elif action == "state-values":
+        values(read_json(sys.argv[2]), STATE + UP)
+    elif action == "legacy":
+        dump(legacy(sys.argv[2]))
+    elif action == "list":
+        for data in records():
+            destination = "Internet" if data["NODE_MODE"] == "direct" else (
+                data["UPSTREAM_ADDRESS"] + ":" + data["UPSTREAM_PORT"])
+            ports = "/".join(p for p in (data.get("REALITY_PORT"), data.get("TLS_PORT")) if p)
+            print("\t".join(clean(x) for x in (data["INSTANCE_ID"], data["INSTANCE_NAME"],
+                  data["NODE_MODE"], ports, destination, data["SERVICE_NAME"])))
+    elif action == "ports":
+        for data in records():
+            for key in ("TLS_PORT", "REALITY_PORT", "INTERNAL_HTTP_PORT", "INTERNAL_HTTPS_PORT"):
+                if data.get(key):
+                    print(data[key])
+    elif action == "unique":
+        for data in records():
+            if data["UUID"].lower() == os.environ["UUID"].lower():
+                fail("该 UUID 已被实例 " + data["INSTANCE_ID"] + " 使用")
+            if data["APP_DIR"] == os.environ["APP_DIR"] or data["SERVICE_NAME"] == os.environ["SERVICE_NAME"]:
+                fail("该目录或服务已登记为实例 " + data["INSTANCE_ID"])
+    elif action == "replace-upstream":
+        config = read_json(sys.argv[2])
+        config["outbounds"] = [upstream_outbound(environment(UP))] + [
+            o for o in config["outbounds"] if o.get("tag") != "upstream-vless"]
+        dump(config)
+    elif action == "client":
+        data = environment(STATE)
+        common = {"encryption": "none", "type": "tcp", "flow": "xtls-rprx-vision"}
+        for security, port in (("reality", data["REALITY_PORT"]), ("tls", data["TLS_PORT"])):
+            if not port or data["SECURITY_MODE"] not in (security, "dual"):
+                continue
+            query = dict(common, security=security, fp=data["REALITY_FINGERPRINT"] or "chrome")
+            if security == "reality":
+                query.update(sni=data["REALITY_SERVER_NAME"], pbk=data["REALITY_PUBLIC_KEY"],
+                             sid=data["REALITY_SHORT_ID"])
+            else:
+                query["sni"] = data["DOMAIN"]
+            label = data["INSTANCE_NAME"] or data["DOMAIN"]
+            print("vless://" + data["UUID"] + "@" + data["DOMAIN"] + ":" + port + "?" +
+                  urlencode(query, quote_via=quote) + "#" + quote(label + "-" + security))
+    else:
+        fail("未知内部操作")
+except (ValueError, KeyError, IndexError, StopIteration, OSError, TypeError):
+    # Do not include parser source snippets or credential-bearing exception reprs.
+    message = sys.exc_info()[1]
+    if isinstance(message, ValueError) and not isinstance(message, json.JSONDecodeError):
+        print("错误：" + str(message), file=sys.stderr)
+    else:
+        print("错误：配置格式或登记文件不正确，请检查字段", file=sys.stderr)
+    sys.exit(1)
+PY
+}
 
 normalize_domain() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g'
@@ -147,23 +571,30 @@ check_ipv4() {
 
 check_host() {
   local h="$1"
-  check_domain "$h" || check_ipv4 "$h" || [[ "$h" == *:* ]]
+  check_domain "$h" || check_ipv4 "$h" || {
+    [[ "$h" =~ ^[0-9a-fA-F:]+$ ]] &&
+      python3 -c 'import ipaddress, sys; ipaddress.IPv6Address(sys.argv[1])' "$h" 2>/dev/null
+  }
 }
 
 check_port_number() {
   local p="$1"
-  [[ "$p" =~ ^[0-9]+$ ]] || return 1
-  (( p >= 1 && p <= 65535 ))
+  [[ "$p" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$p >= 1 && 10#$p <= 65535 ))
 }
 
 port_in_use() {
   local p="$1"
-  ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${p}$"
+  if ss -lnt 2>/dev/null | awk '{print $4}' | grep -E "(:|\\])${p}$" >/dev/null; then
+    return 0
+  fi
+  [[ -d "$MANAGER_DIR/instances" ]] || return 1
+  native_helper ports | grep -Fx "$p" >/dev/null
 }
 
 port_owned_by_nginx() {
   local p="$1"
-  ss -lntp 2>/dev/null | grep -E "(:|\\])${p}[[:space:]]" | grep -q 'nginx'
+  ss -lntp 2>/dev/null | grep -E "(:|\\])${p}[[:space:]]" | grep 'nginx' >/dev/null
 }
 
 normalize_node_mode() {
@@ -251,63 +682,85 @@ validate_short_id() {
 }
 
 parse_upstream_uri() {
-  local uri="$1" rest authority hostport query transport encryption
-  [[ "$uri" == vless://* ]] || die "上游链接必须以 vless:// 开头"
-
-  rest="${uri#vless://}"
-  authority="${rest%%\?*}"
-  [[ "$authority" != "$rest" ]] || die "上游 VLESS 链接缺少查询参数"
-  query="${rest#*\?}"
-  query="${query%%#*}"
-
-  [[ "$authority" == *@* ]] || die "上游链接缺少 UUID 或地址"
-  UPSTREAM_UUID="${authority%%@*}"
-  hostport="${authority#*@}"
-
-  if [[ "$hostport" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
-    UPSTREAM_ADDRESS="${BASH_REMATCH[1]}"
-    UPSTREAM_PORT="${BASH_REMATCH[2]}"
-  else
-    [[ "$hostport" == *:* ]] || die "上游 VLESS 链接缺少端口"
-    UPSTREAM_ADDRESS="${hostport%:*}"
-    UPSTREAM_PORT="${hostport##*:}"
-  fi
-
-  UPSTREAM_SECURITY="$(query_param "$query" security || true)"
-  transport="$(query_param "$query" type || true)"
-  encryption="$(query_param "$query" encryption || true)"
-  UPSTREAM_SNI="$(query_param "$query" sni || true)"
-  UPSTREAM_FLOW="$(query_param "$query" flow || true)"
-  UPSTREAM_FINGERPRINT="$(query_param "$query" fp || true)"
-  UPSTREAM_REALITY_PUBLIC_KEY="$(query_param "$query" pbk || true)"
-  UPSTREAM_REALITY_SHORT_ID="$(query_param "$query" sid || true)"
-  UPSTREAM_REALITY_MLDSA65_VERIFY="$(query_param "$query" pqv || true)"
-
-  [[ -n "$UPSTREAM_SECURITY" ]] || UPSTREAM_SECURITY=tls
-  [[ -n "$transport" ]] || transport=tcp
-  [[ -n "$encryption" ]] || encryption=none
-  [[ -n "$UPSTREAM_FLOW" ]] || UPSTREAM_FLOW=xtls-rprx-vision
-  [[ -n "$UPSTREAM_FINGERPRINT" ]] || UPSTREAM_FINGERPRINT=chrome
-  [[ -n "$UPSTREAM_SNI" ]] || UPSTREAM_SNI="$UPSTREAM_ADDRESS"
-
-  [[ "$transport" == tcp || "$transport" == raw ]] || die "当前链式模式只支持 type=tcp/raw"
-  [[ "$encryption" == none ]] || die "上游 encryption 必须为 none"
-  [[ "$UPSTREAM_SECURITY" == tls || "$UPSTREAM_SECURITY" == reality ]] || die "上游仅支持 TLS / REALITY"
+  ensure_work_dir
+  printf '%s\n' "$1" > "$WORK_DIR/node.input"
+  native_helper parse "$WORK_DIR/node.input" > "$WORK_DIR/upstream.json" || return 1
+  load_values upstream-values "$WORK_DIR/upstream.json"
 }
 
 validate_upstream() {
-  check_host "$UPSTREAM_ADDRESS" || die "上游地址格式不正确：$UPSTREAM_ADDRESS"
-  check_port_number "$UPSTREAM_PORT" || die "上游端口格式不正确：$UPSTREAM_PORT"
-  [[ "$UPSTREAM_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || die "上游 UUID 格式不正确"
-  [[ "$UPSTREAM_FLOW" == xtls-rprx-vision || "$UPSTREAM_FLOW" == xtls-rprx-vision-udp443 ]] || die "当前只支持 Vision flow"
+  native_helper validate
+}
 
-  if [[ "$UPSTREAM_SECURITY" == reality ]]; then
-    [[ -n "$UPSTREAM_REALITY_PUBLIC_KEY" ]] || die "REALITY 上游缺少 pbk"
-    validate_short_id "$UPSTREAM_REALITY_SHORT_ID" || die "REALITY 上游 sid 格式不正确"
+detect_platform() {
+  if need_cmd apt-get; then PACKAGE_MANAGER=apt
+  elif need_cmd dnf; then PACKAGE_MANAGER=dnf
+  elif need_cmd yum; then PACKAGE_MANAGER=yum
+  elif need_cmd apk; then PACKAGE_MANAGER=apk
+  else die "支持 apt、dnf/yum、apk 系统，未找到包管理器"
+  fi
+  if [[ -z "$INIT_SYSTEM" ]]; then
+    if [[ -d /run/systemd/system ]] && need_cmd systemctl; then INIT_SYSTEM=systemd
+    elif need_cmd rc-service && need_cmd rc-update; then INIT_SYSTEM=openrc
+    else die "未检测到运行中的 systemd 或 OpenRC；请在实际服务器上运行"
+    fi
+  fi
+  case "$INIT_SYSTEM" in
+    systemd) need_cmd systemctl || die "找不到 systemctl" ;;
+    openrc)
+      if ! need_cmd rc-service || ! need_cmd rc-update; then die "找不到 OpenRC 管理命令"; fi ;;
+    *) die "INIT_SYSTEM 必须为 systemd/openrc" ;;
+  esac
+  if [[ "$PACKAGE_MANAGER" == apk && "$NGINX_CONF_DIR" == /etc/nginx/conf.d ]]; then
+    NGINX_CONF_DIR=/etc/nginx/http.d
+  fi
+}
+
+package_install() {
+  case "$PACKAGE_MANAGER" in
+    apt) apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    dnf|yum) "$PACKAGE_MANAGER" install -y "$@" ;;
+    apk) apk add --no-cache "$@" ;;
+    *) die "请先检测发行版" ;;
+  esac
+} 9>&-
+
+service_action() {
+  local action="$1" service="${2:-$SERVICE_NAME}"
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    case "$action" in
+      active) systemctl is-active --quiet "$service" ;;
+      enabled) systemctl is-enabled --quiet "$service" ;;
+      *) systemctl "$action" "$service" ;;
+    esac
+  else
+    case "$action" in
+      active|status) rc-service "$service" status ;;
+      enable) rc-update add "$service" default ;;
+      disable) rc-update del "$service" default ;;
+      enabled) rc-update show default | awk '{print $1}' | grep -Fx "$service" >/dev/null ;;
+      *) rc-service "$service" "$action" ;;
+    esac
+  fi
+} 9>&-
+
+service_logs() {
+  local follow="${1:-false}"
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    if [[ "$follow" == true ]]; then
+      journalctl -u "$SERVICE_NAME" -n 100 -f --no-pager
+    else
+      journalctl -u "$SERVICE_NAME" -n 100 --no-pager
+    fi
+  else
+    local log="$APP_DIR/logs/service.log"
+    [[ -f "$log" ]] || { yellow "尚无服务日志：$log"; return 0; }
+    if [[ "$follow" == true ]]; then tail -n 100 -F "$log"; else tail -n 100 "$log"; fi
   fi
 }
 
 repair_dpkg_state() {
+  [[ "$PACKAGE_MANAGER" == apt ]] || return 0
   if need_cmd dpkg && dpkg --audit 2>/dev/null | grep -q .; then
     yellow "检测到 dpkg 状态异常，尝试修复..."
     dpkg --configure -a >/dev/null 2>&1 || true
@@ -316,19 +769,40 @@ repair_dpkg_state() {
 }
 
 install_base_tools() {
-  need_cmd apt-get || die "当前版本仅适配 Debian / Ubuntu"
+  detect_platform
   repair_dpkg_state
-
-  local packages=(ca-certificates curl openssl iproute2 coreutils)
-  local missing=0 cmd
-  for cmd in curl openssl ss timeout; do
-    need_cmd "$cmd" || missing=1
+  local packages=() cmd needs_coreutils=0
+  need_cmd curl || packages+=(curl)
+  need_cmd openssl || packages+=(openssl)
+  need_cmd python3 || packages+=(python3)
+  need_cmd unzip || packages+=(unzip)
+  # Respect working curl-minimal/coreutils-single alternatives on CentOS.
+  for cmd in timeout install mktemp chmod cp mv; do
+    need_cmd "$cmd" || needs_coreutils=1
   done
-
-  if [[ "$missing" == 1 ]]; then
-    blue "安装基础依赖..."
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+  [[ "$needs_coreutils" != 1 ]] || packages+=(coreutils)
+  if ! need_cmd ss; then
+    case "$PACKAGE_MANAGER" in
+      apt) packages+=(iproute2) ;;
+      dnf|yum) packages+=(iproute) ;;
+      apk) packages+=(iproute2 iproute2-ss) ;;
+    esac
+  fi
+  if ! need_cmd flock; then
+    if [[ "$PACKAGE_MANAGER" == apk ]]; then packages+=(flock)
+    else packages+=(util-linux)
+    fi
+  fi
+  if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    case "$PACKAGE_MANAGER" in
+      apt) packages+=(python3-yaml) ;;
+      dnf|yum) packages+=(python3-pyyaml) ;;
+      apk) packages+=(py3-yaml) ;;
+    esac
+  fi
+  if [[ "${#packages[@]}" -gt 0 ]]; then
+    blue "安装缺少的基础依赖..."
+    package_install ca-certificates "${packages[@]}"
   else
     green "基础依赖已满足"
   fi
@@ -336,21 +810,40 @@ install_base_tools() {
 
 install_xray_if_needed() {
   if [[ -x "$XRAY_BIN" ]]; then
+    "$XRAY_BIN" version >/dev/null 2>&1 || die "现有 Xray 无法运行：$XRAY_BIN，请先安装适用于本机的版本"
     green "检测到 Xray：$($XRAY_BIN version 2>/dev/null | head -n1 || true)"
     return 0
   fi
 
-  blue "未检测到 Xray，使用 XTLS 官方安装脚本安装..."
-  local tmp
-  tmp="$(mktemp)"
-  curl -fsSL "$XRAY_INSTALL_URL" -o "$tmp" || die "下载 Xray 官方安装脚本失败"
-  bash "$tmp" install --without-geodata -u root
-  rm -f "$tmp"
+  blue "下载 XTLS 官方 Xray 二进制..."
+  ensure_work_dir
+  local arch release asset
+  case "$(uname -m)" in
+    x86_64|amd64) arch=64 ;;
+    aarch64|arm64) arch=arm64-v8a ;;
+    armv7l) arch=arm32-v7a ;;
+    armv6l) arch=arm32-v6 ;;
+    i386|i686) arch=32 ;;
+    riscv64) arch=riscv64 ;;
+    s390x) arch=s390x ;;
+    ppc64le) arch=ppc64le ;;
+    *) die "暂不支持该 CPU 架构，请预先安装 Xray" ;;
+  esac
+  release="${XRAY_VERSION:-latest}"
+  if [[ "$release" == latest ]]; then
+    curl -fsSL --retry 3 https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+      -o "$WORK_DIR/release.json"
+    release="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "$WORK_DIR/release.json")"
+  fi
+  [[ "$release" =~ ^v[0-9][0-9.]*$ ]] || die "XRAY_VERSION 格式不正确"
+  asset="Xray-linux-${arch}.zip"
+  curl -fsSL --retry 3 "https://github.com/XTLS/Xray-core/releases/download/${release}/${asset}" \
+    -o "$WORK_DIR/xray.zip"
+  unzip -q "$WORK_DIR/xray.zip" xray -d "$WORK_DIR/xray"
+  "$WORK_DIR/xray/xray" version >/dev/null || die "该 Xray 二进制无法在本机运行"
+  mkdir -p "$(dirname "$XRAY_BIN")"
+  install -m 755 "$WORK_DIR/xray/xray" "$XRAY_BIN"
   [[ -x "$XRAY_BIN" ]] || die "Xray 安装失败"
-
-  # The official installer creates xray.service. This script uses an isolated
-  # xray-chain.service and therefore disables only the newly installed default service.
-  systemctl disable --now xray.service >/dev/null 2>&1 || true
   green "Xray 安装完成"
 }
 
@@ -364,24 +857,30 @@ install_nginx_if_needed() {
   if need_cmd nginx; then
     green "检测到系统已安装 Nginx，直接复用"
   else
-    blue "未检测到 Nginx，使用 apt 安装..."
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+    blue "未检测到 Nginx，使用系统包管理器安装..."
+    if [[ "$PACKAGE_MANAGER" == apk ]]; then package_install nginx nginx-openrc
+    else package_install nginx
+    fi
   fi
 
-  systemctl enable nginx >/dev/null 2>&1 || true
+  service_action enable nginx >/dev/null 2>&1 || true
 }
 
 install_certbot_for_mode() {
   [[ "$CERT_MODE" == http || "$CERT_MODE" == cloudflare ]] || return 0
 
   blue "检查 Certbot..."
-  apt-get update -y
-  if [[ "$CERT_MODE" == http ]]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
-  else
-    DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-dns-cloudflare
+  local plugin=""
+  if [[ "$CERT_MODE" == cloudflare ]]; then
+    if [[ "$PACKAGE_MANAGER" == apk ]]; then plugin=certbot-dns-cloudflare
+    else plugin=python3-certbot-dns-cloudflare
+    fi
   fi
+  if [[ "$PACKAGE_MANAGER" == dnf || "$PACKAGE_MANAGER" == yum ]]; then
+    # Certbot and DNS plugins are supplied by EPEL on CentOS/RHEL derivatives.
+    if ! rpm -q epel-release >/dev/null 2>&1; then package_install epel-release; fi
+  fi
+  package_install certbot ${plugin:+"$plugin"}
   need_cmd certbot || die "Certbot 安装失败"
 }
 
@@ -436,7 +935,11 @@ ask_reality_target() {
     split_host_port "$REALITY_TARGET"
     check_host "$SPLIT_HOST" || die "REALITY target 主机格式不正确"
     check_port_number "$SPLIT_PORT" || die "REALITY target 端口不正确"
-    REALITY_TARGET="${SPLIT_HOST}:${SPLIT_PORT}"
+    if [[ "$SPLIT_HOST" == *:* ]]; then
+      REALITY_TARGET="[${SPLIT_HOST}]:${SPLIT_PORT}"
+    else
+      REALITY_TARGET="${SPLIT_HOST}:${SPLIT_PORT}"
+    fi
     [[ -n "$REALITY_SERVER_NAME" ]] || REALITY_SERVER_NAME="$SPLIT_HOST"
   else
     [[ -n "$REALITY_SERVER_NAME" ]] || REALITY_SERVER_NAME="$DOMAIN"
@@ -482,17 +985,27 @@ ask_cert_mode() {
 
 choose_port_interactive() {
   local label="$1" current="$2" fallback="$3"
+  fallback="$(find_free_internal_port "$fallback")"
+  if [[ "$INTERACTIVE" == 1 && -n "$INSTANCE_ID" ]]; then
+    local suggested="$current"
+    if port_in_use "$suggested"; then suggested="$fallback"; fi
+    read -rp "${label} 监听端口 [默认 ${suggested}]: " current
+    [[ -n "$current" ]] || current="$suggested"
+    check_port_number "$current" || die "端口必须为 1–65535" >&2
+  fi
   while port_in_use "$current"; do
-    yellow "${label} 端口 ${current} 已被占用。"
+    yellow "${label} 端口 ${current} 已被占用。" >&2
     if [[ "$INTERACTIVE" != 1 ]]; then
-      die "端口 ${current} 已占用；请显式设置其它端口后重试"
+      die "端口 ${current} 已占用；请显式设置其它端口后重试" >&2
     fi
     read -rp "请输入新的 ${label} 端口 [默认 ${fallback}]: " current
     [[ -n "$current" ]] || current="$fallback"
-    check_port_number "$current" || { yellow "端口格式不正确"; current="$fallback"; }
-    fallback=$((current + 1))
+    check_port_number "$current" || { yellow "端口格式不正确" >&2; current="$fallback"; }
+    current=$((10#$current))
+    (( current < 65535 )) || die "没有可用端口" >&2
+    fallback="$(find_free_internal_port "$((current + 1))")"
   done
-  printf '%s' "$current"
+  printf '%s' "$((10#$current))"
 }
 
 choose_public_ports() {
@@ -523,18 +1036,66 @@ ask_upstream() {
   echo
   blue "配置下一跳 VLESS："
 
+  ensure_work_dir
   if [[ -n "$UPSTREAM_URI" ]]; then
-    parse_upstream_uri "$UPSTREAM_URI"
-  elif [[ -n "$UPSTREAM_ADDRESS" && -n "$UPSTREAM_PORT" && -n "$UPSTREAM_UUID" ]]; then
-    [[ -n "$UPSTREAM_SECURITY" ]] || UPSTREAM_SECURITY=tls
-    [[ -n "$UPSTREAM_SNI" ]] || UPSTREAM_SNI="$UPSTREAM_ADDRESS"
-  else
-    read -rp "请粘贴下一跳 vless:// 分享链接: " UPSTREAM_URI
-    parse_upstream_uri "$UPSTREAM_URI"
+    parse_upstream_uri "$UPSTREAM_URI" || die "落地配置导入失败"
+  elif [[ -z "$UPSTREAM_ADDRESS" ]]; then
+    blue "粘贴单条 vless:// 或单个 YAML/JSON 节点；多行节点最后输入 END。"
+    local line input=""
+    read -rp "落地配置（留空进入手工填写）: " line || die "已取消"
+    if [[ -n "$line" ]]; then
+      input="$line"
+      if [[ "$line" != vless://* && "$line" != *"}" && "$line" != *"]" ]]; then
+        while IFS= read -r line && [[ "$line" != END ]]; do
+          input+=$'\n'"$line"
+        done
+      fi
+      parse_upstream_uri "$input" || die "落地配置导入失败"
+    fi
   fi
+  complete_upstream
+  validate_upstream || die "落地配置校验失败"
+  blue "落地：${UPSTREAM_NAME:-未命名}  ${UPSTREAM_ADDRESS}:${UPSTREAM_PORT}"
+  blue "传输：${UPSTREAM_TRANSPORT}  安全：${UPSTREAM_SECURITY}  SNI：${UPSTREAM_SNI}"
+  if [[ "$UPSTREAM_TRANSPORT" == xhttp ]]; then
+    blue "XHTTP path：${UPSTREAM_XHTTP_PATH}  mode：${UPSTREAM_XHTTP_MODE}"
+  fi
+  if [[ "$INTERACTIVE" == 1 ]]; then
+    local confirm
+    read -rp "使用这个落地配置？[Y/n]: " confirm || die "已取消"
+    [[ "$confirm" != n && "$confirm" != N ]] || die "已取消"
+  fi
+}
 
-  validate_upstream
-  green "下一跳：${UPSTREAM_ADDRESS}:${UPSTREAM_PORT} (${UPSTREAM_SECURITY})"
+ask_missing() {
+  local key="$1" label="$2" default="${3:-}" answer
+  [[ -z "${!key}" ]] || return 0
+  [[ "$INTERACTIVE" == 1 ]] || die "缺少字段 ${key}，请设置环境变量或提供完整落地配置"
+  read -rp "${label}${default:+ [默认 $default]}: " answer || die "已取消"
+  printf -v "$key" '%s' "${answer:-$default}"
+}
+
+complete_upstream() {
+  ask_missing UPSTREAM_ADDRESS "落地服务器域名/IP"
+  ask_missing UPSTREAM_PORT "落地端口"
+  ask_missing UPSTREAM_UUID "落地 UUID"
+  ask_missing UPSTREAM_TRANSPORT "落地传输方式 raw/xhttp" raw
+  [[ "$UPSTREAM_TRANSPORT" != tcp ]] || UPSTREAM_TRANSPORT=raw
+  ask_missing UPSTREAM_SECURITY "落地安全方式 tls/reality" tls
+  if [[ "$INTERACTIVE" == 1 ]]; then
+    ask_missing UPSTREAM_SNI "落地 SNI/servername" "$UPSTREAM_ADDRESS"
+  else
+    [[ -n "$UPSTREAM_SNI" ]] || UPSTREAM_SNI="$UPSTREAM_ADDRESS"
+  fi
+  if [[ "$UPSTREAM_SECURITY" == reality ]]; then
+    ask_missing UPSTREAM_REALITY_PUBLIC_KEY "REALITY public-key/pbk"
+    if [[ -z "$UPSTREAM_REALITY_SHORT_ID" && "$INTERACTIVE" == 1 ]]; then
+      read -rp "REALITY short-id/sid（落地允许空值时可留空）: " UPSTREAM_REALITY_SHORT_ID || die "已取消"
+    fi
+  fi
+  if [[ "$UPSTREAM_TRANSPORT" == xhttp ]]; then
+    ask_missing UPSTREAM_XHTTP_PATH "XHTTP path" /
+  fi
 }
 
 warn_dns() {
@@ -577,15 +1138,27 @@ HTML
 
 find_free_internal_port() {
   local p="$1"
-  while port_in_use "$p"; do p=$((p + 1)); done
+  check_port_number "$p" || die "内部端口必须为 1–65535" >&2
+  p=$((10#$p))
+  while port_in_use "$p"; do
+    (( p < 65535 )) || die "没有可用端口" >&2
+    p=$((p + 1))
+  done
   printf '%s' "$p"
 }
 
 choose_internal_ports() {
   needs_nginx || return 0
-  INTERNAL_HTTP_PORT="$(find_free_internal_port "$INTERNAL_HTTP_PORT")"
-  INTERNAL_HTTPS_PORT="$(find_free_internal_port "$INTERNAL_HTTPS_PORT")"
-  [[ "$INTERNAL_HTTP_PORT" != "$INTERNAL_HTTPS_PORT" ]] || INTERNAL_HTTPS_PORT=$((INTERNAL_HTTPS_PORT + 1))
+  # Include the new public ports before its state record is committed.
+  local port
+  for port in INTERNAL_HTTP_PORT INTERNAL_HTTPS_PORT; do
+    printf -v "$port" '%s' "$(find_free_internal_port "${!port}")"
+    while [[ "${!port}" == "$TLS_PORT" || "${!port}" == "$REALITY_PORT" ||
+             ( "$port" == INTERNAL_HTTPS_PORT && "${!port}" == "$INTERNAL_HTTP_PORT" ) ]]; do
+      (( ${!port} < 65535 )) || die "没有可用内部端口"
+      printf -v "$port" '%s' "$(find_free_internal_port "$(( ${!port} + 1 ))")"
+    done
+  done
 
   if uses_reality && [[ "$REALITY_TARGET_MODE" == local ]]; then
     REALITY_TARGET="127.0.0.1:${INTERNAL_HTTPS_PORT}"
@@ -594,17 +1167,13 @@ choose_internal_ports() {
 }
 
 nginx_conf_path() {
-  printf '/etc/nginx/conf.d/xray-chain-%s.conf' "$DOMAIN"
+  printf '%s/%s-%s.conf' "$NGINX_CONF_DIR" "$SERVICE_NAME" "$DOMAIN"
 }
 
 detect_preexisting_nginx_domain() {
-  local own_conf
-  own_conf="$(nginx_conf_path)"
-
   if grep -RhsE \
-    --exclude="$(basename "$own_conf")" \
     "server_name[[:space:]][^;]*${DOMAIN//./\\.}([[:space:];]|$)" \
-    /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | grep -q .; then
+    "$NGINX_CONF_DIR" /etc/nginx/sites-enabled 2>/dev/null | grep . >/dev/null; then
     NGINX_DOMAIN_PREEXISTED=1
   else
     NGINX_DOMAIN_PREEXISTED=0
@@ -613,47 +1182,31 @@ detect_preexisting_nginx_domain() {
 
 write_nginx_challenge_config() {
   [[ "$CERT_MODE" == http ]] || return 0
-  local conf
-  conf="$(nginx_conf_path)"
-  mkdir -p /etc/nginx/conf.d
-
-  local public80=""
-  if [[ "$NGINX_DOMAIN_PREEXISTED" == 1 ]]; then
-    yellow "Nginx 已存在 ${DOMAIN} 的 server_name，Certbot 将复用现有站点进行 HTTP-01 验证。"
-  else
-    public80=$(cat <<NGINX
+  local conf="$NGINX_CONF_DIR/xray-chain-http-$DOMAIN.conf"
+  local root="$MANAGER_WEB_ROOT/domains/$DOMAIN"
+  mkdir -p "$NGINX_CONF_DIR" "$root/.well-known/acme-challenge"
+  chmod 755 "$MANAGER_WEB_ROOT" "$MANAGER_WEB_ROOT/domains" "$root" "$root/.well-known" "$root/.well-known/acme-challenge"
+  if [[ "$NGINX_DOMAIN_PREEXISTED" == 1 && ! -f "$conf" ]]; then
+    die "域名已有其它 Nginx 站点。请选择 DNS-01 或已有证书"
+  fi
+  if [[ ! -f "$conf" ]]; then
+    INSTALL_HTTP_CREATED=1
+    cat > "$conf" <<NGINX
+# Managed shared HTTP-01 webroot; retained for certificate renewal.
 server {
     listen 80;
     listen [::]:80;
-    server_name ${DOMAIN};
-    root ${WEB_ROOT};
-
-    location ^~ /.well-known/acme-challenge/ {
-        try_files \$uri =404;
-    }
-
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
+    server_name $DOMAIN;
+    root $root;
+    location ^~ /.well-known/acme-challenge/ { try_files \$uri =404; }
+    location / { return 404; }
 }
 NGINX
-)
   fi
-
-  cat > "$conf" <<NGINX
-# Managed by xray-vless-native-v3.sh
-${public80}
-server {
-    listen 127.0.0.1:${INTERNAL_HTTP_PORT};
-    server_name ${DOMAIN};
-    root ${WEB_ROOT};
-    index index.html;
-    location / { try_files \$uri \$uri/ /index.html; }
-}
-NGINX
-
-  nginx -t || die "Nginx challenge 配置检查失败"
-  systemctl restart nginx
+  nginx -t || die "Nginx HTTP-01 配置检查失败"
+  if service_action active nginx >/dev/null 2>&1; then service_action reload nginx
+  else service_action start nginx
+  fi
 }
 
 verify_cf_token() {
@@ -667,7 +1220,9 @@ verify_cf_token() {
     -w $'\nHTTP_STATUS:%{http_code}')" || die "Cloudflare Token 校验请求失败"
   status="$(echo "$response" | awk -F 'HTTP_STATUS:' 'NF>1{print $2}' | tail -n1)"
   body="$(echo "$response" | sed '/HTTP_STATUS:/d')"
-  [[ "$status" == 200 ]] && echo "$body" | grep -q '"success"[[:space:]]*:[[:space:]]*true' || die "Cloudflare Token 校验失败"
+  if [[ "$status" != 200 ]] || ! echo "$body" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
+    die "Cloudflare Token 校验失败"
+  fi
   green "Cloudflare Token 有效"
 }
 
@@ -676,8 +1231,8 @@ obtain_or_copy_cert() {
   local le_live="/etc/letsencrypt/live/${DOMAIN}"
 
   if [[ "$CERT_MODE" == http ]]; then
-    blue "使用 Certbot + Nginx 执行 HTTP-01 证书申请..."
-    certbot certonly --nginx \
+    blue "使用 Certbot webroot 执行 HTTP-01 证书申请..."
+    certbot certonly --webroot -w "$MANAGER_WEB_ROOT/domains/$DOMAIN" \
       -d "$DOMAIN" \
       --email "$EMAIL" \
       --agree-tos \
@@ -688,14 +1243,21 @@ obtain_or_copy_cert() {
     KEY_FILE="${le_live}/privkey.pem"
   elif [[ "$CERT_MODE" == cloudflare ]]; then
     blue "使用 Cloudflare DNS-01 申请证书..."
-    cat > "$APP_DIR/cloudflare.ini" <<CF
+    mkdir -p "$MANAGER_DIR/credentials"
+    chmod 700 "$MANAGER_DIR/credentials"
+    local credentials="$MANAGER_DIR/credentials/$DOMAIN.ini"
+    ensure_work_dir
+    if [[ -f "$credentials" ]]; then cp -p "$credentials" "$WORK_DIR/cloudflare.backup"; fi
+    INSTALL_CF_PATH="$credentials"
+    INSTALL_CF_CHANGED=1
+    cat > "$credentials" <<CF
 # Managed by xray-vless-native-v3.sh
 dns_cloudflare_api_token = ${CF_API_TOKEN}
 CF
-    chmod 600 "$APP_DIR/cloudflare.ini"
+    chmod 600 "$credentials"
     certbot certonly \
       --dns-cloudflare \
-      --dns-cloudflare-credentials "$APP_DIR/cloudflare.ini" \
+      --dns-cloudflare-credentials "$credentials" \
       --dns-cloudflare-propagation-seconds 60 \
       -d "$DOMAIN" \
       --email "$EMAIL" \
@@ -721,66 +1283,75 @@ primary_public_port() {
   if uses_reality; then printf '%s' "$REALITY_PORT"; else printf '%s' "$TLS_PORT"; fi
 }
 
+configure_selinux() {
+  needs_nginx || return 0
+  need_cmd getenforce || return 0
+  [[ "$(getenforce)" == Enforcing ]] || return 0
+  if ! need_cmd semanage; then
+    local policy_package=policycoreutils-python-utils
+    if [[ "$PACKAGE_MANAGER" == yum ]] && rpm -q --qf '%{VERSION}' centos-release 2>/dev/null | grep -q '^7'; then
+      policy_package=policycoreutils-python
+    fi
+    package_install policycoreutils "$policy_package"
+  fi
+  local port
+  for port in "$INTERNAL_HTTP_PORT" "$INTERNAL_HTTPS_PORT"; do
+    if ! semanage port -l | python3 -c '
+import sys
+p=int(sys.argv[1]); found=False
+for line in sys.stdin:
+    fields=line.split()
+    if fields[:2] != ["http_port_t","tcp"]: continue
+    for part in "".join(fields[2:]).split(","):
+        if not part: continue
+        nums=[int(v) for v in part.split("-")]
+        if nums[0] <= p <= nums[-1]: found=True
+sys.exit(0 if found else 1)' "$port"; then
+      semanage port -a -t http_port_t -p tcp "$port" ||
+        die "SELinux 端口 $port 已被其它类型使用，请调整 INTERNAL_HTTP_PORT/INTERNAL_HTTPS_PORT"
+    fi
+  done
+  local root="$MANAGER_WEB_ROOT/domains/$DOMAIN"
+  mkdir -p "$root/.well-known/acme-challenge"
+  # Keep SELinux enabled; label only this manager's website and certificate paths.
+  semanage fcontext -a -t httpd_sys_content_t "$MANAGER_WEB_ROOT(/.*)?" 2>/dev/null ||
+    semanage fcontext -m -t httpd_sys_content_t "$MANAGER_WEB_ROOT(/.*)?"
+  semanage fcontext -a -t httpd_config_t "$APP_DIR/certs(/.*)?" 2>/dev/null ||
+    semanage fcontext -m -t httpd_config_t "$APP_DIR/certs(/.*)?"
+  restorecon -RF "$MANAGER_WEB_ROOT" "$APP_DIR/certs"
+}
+
 write_final_nginx_config() {
   needs_nginx || return 0
-  local conf public80="" primary_port
+  local conf
   conf="$(nginx_conf_path)"
-  primary_port="$(primary_public_port)"
-
-  if [[ "$CERT_MODE" == http && "$NGINX_DOMAIN_PREEXISTED" != 1 ]]; then
-    local redirect_target
-    if [[ "$primary_port" == 443 ]]; then
-      redirect_target='https://$host$request_uri'
-    else
-      redirect_target="https://\$host:${primary_port}\$request_uri"
-    fi
-
-    public80=$(cat <<NGINX
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
-    root ${WEB_ROOT};
-
-    location ^~ /.well-known/acme-challenge/ {
-        try_files \$uri =404;
-    }
-
-    location / {
-        return 301 ${redirect_target};
-    }
-}
-NGINX
-)
-  fi
-
+  [[ ! -e "$conf" ]] || die "Nginx 配置已存在：$conf"
+  INSTALL_NGINX_CREATED=1
+  mkdir -p "$NGINX_CONF_DIR"
   cat > "$conf" <<NGINX
-# Managed by xray-vless-native-v3.sh
-${public80}
-# TLS fallback after Xray has terminated TLS.
+# Managed by xray-vless-native-v3.sh; instance $INSTANCE_ID.
 server {
-    listen 127.0.0.1:${INTERNAL_HTTP_PORT};
-    server_name ${DOMAIN};
-    root ${WEB_ROOT};
+    listen 127.0.0.1:$INTERNAL_HTTP_PORT;
+    server_name $DOMAIN;
+    root $WEB_ROOT;
     index index.html;
     location / { try_files \$uri \$uri/ /index.html; }
 }
-
-# REALITY local target. This listener performs a real local TLS handshake.
 server {
-    listen 127.0.0.1:${INTERNAL_HTTPS_PORT} ssl;
-    server_name ${DOMAIN};
-    ssl_certificate ${APP_DIR}/certs/fullchain.pem;
-    ssl_certificate_key ${APP_DIR}/certs/privkey.pem;
+    listen 127.0.0.1:$INTERNAL_HTTPS_PORT ssl;
+    server_name $DOMAIN;
+    ssl_certificate $APP_DIR/certs/fullchain.pem;
+    ssl_certificate_key $APP_DIR/certs/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    root ${WEB_ROOT};
+    root $WEB_ROOT;
     index index.html;
     location / { try_files \$uri \$uri/ /index.html; }
 }
 NGINX
-
   nginx -t || die "Nginx 最终配置检查失败"
-  systemctl restart nginx
+  if service_action active nginx >/dev/null 2>&1; then service_action reload nginx
+  else service_action start nginx
+  fi
   green "Nginx 配置完成"
 }
 
@@ -813,83 +1384,18 @@ ENV
 }
 
 build_upstream_outbounds() {
-  if [[ "$NODE_MODE" == direct ]]; then
-    cat <<JSON
-    {
-      "tag": "direct",
-      "protocol": "freedom"
-    }
-JSON
-    return 0
+  if [[ "$NODE_MODE" == relay ]]; then
+    native_helper outbound
+    printf ',\n'
   fi
-
-  if [[ "$UPSTREAM_SECURITY" == tls ]]; then
-    cat <<JSON
-    {
-      "tag": "upstream-vless",
-      "protocol": "vless",
-      "settings": {
-        "address": "${UPSTREAM_ADDRESS}",
-        "port": ${UPSTREAM_PORT},
-        "id": "${UPSTREAM_UUID}",
-        "encryption": "none",
-        "flow": "${UPSTREAM_FLOW}"
-      },
-      "streamSettings": {
-        "method": "raw",
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "${UPSTREAM_SNI}",
-          "allowInsecure": ${UPSTREAM_ALLOW_INSECURE},
-          "fingerprint": "${UPSTREAM_FINGERPRINT}"
-        }
-      }
-    },
-    {
-      "tag": "direct",
-      "protocol": "freedom"
-    }
-JSON
-  else
-    local pq=""
-    if [[ -n "$UPSTREAM_REALITY_MLDSA65_VERIFY" ]]; then
-      pq=",\n          \"mldsa65Verify\": \"${UPSTREAM_REALITY_MLDSA65_VERIFY}\""
-    fi
-    cat <<JSON
-    {
-      "tag": "upstream-vless",
-      "protocol": "vless",
-      "settings": {
-        "address": "${UPSTREAM_ADDRESS}",
-        "port": ${UPSTREAM_PORT},
-        "id": "${UPSTREAM_UUID}",
-        "encryption": "none",
-        "flow": "${UPSTREAM_FLOW}"
-      },
-      "streamSettings": {
-        "method": "raw",
-        "security": "reality",
-        "realitySettings": {
-          "serverName": "${UPSTREAM_SNI}",
-          "fingerprint": "${UPSTREAM_FINGERPRINT}",
-          "password": "${UPSTREAM_REALITY_PUBLIC_KEY}",
-          "shortId": "${UPSTREAM_REALITY_SHORT_ID}"${pq}
-        }
-      }
-    },
-    {
-      "tag": "direct",
-      "protocol": "freedom"
-    }
-JSON
-  fi
+  printf '{"tag":"direct","protocol":"freedom"}\n'
 }
 
 write_xray_config() {
   blue "写入 Xray 配置..."
   local inbounds="" inbound_tags="" route_outbound outbounds
   route_outbound=direct
-  [[ "$NODE_MODE" == relay ]] && route_outbound=upstream-vless
+  [[ "$NODE_MODE" == relay ]] && route_outbound='upstream-vless'
 
   if uses_tls; then
     inbounds=$(cat <<JSON
@@ -977,7 +1483,7 @@ JSON
   cat > "$APP_DIR/config.json" <<JSON
 {
   "log": {
-    "loglevel": "warning"
+    "loglevel": "info"
   },
   "routing": {
     "domainStrategy": "AsIs",
@@ -1001,26 +1507,50 @@ JSON
 }
 
 write_systemd_service() {
-  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<SERVICE
+  INSTALL_SERVICE_CREATED=1
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    mkdir -p "$SYSTEMD_DIR"
+    cat > "$SYSTEMD_DIR/$SERVICE_NAME.service" <<SERVICE
 [Unit]
-Description=Xray VLESS Chain Service
-Documentation=https://github.com/XTLS/Xray-core
+Description=Xray VLESS instance $INSTANCE_ID
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=${XRAY_BIN} run -config ${APP_DIR}/config.json
+ExecStart=$XRAY_BIN run -config $APP_DIR/config.json
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1000000
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
-
-  systemctl daemon-reload
+    systemctl daemon-reload
+  else
+    mkdir -p "$OPENRC_DIR" "$APP_DIR/logs"
+    touch "$APP_DIR/logs/service.log"
+    chmod 600 "$APP_DIR/logs/service.log"
+    cat > "$OPENRC_DIR/$SERVICE_NAME" <<SERVICE
+#!/sbin/openrc-run
+description="Xray VLESS instance $INSTANCE_ID"
+supervisor="supervise-daemon"
+command="$XRAY_BIN"
+command_args="run -config $APP_DIR/config.json"
+pidfile="/run/$SERVICE_NAME.pid"
+respawn_delay=3
+respawn_max=0
+output_log="$APP_DIR/logs/service.log"
+error_log="$APP_DIR/logs/service.log"
+depend() {
+    need net
+    after firewall
+}
+SERVICE
+    chmod 755 "$OPENRC_DIR/$SERVICE_NAME"
+  fi
 }
 
 validate_xray_config() {
@@ -1031,81 +1561,76 @@ validate_xray_config() {
 
 check_upstream_reachability() {
   [[ "$NODE_MODE" == relay ]] || return 0
-  blue "检查下一跳 TCP ${UPSTREAM_ADDRESS}:${UPSTREAM_PORT}..."
-  if timeout 6 bash -c "</dev/tcp/${UPSTREAM_ADDRESS}/${UPSTREAM_PORT}" 2>/dev/null; then
+  blue "检查下一跳 TCP $UPSTREAM_ADDRESS:$UPSTREAM_PORT..."
+  # Expand positional arguments inside the child shell, never in shell source.
+  # shellcheck disable=SC2016
+  if timeout 6 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$UPSTREAM_ADDRESS" "$UPSTREAM_PORT" 2>/dev/null; then
     green "下一跳端口可达"
   else
-    yellow "下一跳当前不可达；保留配置，但 relay 启动后可能无法正常转发。"
+    yellow "下一跳当前不可达；配置已保留，请检查落地服务和网络。"
   fi
 }
 
 start_xray() {
-  systemctl enable --now "$SERVICE_NAME"
-  sleep 2
-  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-    journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
+  service_action enable
+  service_action start
+  sleep 1
+  if ! service_action active >/dev/null 2>&1; then
+    service_logs || true
     die "Xray 服务启动失败"
   fi
-  green "${SERVICE_NAME} 已启动"
+  green "$SERVICE_NAME 已启动"
 }
 
 setup_cert_renew_hook() {
   [[ "$CERT_MODE" == http || "$CERT_MODE" == cloudflare ]] || return 0
-  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-  cat > /etc/letsencrypt/renewal-hooks/deploy/xray-chain-reload.sh <<HOOK
+  mkdir -p "$RENEW_HOOK_DIR"
+  local hook="$RENEW_HOOK_DIR/$SERVICE_NAME.sh"
+  [[ ! -e "$hook" ]] || die "续期脚本已存在：$hook"
+  INSTALL_HOOK_CREATED=1
+  cat > "$hook" <<HOOK
 #!/usr/bin/env bash
 set -Eeuo pipefail
-DOMAIN='${DOMAIN}'
-APP_DIR='${APP_DIR}'
-cp -L "/etc/letsencrypt/live/\${DOMAIN}/fullchain.pem" "\${APP_DIR}/certs/fullchain.pem"
-cp -L "/etc/letsencrypt/live/\${DOMAIN}/privkey.pem" "\${APP_DIR}/certs/privkey.pem"
-chmod 644 "\${APP_DIR}/certs/fullchain.pem"
-chmod 600 "\${APP_DIR}/certs/privkey.pem"
-nginx -t && systemctl reload nginx
-systemctl restart '${SERVICE_NAME}'
+# Only copy this instance's own certificate; unrelated renewals are ignored.
+[[ "\${RENEWED_LINEAGE:-}" == "/etc/letsencrypt/live/$DOMAIN" ]] || exit 0
+cp -L "\$RENEWED_LINEAGE/fullchain.pem" "$APP_DIR/certs/fullchain.pem"
+cp -L "\$RENEWED_LINEAGE/privkey.pem" "$APP_DIR/certs/privkey.pem"
+chmod 644 "$APP_DIR/certs/fullchain.pem"
+chmod 600 "$APP_DIR/certs/privkey.pem"
+nginx -t
+if [[ "$INIT_SYSTEM" == systemd ]]; then
+  if systemctl is-active --quiet nginx; then systemctl reload nginx; fi
+  if systemctl is-active --quiet "$SERVICE_NAME"; then systemctl restart "$SERVICE_NAME"; fi
+else
+  if rc-service nginx status >/dev/null 2>&1; then rc-service nginx reload; fi
+  if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then rc-service "$SERVICE_NAME" restart; fi
+fi
 HOOK
-  chmod 700 /etc/letsencrypt/renewal-hooks/deploy/xray-chain-reload.sh
-  systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+  chmod 700 "$hook"
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    systemctl enable --now certbot.timer >/dev/null 2>&1 ||
+      systemctl enable --now certbot-renew.timer >/dev/null 2>&1 ||
+      yellow "未找到 Certbot timer，请配置定时运行 certbot renew"
+  else
+    mkdir -p /etc/periodic/daily
+    if [[ ! -e /etc/periodic/daily/xray-chain-certbot ]]; then
+      printf '#!/bin/sh\ncertbot renew --quiet\n' > /etc/periodic/daily/xray-chain-certbot
+      chmod 755 /etc/periodic/daily/xray-chain-certbot
+    fi
+    service_action enable crond >/dev/null 2>&1 || true
+    service_action active crond >/dev/null 2>&1 || service_action start crond
+  fi
 }
 
 write_client_info() {
-  local tls_uri reality_uri mode_text
-  if [[ "$NODE_MODE" == relay ]]; then
-    mode_text="relay -> ${UPSTREAM_SECURITY}://${UPSTREAM_ADDRESS}:${UPSTREAM_PORT}"
-  else
-    mode_text="direct -> Internet"
-  fi
-
-  : > "$APP_DIR/client.txt"
   {
-    echo "节点角色: ${mode_text}"
-    echo "入口域名: ${DOMAIN}"
-    echo "UUID: ${UUID}"
-    echo "证书模式: ${CERT_MODE}"
-    echo
-
-    if uses_reality; then
-      reality_uri="vless://${UUID}@${DOMAIN}:${REALITY_PORT}?encryption=none&security=reality&type=tcp&sni=${REALITY_SERVER_NAME}&fp=${REALITY_FINGERPRINT}&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&flow=xtls-rprx-vision#${DOMAIN}-REALITY-Vision"
-      echo "[推荐] VLESS + REALITY + Vision"
-      echo "端口: ${REALITY_PORT}"
-      echo "SNI: ${REALITY_SERVER_NAME}"
-      echo "PublicKey/Password: ${REALITY_PUBLIC_KEY}"
-      echo "ShortId: ${REALITY_SHORT_ID}"
-      echo "分享链接:"
-      echo "$reality_uri"
-      echo
+    printf '租户：%s\n角色：%s\n入口域名：%s\nUUID：%s\n' "$INSTANCE_NAME" "$NODE_MODE" "$DOMAIN" "$UUID"
+    if [[ "$NODE_MODE" == relay ]]; then
+      printf '绑定落地：%s:%s (%s + %s)\n' "$UPSTREAM_ADDRESS" "$UPSTREAM_PORT" "$UPSTREAM_SECURITY" "$UPSTREAM_TRANSPORT"
     fi
-
-    if uses_tls; then
-      tls_uri="vless://${UUID}@${DOMAIN}:${TLS_PORT}?encryption=none&security=tls&type=tcp&sni=${DOMAIN}&fp=chrome&flow=xtls-rprx-vision#${DOMAIN}-TLS-Vision"
-      echo "VLESS + TLS + Vision"
-      echo "端口: ${TLS_PORT}"
-      echo "SNI: ${DOMAIN}"
-      echo "分享链接:"
-      echo "$tls_uri"
-      echo
-    fi
-  } >> "$APP_DIR/client.txt"
+    printf '\n分享链接：\n'
+    native_helper client
+  } > "$APP_DIR/client.txt"
   chmod 600 "$APP_DIR/client.txt"
 }
 
@@ -1128,74 +1653,429 @@ ENV
 
 show_result() {
   echo
-  green "安装完成"
-  blue "Xray 配置：${APP_DIR}/config.json"
-  blue "客户端信息：${APP_DIR}/client.txt"
-  blue "Nginx 配置：$(nginx_conf_path)"
-  blue "systemd 服务：${SERVICE_NAME}.service"
-  echo
+  green "安装完成：$INSTANCE_NAME ($INSTANCE_ID)"
+  blue "配置：$APP_DIR/config.json"
+  blue "服务：$SERVICE_NAME ($INIT_SYSTEM)"
   cat "$APP_DIR/client.txt"
-  echo
-  yellow "管理命令："
-  echo "  systemctl status ${SERVICE_NAME}"
-  echo "  journalctl -u ${SERVICE_NAME} -f"
-  echo "  systemctl restart ${SERVICE_NAME}"
-  if needs_nginx; then
-    echo "  nginx -t && systemctl reload nginx"
-  fi
-  if [[ "$CERT_MODE" == http || "$CERT_MODE" == cloudflare ]]; then
-    echo "  certbot renew --dry-run"
-  fi
-  echo
-  if [[ "$CERT_MODE" == http ]]; then
-    yellow "HTTP-01 使用公网 80 做证书验证；代理入口默认优先 443，但证书本身并不强制只能用于 443。"
-  fi
-  yellow "脚本不会自动接管已经被其它服务占用的 443，以避免破坏已有网站。"
+  printf '\n再次执行脚本进入管理菜单；也可执行：bash %s manage %s\n' "$SCRIPT_PATH" "$INSTANCE_ID"
 }
 
-main() {
+ensure_work_dir() {
+  if [[ -z "$WORK_DIR" ]]; then
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/xray-chain.XXXXXXXX")"
+    chmod 700 "$WORK_DIR"
+  fi
+}
+
+load_values() {
+  local action="$1" path="$2" key value
+  ensure_work_dir
+  native_helper "$action" "$path" > "$WORK_DIR/values.bin" || return 1
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    case " ${STATE_FIELDS[*]} ${UPSTREAM_FIELDS[*]} " in
+      *" $key "*) printf -v "$key" '%s' "$value" ;;
+      *) die "未知配置字段" ;;
+    esac
+  done < "$WORK_DIR/values.bin"
+  rm -f "$WORK_DIR/values.bin"
+}
+
+validate_instance_id() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$ ]] ||
+    die "租户编号使用 1–40 位英文字母、数字、下划线、短横线"
+}
+
+safe_path() {
+  [[ "$1" == /* && "$1" =~ ^[a-zA-Z0-9_./-]+$ && "$1" != *"/../"* && "$1" != */.. ]] ||
+    die "路径必须为不含空格、特殊字符或 .. 的绝对路径：$1"
+}
+
+manager_lock() {
+  need_cmd flock || die "缺少 flock，请先安装 util-linux"
+  safe_path "$MANAGER_DIR"
+  mkdir -p "$MANAGER_DIR/instances"
+  chmod 700 "$MANAGER_DIR" "$MANAGER_DIR/instances"
+  exec 9>"$MANAGER_DIR/.lock"
+  flock -n 9 || die "另一个管理操作正在执行，请稍后重试"
+}
+
+record_path() {
+  printf '%s/instances/%s/state.json' "$MANAGER_DIR" "$INSTANCE_ID"
+}
+
+load_instance() {
+  validate_instance_id "$1"
+  local path="$MANAGER_DIR/instances/$1/state.json" requested="$1"
+  [[ -f "$path" ]] || die "实例不存在：$1"
+  load_values state-values "$path" || die "无法读取实例登记"
+  [[ "$INSTANCE_ID" == "$requested" ]] || die "实例编号与登记不一致"
+  safe_path "$APP_DIR"
+  safe_path "$XRAY_BIN"
+  [[ "$SERVICE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$ ]] || die "服务名不正确"
+  [[ -f "$APP_DIR/config.json" ]] || die "找不到实例配置：$APP_DIR/config.json"
+}
+
+restore_file() {
+  local source="$1" destination="$2" temp
+  temp="$(mktemp "$(dirname "$destination")/.restore.XXXXXXXX")" || return 1
+  if cp -p "$source" "$temp" && mv -f "$temp" "$destination"; then return 0; fi
+  rm -f "$temp"
+  return 1
+}
+
+cleanup() {
+  local result=$?
+  trap - EXIT INT TERM
+  set +e
+  if [[ "$UPDATE_PENDING" == 1 ]]; then
+    yellow "操作未完成，恢复原来的落地绑定..." >&2
+    restore_file "$WORK_DIR/config.backup" "$APP_DIR/config.json" ||
+      red "恢复失败：$APP_DIR/config.json" >&2
+    restore_file "$WORK_DIR/state.backup" "$(record_path)" ||
+      red "恢复失败：$(record_path)" >&2
+    if [[ -f "$WORK_DIR/client.backup" ]]; then
+      restore_file "$WORK_DIR/client.backup" "$APP_DIR/client.txt" ||
+        red "恢复失败：$APP_DIR/client.txt" >&2
+    else
+      rm -f "$APP_DIR/client.txt"
+    fi
+    if [[ "$UPDATE_WAS_ACTIVE" == 1 ]]; then
+      service_action restart || red "原服务恢复启动失败：$SERVICE_NAME" >&2
+    fi
+  fi
+  if [[ "$INSTALL_PENDING" == 1 ]]; then
+    yellow "安装未完成，清理本次新增实例..." >&2
+    if [[ "$INSTALL_SERVICE_CREATED" == 1 ]]; then
+      service_action stop >/dev/null 2>&1
+      service_action disable >/dev/null 2>&1
+      if [[ "$INIT_SYSTEM" == systemd ]]; then
+        rm -f "$SYSTEMD_DIR/$SERVICE_NAME.service"
+        systemctl daemon-reload
+      else
+        rm -f "$OPENRC_DIR/$SERVICE_NAME"
+      fi
+    fi
+    [[ "$INSTALL_HOOK_CREATED" != 1 ]] || rm -f "$RENEW_HOOK_DIR/$SERVICE_NAME.sh"
+    if [[ "$INSTALL_HTTP_CREATED" == 1 ]]; then
+      rm -f "$NGINX_CONF_DIR/xray-chain-http-$DOMAIN.conf"
+    fi
+    if [[ "$INSTALL_NGINX_CREATED" == 1 ]]; then
+      rm -f "$(nginx_conf_path)"
+    fi
+    if [[ "$INSTALL_HTTP_CREATED" == 1 || "$INSTALL_NGINX_CREATED" == 1 ]]; then
+      nginx -t && service_action reload nginx
+    fi
+    if [[ "$INSTALL_CF_CHANGED" == 1 ]]; then
+      if [[ -f "$WORK_DIR/cloudflare.backup" ]]; then
+        restore_file "$WORK_DIR/cloudflare.backup" "$INSTALL_CF_PATH" ||
+          red "凭据恢复失败：$INSTALL_CF_PATH" >&2
+      else
+        rm -f "$INSTALL_CF_PATH"
+      fi
+    fi
+    if [[ "$INSTALL_APP_CREATED" == 1 && "$APP_DIR" == "$MANAGER_DIR/instances/$INSTANCE_ID" ]]; then
+      rm -rf -- "$APP_DIR"
+      rm -rf -- "$WEB_ROOT"
+    fi
+  fi
+  [[ -z "${CANDIDATE_PATH:-}" ]] || rm -f "$CANDIDATE_PATH"
+  if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    rm -rf -- "$WORK_DIR" || red "临时目录清理失败：$WORK_DIR" >&2
+  fi
+  return "$result"
+}
+
+import_instance() {
+  INSTANCE_ID="${1:-}"
+  if [[ -z "$INSTANCE_ID" ]]; then
+    read -rp "导入后使用的租户编号: " INSTANCE_ID || die "已取消"
+  fi
+  validate_instance_id "$INSTANCE_ID"
+  local source="${2:-/etc/xray-chain}" service="${3:-xray-chain}"
+  safe_path "$source"
+  [[ "$service" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$ ]] || die "旧服务名格式不正确"
+  need_cmd python3 || install_base_tools
+  manager_lock
+  [[ ! -e "$MANAGER_DIR/instances/$INSTANCE_ID" ]] || die "该租户编号已存在"
+  SERVICE_NAME="$service"
+  [[ -f "$source/config.json" ]] || die "旧目录没有 config.json"
+  INSTANCE_NAME="${INSTANCE_NAME:-$INSTANCE_ID}"
+  ensure_work_dir
+  native_helper legacy "$source" > "$WORK_DIR/import.json" || die "旧配置导入失败"
+  load_values state-values "$WORK_DIR/import.json"
+  ask_missing DOMAIN "旧节点对外域名"
+  DOMAIN="$(normalize_domain "$DOMAIN")"
+  check_domain "$DOMAIN" || die "旧节点对外域名格式不正确"
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    systemctl cat "$SERVICE_NAME" | grep -F "$APP_DIR/config.json" >/dev/null ||
+      die "旧服务没有使用这个配置文件，请核对服务名和旧目录"
+  else
+    if [[ ! -f "$OPENRC_DIR/$SERVICE_NAME" ]] ||
+      ! grep -F "$APP_DIR/config.json" "$OPENRC_DIR/$SERVICE_NAME" >/dev/null; then
+      die "旧 OpenRC 服务没有使用这个配置文件"
+    fi
+  fi
+  native_helper unique
+  blue "导入：$INSTANCE_ID  服务：$SERVICE_NAME  目录：$APP_DIR"
+  blue "UUID、端口、原配置保持现状；角色：$NODE_MODE"
+  if [[ "$INTERACTIVE" == 1 ]]; then
+    local confirm
+    read -rp "登记这个旧部署？[Y/n]: " confirm || die "已取消"
+    [[ "$confirm" != n && "$confirm" != N ]] || die "已取消"
+  fi
+  mkdir -p "$MANAGER_DIR/instances/$INSTANCE_ID"
+  chmod 700 "$MANAGER_DIR/instances/$INSTANCE_ID"
+  native_helper state-save "$(record_path)"
+  green "已导入，可以进入该实例的运维菜单"
+}
+
+list_instances() {
+  if [[ ! -d "$MANAGER_DIR/instances" ]]; then yellow "尚未创建或导入实例"; return 0; fi
+  local id name mode ports upstream service status
+  printf '%-18s %-16s %-8s %-12s %-10s %s\n' "编号" "名称" "角色" "端口" "运行状态" "落地"
+  while IFS=$'\t' read -r id name mode ports upstream service; do
+    status=stopped
+    if service_action active "$service" >/dev/null 2>&1; then status=running; fi
+    printf '%-18s %-16s %-8s %-12s %-10s %s\n' "$id" "$name" "$mode" "$ports" "$status" "$upstream"
+  done < <(native_helper list)
+}
+
+select_instance() {
+  [[ -d "$MANAGER_DIR/instances" ]] || { yellow "尚无实例"; return 1; }
+  local choice id name mode ports upstream service
+  local ids=()
+  while IFS=$'\t' read -r id name mode ports upstream service; do
+    ids+=("$id")
+    printf '  %d) %s (%s)  %s  %s -> %s\n' "${#ids[@]}" "$name" "$id" "$mode" "$ports" "$upstream"
+  done < <(native_helper list)
+  [[ "${#ids[@]}" -gt 0 ]] || { yellow "尚无实例"; return 1; }
+  read -rp "选择实例编号 [0 返回]: " choice || return 1
+  [[ "$choice" =~ ^[0-9]+$ && "${#choice}" -le 3 ]] || return 1
+  (( 10#$choice >= 1 && 10#$choice <= ${#ids[@]} )) || return 1
+  SELECTED_INSTANCE="${ids[$((10#$choice - 1))]}"
+}
+
+show_instance() {
+  printf '租户：%s (%s)\n角色：%s\n域名：%s\n端口：%s %s\n服务：%s\n' \
+    "$INSTANCE_NAME" "$INSTANCE_ID" "$NODE_MODE" "$DOMAIN" "$REALITY_PORT" "$TLS_PORT" "$SERVICE_NAME"
+  if [[ "$NODE_MODE" == relay ]]; then
+    printf '落地：%s:%s (%s + %s)\n' "$UPSTREAM_ADDRESS" "$UPSTREAM_PORT" "$UPSTREAM_SECURITY" "$UPSTREAM_TRANSPORT"
+  fi
+  if service_action enabled >/dev/null 2>&1; then echo "开机自启：开启"; else echo "开机自启：关闭"; fi
+  service_action status || true
+}
+
+replace_upstream() {
+  manager_lock
+  load_instance "$1"
+  [[ "$NODE_MODE" == relay ]] || die "只有入口实例可以更换落地"
+  local key
+  for key in "${UPSTREAM_FIELDS[@]}"; do printf -v "$key" '%s' ""; done
+  UPSTREAM_FINGERPRINT=chrome
+  UPSTREAM_ALLOW_INSECURE=false
+  UPSTREAM_XHTTP_MODE=auto
+  UPSTREAM_XHTTP_EXTRA='{}'
+  ask_upstream
+  CANDIDATE_PATH="$(mktemp "$APP_DIR/.config.XXXXXXXX")"
+  native_helper replace-upstream "$APP_DIR/config.json" > "$CANDIDATE_PATH"
+  chmod 600 "$CANDIDATE_PATH"
+  "$XRAY_BIN" run -test -config "$CANDIDATE_PATH" >/dev/null
+  cp -p "$APP_DIR/config.json" "$WORK_DIR/config.backup"
+  cp -p "$(record_path)" "$WORK_DIR/state.backup"
+  if [[ -f "$APP_DIR/client.txt" ]]; then cp -p "$APP_DIR/client.txt" "$WORK_DIR/client.backup"; fi
+  if service_action active >/dev/null 2>&1; then UPDATE_WAS_ACTIVE=1; fi
+  UPDATE_PENDING=1
+  mv -f "$CANDIDATE_PATH" "$APP_DIR/config.json"
+  CANDIDATE_PATH=""
+  native_helper state-save "$(record_path)"
+  write_client_info
+  if [[ "$UPDATE_WAS_ACTIVE" == 1 ]]; then
+    service_action restart
+    sleep 1
+    service_action active >/dev/null 2>&1 || die "新落地配置启动失败"
+  fi
+  UPDATE_PENDING=0
+  green "落地绑定已更新，入口 UUID 和端口保持不变"
+}
+
+run_menu_command() {
+  # Run each operation in a fresh shell so conditional calls cannot disable errexit.
+  local result
+  trap ':' INT
+  set +e
+  bash "$SCRIPT_PATH" "$@"
+  result=$?
+  set -e
+  trap 'exit 130' INT
+  if [[ "$result" != 0 && "$result" != 130 ]]; then
+    yellow "操作未完成（退出码 $result），已返回菜单"
+  fi
+  return 0
+}
+
+instance_menu() {
+  load_instance "$1"
+  local choice
+  while true; do
+    echo
+    blue "租户：$INSTANCE_NAME ($INSTANCE_ID)  $NODE_MODE"
+    echo "  1) 查看状态和绑定落地"
+    echo "  2) 查看最近日志"
+    echo "  3) 持续查看日志（Ctrl+C 返回）"
+    echo "  4) 启动"
+    echo "  5) 停止"
+    echo "  6) 重启"
+    echo "  7) 开启开机自启"
+    echo "  8) 关闭开机自启"
+    echo "  9) 查看入口分享链接"
+    [[ "$NODE_MODE" != relay ]] || echo " 10) 更换绑定落地"
+    echo "  0) 返回"
+    read -rp "请选择: " choice || return 0
+    case "$choice" in
+      1) run_menu_command status "$INSTANCE_ID" ;;
+      2) run_menu_command logs "$INSTANCE_ID" ;;
+      3) run_menu_command follow "$INSTANCE_ID" ;;
+      4) run_menu_command start "$INSTANCE_ID" ;;
+      5) run_menu_command stop "$INSTANCE_ID" ;;
+      6) run_menu_command restart "$INSTANCE_ID" ;;
+      7) run_menu_command enable "$INSTANCE_ID" ;;
+      8) run_menu_command disable "$INSTANCE_ID" ;;
+      9) run_menu_command links "$INSTANCE_ID" ;;
+      10) run_menu_command upstream "$INSTANCE_ID" ;;
+      0) return 0 ;;
+      *) yellow "请选择菜单中的编号" ;;
+    esac
+  done
+}
+
+manager_menu() {
+  local choice
+  while true; do
+    echo
+    blue "VLESS 实例管理"
+    echo "  1) 安装落地 VLESS（直接出网）"
+    echo "  2) 新增租户入口 VLESS（粘贴落地配置）"
+    echo "  3) 列出所有实例和绑定"
+    echo "  4) 选择实例进行运维"
+    echo "  5) 导入旧版部署"
+    echo "  0) 退出"
+    read -rp "请选择: " choice || return 0
+    case "$choice" in
+      1) run_menu_command install direct ;;
+      2) run_menu_command install relay ;;
+      3) list_instances ;;
+      4) if select_instance; then run_menu_command manage "$SELECTED_INSTANCE"; fi ;;
+      5)
+        local source service id
+        read -rp "旧配置目录 [默认 /etc/xray-chain]: " source || return 0
+        read -rp "旧服务名 [默认 xray-chain]: " service || return 0
+        read -rp "导入后租户编号: " id || return 0
+        run_menu_command import "$id" "${source:-/etc/xray-chain}" "${service:-xray-chain}"
+        ;;
+      0) return 0 ;;
+      *) yellow "请选择菜单中的编号" ;;
+    esac
+  done
+}
+
+install_instance() {
+  NODE_MODE="$(normalize_node_mode "${1:-$NODE_MODE}")" || die "选择 direct 或 relay"
+  INSTANCE_ID="${2:-$INSTANCE_ID}"
+  if [[ -z "$INSTANCE_ID" ]]; then
+    read -rp "租户编号（字母、数字、_、-）: " INSTANCE_ID || die "已取消"
+  fi
+  validate_instance_id "$INSTANCE_ID"
   install_base_tools
+  manager_lock
+  [[ ! -e "$MANAGER_DIR/instances/$INSTANCE_ID" ]] || die "租户已存在：$INSTANCE_ID"
+  APP_DIR="$MANAGER_DIR/instances/$INSTANCE_ID"
+  WEB_ROOT="$MANAGER_WEB_ROOT/instances/$INSTANCE_ID"
+  SERVICE_NAME="xray-chain-$INSTANCE_ID"
+  INSTANCE_IMPORTED=false
+  safe_path "$APP_DIR"; safe_path "$WEB_ROOT"; safe_path "$XRAY_BIN"
+  [[ ! -e "$WEB_ROOT" ]] || die "网站目录已存在：$WEB_ROOT"
+  [[ ! -e "$SYSTEMD_DIR/$SERVICE_NAME.service" && ! -e "$OPENRC_DIR/$SERVICE_NAME" ]] ||
+    die "服务已存在：$SERVICE_NAME"
+  if [[ -z "$INSTANCE_NAME" && "$INTERACTIVE" == 1 ]]; then
+    read -rp "租户显示名称 [默认 $INSTANCE_ID]: " INSTANCE_NAME || die "已取消"
+  fi
+  [[ -n "$INSTANCE_NAME" ]] || INSTANCE_NAME="$INSTANCE_ID"
+  [[ ! "$INSTANCE_NAME" =~ [[:cntrl:]] ]] || die "名称不能包含控制字符"
   ask_domain_and_role
   ask_reality_target
   ask_cert_mode
-
-  # Stop only our own previous instance before checking public ports.
-  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-
   choose_public_ports
   ask_upstream
   warn_dns
+  [[ ! -e "$(nginx_conf_path)" && ! -e "$RENEW_HOOK_DIR/$SERVICE_NAME.sh" ]] ||
+    die "该实例的 Nginx 配置或续期脚本已存在"
+  INSTALL_PENDING=1
+  INSTALL_APP_CREATED=1
   prepare_dirs
-
+  chmod 755 "$MANAGER_WEB_ROOT" "$MANAGER_WEB_ROOT/instances" "$WEB_ROOT"
   install_xray_if_needed
   install_nginx_if_needed
   install_certbot_for_mode
   choose_internal_ports
-  if needs_nginx; then
-    detect_preexisting_nginx_domain
-  fi
-
-  if [[ -z "$UUID" ]]; then UUID="$($XRAY_BIN uuid)"; fi
-  [[ "$UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || die "UUID 格式不正确：$UUID"
-
-  if [[ "$CERT_MODE" == http ]]; then
-    write_nginx_challenge_config
-  fi
-
+  configure_selinux
+  if needs_nginx; then detect_preexisting_nginx_domain; fi
+  if [[ -z "$UUID" ]]; then UUID="$("$XRAY_BIN" uuid)"; fi
+  [[ "$UUID" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
+  native_helper unique
+  if [[ "$CERT_MODE" == http ]]; then write_nginx_challenge_config; fi
   verify_cf_token
   obtain_or_copy_cert
   write_final_nginx_config
   generate_reality_keys
   write_xray_config
-  write_systemd_service
   validate_xray_config
+  write_systemd_service
   check_upstream_reachability
   start_xray
   setup_cert_renew_hook
   write_client_info
   save_install_env
+  native_helper state-save "$(record_path)"
+  INSTALL_PENDING=0
   show_result
 }
 
-main "$@"
+main() {
+  case "${1:-}" in -h|--help|help) usage; return 0 ;; esac
+  [[ "$(id -u)" -eq 0 ]] || die "请使用 root 用户执行"
+  umask 077
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  detect_platform
+  local action="${1:-menu}"
+  case "$action" in
+    menu) manager_menu ;;
+    install) install_instance "${2:-}" "${3:-}" ;;
+    import) import_instance "${2:-}" "${3:-/etc/xray-chain}" "${4:-xray-chain}" ;;
+    list) list_instances ;;
+    manage)
+      if [[ -n "${2:-}" ]]; then instance_menu "$2"
+      elif select_instance; then instance_menu "$SELECTED_INSTANCE"
+      fi ;;
+    upstream) replace_upstream "${2:-}" ;;
+    status|logs|follow|start|stop|restart|enable|disable|links)
+      load_instance "${2:-}"
+      case "$action" in
+        status) show_instance ;;
+        logs) service_logs ;;
+        follow) service_logs true ;;
+        links)
+          if [[ -f "$APP_DIR/client.txt" ]]; then cat "$APP_DIR/client.txt"
+          else native_helper client
+          fi ;;
+        *) manager_lock; service_action "$action"; green "$INSTANCE_ID：$action 已执行" ;;
+      esac ;;
+    *) usage; die "未知命令：$action" ;;
+  esac
+}
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+  main "$@"
+fi
