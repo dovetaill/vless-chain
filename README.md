@@ -64,6 +64,10 @@ bash ./xray-vless-native-v3.sh install direct landing01
 
 REALITY 使用外部伪装目标时不需要本地 TLS 证书。如果选择 TLS、dual 或本机 HTTPS 伪装站，则继续按提示配置证书。
 
+HTTP-01 除了需要正确的 DNS 记录，还需要 Nginx 能读到验证文件。v3 默认把新实例的网站和验证文件放在 `/var/lib/xray-chain-manager`，避免部分系统的 `/var/www` 权限为 `700` 时阻断 Nginx 访问。已有实例继续使用登记的路径；已有证书续期继续使用原来的 webroot。可通过 `MANAGER_WEB_ROOT` 指定其他位置，但所有父目录都必须允许 Nginx 工作用户穿过。
+
+申请前脚本会分别检查本机 Nginx 和域名访问，要求返回 HTTP 200 且内容匹配。若提示本机自检失败，查看 `nginx -T` 和 Nginx 错误日志；`Permission denied` 表示需要检查整个目录链的权限。脚本不会自动修改 `/var/www` 或 `/var/lib/nginx/proxy` 的权限、所有者，也不会修改 Nginx 的工作用户。
+
 安装成功后会生成节点分享链接。之后可以随时查看：
 
 ```sh

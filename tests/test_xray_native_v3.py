@@ -73,7 +73,20 @@ elif name == "ss":
         if port: print("LISTEN 0 128 0.0.0.0:" + port + " 0.0.0.0:*")
 elif name == "timeout":
     sys.exit(1)
-elif name in ("curl", "getent", "dpkg", "sleep", "nginx", "rpm"):
+elif name == "curl":
+    from urllib.parse import urlsplit
+    url = next((arg for arg in args if arg.startswith("http://")), "")
+    if url and "-o" in args:
+        scope = "LOCAL" if "--resolve" in args else "PUBLIC"
+        status = os.environ.get("TEST_HTTP_" + scope + "_STATUS", "200")
+        source = Path(os.environ["MANAGER_WEB_ROOT"]) / "domains" / urlsplit(url).hostname
+        source /= urlsplit(url).path.lstrip("/")
+        content = source.read_bytes() if status == "200" else b"not found"
+        if os.environ.get("TEST_HTTP_WRONG_BODY"): content = b"another site"
+        Path(args[args.index("-o") + 1]).write_bytes(content)
+        print(status, end="")
+        sys.exit(int(os.environ.get("TEST_HTTP_CURL_EXIT", "0")))
+elif name in ("getent", "dpkg", "sleep", "nginx", "rpm"):
     if name == "rpm": sys.exit(1)
 elif name == "journalctl":
     print("mock service log")
@@ -371,6 +384,46 @@ class ManagerChecks(unittest.TestCase):
         self.shell('INSTALL_PENDING=1; CERT_MODE=cloudflare; SECURITY_MODE=tls; '
                    'CF_API_TOKEN=new-token; certbot() { return 1; }; obtain_or_copy_cert', success=False)
         self.assertEqual(credentials.read_bytes(), snapshot)
+
+    def test_http_preflight_checks_local_and_domain_and_cleans_probe(self):
+        self.shell('CERT_MODE=http; write_nginx_challenge_config; verify_http_challenge')
+        requests = [event for event in self.events() if event[0] == "curl"]
+        self.assertEqual(len(requests), 2)
+        self.assertIn("edge.example.com:80:127.0.0.1", requests[0])
+        self.assertNotIn("--resolve", requests[1])
+        for request in requests:
+            self.assertEqual(request[request.index("--noproxy") + 1], "*")
+        web = Path(self.env["MANAGER_WEB_ROOT"]) / "domains" / "edge.example.com"
+        self.assertEqual(list((web / ".well-known" / "acme-challenge").iterdir()), [])
+        self.assertEqual(list(self.root.glob("xray-chain.*")), [])
+
+    def test_http_preflight_failure_stops_before_certbot_and_cleans_probe(self):
+        cases = (({"TEST_HTTP_LOCAL_STATUS": "404"}, "本机 HTTP-01 自检失败", 3),
+                 ({"TEST_HTTP_PUBLIC_STATUS": "404"}, "域名 HTTP-01 自检失败", 4),
+                 ({"TEST_HTTP_WRONG_BODY": "1"}, "本机 HTTP-01 自检失败", 3),
+                 ({"TEST_HTTP_CURL_EXIT": "28"}, "本机 HTTP-01 自检失败", 3))
+        for values, message, request_count in cases:
+            with self.subTest(values=values):
+                before = len(self.events())
+                output = self.shell('CERT_MODE=http; SECURITY_MODE=tls; '
+                                    'certbot() { touch "$TEST_RUNTIME/certbot-called"; }; '
+                                    'write_nginx_challenge_config; obtain_or_copy_cert',
+                                    values, success=False)
+                self.assertIn(message, output)
+                self.assertFalse((self.root / "certbot-called").exists())
+                requests = [event for event in self.events()[before:] if event[0] == "curl"]
+                self.assertEqual(len(requests), request_count)
+                web = Path(self.env["MANAGER_WEB_ROOT"]) / "domains" / "edge.example.com"
+                self.assertEqual(list((web / ".well-known" / "acme-challenge").iterdir()), [])
+                self.assertEqual(list(self.root.glob("xray-chain.*")), [])
+
+    def test_http_preflight_interruption_cleans_probe(self):
+        self.shell('CERT_MODE=http; write_nginx_challenge_config; '
+                   'trap "exit 143" TERM; curl() { kill -TERM $$; return 1; }; '
+                   'verify_http_challenge', success=False)
+        web = Path(self.env["MANAGER_WEB_ROOT"]) / "domains" / "edge.example.com"
+        self.assertEqual(list((web / ".well-known" / "acme-challenge").iterdir()), [])
+        self.assertEqual(list(self.root.glob("xray-chain.*")), [])
 
     def test_menu_and_follow_log_ctrl_c_return(self):
         first = self.install("alpine", 20701, extra={"INIT_SYSTEM": "openrc"})

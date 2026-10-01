@@ -9,7 +9,9 @@ WEB_ROOT="${WEB_ROOT:-/var/www/xray-chain}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 SERVICE_NAME="${SERVICE_NAME:-xray-chain}"
 MANAGER_DIR="${MANAGER_DIR:-/etc/xray-chain-manager}"
-MANAGER_WEB_ROOT="${MANAGER_WEB_ROOT:-/var/www/xray-chain-manager}"
+# Alpine installations may keep /var/www private (0700). Use a separate public
+# tree so Nginx can traverse it without changing permissions on existing sites.
+MANAGER_WEB_ROOT="${MANAGER_WEB_ROOT:-/var/lib/xray-chain-manager}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 RENEW_HOOK_DIR="${RENEW_HOOK_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
@@ -76,6 +78,7 @@ INTERACTIVE=1
 [[ -t 0 ]] || INTERACTIVE=0
 NGINX_DOMAIN_PREEXISTED=0
 WORK_DIR=""
+HTTP_PROBE_FILE=""
 INSTALL_PENDING=0
 INSTALL_APP_CREATED=0
 INSTALL_SERVICE_CREATED=0
@@ -1209,6 +1212,55 @@ NGINX
   fi
 }
 
+verify_http_challenge() {
+  [[ "$CERT_MODE" == http ]] || return 0
+  ensure_work_dir
+  local root="$MANAGER_WEB_ROOT/domains/$DOMAIN"
+  local expected url target attempt status matched response="$WORK_DIR/http-preflight.response"
+  local curl_args=()
+  HTTP_PROBE_FILE="$(mktemp "$root/.well-known/acme-challenge/xray-preflight-XXXXXXXX")" ||
+    die "无法创建 HTTP-01 测试文件：$root/.well-known/acme-challenge"
+  expected="xray-http-01:${HTTP_PROBE_FILE##*/}"
+  printf '%s' "$expected" > "$HTTP_PROBE_FILE"
+  chmod 644 "$HTTP_PROBE_FILE"
+  url="http://$DOMAIN/.well-known/acme-challenge/${HTTP_PROBE_FILE##*/}"
+  blue "检查 HTTP-01 验证文件：本机 Nginx 和域名访问..."
+
+  for target in local public; do
+    matched=0
+    curl_args=()
+    if [[ "$target" == local ]]; then curl_args=(--resolve "$DOMAIN:80:127.0.0.1"); fi
+    for attempt in 1 2 3; do
+      status=""
+      : > "$response"
+      if status="$(curl --noproxy '*' -sS --connect-timeout 3 --max-time 5 \
+        "${curl_args[@]}" -o "$response" -w '%{http_code}' "$url" \
+        2>"$WORK_DIR/http-preflight.error")" &&
+        [[ "$status" == 200 && "$(<"$response")" == "$expected" ]]; then
+        matched=1
+        break
+      fi
+      if [[ "$attempt" != 3 ]]; then sleep 1; fi
+    done
+    if [[ "$matched" != 1 ]]; then
+      if [[ "$target" == local ]]; then
+        yellow "本机 HTTP-01 自检失败（HTTP ${status:-000}）：$url"
+        yellow "请确认实际运行的 Nginx 加载了 $NGINX_CONF_DIR/xray-chain-http-$DOMAIN.conf，且没有同域名的 80 端口站点冲突。"
+        yellow "Certbot webroot 应为：$root；使用 nginx -T 检查生效配置。"
+        yellow "请同时检查该目录所有父目录的执行权限及 Nginx error.log 中的 Permission denied。"
+      else
+        yellow "域名 HTTP-01 自检失败（HTTP ${status:-000}）：$url"
+        yellow "本机验证文件已可读取；请检查域名的 A/AAAA 记录、80 端口转发及 CDN/重定向规则是否指向本机验证目录。"
+      fi
+      if [[ -s "$WORK_DIR/http-preflight.error" ]]; then cat "$WORK_DIR/http-preflight.error" >&2; fi
+      die "HTTP-01 验证路径不可用，尚未向证书机构提交申请。也可选择 Cloudflare DNS-01。"
+    fi
+  done
+  rm -f -- "$HTTP_PROBE_FILE"
+  HTTP_PROBE_FILE=""
+  green "HTTP-01 验证文件自检通过"
+}
+
 verify_cf_token() {
   [[ "$CERT_MODE" == cloudflare ]] || return 0
   blue "校验 Cloudflare API Token..."
@@ -1231,6 +1283,7 @@ obtain_or_copy_cert() {
   local le_live="/etc/letsencrypt/live/${DOMAIN}"
 
   if [[ "$CERT_MODE" == http ]]; then
+    verify_http_challenge
     blue "使用 Certbot webroot 执行 HTTP-01 证书申请..."
     certbot certonly --webroot -w "$MANAGER_WEB_ROOT/domains/$DOMAIN" \
       -d "$DOMAIN" \
@@ -1727,6 +1780,7 @@ cleanup() {
   local result=$?
   trap - EXIT INT TERM
   set +e
+  [[ -z "$HTTP_PROBE_FILE" ]] || rm -f -- "$HTTP_PROBE_FILE"
   if [[ "$UPDATE_PENDING" == 1 ]]; then
     yellow "操作未完成，恢复原来的落地绑定..." >&2
     restore_file "$WORK_DIR/config.backup" "$APP_DIR/config.json" ||
