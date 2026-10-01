@@ -54,6 +54,10 @@ if name in ("systemctl", "rc-service", "rc-update"):
         if action == "restart" and os.environ.get("TEST_FAIL_RESTART") and not marker.exists():
             marker.touch(); sys.exit(1)
         status["active"] = True
+    elif action == "reload" and os.environ.get("TEST_FAIL_NGINX_RELOAD"):
+        marker = root / "reload-failed"
+        if service == "nginx" and not marker.exists():
+            marker.touch(); sys.exit(1)
     elif action == "stop": status["active"] = False
     elif action == "enable": status["enabled"] = True
     elif action == "disable": status["enabled"] = False
@@ -62,10 +66,17 @@ elif name == "xray":
     if args[0] == "version": print("Xray mock")
     elif args[0] == "uuid": print(uuid.uuid4())
     elif args[0] == "x25519":
-        print("PrivateKey: " + "A" * 43 + "\nPassword: " + "B" * 43)
+        import base64, hashlib
+        private = args[args.index("-i") + 1] if "-i" in args else base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+        public = base64.urlsafe_b64encode(hashlib.sha256(private.encode()).digest()).decode().rstrip("=")
+        print("PrivateKey: " + private + "\nPassword (PublicKey): " + public)
     elif args[0] == "run":
-        config = json.loads(Path(args[args.index("-config") + 1]).read_text())
-        if os.environ.get("TEST_FAIL_CONFIG"): sys.exit(1)
+        config_path = Path(args[args.index("-config") + 1])
+        if "-format" not in args and config_path.suffix != ".json":
+            print("Failed to get format of " + str(config_path)); sys.exit(23)
+        config = json.loads(config_path.read_text())
+        if os.environ.get("TEST_FAIL_CONFIG"):
+            print("mock configuration rejected"); sys.exit(1)
         assert len({u["id"] for i in config["inbounds"] for u in i["settings"]["clients"]}) == 1
 elif name == "ss":
     print("State Recv-Q Send-Q Local Address:Port Peer Address:Port")
@@ -445,6 +456,156 @@ class ManagerChecks(unittest.TestCase):
         remaining, _ = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, (output + remaining).decode())
         self.assertIn("VLESS 实例管理", self.cli(input_text="0\n"))
+
+    def test_main_menu_recovers_current_links_without_saved_export(self):
+        import yaml
+        app = self.install("forgot", 20801)
+        original = json.loads((app / "state.json").read_text())
+        (app / "client.txt").unlink()
+        stale = dict(original, UUID=UUID, REALITY_PUBLIC_KEY="stale")
+        (app / "state.json").write_text(json.dumps(stale))
+        output = self.cli(input_text="6\n1\n0\n")
+        self.assertIn("查看租户 VLESS 链接", output)
+        self.assertIn("vless://" + original["UUID"], output)
+        self.assertIn("pbk=" + original["REALITY_PUBLIC_KEY"], output)
+        self.assertNotIn("pbk=stale", output)
+        self.assertNotIn(original["REALITY_PRIVATE_KEY"], output)
+        node_line = next(line for line in output.splitlines() if line.startswith("  - {"))
+        node = yaml.safe_load(node_line)[0]
+        self.assertEqual(node["reality-opts"]["short-id"], original["REALITY_SHORT_ID"])
+        self.assertEqual(node["uuid"], original["UUID"])
+        self.assertFalse((app / "client.txt").exists())  # viewing stays read-only
+
+    def test_interactive_edit_returns_to_refreshed_tenant_menu(self):
+        app = self.install("rename", 20802)
+        original_config = (app / "config.json").read_bytes()
+        output = self.cli(input_text='4\n1\n11\n1\n香港 "一号"\n0\n9\n0\n0\n')
+        self.assertEqual(json.loads((app / "state.json").read_text())["INSTANCE_NAME"], '香港 "一号"')
+        self.assertIn('租户：香港 "一号" (rename)', output)
+        self.assertIn(quote('香港 "一号"-reality'), output)
+        self.assertEqual((app / "config.json").read_bytes(), original_config)
+
+    def test_credentials_reset_cancellation_and_complete_rotation(self):
+        app = self.install("rotate", 20803)
+        original = json.loads((app / "state.json").read_text())
+        old_config = json.loads((app / "config.json").read_text())
+        snapshot = {name: (app / name).read_bytes() for name in ("state.json", "config.json", "client.txt", "reality.env", "install.env")}
+        self.cli("reset", "rotate", "all", input_text="\n")
+        self.assertEqual(snapshot, {name: (app / name).read_bytes() for name in snapshot})
+        self.cli("credentials", "rotate", input_text="4\nrotate\n0\n")
+        new = json.loads((app / "state.json").read_text())
+        config = json.loads((app / "config.json").read_text())
+        for field in ("UUID", "REALITY_PRIVATE_KEY", "REALITY_PUBLIC_KEY", "REALITY_SHORT_ID"):
+            self.assertNotEqual(new[field], original[field])
+        self.assertEqual(config["inbounds"][0]["settings"]["clients"][0]["id"], new["UUID"])
+        self.assertEqual(config["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"], new["REALITY_PRIVATE_KEY"])
+        self.assertEqual(config["outbounds"], old_config["outbounds"])
+        self.assertEqual(new["REALITY_PORT"], original["REALITY_PORT"])
+        output = self.cli("links", "rotate")
+        self.assertIn("vless://" + new["UUID"], output)
+        self.assertNotIn(original["UUID"], output)
+
+    def test_reset_restart_failure_restores_every_file(self):
+        app = self.install("rollback", 20804)
+        names = ("state.json", "config.json", "client.txt", "reality.env", "install.env")
+        snapshot = {name: (app / name).read_bytes() for name in names}
+        self.cli("reset", "rollback", "all", values={"TEST_FAIL_RESTART": "1"}, input_text="rollback\n", success=False)
+        self.assertEqual(snapshot, {name: (app / name).read_bytes() for name in names})
+        self.assertEqual(list(app.glob(".config.*")), [])
+        self.assertEqual(list(app.glob(".client.*")), [])
+        self.assertEqual(list(self.root.glob("xray-chain.*")), [])
+
+    def test_port_edit_preserves_stopped_state_and_blocks_collisions(self):
+        app = self.install("ports", 20805)
+        other = self.install("other", 20806)
+        self.cli("stop", "ports")
+        config = json.loads((app / "config.json").read_text())
+        self.cli("ports", "ports", input_text="20807\nports\n")
+        new = json.loads((app / "config.json").read_text())
+        self.assertEqual(new["inbounds"][0]["port"], 20807)
+        self.assertEqual(new["outbounds"], config["outbounds"])
+        services = json.loads((self.root / "services.json").read_text())
+        self.assertFalse(services["xray-chain-ports"]["active"])
+        before = (app / "config.json").read_bytes()
+        other_before = (other / "config.json").read_bytes()
+        self.cli("ports", "ports", input_text="20806\n", success=False)
+        self.assertEqual(before, (app / "config.json").read_bytes())
+        self.assertEqual(other_before, (other / "config.json").read_bytes())
+
+    def test_duplicate_custom_uuid_is_rejected_without_changes(self):
+        app = self.install("first", 20808)
+        other = self.install("second", 20809)
+        duplicate = json.loads((other / "state.json").read_text())["UUID"]
+        snapshot = (app / "config.json").read_bytes()
+        self.cli("reset", "first", "custom-uuid", input_text=duplicate + "\nfirst\n", success=False)
+        self.assertEqual(snapshot, (app / "config.json").read_bytes())
+
+    def test_delete_confirmed_tenant_preserves_other_and_shared_certificate_site(self):
+        cert = self.root / "cert.pem"; key = self.root / "key.pem"
+        cert.write_text("fake certificate"); key.write_text("fake key")
+        extra = {"SECURITY_MODE": "tls", "TLS_PORT": "20810", "CERT_MODE": "existing", "CERT_FILE": str(cert), "KEY_FILE": str(key)}
+        app = self.install("delete", 20810, extra=extra)
+        other = self.install("keep", 20811)
+        other_config = (other / "config.json").read_bytes()
+        shared = Path(self.env["NGINX_CONF_DIR"]) / "xray-chain-http-edge.example.com.conf"
+        shared.write_text("shared certificate validation site\n")
+        self.cli("delete", "delete", input_text="wrong\n")
+        self.assertTrue(app.exists())
+        output = self.cli(input_text="4\n1\n13\ndelete\n0\n")
+        self.assertIn("已删除租户：delete", output)
+        self.assertFalse(app.exists())
+        self.assertFalse((Path(self.env["MANAGER_WEB_ROOT"]) / "instances" / "delete").exists())
+        self.assertFalse((Path(self.env["SYSTEMD_DIR"]) / "xray-chain-delete.service").exists())
+        self.assertEqual((other / "config.json").read_bytes(), other_config)
+        self.assertTrue(shared.exists())
+        self.assertTrue(cert.exists())
+        services = json.loads((self.root / "services.json").read_text())
+        self.assertTrue(services["xray-chain-keep"]["active"])
+        self.assertFalse(services["xray-chain-delete"]["active"])
+        self.assertFalse(services["xray-chain-delete"]["enabled"])
+
+    def test_delete_nginx_reload_failure_restores_service_and_files(self):
+        cert = self.root / "cert.pem"; key = self.root / "key.pem"
+        cert.write_text("fake certificate"); key.write_text("fake key")
+        app = self.install("rollback-delete", 20812, extra={"SECURITY_MODE": "tls", "TLS_PORT": "20812", "CERT_MODE": "existing", "CERT_FILE": str(cert), "KEY_FILE": str(key)})
+        unit = Path(self.env["SYSTEMD_DIR"]) / "xray-chain-rollback-delete.service"
+        conf = Path(self.env["NGINX_CONF_DIR"]) / "xray-chain-rollback-delete-edge.example.com.conf"
+        snapshot = {p: p.read_bytes() for p in (app / "config.json", app / "state.json", unit, conf)}
+        self.cli("delete", "rollback-delete", values={"TEST_FAIL_NGINX_RELOAD": "1"}, input_text="rollback-delete\n", success=False)
+        self.assertEqual(snapshot, {p: p.read_bytes() for p in snapshot})
+        services = json.loads((self.root / "services.json").read_text())
+        self.assertTrue(services["xray-chain-rollback-delete"]["active"])
+        self.assertTrue(services["xray-chain-rollback-delete"]["enabled"])
+
+    def test_imported_delete_only_unregisters_original_deployment(self):
+        app = self.install("legacy", 20813)
+        record = app / "state.json"
+        state = json.loads(record.read_text())
+        original = self.root / "original"
+        original.mkdir()
+        source_config = original / "config.json"
+        source_config.write_bytes((app / "config.json").read_bytes())
+        state.update(INSTANCE_IMPORTED="true", APP_DIR=str(original))
+        record.write_text(json.dumps(state))
+        before = source_config.read_bytes()
+        self.cli("delete", "legacy", input_text="legacy\n")
+        self.assertFalse(record.exists())
+        self.assertEqual(source_config.read_bytes(), before)
+        services = json.loads((self.root / "services.json").read_text())
+        self.assertTrue(services["xray-chain-legacy"]["active"])
+
+    def test_dual_reset_and_exports_use_same_uuid_and_both_ports(self):
+        cert = self.root / "cert.pem"; key = self.root / "key.pem"
+        cert.write_text("fake certificate"); key.write_text("fake key")
+        app = self.install("dual", 20814, extra={"SECURITY_MODE": "dual", "TLS_PORT": "20815", "CERT_MODE": "existing", "CERT_FILE": str(cert), "KEY_FILE": str(key)})
+        self.cli("reset", "dual", "uuid", input_text="dual\n")
+        config = json.loads((app / "config.json").read_text())
+        ids = {client["id"] for inbound in config["inbounds"] for client in inbound["settings"]["clients"]}
+        self.assertEqual(len(ids), 1)
+        output = self.cli("links", "dual")
+        self.assertEqual(output.count("vless://"), 2)
+        self.assertIn(":20814?", output)
+        self.assertIn(":20815?", output)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,10 @@ INSTALL_CF_CHANGED=0
 INSTALL_CF_PATH=""
 UPDATE_PENDING=0
 UPDATE_WAS_ACTIVE=0
+DELETE_PENDING=0
+DELETE_WAS_ACTIVE=0
+DELETE_WAS_ENABLED=0
+EXPORT_PATH=""
 
 # Only named fields cross the Bash/Python boundary. Never source imported data.
 STATE_FIELDS=(INSTANCE_ID INSTANCE_NAME INSTANCE_IMPORTED APP_DIR WEB_ROOT SERVICE_NAME INIT_SYSTEM
@@ -117,6 +121,10 @@ usage() {
   bash $0 manage 租户编号             单实例运维菜单
   bash $0 status|logs|follow|start|stop|restart|enable|disable|links 租户编号
   bash $0 upstream 租户编号           更换入口绑定的落地
+  bash $0 edit 租户编号               交互修改租户信息
+  bash $0 credentials 租户编号        恢复链接或重置接入凭据
+  bash $0 delete 租户编号             确认后删除；导入实例仅取消登记
+  bash $0 diagnose|repair-site 租户编号 诊断实例或修复伪装站权限
   bash $0 import 租户编号 [旧目录] [旧服务名]
 
 支持 Debian/Ubuntu（apt）、CentOS/RHEL 系（dnf/yum）、Alpine（apk）。
@@ -400,6 +408,50 @@ def upstream_outbound(data):
                                  "extra": json.loads(data["UPSTREAM_XHTTP_EXTRA"])}
     return {"tag": "upstream-vless", "protocol": "vless", "settings": settings, "streamSettings": stream}
 
+def access_data(config, data):
+    """Recover exported credentials from the running service's config, not a cache."""
+    ids, modes = set(), set()
+    data.update(TLS_PORT="", REALITY_PORT="")
+    for inbound in config.get("inbounds", []):
+        if inbound.get("protocol") != "vless":
+            continue
+        clients = inbound.get("settings", {}).get("clients", [])
+        ids.update(c.get("id") for c in clients)
+        stream = inbound.get("streamSettings", {})
+        security = stream.get("security")
+        if security not in ("tls", "reality"):
+            fail("链接导出仅支持 TLS / REALITY 入站")
+        if security in modes:
+            fail("同种安全模式存在多个入站，不能确定要导出的端口")
+        modes.add(security)
+        data[security.upper() + "_PORT"] = str(inbound["port"])
+        if security == "reality":
+            reality = stream["realitySettings"]
+            data.update(REALITY_PRIVATE_KEY=reality["privateKey"], REALITY_PUBLIC_KEY="",
+                        REALITY_SERVER_NAME=(reality.get("serverNames") or [""])[0],
+                        REALITY_SHORT_ID=(reality.get("shortIds") or [""])[0])
+    if len(ids) != 1 or None in ids or not modes:
+        fail("实例必须只有一个 UUID 才能导出或修改接入信息")
+    data["UUID"] = ids.pop()
+    data["SECURITY_MODE"] = "dual" if len(modes) == 2 else next(iter(modes))
+    return data
+
+def client_nodes(data):
+    for security, port in (("reality", data["REALITY_PORT"]), ("tls", data["TLS_PORT"])):
+        if not port or data["SECURITY_MODE"] not in (security, "dual"):
+            continue
+        label = (data["INSTANCE_NAME"] or data["DOMAIN"]) + "-" + security
+        node = {"name": label, "type": "vless", "server": data["DOMAIN"], "port": int(port),
+                "uuid": data["UUID"], "network": "tcp", "tls": True,
+                "flow": "xtls-rprx-vision", "skip-cert-verify": False,
+                "client-fingerprint": data["REALITY_FINGERPRINT"] or "chrome",
+                "servername": data["DOMAIN"]}
+        if security == "reality":
+            node.update(servername=data["REALITY_SERVER_NAME"], **{
+                "reality-opts": {"public-key": data["REALITY_PUBLIC_KEY"],
+                                 "short-id": data["REALITY_SHORT_ID"]}})
+        yield security, node
+
 def records():
     root = Path(os.environ["MANAGER_DIR"]) / "instances"
     for path in sorted(root.glob("*/state.json")):
@@ -500,6 +552,8 @@ try:
         atomic(sys.argv[2], environment(STATE + UP))
     elif action == "state-values":
         values(read_json(sys.argv[2]), STATE + UP)
+    elif action == "access-values":
+        values(access_data(read_json(sys.argv[2]), environment(STATE + UP)), STATE + UP)
     elif action == "legacy":
         dump(legacy(sys.argv[2]))
     elif action == "list":
@@ -520,16 +574,39 @@ try:
                 fail("该 UUID 已被实例 " + data["INSTANCE_ID"] + " 使用")
             if data["APP_DIR"] == os.environ["APP_DIR"] or data["SERVICE_NAME"] == os.environ["SERVICE_NAME"]:
                 fail("该目录或服务已登记为实例 " + data["INSTANCE_ID"])
+    elif action == "uuid-unique":
+        for data in records():
+            if data["INSTANCE_ID"] != os.environ["INSTANCE_ID"] and data["UUID"].lower() == os.environ["UUID"].lower():
+                fail("该 UUID 已被实例 " + data["INSTANCE_ID"] + " 使用")
+    elif action == "edit-access":
+        config = read_json(sys.argv[2])
+        access_data(config, environment(STATE + UP))
+        for inbound in config["inbounds"]:
+            if inbound.get("protocol") != "vless":
+                continue
+            for client in inbound["settings"]["clients"]:
+                client["id"] = os.environ["UUID"]
+            security = inbound["streamSettings"]["security"]
+            inbound["port"] = int(os.environ[security.upper() + "_PORT"])
+            if security == "reality":
+                reality = inbound["streamSettings"]["realitySettings"]
+                reality["privateKey"] = os.environ["REALITY_PRIVATE_KEY"]
+                reality["shortIds"] = [os.environ["REALITY_SHORT_ID"]]
+        dump(config)
     elif action == "replace-upstream":
         config = read_json(sys.argv[2])
         config["outbounds"] = [upstream_outbound(environment(UP))] + [
             o for o in config["outbounds"] if o.get("tag") != "upstream-vless"]
         dump(config)
-    elif action == "client":
+    elif action in ("client", "client-yaml"):
         data = environment(STATE)
         common = {"encryption": "none", "type": "tcp", "flow": "xtls-rprx-vision"}
-        for security, port in (("reality", data["REALITY_PORT"]), ("tls", data["TLS_PORT"])):
-            if not port or data["SECURITY_MODE"] not in (security, "dual"):
+        if action == "client-yaml":
+            print("proxies:")
+        for security, node in client_nodes(data):
+            if action == "client-yaml":
+                # JSON flow objects are valid YAML; strings such as short-id stay quoted.
+                print("  - " + json.dumps(node, ensure_ascii=False))
                 continue
             query = dict(common, security=security, fp=data["REALITY_FINGERPRINT"] or "chrome")
             if security == "reality":
@@ -537,9 +614,8 @@ try:
                              sid=data["REALITY_SHORT_ID"])
             else:
                 query["sni"] = data["DOMAIN"]
-            label = data["INSTANCE_NAME"] or data["DOMAIN"]
-            print("vless://" + data["UUID"] + "@" + data["DOMAIN"] + ":" + port + "?" +
-                  urlencode(query, quote_via=quote) + "#" + quote(label + "-" + security))
+            print("vless://" + data["UUID"] + "@" + data["DOMAIN"] + ":" + str(node["port"]) + "?" +
+                  urlencode(query, quote_via=quote) + "#" + quote(node["name"]))
     else:
         fail("未知内部操作")
 except (ValueError, KeyError, IndexError, StopIteration, OSError, TypeError):
@@ -1137,6 +1213,8 @@ prepare_dirs() {
 </body>
 </html>
 HTML
+  # The manager uses umask 077; Nginx workers must be able to read this public page.
+  chmod 644 "$WEB_ROOT/index.html"
 }
 
 find_free_internal_port() {
@@ -1408,7 +1486,14 @@ NGINX
   green "Nginx 配置完成"
 }
 
-generate_reality_keys() {
+derive_reality_public_key() {
+  local out
+  out="$("$XRAY_BIN" x25519 -i "$REALITY_PRIVATE_KEY")"
+  REALITY_PUBLIC_KEY="$(printf '%s\n' "$out" | awk -F': *' '/Password|PublicKey|Public key/{print $2; exit}')"
+  [[ -n "$REALITY_PUBLIC_KEY" ]] || die "无法从当前 REALITY 私钥恢复公钥"
+}
+
+prepare_reality_keys() {
   uses_reality || return 0
   blue "准备 REALITY X25519 密钥..."
   local out
@@ -1425,7 +1510,10 @@ generate_reality_keys() {
   [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || die "REALITY 密钥生成失败"
   [[ -n "$REALITY_SHORT_ID" ]] || REALITY_SHORT_ID="$(openssl rand -hex 8)"
   validate_short_id "$REALITY_SHORT_ID" || die "REALITY_SHORT_ID 格式不正确"
+}
 
+save_reality_env() {
+  uses_reality || return 0
   cat > "$APP_DIR/reality.env" <<ENV
 REALITY_PRIVATE_KEY=${REALITY_PRIVATE_KEY}
 REALITY_PUBLIC_KEY=${REALITY_PUBLIC_KEY}
@@ -1434,6 +1522,11 @@ REALITY_TARGET=${REALITY_TARGET}
 REALITY_SERVER_NAME=${REALITY_SERVER_NAME}
 ENV
   chmod 600 "$APP_DIR/reality.env"
+}
+
+generate_reality_keys() {
+  prepare_reality_keys
+  save_reality_env
 }
 
 build_upstream_outbounds() {
@@ -1608,8 +1701,18 @@ SERVICE
 
 validate_xray_config() {
   blue "校验 Xray 配置..."
-  "$XRAY_BIN" run -test -config "$APP_DIR/config.json" >/dev/null
+  test_xray_config_file "$APP_DIR/config.json"
   green "Xray 配置校验通过"
+}
+
+test_xray_config_file() {
+  ensure_work_dir
+  # Atomic-update candidates have random suffixes; Xray cannot infer their format.
+  if "$XRAY_BIN" run -test -format json -config "$1" > "$WORK_DIR/xray-validation.log" 2>&1; then
+    return 0
+  fi
+  cat "$WORK_DIR/xray-validation.log" >&2
+  die "Xray 配置校验失败，原配置未替换"
 }
 
 check_upstream_reachability() {
@@ -1618,7 +1721,7 @@ check_upstream_reachability() {
   # Expand positional arguments inside the child shell, never in shell source.
   # shellcheck disable=SC2016
   if timeout 6 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$UPSTREAM_ADDRESS" "$UPSTREAM_PORT" 2>/dev/null; then
-    green "下一跳端口可达"
+    green "下一跳 TCP 端口可达（尚未验证 VLESS 登录及出网）"
   else
     yellow "下一跳当前不可达；配置已保留，请检查落地服务和网络。"
   fi
@@ -1675,16 +1778,34 @@ HOOK
   fi
 }
 
-write_client_info() {
-  {
+render_client_info() {
     printf '租户：%s\n角色：%s\n入口域名：%s\nUUID：%s\n' "$INSTANCE_NAME" "$NODE_MODE" "$DOMAIN" "$UUID"
     if [[ "$NODE_MODE" == relay ]]; then
       printf '绑定落地：%s:%s (%s + %s)\n' "$UPSTREAM_ADDRESS" "$UPSTREAM_PORT" "$UPSTREAM_SECURITY" "$UPSTREAM_TRANSPORT"
     fi
     printf '\n分享链接：\n'
-    native_helper client
-  } > "$APP_DIR/client.txt"
-  chmod 600 "$APP_DIR/client.txt"
+    native_helper client || return 1
+    printf '\nClash / Mihomo 节点（复制到客户端配置）：\n'
+    native_helper client-yaml
+}
+
+write_client_info() {
+  EXPORT_PATH="$(mktemp "$APP_DIR/.client.XXXXXXXX")"
+  render_client_info > "$EXPORT_PATH" || return 1
+  chmod 600 "$EXPORT_PATH"
+  mv -f "$EXPORT_PATH" "$APP_DIR/client.txt"
+  EXPORT_PATH=""
+}
+
+sync_access_info() {
+  load_values access-values "$APP_DIR/config.json" || die "无法恢复当前接入信息"
+  if uses_reality; then derive_reality_public_key; fi
+}
+
+show_client_info() {
+  sync_access_info
+  render_client_info
+  printf '\n提示：以后从主菜单“查看租户 VLESS 链接”即可再次查看。\n'
 }
 
 save_install_env() {
@@ -1710,6 +1831,7 @@ show_result() {
   blue "配置：$APP_DIR/config.json"
   blue "服务：$SERVICE_NAME ($INIT_SYSTEM)"
   cat "$APP_DIR/client.txt"
+  printf '\n请在云安全组 / 防火墙允许入口 TCP 端口：%s %s\n' "$REALITY_PORT" "$TLS_PORT"
   printf '\n再次执行脚本进入管理菜单；也可执行：bash %s manage %s\n' "$SCRIPT_PATH" "$INSTANCE_ID"
 }
 
@@ -1763,7 +1885,9 @@ load_instance() {
   load_values state-values "$path" || die "无法读取实例登记"
   [[ "$INSTANCE_ID" == "$requested" ]] || die "实例编号与登记不一致"
   safe_path "$APP_DIR"
+  safe_path "$WEB_ROOT"
   safe_path "$XRAY_BIN"
+  check_domain "$DOMAIN" || die "实例登记的域名不正确"
   [[ "$SERVICE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$ ]] || die "服务名不正确"
   [[ -f "$APP_DIR/config.json" ]] || die "找不到实例配置：$APP_DIR/config.json"
 }
@@ -1782,20 +1906,39 @@ cleanup() {
   set +e
   [[ -z "$HTTP_PROBE_FILE" ]] || rm -f -- "$HTTP_PROBE_FILE"
   if [[ "$UPDATE_PENDING" == 1 ]]; then
-    yellow "操作未完成，恢复原来的落地绑定..." >&2
+    yellow "操作未完成，恢复原配置和租户信息..." >&2
     restore_file "$WORK_DIR/config.backup" "$APP_DIR/config.json" ||
       red "恢复失败：$APP_DIR/config.json" >&2
     restore_file "$WORK_DIR/state.backup" "$(record_path)" ||
       red "恢复失败：$(record_path)" >&2
-    if [[ -f "$WORK_DIR/client.backup" ]]; then
-      restore_file "$WORK_DIR/client.backup" "$APP_DIR/client.txt" ||
-        red "恢复失败：$APP_DIR/client.txt" >&2
-    else
-      rm -f "$APP_DIR/client.txt"
-    fi
+    local filename
+    for filename in client.txt reality.env install.env; do
+      if [[ -f "$WORK_DIR/$filename.backup" ]]; then
+        restore_file "$WORK_DIR/$filename.backup" "$APP_DIR/$filename" ||
+          red "恢复失败：$APP_DIR/$filename" >&2
+      else
+        rm -f "$APP_DIR/$filename"
+      fi
+    done
     if [[ "$UPDATE_WAS_ACTIVE" == 1 ]]; then
       service_action restart || red "原服务恢复启动失败：$SERVICE_NAME" >&2
     fi
+  fi
+  if [[ "$DELETE_PENDING" == 1 ]]; then
+    yellow "删除未完成，恢复原服务和站点..." >&2
+    local entry
+    for entry in service nginx hook; do
+      if [[ -f "$WORK_DIR/delete.$entry.backup" ]]; then
+        local destination
+        destination="$(cat "$WORK_DIR/delete.$entry.path")"
+        restore_file "$WORK_DIR/delete.$entry.backup" "$destination" ||
+          red "恢复失败：$destination" >&2
+      fi
+    done
+    if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload; fi
+    if [[ -f "$WORK_DIR/delete.nginx.backup" ]]; then nginx -t && service_action reload nginx; fi
+    if [[ "$DELETE_WAS_ENABLED" == 1 ]]; then service_action enable; else service_action disable; fi
+    if [[ "$DELETE_WAS_ACTIVE" == 1 ]]; then service_action start; fi
   fi
   if [[ "$INSTALL_PENDING" == 1 ]]; then
     yellow "安装未完成，清理本次新增实例..." >&2
@@ -1833,6 +1976,7 @@ cleanup() {
     fi
   fi
   [[ -z "${CANDIDATE_PATH:-}" ]] || rm -f "$CANDIDATE_PATH"
+  [[ -z "$EXPORT_PATH" ]] || rm -f "$EXPORT_PATH"
   if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
     rm -rf -- "$WORK_DIR" || red "临时目录清理失败：$WORK_DIR" >&2
   fi
@@ -1919,6 +2063,282 @@ show_instance() {
   service_action status || true
 }
 
+begin_instance_update() {
+  ensure_work_dir
+  cp -p "$APP_DIR/config.json" "$WORK_DIR/config.backup"
+  cp -p "$(record_path)" "$WORK_DIR/state.backup"
+  local filename
+  for filename in client.txt reality.env install.env; do
+    if [[ -f "$APP_DIR/$filename" ]]; then cp -p "$APP_DIR/$filename" "$WORK_DIR/$filename.backup"; fi
+  done
+  UPDATE_WAS_ACTIVE=0
+  if service_action active >/dev/null 2>&1; then UPDATE_WAS_ACTIVE=1; fi
+  UPDATE_PENDING=1
+}
+
+commit_instance_update() {
+  local restart="${1:-false}"
+  if [[ -n "${CANDIDATE_PATH:-}" ]]; then
+    mv -f "$CANDIDATE_PATH" "$APP_DIR/config.json"
+    CANDIDATE_PATH=""
+  fi
+  native_helper state-save "$(record_path)"
+  write_client_info
+  if [[ "$INSTANCE_IMPORTED" != true ]]; then save_install_env; save_reality_env; fi
+  if [[ "$restart" == true && "$UPDATE_WAS_ACTIVE" == 1 ]]; then
+    service_action restart
+    sleep 1
+    service_action active >/dev/null 2>&1 || die "修改后的服务启动失败"
+  fi
+  UPDATE_PENDING=0
+}
+
+make_access_candidate() {
+  CANDIDATE_PATH="$(mktemp "$APP_DIR/.config.XXXXXXXX")"
+  native_helper edit-access "$APP_DIR/config.json" > "$CANDIDATE_PATH"
+  chmod 600 "$CANDIDATE_PATH"
+  test_xray_config_file "$CANDIDATE_PATH"
+}
+
+confirm_instance_action() {
+  local answer
+  yellow "$1"
+  printf '租户：%s (%s)；入口：%s；服务：%s\n' "$INSTANCE_NAME" "$INSTANCE_ID" "$DOMAIN" "$SERVICE_NAME"
+  read -rp "输入租户编号 $INSTANCE_ID 确认，留空取消: " answer || return 1
+  [[ "$answer" == "$INSTANCE_ID" ]] || { yellow "已取消"; return 1; }
+}
+
+rename_instance() {
+  manager_lock
+  load_instance "$1"
+  sync_access_info
+  local name
+  read -rp "新的租户显示名称 [当前 $INSTANCE_NAME；留空保持]: " name || return 0
+  [[ -n "$name" ]] || return 0
+  [[ ! "$name" =~ [[:cntrl:]] ]] || die "名称不能包含控制字符"
+  begin_instance_update
+  INSTANCE_NAME="$name"
+  commit_instance_update false
+  green "租户名称已更新"
+  render_client_info
+}
+
+edit_instance_ports() {
+  manager_lock
+  load_instance "$1"
+  sync_access_info
+  local key value old changed=0
+  for key in REALITY_PORT TLS_PORT; do
+    old="${!key}"
+    [[ -n "$old" ]] || continue
+    read -rp "${key%_PORT} 入口端口 [当前 $old；留空保持，0 取消]: " value || return 0
+    [[ "$value" != 0 ]] || { yellow "已取消"; return 0; }
+    [[ -n "$value" ]] || value="$old"
+    check_port_number "$value" || die "端口必须为 1–65535"
+    value=$((10#$value))
+    if [[ "$value" != "$old" ]]; then
+      port_in_use "$value" && die "端口 $value 已被占用或被其它实例预留"
+      changed=1
+    fi
+    printf -v "$key" '%s' "$value"
+  done
+  [[ "$changed" == 1 ]] || { green "端口保持原值"; return 0; }
+  [[ -z "$TLS_PORT" || -z "$REALITY_PORT" || "$TLS_PORT" != "$REALITY_PORT" ]] || die "两个入口不能使用同一端口"
+  confirm_instance_action "修改端口会使原链接失效；运行中的实例将重启，停止的实例保持停止。" || return 0
+  make_access_candidate
+  begin_instance_update
+  commit_instance_update true
+  green "入口端口已更新，请在云安全组允许 TCP：$REALITY_PORT $TLS_PORT"
+  render_client_info
+}
+
+reset_instance_credentials() {
+  manager_lock
+  load_instance "$1"
+  sync_access_info
+  local kind="${2:-uuid}" value
+  case "$kind" in uuid|custom-uuid|reality|all) ;; *) die "请选择 UUID 或 REALITY 凭据重置" ;; esac
+  if [[ "$kind" == reality || "$kind" == all ]]; then
+    uses_reality || die "该实例没有 REALITY 入口"
+  fi
+  if [[ "$kind" == custom-uuid ]]; then
+    read -rp "请输入新的 UUID [留空取消]: " value || return 0
+    [[ -n "$value" ]] || return 0
+    [[ "$value" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
+  fi
+  confirm_instance_action "重置接入凭据会使对应旧链接失效；请重新导入生成的新链接。" || return 0
+  if [[ "$kind" == uuid || "$kind" == all ]]; then UUID="$("$XRAY_BIN" uuid)"
+  elif [[ "$kind" == custom-uuid ]]; then UUID="$value"
+  fi
+  native_helper uuid-unique
+  if [[ "$kind" == reality || "$kind" == all ]]; then
+    REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""
+    prepare_reality_keys
+  fi
+  make_access_candidate
+  begin_instance_update
+  commit_instance_update true
+  green "接入凭据已更新"
+  render_client_info
+}
+
+refresh_client_info() {
+  manager_lock
+  load_instance "$1"
+  sync_access_info
+  begin_instance_update
+  commit_instance_update false
+  green "已从当前服务配置恢复并重新导出接入信息"
+  render_client_info
+}
+
+delete_instance() {
+  manager_lock
+  load_instance "$1"
+  if [[ "$INSTANCE_IMPORTED" == true ]]; then
+    confirm_instance_action "这是导入的旧部署：只取消管理登记，保留原服务、配置、网站和证书。" || return 0
+    [[ ! -L "$MANAGER_DIR/instances/$INSTANCE_ID" ]] || die "登记目录不能是符号链接"
+    rm -f -- "$(record_path)"
+    rmdir "$MANAGER_DIR/instances/$INSTANCE_ID" || yellow "登记已取消；登记目录还有其它文件，已保留"
+    green "已取消登记：$INSTANCE_ID"
+    return 0
+  fi
+  [[ "$APP_DIR" == "$MANAGER_DIR/instances/$INSTANCE_ID" &&
+     "$WEB_ROOT" == "$MANAGER_WEB_ROOT/instances/$INSTANCE_ID" &&
+     "$SERVICE_NAME" == "xray-chain-$INSTANCE_ID" ]] || die "目录或服务归属不符合独立实例规则，停止删除"
+  local path conf unit hook entry
+  for path in "$MANAGER_DIR" "$MANAGER_DIR/instances" "$APP_DIR" "$MANAGER_WEB_ROOT" "$MANAGER_WEB_ROOT/instances" "$WEB_ROOT"; do
+    [[ ! -L "$path" ]] || die "删除路径不能是符号链接：$path"
+  done
+  conf="$(nginx_conf_path)"; hook="$RENEW_HOOK_DIR/$SERVICE_NAME.sh"
+  if [[ "$INIT_SYSTEM" == systemd ]]; then unit="$SYSTEMD_DIR/$SERVICE_NAME.service"
+  else unit="$OPENRC_DIR/$SERVICE_NAME"
+  fi
+  if [[ -f "$conf" ]]; then nginx -t || die "请先修复现有 Nginx 配置，再删除租户"; fi
+  confirm_instance_action "将停止并删除这个实例的服务、配置和伪装网页；共享证书及 HTTP 验证站保留。" || return 0
+  ensure_work_dir
+  for entry in service nginx hook; do
+    case "$entry" in service) path="$unit" ;; nginx) path="$conf" ;; hook) path="$hook" ;; esac
+    [[ ! -L "$path" ]] || die "实例文件不能是符号链接：$path"
+    if [[ -f "$path" ]]; then
+      cp -p "$path" "$WORK_DIR/delete.$entry.backup"
+      printf '%s' "$path" > "$WORK_DIR/delete.$entry.path"
+    fi
+  done
+  if service_action active >/dev/null 2>&1; then DELETE_WAS_ACTIVE=1; fi
+  if service_action enabled >/dev/null 2>&1; then DELETE_WAS_ENABLED=1; fi
+  DELETE_PENDING=1
+  if [[ "$DELETE_WAS_ACTIVE" == 1 ]]; then service_action stop; fi
+  service_action disable
+  rm -f -- "$unit" "$conf" "$hook"
+  if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload; fi
+  if [[ -f "$WORK_DIR/delete.nginx.backup" ]]; then nginx -t; service_action reload nginx; fi
+  DELETE_PENDING=0
+  rm -rf -- "$WEB_ROOT" "$APP_DIR" || die "实例已停用，但目录未完全删除：$WEB_ROOT；$APP_DIR"
+  green "已删除租户：$INSTANCE_ID"
+}
+
+repair_instance_site() {
+  manager_lock
+  load_instance "$1"
+  needs_nginx || { green "该实例使用外部伪装目标，没有本机站点"; return 0; }
+  [[ "$INSTANCE_IMPORTED" != true && "$WEB_ROOT" == "$MANAGER_WEB_ROOT/instances/$INSTANCE_ID" ]] ||
+    die "只能自动修复本脚本创建的独立伪装站；导入站点请检查原目录权限"
+  local path
+  for path in "$MANAGER_WEB_ROOT" "$MANAGER_WEB_ROOT/instances" "$WEB_ROOT" "$WEB_ROOT/index.html"; do
+    [[ ! -L "$path" ]] || die "站点路径不能是符号链接：$path"
+  done
+  [[ -f "$WEB_ROOT/index.html" ]] || die "首页文件不存在：$WEB_ROOT/index.html"
+  chmod 755 "$MANAGER_WEB_ROOT" "$MANAGER_WEB_ROOT/instances" "$WEB_ROOT"
+  chmod 644 "$WEB_ROOT/index.html"
+  green "伪装站目录和公开首页权限已修复"
+}
+
+diagnose_instance() {
+  load_instance "$1"
+  show_instance
+  blue "检查 Xray 配置..."
+  if "$XRAY_BIN" run -test -config "$APP_DIR/config.json" >/dev/null 2>&1; then green "Xray 配置有效"
+  else yellow "Xray 配置无效，请查看最近日志"
+  fi
+  local port
+  for port in "$REALITY_PORT" "$TLS_PORT"; do
+    [[ -n "$port" ]] || continue
+    if ss -lnt 2>/dev/null | awk '{print $4}' | grep -E "(:|\\])${port}$" >/dev/null; then green "入口 TCP $port 正在监听"
+    else yellow "入口 TCP $port 未监听（若实例已停止，这是预期状态）"
+    fi
+  done
+  if needs_nginx; then
+    local status
+    ensure_work_dir
+    if [[ -f "$WEB_ROOT/index.html" ]]; then
+      printf '首页权限：%s\n' "$(stat -c '%a' "$WEB_ROOT/index.html")"
+    else yellow "首页文件缺失：$WEB_ROOT/index.html"
+    fi
+    status="$(curl --noproxy '*' -sS --max-time 6 --resolve "$DOMAIN:$INTERNAL_HTTPS_PORT:127.0.0.1" \
+      "https://$DOMAIN:$INTERNAL_HTTPS_PORT/" -o "$WORK_DIR/site.response" -w '%{http_code}' 2>/dev/null || true)"
+    if [[ "$status" == 200 ]]; then green "本机 HTTPS 伪装站正常（200）"
+    else yellow "本机 HTTPS 伪装站返回 ${status:-连接失败}；403 可在菜单选择修复伪装站权限"
+    fi
+    if [[ -f "$APP_DIR/certs/fullchain.pem" ]]; then
+      if openssl x509 -checkend 604800 -noout -in "$APP_DIR/certs/fullchain.pem" >/dev/null 2>&1; then green "证书有效期超过 7 天"
+      else yellow "证书将在 7 天内过期或无法读取，请检查 Certbot 续期任务"
+      fi
+    fi
+  fi
+  check_upstream_reachability
+  printf '公网访问还需要云安全组允许 TCP：%s %s；本机检测不能确认云安全组规则。\n' "$REALITY_PORT" "$TLS_PORT"
+}
+
+edit_instance_menu() {
+  local id="$1" choice
+  while true; do
+    load_instance "$id"
+    blue "修改租户：$INSTANCE_NAME ($INSTANCE_ID)"
+    echo "  1) 修改显示名称"
+    echo "  2) 修改入口监听端口"
+    echo "  3) 设置指定 UUID（旧链接失效）"
+    [[ "$NODE_MODE" != relay ]] || echo "  4) 更换绑定落地"
+    echo "  0) 返回"
+    read -rp "请选择: " choice || return 0
+    case "$choice" in
+      1) run_menu_command rename "$id" ;;
+      2) run_menu_command ports "$id" ;;
+      3) run_menu_command reset "$id" custom-uuid ;;
+      4) if [[ "$NODE_MODE" == relay ]]; then run_menu_command upstream "$id"; else yellow "落地实例无需绑定下一跳"; fi ;;
+      0) return 0 ;;
+      *) yellow "请选择菜单中的编号" ;;
+    esac
+  done
+}
+
+credentials_menu() {
+  local id="$1" choice
+  while true; do
+    load_instance "$id"
+    blue "接入信息：$INSTANCE_NAME ($INSTANCE_ID)"
+    echo "  1) 恢复并重新导出链接（保留当前凭据）"
+    echo "  2) 重新生成 UUID（旧链接失效）"
+    if uses_reality; then
+      echo "  3) 重新生成 REALITY 密钥和 short-id（旧 REALITY 链接失效）"
+      echo "  4) 重新生成 UUID 和 REALITY 全部凭据（旧链接失效）"
+    fi
+    echo "  0) 返回"
+    read -rp "请选择: " choice || return 0
+    case "$choice" in
+      1) run_menu_command refresh-client "$id" ;;
+      2) run_menu_command reset "$id" uuid ;;
+      3|4)
+        if uses_reality; then
+          if [[ "$choice" == 3 ]]; then run_menu_command reset "$id" reality; else run_menu_command reset "$id" all; fi
+        else yellow "该实例没有 REALITY 入口"
+        fi ;;
+      0) return 0 ;;
+      *) yellow "请选择菜单中的编号" ;;
+    esac
+  done
+}
+
 replace_upstream() {
   manager_lock
   load_instance "$1"
@@ -1933,22 +2353,10 @@ replace_upstream() {
   CANDIDATE_PATH="$(mktemp "$APP_DIR/.config.XXXXXXXX")"
   native_helper replace-upstream "$APP_DIR/config.json" > "$CANDIDATE_PATH"
   chmod 600 "$CANDIDATE_PATH"
-  "$XRAY_BIN" run -test -config "$CANDIDATE_PATH" >/dev/null
-  cp -p "$APP_DIR/config.json" "$WORK_DIR/config.backup"
-  cp -p "$(record_path)" "$WORK_DIR/state.backup"
-  if [[ -f "$APP_DIR/client.txt" ]]; then cp -p "$APP_DIR/client.txt" "$WORK_DIR/client.backup"; fi
-  if service_action active >/dev/null 2>&1; then UPDATE_WAS_ACTIVE=1; fi
-  UPDATE_PENDING=1
-  mv -f "$CANDIDATE_PATH" "$APP_DIR/config.json"
-  CANDIDATE_PATH=""
-  native_helper state-save "$(record_path)"
-  write_client_info
-  if [[ "$UPDATE_WAS_ACTIVE" == 1 ]]; then
-    service_action restart
-    sleep 1
-    service_action active >/dev/null 2>&1 || die "新落地配置启动失败"
-  fi
-  UPDATE_PENDING=0
+  test_xray_config_file "$CANDIDATE_PATH"
+  sync_access_info
+  begin_instance_update
+  commit_instance_update true
   green "落地绑定已更新，入口 UUID 和端口保持不变"
 }
 
@@ -1968,9 +2376,10 @@ run_menu_command() {
 }
 
 instance_menu() {
-  load_instance "$1"
-  local choice
+  local id="$1" choice
   while true; do
+    [[ -f "$MANAGER_DIR/instances/$id/state.json" ]] || return 0
+    load_instance "$id"
     echo
     blue "租户：$INSTANCE_NAME ($INSTANCE_ID)  $NODE_MODE"
     echo "  1) 查看状态和绑定落地"
@@ -1981,8 +2390,13 @@ instance_menu() {
     echo "  6) 重启"
     echo "  7) 开启开机自启"
     echo "  8) 关闭开机自启"
-    echo "  9) 查看入口分享链接"
+    echo "  9) 查看 VLESS 链接和 Clash / Mihomo 节点"
     [[ "$NODE_MODE" != relay ]] || echo " 10) 更换绑定落地"
+    echo " 11) 修改租户信息（名称 / 端口 / UUID）"
+    echo " 12) 恢复链接 / 重新生成接入凭据"
+    echo " 13) 删除租户 / 取消旧部署登记"
+    echo " 14) 诊断配置、端口、证书和站点"
+    echo " 15) 修复伪装站权限（403）"
     echo "  0) 返回"
     read -rp "请选择: " choice || return 0
     case "$choice" in
@@ -1996,6 +2410,11 @@ instance_menu() {
       8) run_menu_command disable "$INSTANCE_ID" ;;
       9) run_menu_command links "$INSTANCE_ID" ;;
       10) run_menu_command upstream "$INSTANCE_ID" ;;
+      11) run_menu_command edit "$INSTANCE_ID" ;;
+      12) run_menu_command credentials "$INSTANCE_ID" ;;
+      13) run_menu_command delete "$INSTANCE_ID" ;;
+      14) run_menu_command diagnose "$INSTANCE_ID" ;;
+      15) run_menu_command repair-site "$INSTANCE_ID" ;;
       0) return 0 ;;
       *) yellow "请选择菜单中的编号" ;;
     esac
@@ -2010,8 +2429,10 @@ manager_menu() {
     echo "  1) 安装落地 VLESS（直接出网）"
     echo "  2) 新增租户入口 VLESS（粘贴落地配置）"
     echo "  3) 列出所有实例和绑定"
-    echo "  4) 选择实例进行运维"
+    echo "  4) 管理租户（查看链接 / 修改 / 重置 / 删除）"
     echo "  5) 导入旧版部署"
+    echo "  6) 查看租户 VLESS 链接和 Clash / Mihomo 节点"
+    echo "  7) 选择租户进行一键诊断"
     echo "  0) 退出"
     read -rp "请选择: " choice || return 0
     case "$choice" in
@@ -2026,6 +2447,8 @@ manager_menu() {
         read -rp "导入后租户编号: " id || return 0
         run_menu_command import "$id" "${source:-/etc/xray-chain}" "${service:-xray-chain}"
         ;;
+      6) if select_instance; then run_menu_command links "$SELECTED_INSTANCE"; fi ;;
+      7) if select_instance; then run_menu_command diagnose "$SELECTED_INSTANCE"; fi ;;
       0) return 0 ;;
       *) yellow "请选择菜单中的编号" ;;
     esac
@@ -2113,16 +2536,22 @@ main() {
       elif select_instance; then instance_menu "$SELECTED_INSTANCE"
       fi ;;
     upstream) replace_upstream "${2:-}" ;;
+    edit) edit_instance_menu "${2:-}" ;;
+    credentials) credentials_menu "${2:-}" ;;
+    rename) rename_instance "${2:-}" ;;
+    ports) edit_instance_ports "${2:-}" ;;
+    reset) reset_instance_credentials "${2:-}" "${3:-uuid}" ;;
+    refresh-client) refresh_client_info "${2:-}" ;;
+    delete) delete_instance "${2:-}" ;;
+    diagnose) diagnose_instance "${2:-}" ;;
+    repair-site) repair_instance_site "${2:-}" ;;
     status|logs|follow|start|stop|restart|enable|disable|links)
       load_instance "${2:-}"
       case "$action" in
         status) show_instance ;;
         logs) service_logs ;;
         follow) service_logs true ;;
-        links)
-          if [[ -f "$APP_DIR/client.txt" ]]; then cat "$APP_DIR/client.txt"
-          else native_helper client
-          fi ;;
+        links) show_client_info ;;
         *) manager_lock; service_action "$action"; green "$INSTANCE_ID：$action 已执行" ;;
       esac ;;
     *) usage; die "未知命令：$action" ;;
