@@ -1,0 +1,33 @@
+/* The selected Metronic components share these tokens; demo-only styles omitted. */
+@theme {
+  --text-2sm: 0.8125rem;
+  --text-2sm--line-height: calc(1.075 / 0.8125);
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: calc(0.825 / 0.6875);
+}
+
+:root {
+  --primary: #2563eb;
+  --primary-foreground: #fff;
+  --ring: #93b4fa;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  color: #252f4a;
+  background: #f9fafb;
+  font-synthesis: none;
+}
+body { margin: 0; min-width: 320px; }
+button, input, select, textarea { font: inherit; }
+.select, .textarea {
+  width: 100%; border: 1px solid var(--input); border-radius: 6px;
+  background: white; padding: 8px 12px; font-size: 13px;
+}
+.textarea { min-height: 110px; resize: vertical; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.data-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
+.data-table th { background: #fcfcfd; color: #78829d; font-size: 12px; font-weight: 500; padding: 14px 20px; white-space: nowrap; }
+.data-table td { padding: 20px; border-top: 1px solid var(--border); vertical-align: middle; }
+.data-table tr:hover td { background: #fcfcfd; }
+.muted { color: #78829d; font-size: 12px; line-height: 1.7; }
+.field { display: flex; flex-direction: column; gap: 8px; font-size: 13px; font-weight: 500; }
+.secret { overflow-wrap: anywhere; white-space: pre-wrap; background: #f8fafc; border: 1px dashed #dbe1ea; border-radius: 8px; padding: 14px; font-size: 12px; line-height: 1.8; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
