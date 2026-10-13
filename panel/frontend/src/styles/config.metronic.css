@@ -332,10 +332,7 @@ nav .nav-item {
   font-size: 12px;
   font-weight: 500;
 }
-.row-menu {
-  position: relative;
-}
-.row-menu summary {
+.row-menu-trigger {
   display: flex;
   width: 30px;
   height: 32px;
@@ -345,17 +342,11 @@ nav .nav-item {
   cursor: pointer;
   color: #8995a9;
 }
-.row-menu summary::-webkit-details-marker {
-  display: none;
-}
-.row-menu[open] summary {
+.row-menu-trigger[data-state="open"] {
   background: #edf4ff;
   color: #2563eb;
 }
-.row-menu > div {
-  position: absolute;
-  top: 32px;
-  right: 0;
+.row-menu-content {
   z-index: 20;
   width: 140px;
   padding: 5px;
@@ -364,7 +355,7 @@ nav .nav-item {
   background: white;
   box-shadow: 0 8px 24px #15233c15;
 }
-.row-menu button {
+.row-menu-content [role="menuitem"] {
   display: block;
   width: 100%;
   border-radius: 5px;
@@ -373,10 +364,11 @@ nav .nav-item {
   font-size: 12px;
   cursor: pointer;
 }
-.row-menu button:hover {
+.row-menu-content [role="menuitem"][data-highlighted] {
+  outline: none;
   background: #f5f7fb;
 }
-.row-menu button:disabled {
+.row-menu-content [role="menuitem"][data-disabled] {
   opacity: 0.4;
   cursor: default;
 }

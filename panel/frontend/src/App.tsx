@@ -34,6 +34,7 @@ import {
   KeyRound,
   Cable,
 } from "lucide-react";
+import { DropdownMenu } from "radix-ui";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -1091,60 +1092,70 @@ export function App() {
                               >
                                 编辑
                               </Button>
-                              <details className="row-menu">
-                                <summary aria-label={`${l.name} 更多操作`}>
+                              <DropdownMenu.Root>
+                                <DropdownMenu.Trigger
+                                  className="row-menu-trigger"
+                                  aria-label={`${l.name} 更多操作`}
+                                >
                                   <MoreHorizontal className="size-4" />
-                                </summary>
-                                <div>
-                                  <button
-                                    disabled={
-                                      !l.published || !l.enabled || state.busy
-                                    }
-                                    onClick={() =>
-                                      setModal(
-                                        <ProbeEditor
-                                          line={l}
-                                          state={state}
-                                          close={close}
-                                          saved={refresh}
-                                        />,
-                                      )
-                                    }
+                                </DropdownMenu.Trigger>
+                                <DropdownMenu.Portal>
+                                  <DropdownMenu.Content
+                                    className="row-menu-content"
+                                    align="end"
+                                    sideOffset={4}
+                                    collisionPadding={8}
                                   >
-                                    检查连接
-                                  </button>
-                                  <button
-                                    disabled={state.busy}
-                                    onClick={() => void run(() => apply(l.id))}
-                                  >
-                                    应用修改
-                                  </button>
-                                  <button
-                                    disabled={state.busy}
-                                    className="text-red-600"
-                                    onClick={() =>
-                                      setModal(
-                                        <Modal
-                                          title="删除规则"
-                                          description={`删除「${l.name}」并应用配置后，该入口停止服务。`}
-                                          submit="删除并应用"
-                                          close={close}
-                                          action={async () => {
-                                            await api(
-                                              `/lines/${l.id}`,
-                                              "DELETE",
-                                            );
-                                            await refresh();
-                                            await apply(l.id);
-                                          }}
-                                        />,
-                                      )
-                                    }
-                                  >
-                                    删除规则
-                                  </button>
-                                </div>
-                              </details>
+                                    <DropdownMenu.Item
+                                      disabled={
+                                        !l.published || !l.enabled || state.busy
+                                      }
+                                      onSelect={() =>
+                                        setModal(
+                                          <ProbeEditor
+                                            line={l}
+                                            state={state}
+                                            close={close}
+                                            saved={refresh}
+                                          />,
+                                        )
+                                      }
+                                    >
+                                      检查连接
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      disabled={state.busy}
+                                      onSelect={() => void run(() => apply(l.id))}
+                                    >
+                                      应用修改
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      disabled={state.busy}
+                                      className="text-red-600"
+                                      onSelect={() =>
+                                        setModal(
+                                          <Modal
+                                            title="删除规则"
+                                            description={`删除「${l.name}」并应用配置后，该入口停止服务。`}
+                                            submit="删除并应用"
+                                            close={close}
+                                            action={async () => {
+                                              await api(
+                                                `/lines/${l.id}`,
+                                                "DELETE",
+                                              );
+                                              await refresh();
+                                              await apply(l.id);
+                                            }}
+                                          />,
+                                        )
+                                      }
+                                    >
+                                      删除规则
+                                    </DropdownMenu.Item>
+                                  </DropdownMenu.Content>
+                                </DropdownMenu.Portal>
+                              </DropdownMenu.Root>
                             </div>
                           </td>
                         </tr>

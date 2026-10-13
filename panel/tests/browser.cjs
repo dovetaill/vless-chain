@@ -55,6 +55,22 @@ const base = address.replace('127.0.0.1', 'localhost');
     await shot('proxy-editor');
     await close();
     const first = page.locator('tbody tr').filter({ hasText: '三跳代理' });
+    // A single row must not clip its menu inside the table's scroll container.
+    await page.getByLabel('搜索规则').fill('三跳代理');
+    await first.getByRole('button', { name: '三跳代理 更多操作' }).click();
+    const menu = page.getByRole('menu');
+    await menu.waitFor();
+    assert.equal(await menu.getByRole('menuitem').count(), 3);
+    assert.equal(await menu.evaluate(el => el.closest('.overflow-x-auto')), null);
+    const remove = menu.getByRole('menuitem', { name: '删除规则' });
+    assert.ok(await remove.evaluate(el => {
+      const r = el.getBoundingClientRect();
+      return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+    }), 'Last menu item must be visible and unobstructed');
+    await page.keyboard.press('Escape');
+    await menu.waitFor({ state: 'hidden' });
+    assert.equal(await first.getByRole('button', { name: '三跳代理 更多操作' }).evaluate(el => el === document.activeElement), true);
+    await page.getByLabel('搜索规则').fill('');
     await first.getByRole('button', { name: '接入', exact: true }).click();
     await page.getByAltText('接入二维码').waitFor();
     assert.match(await page.getByLabel('分享链接').inputValue(), /^vless:\/\//);
