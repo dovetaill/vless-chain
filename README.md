@@ -1,20 +1,31 @@
 # VLESS / Xray 原生实例管理
 
-## Web 控制台：从安装向导开始
+## Web 控制台：一键安装
 
 管理多条 VLESS 代理链和 TCP/UDP 转发，使用 [Chain Panel 上手指南](panel/README.md)。
 
-在服务器运行：
+在使用 systemd 的 Linux x86_64 / aarch64 服务器上运行，支持 Ubuntu 22.04+ / Debian 12+：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo bash
 ```
 
-首次运行直接安装控制台和本机 Agent，只需输入可选的面板域名：留空即通过自动分配的空闲随机端口访问；填写域名则检查解析，通过系统软件源安装 Nginx/Certbot，配置 HTTPS 与自动续期。服务器地址读取网卡公网 IPv4，不使用代理出口 IP。完成后直接显示登录地址和自动生成的管理令牌。
+首次运行自动下载并校验正式安装包，默认安装控制台和本机 Agent。网卡已有公网 IPv4 时，只需回答一个可选输入：
+
+```text
+面板域名（可选，直接回车使用 IP 访问）:
+```
+
+- 直接回车：使用 `http://公网IP:随机端口`。端口从 `10000–59999` 中自动选择，排除已被 IPv4/IPv6 TCP、UDP 占用的端口；按安装结果在防火墙和云安全组放行对应 TCP 端口。
+- 填写域名：检查公共 DNS 的 A/AAAA 记录是否指向本机，复用系统 Nginx，缺少依赖时通过 apt/dnf 安装 Nginx/Certbot，配置 HTTPS、443 和证书自动续期。域名需直接解析到服务器，并放行 TCP 80、443。
+
+**服务器地址从网卡读取公网入站 IPv4，不查询代理出口 IP。** 只有网卡没有公网 IPv4（例如位于 NAT 后）时，才提示补填公网入站地址。无域名方式使用 HTTP，浏览器到面板的通信不加密。
+
+安装完成后显示登录地址和自动生成的管理令牌，本机节点自动接入，无需再设置账号密码或手动添加本机。
 
 其他服务器可在 Web 填写 SSH 信息直接安装，也可使用脚本粘贴接入码。日常只需输入 `chainctl` 打开菜单；重复执行安装命令保留已有端口和凭据，升级使用 `chainctl update`。[详细安装说明](panel/README.md)。
 
-已有本仓库或解压后的发行包时，直接运行 `sudo ./scripts/install-server.sh`。在线安装需要已有正式 Release；源码构建与发布供维护者使用，见 [高级文档](panel/docs/advanced.md)。
+已有本仓库或解压后的发行包时，直接运行 `sudo ./scripts/install-server.sh`。在线脚本自动选择与本机架构匹配的 [最新正式安装包](https://github.com/dovetaill/vless-chain/releases/latest)，无需手动编译或选择下载附件。源码构建与发布供维护者使用，见 [高级文档](panel/docs/advanced.md)。
 
 ## 原有 SSH 脚本
 
