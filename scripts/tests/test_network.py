@@ -219,8 +219,19 @@ class Network(unittest.TestCase):
                           '-subj', '/CN=panel.example.com', '-keyout', site.cert / 'privkey.pem',
                           '-out', site.cert / 'fullchain.pem'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 conf = work.root / 'nginx.conf'
+                http_port, https_port = network.available_port(), network.available_port()
+                while https_port == http_port:
+                    https_port = network.available_port()
+                work.manifest['ports'] = [http_port, https_port]
+                work.record()
+                site_config = site.config(tls=True).replace('listen 80;', f'listen 127.0.0.1:{http_port};').replace(
+                    'listen [::]:80;', f'listen [::]:{http_port};').replace(
+                    'listen 443 ssl;', f'listen 127.0.0.1:{https_port} ssl;').replace(
+                    'listen [::]:443 ssl;', f'listen [::]:{https_port} ssl;')
                 conf.write_text(f'pid {work.root}/nginx.pid;\nerror_log {work.root}/error.log;\nevents {{}}\n'
-                                'http { access_log off;\n' + site.config(tls=True) + '}\n')
+                                'http { access_log off;\n' + ''.join(
+                                    f'{name}_temp_path {work.root}/{name};\n'
+                                    for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')) + site_config + '}\n')
                 work.run(['nginx', '-t', '-p', str(work.root), '-c', conf, '-e', work.root / 'error.log'])
 
 

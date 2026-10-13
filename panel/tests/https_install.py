@@ -48,7 +48,8 @@ def main():
             conf = root / 'nginx.conf'
             # Single process stays in the owned group; no host paths/listeners.
             conf.write_text(f'pid {root}/nginx.pid;\nerror_log {root}/error.log;\nevents {{}}\n'
-                            f'http {{ access_log off; client_body_temp_path {root}/client; proxy_temp_path {root}/proxy;\n' +
+                            'http { access_log off;\n' + ''.join(f'{name}_temp_path {root}/{name};\n'
+                                for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')) +
                             site.config(tls=True).replace('listen 80;', f'listen 127.0.0.1:{http_port};').replace(
                                 'listen 443 ssl;', f'listen 127.0.0.1:{https_port} ssl;') + '}\n')
             nginx_log = (root / 'nginx.log').open('wb')

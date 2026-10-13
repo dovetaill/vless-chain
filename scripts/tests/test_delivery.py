@@ -375,7 +375,8 @@ class Delivery(unittest.TestCase):
             shutil.copy2(source / 'release.json', destination / 'release.json')
             (destination / 'SHA256SUMS').write_text(f'{common.sha256(archive)}  {name}\n')
         outgoing = self.root / 'published'
-        ci.assemble(incoming, outgoing, 'v0.1.0', commit)
+        with patch.object(ci, 'version', return_value='0.1.0'):
+            ci.assemble(incoming, outgoing, 'v0.1.0', commit)
         self.assertEqual(len(list(outgoing.iterdir())), 5)
         for archive in outgoing.glob('*.tar.gz'):
             common.verify_archive_checksum(archive)
@@ -387,7 +388,7 @@ class Delivery(unittest.TestCase):
         shutil.copy2(archive, destination / name)
         shutil.copy2(source / 'release.json', destination / 'release.json')
         (destination / 'SHA256SUMS').write_text(f'{common.sha256(archive)}  {name}\n')
-        with self.assertRaisesRegex(ValueError, '拒绝发布'):
+        with patch.object(ci, 'version', return_value='0.1.0'), self.assertRaisesRegex(ValueError, '拒绝发布'):
             ci.assemble(incoming, self.root / 'rejected', 'v0.1.0', commit)
         self.assertFalse((self.root / 'rejected').exists())
 

@@ -47,12 +47,17 @@ jobs:
           package-manager-cache: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
-      - name: Check installer and build native release
+      - name: Check installer
+        run: ./scripts/version-release.sh check
+      - name: Build native release
         env:
           RELEASE_ARCH: ${{ matrix.arch }}
         run: |
-          ./scripts/version-release.sh check
           ./scripts/version-release.sh build --work-parent "$RUNNER_TEMP" --output "$RUNNER_TEMP/release-$RELEASE_ARCH"
+      - name: Verify installed panel and local Agent
+        env:
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: |
           python3 -B scripts/ci_release.py smoke --input "$RUNNER_TEMP/release-$RELEASE_ARCH"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
