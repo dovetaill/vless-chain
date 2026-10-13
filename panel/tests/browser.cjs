@@ -70,7 +70,24 @@ const [base, tokenFile, artifacts] = process.argv.slice(2);
     await page.getByLabel('REALITY 目标', { exact: true }).fill('localhost:443');
     await page.getByLabel('REALITY Server Name', { exact: true }).fill('localhost');
     await page.getByRole('button', { name: '创建服务器', exact: true }).click();
-    await page.getByRole('heading', { name: '连接 Rust Agent', exact: true }).waitFor();
+    await page.getByRole('heading', { name: '接入服务器', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '安装并接入 Agent', exact: true }).isDisabled(), true);
+    await page.getByLabel('节点可以访问的控制台地址').fill('https://panel.example.com');
+    await page.getByRole('button', { name: '使用脚本安装', exact: true }).click();
+    const code = await page.getByLabel('节点接入码', { exact: true }).inputValue();
+    assert.ok(code.startsWith('chain-agent-v1:'));
+    const connection = JSON.parse(Buffer.from(code.split(':')[1], 'base64url').toString());
+    assert.equal(connection.panel_url, 'https://panel.example.com');
+    assert.ok(connection.token.length >= 32);
+    assert.ok(!await page.getByRole('dialog').innerText().then(text => text.includes('CHAIN_NODE_TOKEN_FILE')));
+    const { execFileSync } = require('node:child_process');
+    const decoded = JSON.parse(execFileSync('python3', ['-B', '-c', 'import sys,json; sys.path.insert(0,sys.argv[1]); from chain_install import decode_connection_code; print(json.dumps(decode_connection_code(sys.stdin.read())))', path.resolve(__dirname, '../../scripts')], { input: code, encoding: 'utf8' }));
+    assert.deepEqual(decoded, connection, 'Web connection code must work in the actual installer');
+    const heartbeat = await context.request.post(`${base}/api/agent/${connection.node_id}/sync`, {
+      headers: { Authorization: `Bearer ${connection.token}` }, data: { running: false, applied: false, revision: '', error: '' },
+    });
+    assert.equal(heartbeat.status(), 200);
+    await page.getByText('节点已在线，可以创建线路了', { exact: true }).waitFor();
     await close();
     await page.getByRole('button', { name: '删除 浏览器测试节点', exact: true }).click();
     await page.getByRole('button', { name: '确认删除', exact: true }).click();

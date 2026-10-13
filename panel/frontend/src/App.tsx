@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { api, ApiError } from './api';
+import { AgentSetup } from './components/agent-setup';
 import type { PanelState, NodeInfo, Line, Preview, Check as CheckResult } from './types';
 
 const pages = [
@@ -166,12 +167,8 @@ export function App() {
     catch { setToast('浏览器未允许复制，请在文本框中手动复制'); }
   }
   function tokenModal(id: string, token: string) {
-    setModal(<Modal key={token} title="连接 Rust Agent" description="此令牌只展示一次，请保存在对应节点的私有文件中。" close={close}>
-      <Field label="节点 ID"><pre className="secret">{id}</pre></Field>
-      <Field label="节点令牌"><pre className="secret">{token}</pre></Field>
-      <Button type="button" variant="outline" onClick={() => void copy(token)}><Copy />复制令牌</Button>
-      <p className="muted">在服务器上配置以下环境变量；令牌文件权限应为 600，控制台 URL 使用节点可访问的 HTTPS 地址。</p>
-      <pre className="secret">{`CHAIN_PANEL_URL=${location.origin}\nCHAIN_NODE_ID=${id}\nCHAIN_NODE_TOKEN_FILE=/etc/chain-agent/token\nCHAIN_AGENT_DIR=/var/lib/chain-agent\nCHAIN_XRAY_BIN=/opt/chain/bin/xray`}</pre>
+    setModal(<Modal key={token} title="接入服务器" description="在 Web 填写 SSH 信息安装，或使用脚本接入。完成后自动显示在线状态。" close={close}>
+      <AgentSetup id={id} token={token} copy={copy} />
     </Modal>);
   }
   function editNode(node?: NodeInfo) {
@@ -249,7 +246,7 @@ export function App() {
         {loginError && <p role="alert" className="text-sm text-red-600">{loginError}</p>}
         {!connected && <p className="text-sm text-amber-700">暂时无法连接服务器，正在重试。</p>}
         <Button className="w-full" size="lg" disabled={loggingIn}>{loggingIn ? '正在登录…' : '进入控制台'}<ArrowRight /></Button>
-      </form><p className="muted mt-6">首次启动时，管理令牌保存在控制台数据目录的 admin-token 文件中。</p>
+      </form><p className="muted mt-6">在控制台服务器输入 chainctl，选择「查看登录信息」获取管理令牌。</p>
     </CardContent></Card>{toastView}
   </main>;
 
@@ -300,8 +297,8 @@ export function App() {
           {state.nodes.length ? <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{state.nodes.map(node => <Card key={node.id}><CardHeader><div className="flex items-center gap-3"><Server className="size-4 text-blue-600" /><CardTitle>{node.name}</CardTitle></div><Status tone={node.online ? 'good' : 'muted'}>{node.online ? '在线' : '离线'}</Status></CardHeader><CardContent>
             <dl className="grid grid-cols-[auto_1fr] gap-x-5 gap-y-3 text-xs"><dt className="text-slate-400">连接地址</dt><dd className="mono break-all text-right">{node.host}</dd><dt className="text-slate-400">REALITY SNI</dt><dd className="break-all text-right">{node.server_name}</dd><dt className="text-slate-400">管理进程</dt><dd className="text-right">{node.report.running ? '正在运行' : '未运行'}</dd><dt className="text-slate-400">最后心跳</dt><dd className="text-right">{stamp(node.seen)}</dd></dl>
             {node.report.error && <p className="mt-4 break-all rounded bg-red-50 p-2 text-xs text-red-600">{node.report.error}</p>}
-            <div className="mt-6 flex gap-2"><Button variant="outline" size="sm" onClick={() => editNode(node)}>编辑</Button><Button variant="ghost" size="sm" onClick={() => setModal(<Modal key={`rotate-${node.id}`} title="重置 Agent 令牌" description="旧令牌会立即失效，需要更新节点上的令牌文件并重启 Agent。" submit="重置令牌" close={close} action={async () => { const r = await api<{ token: string }>(`/nodes/${node.id}/token`, 'POST', {}); tokenModal(node.id, r.token); }}><p className="muted">当前线路不会因控制连接断开而自动停止。Agent 重启时，管理的连接会短暂重连。</p></Modal>)}>重置令牌</Button><Button className="ms-auto" variant="ghost" size="icon" aria-label={`删除 ${node.name}`} onClick={() => remove('nodes', node.id, node.name)}><Trash2 className="size-3.5 text-slate-400" /></Button></div>
-          </CardContent></Card>)}</div> : <Card><Empty title="还没有受管服务器" action={<Button onClick={() => editNode()}><Plus />添加第一台服务器</Button>}>添加服务器后，将专属身份令牌交给该机器的 Rust Agent。</Empty></Card>}
+            <div className="mt-6 flex gap-2"><Button variant="outline" size="sm" onClick={() => editNode(node)}>编辑</Button><Button variant="ghost" size="sm" onClick={() => setModal(<Modal key={`rotate-${node.id}`} title="重置节点接入码" description="旧接入码立即失效。在节点的 chainctl 菜单选择重新接入，粘贴新接入码即可。" submit="重置接入码" close={close} action={async () => { const r = await api<{ token: string }>(`/nodes/${node.id}/token`, 'POST', {}); tokenModal(node.id, r.token); }}><p className="muted">当前线路不会因控制连接断开而自动停止。Agent 重启时，管理的连接会短暂重连。</p></Modal>)}>重置接入码</Button><Button className="ms-auto" variant="ghost" size="icon" aria-label={`删除 ${node.name}`} onClick={() => remove('nodes', node.id, node.name)}><Trash2 className="size-3.5 text-slate-400" /></Button></div>
+          </CardContent></Card>)}</div> : <Card><Empty title="还没有受管服务器" action={<Button onClick={() => editNode()}><Plus />添加第一台服务器</Button>}>添加服务器后，按向导复制接入码并连接节点。</Empty></Card>}
           <div className="mt-9 mb-5 flex items-center justify-between"><div><h2 className="font-semibold">外部落地</h2><p className="muted mt-1">只保存连接参数，不修改对方服务器配置。</p></div><Button variant="outline" onClick={editExternal}><Plus />导入</Button></div>
           <Card>{state.externals.length ? <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>名称</th><th>类型</th><th>操作</th></tr></thead><tbody>{state.externals.map(e => <tr key={e.id}><td>{e.name}</td><td><Status>外部 VLESS</Status></td><td><Button variant="ghost" size="sm" onClick={() => remove('externals', e.id, e.name)}>删除</Button></td></tr>)}</tbody></table></div> : <p className="muted p-7 text-center">没有外部落地。出口也可以直接使用受管服务器。</p>}</Card>
         </>}

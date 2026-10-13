@@ -30,6 +30,7 @@ def main():
     parser.add_argument('--xray', required=True, type=Path)
     parser.add_argument('--work-parent', required=True, type=Path, help='Spacious disk, not a small tmpfs')
     parser.add_argument('--browser', action='store_true')
+    parser.add_argument('--ssh', action='store_true', help='Run isolated root/sshd transport verification')
     args = parser.parse_args()
     xray = args.xray.resolve(strict=True)
     project = Path(__file__).resolve().parents[1]
@@ -68,6 +69,8 @@ def main():
         run(['cargo', 'fmt', '--check'])
         run(['cargo', 'test', '--locked', '--quiet'])
         run(['cargo', 'build', '--locked', '--bins', '--quiet'])
+        if args.ssh:
+            run(['python3', 'tests/ssh_install.py'])
         if args.browser:
             directory = root / 'browser-tools'
             directory.mkdir()

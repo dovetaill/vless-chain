@@ -12,9 +12,47 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 FORMAT = 1
 VERSION_RE = r'[0-9]+\.[0-9]+\.[0-9]+'
+RELEASE_REPO = 'dovetaill/vless-chain'
+
+
+def download_release(directory):
+    """Fetch the latest published native bundle from this project's release channel."""
+    request = urllib.request.Request(f'https://api.github.com/repos/{RELEASE_REPO}/releases/latest',
+                                     headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'chainctl'})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read(1024 * 1024 + 1)
+        require(len(payload) <= 1024 * 1024, '发行信息过大。')
+        release = json.loads(payload)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise ValueError('仓库尚无已发布的安装包。请由维护者先发布 Release；已有本地发行包可在安装向导中选择。') from None
+        raise ValueError(f'获取正式版本失败（HTTP {error.code}），请稍后重试或使用本地发行包。') from None
+    tag = release.get('tag_name', '')
+    require(re.fullmatch('v' + VERSION_RE, tag) and not release.get('draft') and not release.get('prerelease'),
+            '正式版本信息无效。')
+    name = f'chain-panel-{tag[1:]}-linux-{architecture()}.tar.gz'
+    assets = {item['name']: item for item in release.get('assets', [])}
+    require(name in assets and 'SHA256SUMS' in assets, f'正式版本 {tag} 尚未提供本机架构安装包及校验文件。')
+    directory = Path(directory)
+    print(f'正在下载正式版本 {tag}（{architecture()}）…', flush=True)
+    for filename, maximum in [('SHA256SUMS', 65536), (name, 512 * 1024**2)]:
+        url = assets[filename].get('browser_download_url', '')
+        require(url == f'https://github.com/{RELEASE_REPO}/releases/download/{tag}/{filename}', '发行附件来源不匹配。')
+        with urllib.request.urlopen(url, timeout=60) as response, (directory / filename).open('xb') as stream:
+            require(response.geturl().startswith('https://'), '下载必须使用 HTTPS。')
+            total = 0
+            for chunk in iter(lambda: response.read(1024 * 1024), b''):
+                total += len(chunk)
+                require(total <= maximum, '发行附件大小超限。')
+                stream.write(chunk)
+    verify_archive_checksum(directory / name)
+    return directory / name, tag[1:]
 
 
 def require(condition, message):

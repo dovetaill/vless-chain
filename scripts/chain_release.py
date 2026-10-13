@@ -98,9 +98,12 @@ def check(args):
             command = [sys.executable, '-B', ROOT / 'panel/scripts/verify.py', '--xray', xray, '--work-parent', work.root]
             if args.browser:
                 command.append('--browser')
+            if args.ssh:
+                command.append('--ssh')
             work.run(command, cwd=ROOT / 'panel')
     else:
         require(not args.browser, '--browser 需要配合 --full。')
+        require(not args.ssh, '--ssh 需要配合 --full。')
     print('所选检查已完成。' if args.full else '脚本检查已完成；完整前后端与链路验证使用 check --full。')
 
 
@@ -139,6 +142,9 @@ def build(args):
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')
+        shutil.copytree(ROOT / 'panel/docs', stage / 'docs')
+        (stage / 'frontend').mkdir()
+        shutil.copy2(ROOT / 'panel/frontend/THEME.md', stage / 'frontend/THEME.md')
         shutil.copy2(ROOT / 'panel/frontend/THEME.md', stage / 'THEME.md')
         files = {}
         for file in sorted(stage.rglob('*')):
@@ -238,6 +244,7 @@ def main(argv=None):
         elif action == 'check':
             item.add_argument('--full', action='store_true')
             item.add_argument('--browser', action='store_true')
+            item.add_argument('--ssh', action='store_true', help='隔离 SSH 传包验证，需要 root 与 sshd')
         else:
             item.add_argument('--directory', type=Path)
             item.add_argument('--repo', required=True)

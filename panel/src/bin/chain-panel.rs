@@ -272,6 +272,58 @@ async fn add_node(State(app): State<App>, Json(input): Json<NodeInput>) -> ApiRe
     })?;
     Ok(Json(json!({"id":node_id,"token":token})))
 }
+
+static SSH_INSTALLS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+#[derive(Deserialize)]
+struct SshPort {
+    port: u16,
+}
+async fn ssh_keys(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<SshPort>,
+) -> ApiResult<Json<Value>> {
+    let host = app
+        .store
+        .lock()
+        .unwrap()
+        .doc
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .map(|n| n.host.clone())
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "节点不存在"))?;
+    let _permit = SSH_INSTALLS
+        .try_acquire()
+        .map_err(|_| error(StatusCode::CONFLICT, "已有 SSH 安装任务，请稍后重试"))?;
+    Ok(Json(
+        json!({"keys": chain_panel::deploy::scan(&host, input.port).await?}),
+    ))
+}
+async fn install_agent(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<chain_panel::deploy::Install>,
+) -> ApiResult<Json<Value>> {
+    let host = {
+        let store = app.store.lock().unwrap();
+        let node = store
+            .doc
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, "节点不存在"))?;
+        if !equal(&digest(&input.token), &node.token_hash) {
+            return Err(error(StatusCode::BAD_REQUEST, "接入码已失效，请重新生成"));
+        }
+        node.host.clone()
+    };
+    let _permit = SSH_INSTALLS
+        .try_acquire()
+        .map_err(|_| error(StatusCode::CONFLICT, "已有 SSH 安装任务，请稍后重试"))?;
+    chain_panel::deploy::install(&host, &id, &input).await?;
+    Ok(Json(json!({"installed": true})))
+}
 async fn update_node(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -870,6 +922,8 @@ async fn main() -> Result<()> {
         .route("/api/nodes", post(add_node))
         .route("/api/nodes/{id}", post(update_node).delete(remove_node))
         .route("/api/nodes/{id}/token", post(rotate_node))
+        .route("/api/nodes/{id}/ssh-keys", post(ssh_keys))
+        .route("/api/nodes/{id}/install", post(install_agent))
         .route("/api/externals", post(add_external))
         .route("/api/externals/{id}", delete(remove_external))
         .route("/api/lines", post(save_line))

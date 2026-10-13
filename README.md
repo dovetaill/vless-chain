@@ -1,71 +1,20 @@
 # VLESS / Xray 原生实例管理
 
-## 新增 Web 控制台：构建、安装与运维
+## Web 控制台：从安装向导开始
 
-仓库根目录不是 npm 项目，`npm ci` 应在 `panel/frontend/` 执行。推荐直接使用下面两个入口，它们会自动定位目录：
+管理多条 VLESS 代理链和 TCP/UDP 转发，使用 [Chain Panel 上手指南](panel/README.md)。
 
-```bash
-cd /home/wwwroot/vless-chain
-./scripts/version-release.sh    # 版本、检查、构建发行包、GitHub 发布菜单
-./scripts/install-server.sh     # 安装控制台（默认）或 Agent，以及日常运维
-```
-
-### 首次构建与安装
-
-构建需要 Linux x86_64 / aarch64、Rust 2024 edition 工具链、Node.js 20.19+ 或 22.12+、npm、Python 3.10+ 和 C 编译器。安装需要 Python 3.10+、glibc 和 systemd；运行时无需 Node.js 或 Rust。安装和运维命令使用 root，普通用户加 `sudo`。
+在服务器运行：
 
 ```bash
-cd /home/wwwroot/vless-chain
-./scripts/version-release.sh check
-./scripts/version-release.sh build
-sudo ./scripts/install-server.sh install
-sudo chainctl token
+curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo bash
 ```
 
-默认只安装 Web 控制台。构建会自动定位前端目录，生成内嵌页面的 Rust 程序，并将 Xray 一起打包到 `release-output/`。安装器自动选择该目录下本机架构最近生成的包；已有适用的发行包时，跳过 `build` 直接安装即可。发行包不提交到 Git，重新克隆仓库后需要构建或复制已有发行包及 `SHA256SUMS`。
+按提示安装控制台和本机 Agent，登录 Web 即可看到本机节点。其他服务器可在 Web 填写 SSH 信息直接安装，也可使用脚本粘贴接入码。日常只需输入 `chainctl` 打开菜单，输入 `chainctl help` 查看帮助。
 
-同版本输出目录已存在时，构建不会覆盖。重新构建请指定新的 `--output /新的发行目录`，安装时用 `--package /新的发行目录/发行包.tar.gz` 指定它。发行包会检查目标机器的架构和 glibc 版本；兼容较旧系统时应在对应旧环境构建。
+已有本仓库或解压后的发行包时，直接运行 `sudo ./scripts/install-server.sh`。在线安装需要已有正式 Release；源码构建与发布供维护者使用，见 [高级文档](panel/docs/advanced.md)。
 
-### 打开 Web 控制台
-
-默认监听 `127.0.0.1:8088`。在自己电脑的终端执行下面的 SSH 隧道命令，随后打开 `http://127.0.0.1:18088`，输入 `chainctl token` 显示的管理令牌登录。终端按 `Ctrl+C` 关闭隧道。
-
-```bash
-ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
-```
-
-使用域名长期访问时，配置 HTTPS 反向代理并在安装时传入 `--secure-cookie 1`，保留请求 Host。需要直接监听所有 IPv4 地址时，可执行 `sudo ./scripts/install-server.sh install --listen 0.0.0.0:8088`，并按需要配置防火墙访问范围。
-
-### 安装节点 Agent
-
-在 Web「服务器」页面添加节点，取得节点 UUID 和一次性令牌。在节点机器上准备发行包，将令牌保存到私有文件后执行：
-
-```bash
-chmod 600 /root/node-token
-sudo ./scripts/install-server.sh install --component agent \
-  --panel-url https://panel.example.com \
-  --node-id 网页给出的节点UUID --token-file /root/node-token
-```
-
-安装后在 Web 确认节点心跳，再创建代理链或 TCP/UDP 转发线路。控制台机器也参与转发时，在该机器额外安装 Agent。没有源码仓库的节点可使用发行包内的安装脚本，具体步骤见下方完整文档。
-
-### 日常运维与升级
-
-```bash
-sudo chainctl menu                         # 交互运维菜单
-sudo chainctl status                       # 控制台状态
-sudo chainctl logs --component agent       # Agent 最近 100 条日志
-sudo chainctl restart --component panel
-sudo chainctl backup --component panel
-sudo chainctl update --component panel --package /发行目录/新版本.tar.gz
-sudo chainctl rollback --component panel
-```
-
-`--component` 默认是 `panel`，管理 Agent 时改为 `agent`。升级保留配置、令牌和数据，先备份再切换版本；启动失败会恢复先前程序与配置。备份在 `/var/backups/chain-panel/`，包含连接凭据，需私下保存。`rollback` 只回滚程序，不恢复旧数据库；升级、备份或重启 Agent 会使相关连接短暂重连。
-
-发布新版本前使用 `./scripts/version-release.sh version --set X.Y.Z` 同步版本，提交源码后再构建。GitHub 草稿与正式发布使用 `draft`、`publish` 子命令，详见完整文档。
-
-完整参数、升级和回滚说明见 [Web 控制台文档](panel/README.md#构建安装与运维脚本)。原有 SSH 脚本的使用说明如下。
+## 原有 SSH 脚本
 
 本文介绍 `xray-vless-native-v3.sh` 的交互菜单和使用示例。脚本支持 Debian/Ubuntu、CentOS/RHEL 系和 Alpine，使用 systemd 或 OpenRC 管理服务。日常查看链接、修改、重置和删除租户均可在菜单中完成。
 

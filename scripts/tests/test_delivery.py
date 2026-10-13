@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Delivery tests use an isolated installation tree, never real users/systemd."""
 import argparse
+import base64
 import contextlib
 import io
 import json
@@ -14,6 +15,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -92,6 +94,110 @@ class Delivery(unittest.TestCase):
         (source / 'bin/chain-panel').write_text('altered')
         with self.assertRaisesRegex(ValueError, '校验失败'):
             common.verify_tree(source)
+
+    def test_connection_code_validates_and_does_not_echo_secrets(self):
+        document = {'panel_url': 'https://panel.example.com', 'node_id': 'a94a6794-c60a-4c51-a094-b9164ddaaabc', 'token': 's' * 64}
+        def encode(value):
+            return 'chain-agent-v1:' + base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip('=')
+        self.assertEqual(installer.decode_connection_code(encode(document)), document)
+        for value in [encode({**document, 'node_id': 'invalid'}), encode({**document, 'panel_url': 'https://user:pass@host/'}), 'chain-agent-v1:broken']:
+            with self.assertRaisesRegex(ValueError, '接入码无效') as error:
+                installer.decode_connection_code(value)
+            self.assertNotIn(document['token'], str(error.exception))
+
+    def test_guided_panel_and_agent_install_without_manual_env(self):
+        source, _ = self.package()
+        archive = self.archive(source)
+        args = installer.make_parser().parse_args(['install', '--root', str(self.manager.root), '--package', str(archive)])
+        with patch('builtins.input', side_effect=['1', '8099', '192.0.2.1', '2']):
+            installer.install_wizard(self.manager, args)
+        self.assertEqual(installer.parse_env(self.manager.role_paths('panel')[0] / 'panel.env')['CHAIN_PUBLIC_URL'], 'http://192.0.2.1:8099')
+        document = {'panel_url': 'https://panel.example.com', 'node_id': 'a94a6794-c60a-4c51-a094-b9164ddaaabc', 'token': 's' * 64}
+        code = 'chain-agent-v1:' + base64.urlsafe_b64encode(json.dumps(document).encode()).decode().rstrip('=')
+        agent = installer.make_parser().parse_args(['install', '--component', 'agent', '--root', str(self.manager.root), '--package', str(archive)])
+        with patch('getpass.getpass', return_value=code):
+            installer.install_wizard(self.manager, agent)
+        self.assertEqual((self.manager.role_paths('agent')[0] / 'token').read_text().strip(), document['token'])
+        self.assertEqual(set(self.manager.state()['roles']), {'panel', 'agent'})
+
+    def test_help_and_noninteractive_menu_do_not_require_root(self):
+        with patch('os.geteuid', return_value=1000), patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()) as stream:
+            installer.main(['help'])
+            installer.main([])
+        self.assertIn('打开交互管理菜单', stream.getvalue())
+        self.assertIn('--non-interactive', stream.getvalue())
+
+    def test_online_download_missing_release_and_integrity_failure(self):
+        request_error = urllib.error.HTTPError('https://api.github.com/', 404, 'Not found', {}, None)
+        with patch('urllib.request.urlopen', side_effect=request_error):
+            with self.assertRaisesRegex(ValueError, '尚无已发布'):
+                common.download_release(self.root)
+        name = f'chain-panel-0.1.0-linux-{common.architecture()}.tar.gz'
+        release_info = {'tag_name': 'v0.1.0', 'assets': [{'name': n, 'browser_download_url': f'https://github.com/{common.RELEASE_REPO}/releases/download/v0.1.0/{n}'} for n in [name, 'SHA256SUMS']]}
+        class Response(io.BytesIO):
+            def geturl(self):
+                return 'https://release-assets.githubusercontent.com/fixture'
+        def fetch(request, **_):
+            url = request.full_url if hasattr(request, 'full_url') else request
+            if 'api.github' in url:
+                return Response(json.dumps(release_info).encode())
+            return Response((('0' * 64 + '  ' + name + '\n').encode()) if url.endswith('SHA256SUMS') else b'tampered archive')
+        args = installer.make_parser().parse_args(['install', '--latest', '--root', str(self.manager.root), '--work-parent', str(self.root)])
+        with patch('urllib.request.urlopen', side_effect=fetch):
+            with self.assertRaisesRegex(ValueError, 'SHA256'):
+                installer.install_package(self.manager, args)
+        self.assertFalse(self.manager.base.exists())
+        self.assertFalse(list(self.root.glob('chain-install-*')))
+
+    def test_update_downloads_release_without_explicit_package(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        source2, _ = self.package('0.2.0')
+        archive = self.archive(source2)
+        args = installer.make_parser().parse_args(['update', '--root', str(self.manager.root), '--work-parent', str(self.root)])
+        with patch.object(installer, 'download_release', return_value=(archive, '0.2.0')) as download:
+            installer.install_package(self.manager, args)
+        download.assert_called_once()
+        self.assertEqual(self.manager.state()['roles']['panel']['version'], '0.2.0')
+
+    def test_existing_local_agent_is_not_registered_again(self):
+        source, manifest = self.package()
+        token = self.root / 'token'
+        token.write_text('a' * 64)
+        token.chmod(0o600)
+        self.manager.install(source, manifest, self.args(component='agent', panel_url='https://panel.example.com', node_id='a94a6794-c60a-4c51-a094-b9164ddaaabc', token_file=token))
+        with patch('urllib.request.build_opener', side_effect=AssertionError('must not re-register')):
+            installer.provision_local_agent(self.manager, source, manifest, self.args())
+
+    def test_local_agent_auto_registration_and_failed_install_cleanup(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args(secure_cookie='1'))
+        (self.manager.role_paths('panel')[1] / 'admin-token').write_text('fixture-admin-token')
+        node = {'id': 'a94a6794-c60a-4c51-a094-b9164ddaaabc', 'token': 's' * 64}
+        paths = []
+        class Response(io.BytesIO):
+            headers = {'Set-Cookie': 'chain_session=fixture; Path=/; Secure'}
+        class Opener:
+            def open(self, request, **_):
+                path = request.full_url.split('/api/')[1]
+                paths.append((request.method, path))
+                if path != 'login':
+                    assert request.get_header('Cookie') == 'chain_session=fixture'
+                if path == 'nodes':
+                    assert json.loads(request.data)['host'] == '192.0.2.1'
+                return Response(json.dumps(node if path == 'nodes' else {'ok': True}).encode())
+        args = self.args(local_host='192.0.2.1', local_target='tls.example.com:443')
+        with patch('urllib.request.build_opener', return_value=Opener()):
+            with patch.object(self.manager, 'install', side_effect=ValueError('fixture startup failure')):
+                with self.assertRaisesRegex(ValueError, 'startup failure'):
+                    installer.provision_local_agent(self.manager, source, manifest, args)
+            self.assertIn(('DELETE', 'nodes/' + node['id']), paths)
+            self.assertEqual(paths[-1], ('POST', 'logout'))
+            installer.provision_local_agent(self.manager, source, manifest, args)
+        env = installer.parse_env(self.manager.role_paths('agent')[0] / 'agent.env')
+        self.assertEqual(env['CHAIN_NODE_ID'], node['id'])
+        self.assertEqual(env['CHAIN_PANEL_URL'], 'http://127.0.0.1:8088')
+        self.assertEqual((self.manager.role_paths('agent')[0] / 'token').read_text().strip(), node['token'])
 
     def test_install_upgrade_backup_and_rollback_preserve_state(self):
         source, manifest = self.package()
