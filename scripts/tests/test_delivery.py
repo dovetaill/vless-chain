@@ -26,6 +26,23 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def test_local_security_recovery_preserves_token_and_business_data(self):
+        import sqlite3
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        data = self.manager.role_paths('panel')[1]
+        (data / 'admin-token').write_text('keep-this-token')
+        document = {'security': {'totp_secret': 'old', 'passkeys': [{'id': 'old'}]},
+                    'lines': [{'id': 'unchanged-line'}], 'subscriptions': [{'id': 'keep'}]}
+        with contextlib.closing(sqlite3.connect(data / 'panel.db')) as connection, connection:
+            connection.execute('CREATE TABLE state(id INTEGER PRIMARY KEY, body TEXT NOT NULL)')
+            connection.execute('INSERT INTO state VALUES(1,?)', (json.dumps(document),))
+        self.manager.operate(self.args(action='reset-auth', non_interactive=True))
+        with contextlib.closing(sqlite3.connect(data / 'panel.db')) as connection:
+            restored = json.loads(connection.execute('SELECT body FROM state WHERE id=1').fetchone()[0])
+        self.assertEqual(restored, {**document, 'security': {}})
+        self.assertEqual((data / 'admin-token').read_text(), 'keep-this-token')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='chain-delivery-test-')
         self.root = Path(self.temp.name)

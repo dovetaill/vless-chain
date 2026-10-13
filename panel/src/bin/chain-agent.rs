@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
         applied: true,
         running: runtime.running(),
         error: String::new(),
+        ..Default::default()
     };
     let url = format!("{}/api/agent/{}/sync", panel.trim_end_matches('/'), node);
     eprintln!(
@@ -74,6 +75,14 @@ async fn main() -> Result<()> {
     loop {
         let step = async {
             report.running = runtime.running();
+            report.traffic = runtime.traffic.snapshot();
+            runtime.traffic.save()?;
+            report.system = chain_panel::gateway::system_metrics();
+            if let Ok(bytes) = std::fs::read(dir.join("certificate-status.json")) {
+                if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    report.system["certificate"] = status;
+                }
+            }
             if !report.running && report.applied && runtime.active.is_some() {
                 report.applied = false;
                 report.error = "Xray 已退出；请检查节点日志后重新发布".into();
@@ -88,12 +97,28 @@ async fn main() -> Result<()> {
             let desired = response.json::<Option<Desired>>().await?;
             if let Some(desired) = desired {
                 if desired.revision != report.revision {
-                    let outcome = runtime.apply(&desired).await;
+                    let traffic = runtime.traffic.clone();
+                    let application = runtime.apply(&desired);
+                    tokio::pin!(application);
+                    let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
+                    let outcome = loop {
+                        tokio::select! {
+                            result=&mut application=>break result,
+                            _=heartbeat.tick()=>{
+                                report.traffic=traffic.snapshot();let _=traffic.save();
+                                let _=client.post(&url).bearer_auth(token.trim()).json(&report).send().await;
+                            }
+                        }
+                    };
+                    drop(application);
+                    let applied = outcome.is_ok();
                     report = Report {
-                        revision: desired.revision,
+                        revision: desired.revision.clone(),
                         applied: outcome.is_ok(),
                         error: outcome.err().map(|e| format!("{e:#}")).unwrap_or_default(),
-                        running: runtime.running(),
+                        running: applied,
+                        traffic: traffic.snapshot(),
+                        system: chain_panel::gateway::system_metrics(),
                     };
                     // Acknowledge immediately; do not report a saved config as running before application.
                     client

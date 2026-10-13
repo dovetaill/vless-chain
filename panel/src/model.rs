@@ -78,6 +78,10 @@ pub struct Report {
     pub error: String,
     #[serde(default)]
     pub running: bool,
+    #[serde(default)]
+    pub traffic: BTreeMap<String, Traffic>,
+    #[serde(default)]
+    pub system: Value,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,6 +102,75 @@ pub struct External {
 pub enum Kind {
     Vless,
     Forward,
+    Website,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    #[default]
+    Vless,
+    Http,
+    Socks,
+    Shadowsocks,
+    Trojan,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+pub struct Tls {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub cert: String,
+    #[serde(default)]
+    pub key: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+pub struct Access {
+    #[serde(default)]
+    pub protocol: Protocol,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub public_host: String,
+    #[serde(default)]
+    pub public_port: Option<u16>,
+    #[serde(default)]
+    pub tls: Tls,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+pub struct Limits {
+    #[serde(default)]
+    pub upload_mbps: Option<f64>,
+    #[serde(default)]
+    pub download_mbps: Option<f64>,
+    #[serde(default)]
+    pub monthly_gib: Option<f64>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+pub struct Traffic {
+    pub epoch: String,
+    pub month: String,
+    pub upload: u64,
+    pub download: u64,
+    pub total_upload: u64,
+    pub total_download: u64,
+    pub upload_bps: f64,
+    pub download_bps: f64,
+    pub connections: u64,
+    pub sampled_at: u64,
+    pub blocked: bool,
+    #[serde(default)]
+    pub days: BTreeMap<String, [u64; 2]>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -121,6 +194,33 @@ pub struct Line {
     pub network: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    #[serde(default)]
+    pub access: Access,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Security {
+    #[serde(default)]
+    pub totp_secret: String,
+    #[serde(default)]
+    pub totp_step: u64,
+    #[serde(default)]
+    pub recovery_hashes: Vec<String>,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub passkeys: Vec<Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Subscription {
+    pub id: String,
+    pub name: String,
+    pub token_hash: String,
+    pub line_ids: Vec<String>,
+    pub created: u64,
 }
 fn default_network() -> String {
     "tcp".into()
@@ -159,6 +259,10 @@ pub struct Document {
     pub applied_externals: Vec<External>,
     pub checks: BTreeMap<String, Value>,
     pub jobs: Vec<Job>,
+    #[serde(default)]
+    pub security: Security,
+    #[serde(default)]
+    pub subscriptions: Vec<Subscription>,
 }
 impl Document {
     pub fn busy(&self) -> bool {

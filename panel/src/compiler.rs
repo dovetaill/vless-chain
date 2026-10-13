@@ -45,6 +45,9 @@ pub fn address(host: &str, port: u16) -> String {
     }
 }
 pub fn external_outbound(link: &str, tag: &str) -> Result<Value> {
+    if !link.starts_with("vless://") {
+        return crate::access::external(link, tag);
+    }
     let u = Url::parse(link).context("VLESS 链接格式错误")?;
     ensure!(
         u.scheme() == "vless" && u.password().is_none(),
@@ -114,10 +117,18 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
         .iter()
         .find(|n| n.id == h.node_id)
         .context("入口节点不存在")?;
+    if line.access.protocol != Protocol::Vless {
+        return crate::access::share(line, node);
+    }
+    let host = if line.access.public_host.is_empty() {
+        &node.host
+    } else {
+        &line.access.public_host
+    };
     let mut u = Url::parse(&format!(
         "vless://{}@{}",
         h.uuid,
-        address(&node.host, h.port)
+        address(host, line.access.public_port.unwrap_or(h.port))
     ))?;
     u.query_pairs_mut().extend_pairs([
         ("type", "tcp"),
@@ -153,8 +164,16 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         .map(|n| (n.id.clone(), empty_config()))
         .collect();
     let mut ports = BTreeSet::new();
+    let mut websites: BTreeMap<(String, u16), (bool, BTreeSet<String>)> = BTreeMap::new();
     let mut ids = BTreeSet::new();
-    for line in &doc.lines {
+    let mut reserved: BTreeSet<(String, u16)> = doc
+        .lines
+        .iter()
+        .flat_map(|l| l.hops.iter().map(|h| (h.node_id.clone(), h.port)))
+        .collect();
+    let mut ordered: Vec<_> = doc.lines.iter().collect();
+    ordered.sort_by(|a, b| a.id.cmp(&b.id));
+    for line in ordered {
         ensure!(ids.insert(&line.id), "线路 ID 重复");
         ensure!(
             !line.name.trim().is_empty() && line.name.len() <= 120,
@@ -179,11 +198,24 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             uuid::Uuid::parse_str(&h.uuid).context("节点接入 UUID 无效")?;
             ensure!(configs.contains_key(&h.node_id), "线路引用了不存在的节点");
             // Reserve disabled lines too: enabling must not silently steal another line's port.
-            ensure!(
-                ports.insert((&h.node_id, h.port)),
-                "同一节点端口 {} 被多条线路占用",
-                h.port
-            );
+            let fresh = ports.insert((&h.node_id, h.port));
+            if line.kind == Kind::Website {
+                let key = (h.node_id.clone(), h.port);
+                let tls = matches!(line.access.tls.mode.as_str(), "auto" | "manual");
+                ensure!(
+                    fresh || websites.contains_key(&key),
+                    "网站端口 {} 被其他类型的线路占用",
+                    h.port
+                );
+                let (mode, domains) = websites.entry(key).or_insert((tls, BTreeSet::new()));
+                ensure!(*mode == tls, "同一网站监听端口不能混用 HTTP 和 HTTPS");
+                ensure!(
+                    domains.insert(line.access.tls.domain.to_ascii_lowercase()),
+                    "同一监听端口的网站域名重复"
+                );
+            } else {
+                ensure!(fresh, "同一节点端口 {} 被多条线路占用", h.port);
+            }
         }
         let forward = if line.kind == Kind::Forward {
             Some(target(&line.target)?)
@@ -200,6 +232,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         } else {
             None
         };
+        crate::access::validate_line(line)?;
         if !line.enabled {
             continue;
         }
@@ -207,10 +240,13 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             let node = doc.nodes.iter().find(|n| n.id == hop.node_id).unwrap();
             let in_tag = format!("line-{}-in", line.id);
             let out_tag = format!("line-{}-out", line.id);
-            let inbound = if i == 0 && line.kind == Kind::Forward {
+            let mut inbound = if i == 0 && line.kind == Kind::Forward {
                 let (host, port) = forward.as_ref().unwrap();
                 json!({"tag":in_tag,"listen":"0.0.0.0","port":hop.port,"protocol":"dokodemo-door",
                     "settings":{"address":host,"port":port,"network":line.network}})
+            } else if i == 0 && line.kind == Kind::Vless && line.access.protocol != Protocol::Vless
+            {
+                crate::access::inbound(line, hop, &in_tag)
             } else {
                 vless_in(node, hop, &in_tag)
             };
@@ -228,6 +264,25 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 json!({"tag":out_tag,"protocol":"freedom"})
             };
             let config = configs.get_mut(&node.id).unwrap();
+            if i == 0 {
+                let backend = (50000..65535)
+                    .find(|p| !reserved.iter().any(|(_, used)| used == p))
+                    .context("没有可供内部接入使用的端口")?;
+                reserved.insert((node.id.clone(), backend));
+                inbound["listen"] = json!("127.0.0.1");
+                inbound["port"] = json!(backend);
+                if config.get("_chain").is_none() {
+                    config["_chain"] = json!([]);
+                }
+                config["_chain"].as_array_mut().unwrap().push(json!({
+                    "id":line.id,"port":hop.port,"backend":backend,"kind":line.kind,
+                    "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
+                    "limits":line.limits,"tls":line.access.tls,"target":line.target,
+                }));
+                if line.kind == Kind::Website {
+                    continue;
+                }
+            }
             config["inbounds"].as_array_mut().unwrap().push(inbound);
             config["outbounds"].as_array_mut().unwrap().push(outbound);
             config["routing"]["rules"]
@@ -272,8 +327,31 @@ mod tests {
             target: String::new(),
             network: "tcp".into(),
             enabled: true,
+            access: Access::default(),
+            limits: Limits::default(),
         });
         d
+    }
+    #[test]
+    fn legacy_documents_keep_vless_defaults_and_credentials() {
+        let document = fixture();
+        let original = share(&document.lines[0], &document).unwrap();
+        let mut value = serde_json::to_value(document).unwrap();
+        value.as_object_mut().unwrap().remove("security");
+        value.as_object_mut().unwrap().remove("subscriptions");
+        for line in value["lines"].as_array_mut().unwrap() {
+            line.as_object_mut().unwrap().remove("access");
+            line.as_object_mut().unwrap().remove("limits");
+        }
+        for node in value["nodes"].as_array_mut().unwrap() {
+            node["report"].as_object_mut().unwrap().remove("traffic");
+            node["report"].as_object_mut().unwrap().remove("system");
+        }
+        let restored: Document = serde_json::from_value(value).unwrap();
+        assert_eq!(share(&restored.lines[0], &restored).unwrap(), original);
+        assert_eq!(restored.lines[0].access.protocol, Protocol::Vless);
+        assert!(restored.lines[0].limits.monthly_gib.is_none());
+        compile(&restored).unwrap();
     }
     #[test]
     fn three_hops_route_through_actual_next_node() {

@@ -313,6 +313,9 @@ class Manager:
         else:
             require(unit.is_file() and OWNER in unit.read_text(), '服务文件归属不匹配。')
         env, token = self.config(role, args)
+        if self.live and role == 'agent' and not shutil.which('certbot'):
+            from chain_network import install_packages
+            install_packages(['certbot'])
         if self.live and role == 'panel' and any(not shutil.which(name) for name in ('ssh', 'ssh-keyscan', 'tar')):
             print('正在安装 Web 远程接入所需的 SSH 客户端…')
             if shutil.which('apt-get'):
@@ -476,6 +479,28 @@ class Manager:
             print((self.role_paths(role)[1] / 'admin-token').read_text().strip())
         elif action == 'access':
             self.show_access()
+        elif action == 'reset-auth':
+            require(role == 'panel', '登录安全恢复仅用于控制台。')
+            if not args.non_interactive:
+                require(input('此操作将清除 TOTP、Passkey 并退出全部会话，保留当前管理员密钥。输入 RESET 确认: ').strip() == 'RESET', '已取消恢复。')
+            with self.lock():
+                active = self.system.active(role)
+                self.system.call('stop', 'chain-panel.service')
+                try:
+                    self.backup_files(role)
+                    import sqlite3
+                    database = self.role_paths(role)[1] / 'panel.db'
+                    require(database.is_file(), '控制台数据库不存在。')
+                    with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                        row = connection.execute('SELECT body FROM state WHERE id=1').fetchone()
+                        if row:
+                            document = json.loads(row[0])
+                            document['security'] = {}
+                            connection.execute('UPDATE state SET body=? WHERE id=1', (json.dumps(document),))
+                finally:
+                    if active:
+                        self.system.call('start', 'chain-panel.service')
+            print('登录二步验证和 Passkey 已重置；使用原管理员密钥登录。业务线路未改动。')
         elif action == 'rollback':
             self.rollback(role)
         else:
@@ -713,16 +738,16 @@ def menu(root):
             '1': '安装 / 配置控制台与本机节点', '2': '接入 / 重新接入节点', '3': '更新到最新版本',
             '4': '查看状态', '5': '查看日志', '6': '重启服务', '7': '备份数据',
             '8': '回滚上一版本', '9': '查看登录信息', '10': '启动服务', '11': '停止服务',
-            '12': '查看命令帮助', '0': '退出'}, '4' if installed else '1')
+            '12': '查看命令帮助', '13': '重置登录安全（TOTP / Passkey）', '0': '退出'}, '4' if installed else '1')
         if choice == '0':
             return
         try:
             if choice == '12':
                 make_parser().print_help()
                 continue
-            role = 'panel' if choice in ('1', '9') else 'agent' if choice == '2' else select_role(manager)
+            role = 'panel' if choice in ('1', '9', '13') else 'agent' if choice == '2' else select_role(manager)
             action = {'1': 'install', '2': 'install', '3': 'update', '4': 'status', '5': 'logs',
-                      '6': 'restart', '7': 'backup', '8': 'rollback', '9': 'access', '10': 'start', '11': 'stop'}[choice]
+                      '6': 'restart', '7': 'backup', '8': 'rollback', '9': 'access', '10': 'start', '11': 'stop', '13': 'reset-auth'}[choice]
             args = make_parser().parse_args([action, '--component', role, '--root', str(root)])
             if action in ('install', 'update'):
                 install_wizard(manager, args)
@@ -747,12 +772,13 @@ def make_parser():
   start / stop / restart    启动 / 停止 / 重启
   backup / rollback         私有备份 / 回滚程序版本
   access / token            查看登录信息 / 仅输出管理令牌
+  reset-auth                本机恢复登录，清除 TOTP / Passkey（保留管理员密钥）
   --component agent         操作节点 Agent，默认操作控制台
   --package 文件.tar.gz      使用本地发行包，旁边需有 SHA256SUMS
   --non-interactive         自动化调用，不打开安装向导
 
 安装脚本同样支持 help 和以上子命令。""")
-    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token'])
+    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token', 'reset-auth'])
     parser.add_argument('--component', choices=ROLES, default='panel', help='默认 panel；节点机器选择 agent')
     parser.add_argument('--package', type=Path, help='本地发行包，同目录需有 SHA256SUMS')
     parser.add_argument('--latest', action='store_true', help='下载最新正式版本')

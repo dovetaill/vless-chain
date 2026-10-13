@@ -91,11 +91,11 @@ class Harness:
                 self.record()
                 return port
 
-    def launch(self, name, binary, env):
+    def launch(self, name, binary, env, args=None):
         log = (self.root / f"{name}.log").open("wb")
         merged = os.environ.copy()
         merged.update(env)
-        p = subprocess.Popen([str(binary)], env=merged, stdin=subprocess.DEVNULL,
+        p = subprocess.Popen([str(binary), *(args or [])], env=merged, stdin=subprocess.DEVNULL,
                              stdout=log, stderr=log, start_new_session=True)
         self.processes.append((name, p, log))
         self.record()
@@ -190,14 +190,14 @@ class Harness:
 
     def browser(self):
         subprocess.run(["node", str(Path(__file__).with_name("browser.cjs")), self.base,
-                        str(self.root / "control" / "admin-token"), str(self.root.parent)], check=True)
+                        str(self.root / "control" / "admin-token"), str(self.root.parent), str(self.port())], check=True)
 
     def run(self):
         # A local TLS 1.3 target gives REALITY real handshakes without relying on public sites.
         cert, key = self.root / "cert.pem", self.root / "key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
                         "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", str(key),
-                        "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"],
+                        "-out", str(cert), "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tls_port = self.port()
         tls_server = TlsServer(("127.0.0.1", tls_port), HttpHandler)
@@ -256,6 +256,12 @@ class Harness:
         preview = self.request("/api/preview", "POST", {})
         assert len(preview["nodes"]) == 3
         self.publish()
+        if os.environ.get("CHAIN_TEST_FEATURES_ONLY") == "1":
+            from features import exercise
+            exercise(self, nodes, echo_port, agents, agent_envs)
+            if os.environ.get("CHAIN_TEST_BROWSER"):
+                self.browser()
+            return
         if os.environ.get("CHAIN_TEST_BROWSER_ONLY") == "1":
             self.browser()
             return
@@ -313,6 +319,8 @@ class Harness:
         self.probe(main)
         print("PASS interrupted publish, offline recovery status, delayed Agent reconnection and restored traffic", flush=True)
 
+        from features import exercise
+        exercise(self, nodes, echo_port, agents, agent_envs)
         browser = os.environ.get("CHAIN_TEST_BROWSER")
         if browser:
             self.browser()

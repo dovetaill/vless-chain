@@ -19,6 +19,10 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
+#[path = "../delivery_api.rs"]
+mod delivery_api;
+#[path = "../security_api.rs"]
+mod security_api;
 
 struct Store {
     conn: Connection,
@@ -34,7 +38,9 @@ impl Store {
 struct App {
     store: Arc<Mutex<Store>>,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
-    admin_hash: String,
+    admin_hash: Arc<Mutex<String>>,
+    token_file: PathBuf,
+    auth: Arc<chain_panel::security::AuthState>,
     secure_cookie: bool,
     xray: PathBuf,
     probe_lock: Arc<tokio::sync::Mutex<()>>,
@@ -57,6 +63,13 @@ impl From<anyhow::Error> for ApiError {
         Self(StatusCode::BAD_REQUEST, format!("{e:#}"))
     }
 }
+macro_rules! api_from {($($t:ty),* $(,)?)=>{$(impl From<$t> for ApiError {fn from(e:$t)->Self {anyhow::Error::from(e).into()}})*};}
+api_from!(
+    serde_json::Error,
+    serde_yaml_ng::Error,
+    url::ParseError,
+    std::io::Error
+);
 type ApiResult<T> = std::result::Result<T, ApiError>;
 fn error(status: StatusCode, s: &str) -> ApiError {
     ApiError(status, s.into())
@@ -92,7 +105,13 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
                 }
             }
         }
-        if path != "/api/login" {
+        if !matches!(
+            path,
+            "/api/login"
+                | "/api/auth/options"
+                | "/api/auth/passkey/start"
+                | "/api/auth/passkey/finish"
+        ) {
             let token = cookie(request.headers());
             let hash = digest(&token);
             let expiry = app
@@ -134,12 +153,24 @@ fn cookie(headers: &HeaderMap) -> String {
 #[derive(Deserialize)]
 struct Login {
     token: String,
+    #[serde(default)]
+    code: String,
 }
 async fn login(State(app): State<App>, Json(input): Json<Login>) -> ApiResult<Response> {
-    if !equal(&digest(&input.token), &app.admin_hash) {
+    app.auth.rate_limit()?;
+    if !equal(&digest(&input.token), &app.admin_hash.lock().unwrap()) {
         tokio::time::sleep(Duration::from_millis(400)).await;
         return Err(error(StatusCode::UNAUTHORIZED, "管理令牌不正确"));
     }
+    {
+        let mut store = app.store.lock().unwrap();
+        chain_panel::security::second_factor(&mut store.doc.security, &input.code)
+            .map_err(|_| error(StatusCode::UNAUTHORIZED, "动态验证码或恢复码不正确"))?;
+        store.save()?;
+    }
+    Ok(session_response(&app))
+}
+fn session_response(app: &App) -> Response {
     let token = secret();
     {
         let mut sessions = app.sessions.lock().unwrap();
@@ -158,7 +189,7 @@ async fn login(State(app): State<App>, Json(input): Json<Login>) -> ApiResult<Re
         ))
         .unwrap(),
     );
-    Ok(response)
+    response
 }
 async fn logout(State(app): State<App>, headers: HeaderMap) -> Response {
     app.sessions
@@ -202,6 +233,12 @@ fn snapshot(doc: &Document) -> Value {
         .map(|l| {
             let mut v = serde_json::to_value(l).unwrap();
             v["share"] = json!(share(l, doc).ok());
+            let traffic = l
+                .hops
+                .first()
+                .and_then(|h| doc.nodes.iter().find(|n| n.id == h.node_id))
+                .and_then(|n| n.report.traffic.get(&l.id));
+            v["traffic"] = json!(traffic);
             let resources_match = configs
                 .as_ref()
                 .map(|configs| {
@@ -228,7 +265,12 @@ fn snapshot(doc: &Document) -> Value {
         .take(20)
         .map(|j| json!({"id":j.id,"state":j.state,"started":j.started,"events":j.events}))
         .collect();
-    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now()})
+    let subscriptions: Vec<_> = doc
+        .subscriptions
+        .iter()
+        .map(|s| json!({"id":s.id,"name":s.name,"line_ids":s.line_ids,"created":s.created}))
+        .collect();
+    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc)})
 }
 async fn state(State(app): State<App>) -> Json<Value> {
     Json(snapshot(&app.store.lock().unwrap().doc))
@@ -237,8 +279,16 @@ async fn state(State(app): State<App>) -> Json<Value> {
 struct NodeInput {
     name: String,
     host: String,
+    #[serde(default = "default_target")]
     target: String,
+    #[serde(default = "default_server_name")]
     server_name: String,
+}
+fn default_target() -> String {
+    "www.microsoft.com:443".into()
+}
+fn default_server_name() -> String {
+    "www.microsoft.com".into()
 }
 fn validate_node(n: &NodeInput) -> Result<()> {
     ensure!(
@@ -376,11 +426,24 @@ async fn rotate_node(State(app): State<App>, Path(id): Path<String>) -> ApiResul
 struct ExternalInput {
     name: String,
     url: String,
+    #[serde(default)]
+    relay_host: String,
+    #[serde(default)]
+    relay_port: Option<u16>,
 }
 async fn add_external(
     State(app): State<App>,
-    Json(input): Json<ExternalInput>,
+    Json(mut input): Json<ExternalInput>,
 ) -> ApiResult<Json<Value>> {
+    if !input.relay_host.is_empty() {
+        input.url = chain_panel::access::relay_link(
+            &input.url,
+            &input.relay_host,
+            input
+                .relay_port
+                .ok_or_else(|| error(StatusCode::BAD_REQUEST, "请输入中转端口"))?,
+        )?;
+    }
     external_outbound(&input.url, "check")?;
     if input.name.trim().is_empty() || input.name.len() > 120 {
         return Err(error(StatusCode::BAD_REQUEST, "名称无效"));
@@ -431,6 +494,10 @@ struct LineInput {
     network: String,
     #[serde(default = "yes")]
     enabled: bool,
+    #[serde(default)]
+    access: Option<Access>,
+    #[serde(default)]
+    limits: Option<Limits>,
 }
 fn tcp() -> String {
     "tcp".into()
@@ -455,13 +522,25 @@ async fn save_line(State(app): State<App>, Json(input): Json<LineInput>) -> ApiR
             .collect();
         let mut hops = vec![];
         for h in input.hops {
+            let occupied: BTreeSet<u16> = d
+                .nodes
+                .iter()
+                .find(|n| n.id == h.node_id)
+                .and_then(|n| n.report.system["listening_ports"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.as_u64().and_then(|p| u16::try_from(p).ok()))
+                .collect();
             let old = existing
                 .as_ref()
                 .and_then(|l| l.hops.iter().find(|o| o.node_id == h.node_id));
             let port = h
                 .port
                 .or(old.map(|h| h.port))
-                .or_else(|| (20000..50000).find(|p| !used.contains(&(h.node_id.clone(), *p))))
+                .or_else(|| {
+                    (20000..50000)
+                        .find(|p| !used.contains(&(h.node_id.clone(), *p)) && !occupied.contains(p))
+                })
                 .context("没有可分配的端口")?;
             used.insert((h.node_id.clone(), port));
             hops.push(Hop {
@@ -470,6 +549,11 @@ async fn save_line(State(app): State<App>, Json(input): Json<LineInput>) -> ApiR
                 uuid: old.map(|h| h.uuid.clone()).unwrap_or_else(id),
             });
         }
+        let mut access = input
+            .access
+            .or_else(|| existing.as_ref().map(|l| l.access.clone()))
+            .unwrap_or_default();
+        chain_panel::access::fill_credentials(&mut access);
         let line = Line {
             id: line_id.clone(),
             name: input.name,
@@ -479,6 +563,11 @@ async fn save_line(State(app): State<App>, Json(input): Json<LineInput>) -> ApiR
             target: input.target,
             network: input.network,
             enabled: input.enabled,
+            access,
+            limits: input
+                .limits
+                .or_else(|| existing.as_ref().map(|l| l.limits.clone()))
+                .unwrap_or_default(),
         };
         d.lines.retain(|l| l.id != line_id);
         d.lines.push(line.clone());
@@ -502,7 +591,9 @@ fn changed(doc: &Document, configs: &BTreeMap<String, Value>) -> BTreeSet<String
         .iter()
         .filter(|n| {
             let config = &configs[&n.id];
-            (n.desired.is_some() || !config["inbounds"].as_array().unwrap().is_empty())
+            (n.desired.is_some()
+                || !config["inbounds"].as_array().unwrap().is_empty()
+                || config["_chain"].as_array().is_some_and(|v| !v.is_empty()))
                 && (n.desired.as_ref().map(|v| &v.config) != Some(config)
                     || !n.report.applied
                     || !n.report.running
@@ -515,17 +606,41 @@ async fn preview(State(app): State<App>) -> ApiResult<Json<Value>> {
     let doc = &app.store.lock().unwrap().doc;
     let configs = compile(doc)?;
     let affected = changed(doc, &configs);
+    let restarting: BTreeSet<_> = doc
+        .nodes
+        .iter()
+        .filter(|n| affected.contains(&n.id))
+        .filter(|n| {
+            let Some(old) = &n.desired else { return true };
+            chain_panel::gateway::xray_config(&old.config)
+                != chain_panel::gateway::xray_config(&configs[&n.id])
+                || !chain_panel::gateway::same_listeners(
+                    &chain_panel::gateway::specs(&old.config).unwrap_or_default(),
+                    &chain_panel::gateway::specs(&configs[&n.id]).unwrap_or_default(),
+                )
+                || !n.report.running
+                || !n.report.applied
+        })
+        .map(|n| n.id.clone())
+        .collect();
     let nodes:Vec<Value>=doc.nodes.iter().filter(|n|affected.contains(&n.id)).map(|n|json!({"id":n.id,"name":n.name,"online":now().saturating_sub(n.seen)<15,
-        "ports":configs[&n.id]["inbounds"].as_array().unwrap().iter().map(|i|i["port"].clone()).collect::<Vec<_>>()})).collect();
+        "ports":doc.lines.iter().filter(|l|l.enabled).flat_map(|l|l.hops.iter()).filter(|h|h.node_id==n.id).map(|h|h.port).collect::<BTreeSet<_>>()})).collect();
     let lines: BTreeSet<String> = doc
         .lines
         .iter()
         .chain(doc.applied_lines.iter())
-        .filter(|l| l.hops.iter().any(|h| affected.contains(&h.node_id)))
+        .filter(|l| l.hops.iter().any(|h| restarting.contains(&h.node_id)))
         .map(|l| l.name.clone())
         .collect();
+    let affected_ids: BTreeSet<_> = doc
+        .lines
+        .iter()
+        .chain(doc.applied_lines.iter())
+        .filter(|l| l.hops.iter().any(|h| restarting.contains(&h.node_id)))
+        .map(|l| l.id.clone())
+        .collect();
     Ok(Json(
-        json!({"nodes":nodes,"affected_lines":lines,"message":"发布会重启受影响节点上由本平台管理的 Xray；共享该实例的线路会短暂重连。现有脚本的服务不在管理范围内。"}),
+        json!({"nodes":nodes,"affected_lines":lines,"affected_line_ids":affected_ids,"message":if restarting.is_empty(){"流量和限速设置会在线更新，无需重启线路。"}else{"应用会重启受影响服务器上由本平台管理的实例；共享该实例的线路会短暂重连。"}}),
     ))
 }
 async fn publish(State(app): State<App>) -> ApiResult<Json<Value>> {
@@ -536,6 +651,18 @@ async fn publish(State(app): State<App>) -> ApiResult<Json<Value>> {
     let job = edit(&app, |d| {
         let configs = compile(d)?;
         let affected = changed(d, &configs);
+        for node in d.nodes.iter().filter(|n| affected.contains(&n.id)) {
+            if configs[&node.id]["_chain"]
+                .as_array()
+                .is_some_and(|s| !s.is_empty())
+            {
+                ensure!(
+                    node.report.system["gateway_version"] == 1,
+                    "{} 的 Agent 尚未就绪或版本过旧，请先更新 Agent 并等待心跳后再应用",
+                    node.name
+                );
+            }
+        }
         let mut order = vec![];
         for line in &d.lines {
             for h in line.hops.iter().rev() {
@@ -883,7 +1010,9 @@ async fn main() -> Result<()> {
     let app = App {
         store: Arc::new(Mutex::new(Store { conn, doc })),
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        admin_hash: digest(token.trim()),
+        admin_hash: Arc::new(Mutex::new(digest(token.trim()))),
+        token_file: token_file.clone(),
+        auth: Arc::new(chain_panel::security::AuthState::default()),
         secure_cookie: std::env::var("CHAIN_SECURE_COOKIE").as_deref() == Ok("1"),
         xray: std::env::var("CHAIN_XRAY_BIN")
             .unwrap_or_else(|_| "xray".into())
@@ -892,7 +1021,7 @@ async fn main() -> Result<()> {
         apply_timeout: std::env::var("CHAIN_APPLY_TIMEOUT")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(35),
+            .unwrap_or(240),
     };
     let interrupted: Vec<Job> = app
         .store
@@ -917,6 +1046,28 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .fallback(get(web_asset))
         .route("/api/login", post(login))
+        .route("/api/auth/options", get(security_api::options))
+        .route("/api/auth/passkey/start", post(security_api::login_start))
+        .route("/api/auth/passkey/finish", post(security_api::login_finish))
+        .route("/api/security/token", post(security_api::rotate))
+        .route("/api/security/totp/start", post(security_api::totp_start))
+        .route("/api/security/totp/finish", post(security_api::totp_finish))
+        .route(
+            "/api/security/totp/disable",
+            post(security_api::totp_disable),
+        )
+        .route(
+            "/api/security/passkey/start",
+            post(security_api::register_start),
+        )
+        .route(
+            "/api/security/passkey/finish",
+            post(security_api::register_finish),
+        )
+        .route(
+            "/api/security/passkey/remove",
+            post(security_api::remove_passkey),
+        )
         .route("/api/logout", post(logout))
         .route("/api/state", get(state))
         .route("/api/nodes", post(add_node))
@@ -929,6 +1080,10 @@ async fn main() -> Result<()> {
         .route("/api/lines", post(save_line))
         .route("/api/lines/{id}", delete(remove_line))
         .route("/api/lines/{id}/probe", post(diagnose))
+        .route("/api/lines/{id}/export", get(delivery_api::export))
+        .route("/api/subscriptions", post(delivery_api::subscribe))
+        .route("/api/subscriptions/{id}", delete(delivery_api::revoke))
+        .route("/subscription/{token}", get(delivery_api::subscription))
         .route("/api/preview", post(preview))
         .route("/api/publish", post(publish))
         .route("/api/agent/{id}/sync", post(sync))

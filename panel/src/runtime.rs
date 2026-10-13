@@ -113,6 +113,8 @@ pub struct ManagedXray {
     pub dir: PathBuf,
     pub child: Option<Child>,
     pub active: Option<Desired>,
+    pub traffic: std::sync::Arc<crate::gateway::Book>,
+    gateway: Option<crate::gateway::Gateway>,
 }
 impl ManagedXray {
     pub async fn open(binary: PathBuf, dir: PathBuf) -> Result<Self> {
@@ -123,11 +125,14 @@ impl ManagedXray {
         } else {
             None
         };
+        let traffic = crate::gateway::Book::open(&dir)?;
         let mut x = Self {
             binary,
             dir,
             child: None,
             active: None,
+            traffic,
+            gateway: None,
         };
         if let Some(config) = active {
             x.apply(&config).await?;
@@ -135,32 +140,69 @@ impl ManagedXray {
         Ok(x)
     }
     pub fn running(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .map(|c| matches!(c.try_wait(), Ok(None)))
-            .unwrap_or(false)
+        self.gateway.as_ref().is_none_or(|g| g.running())
+            && self
+                .child
+                .as_mut()
+                .map(|c| matches!(c.try_wait(), Ok(None)))
+                .unwrap_or(false)
     }
     async fn start_config(&mut self, config: &Value) -> Result<()> {
         let path = self.dir.join("xray.json");
-        atomic_write(&path, &serde_json::to_vec_pretty(config)?)?;
+        atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&crate::gateway::xray_config(config))?,
+        )?;
         self.child = Some(spawn_xray(&self.binary, &path, &self.dir.join("xray.log"))?);
         tokio::time::sleep(Duration::from_millis(450)).await;
         ensure!(
             self.running(),
             "Xray 启动失败；请查看 Agent 数据目录中的 xray.log"
         );
+        self.gateway = Some(
+            crate::gateway::Gateway::start(
+                crate::gateway::specs(config)?,
+                self.traffic.clone(),
+                self.dir.clone(),
+            )
+            .await?,
+        );
         Ok(())
     }
     pub async fn apply(&mut self, desired: &Desired) -> Result<()> {
         let candidate = self.dir.join("candidate.json");
-        atomic_write(&candidate, &serde_json::to_vec_pretty(&desired.config)?)?;
+        atomic_write(
+            &candidate,
+            &serde_json::to_vec_pretty(&crate::gateway::xray_config(&desired.config))?,
+        )?;
         let result = validate(&self.binary, &candidate).await;
         let _ = std::fs::remove_file(&candidate);
         result?;
+        let specs = crate::gateway::specs(&desired.config)?;
+        if self.active.as_ref().is_some_and(|old| {
+            crate::gateway::xray_config(&old.config) == crate::gateway::xray_config(&desired.config)
+        }) && self.running()
+        {
+            if self.gateway.as_ref().is_some_and(|g| g.limits_only(&specs)) {
+                atomic_write(&self.dir.join("active.json"), &serde_json::to_vec(desired)?)?;
+                self.gateway.as_mut().unwrap().update_limits(&specs);
+                self.active = Some(desired.clone());
+                return Ok(());
+            }
+        }
+        let existing_challenge = self
+            .active
+            .as_ref()
+            .and_then(|d| crate::gateway::specs(&d.config).ok())
+            .is_some_and(|s| {
+                s.iter()
+                    .any(|s| s.tls.mode == "auto" || s.kind == Kind::Website && s.port == 80)
+            });
+        crate::website::prepare(&specs, &self.dir, existing_challenge).await?;
         let old = self.active.clone();
-        stop(&mut self.child).await;
+        self.stop_all().await;
         if let Err(error) = self.start_config(&desired.config).await {
-            stop(&mut self.child).await;
+            self.stop_all().await;
             if let Some(old) = old {
                 if let Err(restore) = self.start_config(&old.config).await {
                     bail!("应用失败: {error}; 恢复失败: {restore}");
@@ -171,7 +213,7 @@ impl ManagedXray {
         if let Err(error) =
             atomic_write(&self.dir.join("active.json"), &serde_json::to_vec(desired)?)
         {
-            stop(&mut self.child).await;
+            self.stop_all().await;
             if let Some(old) = old {
                 self.start_config(&old.config)
                     .await
@@ -183,6 +225,13 @@ impl ManagedXray {
         Ok(())
     }
     pub async fn close(&mut self) {
+        self.stop_all().await;
+        let _ = self.traffic.save();
+    }
+    async fn stop_all(&mut self) {
+        if let Some(mut gateway) = self.gateway.take() {
+            gateway.close().await;
+        }
         stop(&mut self.child).await;
     }
 }
@@ -249,6 +298,34 @@ pub async fn probe(
                 "目标未返回原始探测内容（此模式要求目标为 TCP 回显服务）"
             );
             "TCP 回显数据已经过实际入口和完整转发路径".to_string()
+        }
+        "tcp" => {
+            tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&endpoint)).await??;
+            "入口 TCP 可以建立连接；未验证代理认证或业务响应".into()
+        }
+        "http" if line.kind == Kind::Website => {
+            let scheme = if matches!(line.access.tls.mode.as_str(), "auto" | "manual") {
+                "https"
+            } else {
+                "http"
+            };
+            let url = format!(
+                "{scheme}://{}/",
+                compiler::address(&line.access.tls.domain, entry.port)
+            );
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(12))
+                .build()?
+                .get(url)
+                .send()
+                .await?;
+            ensure!(
+                response.status().is_success(),
+                "网站返回 HTTP {}",
+                response.status()
+            );
+            format!("网站入口返回 HTTP {}", response.status())
         }
         "http" => {
             ensure!(

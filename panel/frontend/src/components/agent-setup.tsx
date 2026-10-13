@@ -12,7 +12,7 @@ export function AgentSetup({ id, token, copy }: { id: string; token: string; cop
   const [address, setAddress] = useState(isLoopback(location.hostname) ? '' : location.origin);
   const [online, setOnline] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
-  const [method, setMethod] = useState<'web' | 'script'>('web');
+  const [method, setMethod] = useState<'web' | 'script'>('script');
   const [port, setPort] = useState('22');
   const [auth, setAuth] = useState('password');
   const [password, setPassword] = useState('');

@@ -67,6 +67,9 @@ def publish(directory, tag, repo, commit):
                  '填写域名后检查 A/AAAA 解析，通过系统包管理器安装 Nginx/Certbot，配置 HTTPS 与自动续期。\n\n'
                  '支持 Ubuntu 22.04+ / Debian 12+，Linux x86_64 与 aarch64，systemd、glibc ≥ 2.35、Python ≥ 3.10。'
                  '下载对应架构的 tar.gz 与 SHA256SUMS 可离线安装。')
+        release_notes = Path(__file__).resolve().parents[1] / 'panel/docs/releases' / (tag + '.md')
+        if release_notes.is_file():
+            notes = release_notes.read_text(encoding='utf-8')
         with Workspace(directory.parent) as work:
             note_file = work.root / 'notes.txt'
             note_file.write_text(notes)

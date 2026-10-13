@@ -47,6 +47,8 @@ jobs:
           package-manager-cache: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Install WebAuthn build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
       - name: Check installer
         run: python3 -B scripts/ci_release.py check
       - name: Build native release
