@@ -232,7 +232,12 @@ class Network(unittest.TestCase):
                                 'http { access_log off;\n' + ''.join(
                                     f'{name}_temp_path {work.root}/{name};\n'
                                     for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')) + site_config + '}\n')
-                work.run(['nginx', '-t', '-p', str(work.root), '-c', conf, '-e', work.root / 'error.log'])
+                command = ['nginx', '-t', '-p', str(work.root), '-c', conf]
+                # Ubuntu 22.04 ships Nginx 1.18, before the -e CLI option.
+                help_text = subprocess.run(['nginx', '-h'], capture_output=True, text=True).stderr
+                if '-e filename' in help_text:
+                    command += ['-e', work.root / 'error.log']
+                work.run(command)
 
 
 if __name__ == '__main__':

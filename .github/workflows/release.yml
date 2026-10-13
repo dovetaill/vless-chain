@@ -48,7 +48,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Check installer
-        run: ./scripts/version-release.sh check
+        run: python3 -B scripts/ci_release.py check
       - name: Build native release
         env:
           RELEASE_ARCH: ${{ matrix.arch }}

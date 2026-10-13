@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import subprocess
 import sys
 
 from chain_common import VERSION_RE, Workspace, atomic_write, output, require, restore_modes, run, safe_extract, sha256, verify_archive_checksum
@@ -98,9 +99,28 @@ def smoke(directory):
             work.run([sys.executable, '-B', root / 'panel/tests/https_install.py', stage], cwd=root)
 
 
+def check():
+    root = Path(__file__).resolve().parents[1]
+    with Workspace(Path(os.environ.get('RUNNER_TEMP', str(root.parent)))) as work:
+        log = work.root / 'checks.log'
+        try:
+            with log.open('w') as stream:
+                work.run(['bash', root / 'scripts/version-release.sh', 'check'], cwd=root,
+                         stdout=stream, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError:
+            # Make the actionable failure visible in the check annotation even
+            # when an unauthenticated maintainer cannot download Actions logs.
+            tail = log.read_text()[-12000:]
+            escaped = tail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+            print('::error title=Installer verification failed::' + escaped, flush=True)
+            raise
+        finally:
+            print(log.read_text(), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['validate', 'assemble', 'publish', 'smoke'])
+    parser.add_argument('action', choices=['validate', 'assemble', 'publish', 'smoke', 'check'])
     parser.add_argument('--tag', default=os.environ.get('GITHUB_REF_NAME', ''))
     parser.add_argument('--commit', default=os.environ.get('GITHUB_SHA', ''))
     parser.add_argument('--repo', default=os.environ.get('GITHUB_REPOSITORY', ''))
@@ -114,6 +134,8 @@ def main():
         publish(args.input, args.tag, args.repo, args.commit)
     elif args.action == 'smoke':
         smoke(args.input)
+    elif args.action == 'check':
+        check()
 
 
 if __name__ == '__main__':

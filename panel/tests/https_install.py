@@ -53,8 +53,11 @@ def main():
                             site.config(tls=True).replace('listen 80;', f'listen 127.0.0.1:{http_port};').replace(
                                 'listen 443 ssl;', f'listen 127.0.0.1:{https_port} ssl;') + '}\n')
             nginx_log = (root / 'nginx.log').open('wb')
-            nginx = subprocess.Popen(['nginx', '-p', str(root), '-c', str(conf), '-e', str(root / 'error.log'),
-                                      '-g', 'daemon off; master_process off;'], stdout=nginx_log, stderr=nginx_log,
+            command = ['nginx', '-p', str(root), '-c', str(conf), '-g', 'daemon off; master_process off;']
+            help_text = subprocess.run(['nginx', '-h'], capture_output=True, text=True).stderr
+            if '-e filename' in help_text:
+                command += ['-e', str(root / 'error.log')]
+            nginx = subprocess.Popen(command, stdout=nginx_log, stderr=nginx_log,
                                      start_new_session=True)
             harness.processes.append(('nginx', nginx, nginx_log))
             harness.record()
