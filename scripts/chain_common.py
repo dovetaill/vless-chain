@@ -96,7 +96,8 @@ def json_write(path, value, mode=0o600):
 
 
 def run(command, **kwargs):
-    return subprocess.run([str(v) for v in command], check=True, **kwargs)
+    kwargs.setdefault('check', True)
+    return subprocess.run([str(v) for v in command], **kwargs)
 
 
 def output(command, **kwargs):
@@ -224,7 +225,7 @@ def verify_tree(directory):
             '发行包格式或版本无效。')
     files = manifest.get('files', {})
     required = {'bin/chain-panel', 'bin/chain-agent', 'bin/xray', 'scripts/chain_common.py',
-                'scripts/chain_install.py', 'scripts/install-server.sh'}
+                'scripts/chain_install.py', 'scripts/chain_network.py', 'scripts/install-server.sh'}
     require(required.issubset(files), '发行包缺少程序或安装脚本。')
     actual = set()
     for path in directory.rglob('*'):

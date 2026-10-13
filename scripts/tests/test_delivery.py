@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import chain_common as common
 import chain_install as installer
 import chain_release as release
+import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
@@ -47,7 +48,7 @@ class Delivery(unittest.TestCase):
         (root / 'scripts').mkdir()
         for name in ['chain-panel', 'chain-agent', 'xray']:
             (root / 'bin' / name).write_text('fixture-' + version)
-        for name in ['chain_common.py', 'chain_install.py', 'install-server.sh']:
+        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'install-server.sh']:
             shutil.copy2(Path(__file__).resolve().parents[1] / name, root / 'scripts' / name)
         files = {str(p.relative_to(root)): {'sha256': common.sha256(p), 'mode': 0o755 if p.parent.name == 'bin' or p.suffix == '.sh' else 0o644}
                  for p in root.rglob('*') if p.is_file()}
@@ -109,9 +110,10 @@ class Delivery(unittest.TestCase):
         source, _ = self.package()
         archive = self.archive(source)
         args = installer.make_parser().parse_args(['install', '--root', str(self.manager.root), '--package', str(archive)])
-        with patch('builtins.input', side_effect=['1', '8099', '192.0.2.1', '2']):
+        with patch('builtins.input', side_effect=['']), patch.object(installer, 'public_ipv4', return_value='192.0.2.1'), \
+                patch.object(installer, 'available_port', return_value=48099):
             installer.install_wizard(self.manager, args)
-        self.assertEqual(installer.parse_env(self.manager.role_paths('panel')[0] / 'panel.env')['CHAIN_PUBLIC_URL'], 'http://192.0.2.1:8099')
+        self.assertEqual(installer.parse_env(self.manager.role_paths('panel')[0] / 'panel.env')['CHAIN_PUBLIC_URL'], 'http://192.0.2.1:48099')
         document = {'panel_url': 'https://panel.example.com', 'node_id': 'a94a6794-c60a-4c51-a094-b9164ddaaabc', 'token': 's' * 64}
         code = 'chain-agent-v1:' + base64.urlsafe_b64encode(json.dumps(document).encode()).decode().rstrip('=')
         agent = installer.make_parser().parse_args(['install', '--component', 'agent', '--root', str(self.manager.root), '--package', str(archive)])
@@ -126,6 +128,58 @@ class Delivery(unittest.TestCase):
             installer.main([])
         self.assertIn('打开交互管理菜单', stream.getvalue())
         self.assertIn('--non-interactive', stream.getvalue())
+
+    def test_first_setup_has_one_domain_prompt_and_repeat_preserves_access(self):
+        source, _ = self.package()
+        archive = self.archive(source)
+        argv = ['setup', '--root', str(self.manager.root), '--package', str(archive)]
+        with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='') as prompt, \
+                patch.object(installer, 'public_ipv4', return_value='192.0.2.1'), \
+                patch.object(installer, 'available_port', return_value=45123):
+            installer.main(argv)
+        self.assertEqual(prompt.call_count, 1)
+        config = self.manager.role_paths('panel')[0] / 'panel.env'
+        original = config.read_bytes()
+        with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', side_effect=AssertionError('no repeated setup')):
+            installer.main(argv)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(installer.parse_env(config)['CHAIN_PUBLIC_URL'], 'http://192.0.2.1:45123')
+
+    def test_unavailable_release_fails_before_any_input(self):
+        args = installer.make_parser().parse_args(['install', '--latest', '--root', str(self.manager.root), '--work-parent', str(self.root)])
+        with patch.object(installer, 'download_release', side_effect=ValueError('no release')), \
+                patch('builtins.input', side_effect=AssertionError('must check release before questions')):
+            with self.assertRaisesRegex(ValueError, 'no release'):
+                installer.install_wizard(self.manager, args)
+        self.assertFalse(list(self.root.glob('chain-install-*')))
+
+    def test_repeated_setup_retries_missing_default_agent(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        self.manager.live = True
+        with patch.object(installer, 'Manager', return_value=self.manager), patch('sys.stdin.isatty', return_value=True), \
+                patch.object(installer, 'install_wizard') as wizard:
+            installer.main(['setup', '--root', str(self.manager.root)])
+        wizard.assert_called_once()
+        self.assertEqual(wizard.call_args.args[1].action, 'install')
+
+    def test_https_port_change_checks_after_stopping_owned_panel(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args(listen='0.0.0.0:45123'))
+        self.manager.live = True
+        events = []
+        with patch.object(self.manager, 'account', return_value=(os.geteuid(), os.getegid())), \
+                patch.object(self.manager.system, 'active', return_value=True), \
+                patch.object(self.manager.system, 'autostart', return_value=True), \
+                patch.object(self.manager.system, 'call', side_effect=lambda *args, **kwargs: events.append(args[0])), \
+                patch.object(self.manager, 'healthy'), patch.object(self.manager, 'show_access'), \
+                patch.object(self.manager, 'check_panel_port', side_effect=lambda env: events.append('bind')):
+            self.manager.install(source, manifest, self.args(listen='127.0.0.1:45123', secure_cookie='1'))
+        self.assertLess(events.index('stop'), events.index('bind'))
+        self.assertLess(events.index('bind'), events.index('restart'))
+
+    def test_common_run_allows_best_effort_cleanup(self):
+        self.assertEqual(common.run([sys.executable, '-c', 'raise SystemExit(3)'], check=False).returncode, 3)
 
     def test_online_download_missing_release_and_integrity_failure(self):
         request_error = urllib.error.HTTPError('https://api.github.com/', 404, 'Not found', {}, None)
@@ -305,6 +359,37 @@ class Delivery(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.set_version('bad; version')
             self.assertEqual((repo / 'panel/Cargo.toml').read_bytes(), before)
+
+    def test_dual_arch_release_aggregation_rejects_dirty_builds(self):
+        source, manifest = self.package()
+        incoming = self.root / 'incoming'
+        commit = 'a' * 40
+        for arch in ci.ARCHES:
+            manifest.update(arch=arch, target=f'{arch}-unknown-linux-gnu', commit=commit, dirty=False)
+            common.json_write(source / 'release.json', manifest)
+            archive = self.archive(source)
+            destination = incoming / ('release-' + arch)
+            destination.mkdir(parents=True)
+            name = f'chain-panel-0.1.0-linux-{arch}.tar.gz'
+            shutil.copy2(archive, destination / name)
+            shutil.copy2(source / 'release.json', destination / 'release.json')
+            (destination / 'SHA256SUMS').write_text(f'{common.sha256(archive)}  {name}\n')
+        outgoing = self.root / 'published'
+        ci.assemble(incoming, outgoing, 'v0.1.0', commit)
+        self.assertEqual(len(list(outgoing.iterdir())), 5)
+        for archive in outgoing.glob('*.tar.gz'):
+            common.verify_archive_checksum(archive)
+        manifest['dirty'] = True
+        common.json_write(source / 'release.json', manifest)
+        archive = self.archive(source)
+        destination = incoming / 'release-aarch64'
+        name = 'chain-panel-0.1.0-linux-aarch64.tar.gz'
+        shutil.copy2(archive, destination / name)
+        shutil.copy2(source / 'release.json', destination / 'release.json')
+        (destination / 'SHA256SUMS').write_text(f'{common.sha256(archive)}  {name}\n')
+        with self.assertRaisesRegex(ValueError, '拒绝发布'):
+            ci.assemble(incoming, self.root / 'rejected', 'v0.1.0', commit)
+        self.assertFalse((self.root / 'rejected').exists())
 
     def test_workspace_stops_owned_process_and_releases_port(self):
         with socket.socket() as reserve:

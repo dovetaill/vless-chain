@@ -91,6 +91,7 @@ def default_output():
 def check(args):
     run(['bash', '-n', ROOT / 'scripts/version-release.sh', ROOT / 'scripts/install-server.sh'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_delivery.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_network.py'])
     if args.full:
         with Workspace(args.work_parent or ROOT.parent) as work:
             xray = work.root / 'bin/xray'
@@ -138,7 +139,7 @@ def build(args):
             shutil.copy2(work.root / 'target' / target / 'release' / binary, stage / 'bin' / binary)
         fetch_xray(work, stage / 'bin/xray')
         work.run([stage / 'bin/xray', 'version'])
-        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py']:
+        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py']:
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')

@@ -29,6 +29,7 @@ import uuid
 
 from chain_common import (architecture, atomic_write, json_write, output, require, restore_modes,
                           run, safe_extract, sha256, verify_archive_checksum, verify_tree, download_release)
+from chain_network import (HttpsSite, available_port, domain_name, public_ipv4, server_addresses, validate_dns)
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER = 'chain-panel-installer-v1'
@@ -269,6 +270,11 @@ class Manager:
             time.sleep(.5)
         raise ValueError(f'chain-{role} 启动检查未通过；请查看 journalctl -u chain-{role}。')
 
+    def check_panel_port(self, env):
+        host, port = listen_address(env['CHAIN_LISTEN'])
+        with socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_STREAM) as check:
+            check.bind((host, port))
+
     def backup_files(self, role):
         etc, data, _ = self.role_paths(role)
         directory = self.path('/var/backups/chain-panel')
@@ -317,10 +323,12 @@ class Manager:
             else:
                 raise ValueError('Web 远程安装需要 openssh-client、tar 和 gzip，请先安装这些系统软件。')
         old_env = parse_env(etc / (role + '.env'))
+        check_after_stop = False
         if self.live and role == 'panel' and (not self.system.active(role) or old_env.get('CHAIN_LISTEN') != env['CHAIN_LISTEN']):
-            host, port = listen_address(env['CHAIN_LISTEN'])
-            with socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_STREAM) as check:
-                check.bind((host, port))  # Never stop an existing port owner.
+            check_after_stop = bool(old and self.system.active(role) and
+                                    listen_address(old_env['CHAIN_LISTEN'])[1] == listen_address(env['CHAIN_LISTEN'])[1])
+            if not check_after_stop:
+                self.check_panel_port(env)  # Never stop a foreign port owner.
         uid, gid = self.account(role)
         release_id = f'{manifest["version"]}-linux-{manifest["arch"]}-{sha256(source / "release.json")[:12]}'
         release = self.base / 'releases' / release_id
@@ -346,6 +354,8 @@ class Manager:
                 if old:
                     self.system.call('stop', 'chain-' + role + '.service')
                     self.backup_files(role)
+                if check_after_stop:
+                    self.check_panel_port(env)
                 for directory in (etc, data):
                     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                     directory.chmod(0o700)
@@ -364,10 +374,13 @@ class Manager:
                 self.healthy(role, env)
                 state['roles'][role] = {'current': release_id, 'previous': old['current'] if old and old['current'] != release_id else (old or {}).get('previous'),
                                         'version': manifest['version']}
+                if role == 'panel':
+                    state['roles'][role]['panel_only'] = (getattr(args, 'panel_only', False) if args.action == 'install'
+                                                          else (old or {}).get('panel_only', False))
                 json_write(self.state_file, state)
                 manager = self.base / 'manager'
                 manager.mkdir(exist_ok=True)
-                for name in ['chain_install.py', 'chain_common.py']:
+                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py']:
                     atomic_write(manager / name, (release / 'scripts' / name).read_bytes(), 0o644)
                 atomic_write(wrapper, f'#!/usr/bin/env bash\n# {OWNER}\nset -Eeuo pipefail\nexec python3 -B {shlex.quote(str(manager / "chain_install.py"))} "$@"\n', 0o755)
             except BaseException:
@@ -396,7 +409,8 @@ class Manager:
         if self.live:
             print(f'chain-{role} 已安装并启动；日常运维：chainctl menu')
             if role == 'panel':
-                self.show_access()
+                if not getattr(args, 'defer_access', False):
+                    self.show_access()
             else:
                 print('Agent 已启动，请回到 Web「服务器」页面等待显示在线。排障时输入 chainctl，选择「查看日志」。')
         else:
@@ -534,13 +548,44 @@ def install_components(manager, source, manifest, args):
 
 
 def install_package(manager, args):
+    def install_source(source, manifest):
+        # Validate the downloaded package before asking for deployment details.
+        require(manifest['arch'] == architecture(), '发行包与本机 CPU 架构不匹配。')
+        glibc = tuple(map(int, output(['getconf', 'GNU_LIBC_VERSION']).split()[-1].split('.')))
+        require(glibc >= tuple(map(int, manifest['glibc_min'].split('.'))),
+                f'发行包需要 glibc ≥ {manifest["glibc_min"]}；请使用 Ubuntu 22.04+ 或 Debian 12+。')
+        if args.action == 'install' and args.component == 'panel' and (
+                getattr(args, 'guided', False) or getattr(args, 'domain', None) is not None):
+            panel_questions(manager, args)
+        elif args.action == 'install' and args.component == 'agent' and getattr(args, 'guided', False):
+            agent_questions(manager, args)
+        site = None
+        if getattr(args, 'domain', None):
+            require(manager.live, '自动 HTTPS 仅用于实际 systemd 安装，不支持 --root 离线模式。')
+            site = HttpsSite(args.domain, listen_address(args.listen)[1], getattr(args, 'domain_ipv6', False))
+        args.defer_access = True
+        with site.activate() if site else contextlib.nullcontext():
+            manager.install(source, manifest, args)
+        # HTTPS and the panel are now committed. An Agent failure must not undo
+        # the working panel URL; rerunning setup retries the missing local node.
+        if manager.live and args.component == 'panel' and args.action == 'install' and not args.panel_only:
+            provision_local_agent(manager, source, manifest, args)
+        if manager.live and args.component == 'panel':
+            manager.show_access()
+            if site:
+                print('HTTPS 与证书自动续期已配置。')
+            else:
+                env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
+                if env.get('CHAIN_PUBLIC_URL', '').startswith('http://'):
+                    print(f'如无法访问，请在云安全组/防火墙放行 TCP {listen_address(env["CHAIN_LISTEN"])[1]}。')
+
     if getattr(args, 'reuse_current', False):
         source = (manager.base / ('current-' + args.component)).resolve(strict=True)
-        install_components(manager, source, verify_tree(source), args)
+        install_source(source, verify_tree(source))
         return
     latest = getattr(args, 'latest', False) or (args.action == 'update' and not args.package)
     if not args.package and not latest and (ROOT / 'release.json').is_file():
-        install_components(manager, ROOT, verify_tree(ROOT), args)
+        install_source(ROOT, verify_tree(ROOT))
         return
     choices = local_packages() if not args.package and not latest else []
     archive = Path(args.package).resolve(strict=True) if args.package else choices[-1] if choices else None
@@ -555,7 +600,7 @@ def install_package(manager, args):
         manifest = safe_extract(archive, stage)
         require(expected_version is None or manifest['version'] == expected_version, '下载包版本与发行信息不一致。')
         print(f'正在安装 {ROLE_NAMES[args.component]} v{manifest["version"]}…', flush=True)
-        install_components(manager, stage, manifest, args)
+        install_source(stage, manifest)
 
 
 def choose(title, options, default='1'):
@@ -572,42 +617,44 @@ def choose(title, options, default='1'):
 def panel_questions(manager, args):
     etc, _, _ = manager.role_paths('panel')
     prior = parse_env(etc / 'panel.env')
-    if args.listen:
+    if (args.listen or prior) and getattr(args, 'domain', None) is None:
         return
-    options = {'1': '浏览器直连（HTTP，适用于可信网络）', '2': '已有 HTTPS 反向代理', '3': '仅本机，通过 SSH 隧道访问'}
-    if prior:
-        options = {'0': f'保留当前访问方式（{prior["CHAIN_LISTEN"]}）', **options}
-    mode = choose('控制台访问方式', options, '0' if prior else '1')
-    if mode == '0':
-        return
-    while True:
-        value = input('控制台端口 [8088]: ').strip() or '8088'
-        if value.isdigit() and 0 < int(value) <= 65535:
-            break
-        print('请输入 1–65535 之间的端口。')
-    args.listen = ('0.0.0.0:' if mode == '1' else '127.0.0.1:') + value
-    args.secure_cookie = '1' if mode == '2' else '0'
-    args.public_url = ''
-    if mode == '1':
+    host = args.local_host or public_ipv4()
+    if not host:
+        require(getattr(args, 'guided', False), '网卡未配置公网 IPv4；NAT 环境请通过 --local-host 指定公网入站地址。')
         while True:
-            host = input('这台服务器可访问的 IP 或域名: ').strip()
+            host = input('网卡没有公网 IPv4（可能位于 NAT 后），请输入公网入站 IPv4: ').strip()
             try:
-                u = validate_panel_url(f'http://{host}:{value}')
-                require(u.hostname == host and ':' not in host, '请填写 IPv4 地址或域名。')
-                args.public_url = f'http://{host}:{value}'
+                ipaddress.IPv4Address(host)
                 break
             except ValueError:
-                print('请输入服务器 IPv4 地址或域名，不要包含协议或路径。')
-    elif mode == '2':
-        while True:
-            url = input('已有 HTTPS 控制台地址（如 https://panel.example.com）: ').strip()
-            try:
-                require(validate_panel_url(url).scheme == 'https', '需要 HTTPS 地址。')
-                args.public_url = url.rstrip('/')
-                break
-            except ValueError as error:
-                print(error)
-        print(f'请将该域名代理到 127.0.0.1:{value}，并保留 Host；向导不会自动安装反向代理。')
+                print('请填写有效 IPv4 地址。')
+    args.local_host = host
+    print(f'服务器地址：{host}；默认安装控制台与本机节点。')
+    explicit = args.domain is not None
+    while True:
+        value = args.domain if explicit else input('面板域名（可选，直接回车使用 IP 访问）: ').strip()
+        if not value:
+            args.domain = None
+            break
+        try:
+            domain = domain_name(value)
+            resolved = validate_dns(domain, server_addresses(host))
+            args.domain, args.domain_ipv6 = domain, any(':' in address for address in resolved)
+            break
+        except (ValueError, OSError) as error:
+            if explicit:
+                raise
+            print(error)
+            print('修改解析后重新输入域名；也可直接回车使用 IP 访问。')
+    retained_listen = args.listen or prior.get('CHAIN_LISTEN')
+    port = listen_address(retained_listen)[1] if retained_listen else available_port()
+    args.listen = f'{"127.0.0.1" if args.domain else "0.0.0.0"}:{port}'
+    args.secure_cookie = '1' if args.domain else '0'
+    args.public_url = f'https://{args.domain}' if args.domain else f'http://{host}:{port}'
+    print(f'{"保留控制台端口" if retained_listen else "已自动选择空闲随机端口"}：{port}。')
+    if not args.domain:
+        print('使用 IP 直接访问（HTTP）；浏览器到面板的通信不加密。')
 
 
 def agent_questions(manager, args):
@@ -638,29 +685,10 @@ def agent_questions(manager, args):
 
 def install_wizard(manager, args):
     print(f'\n{ROLE_NAMES[args.component]} · 安装向导')
-    if args.action == 'install':
-        (panel_questions if args.component == 'panel' else agent_questions)(manager, args)
-        if args.component == 'panel' and not args.panel_only and 'agent' not in manager.state()['roles']:
-            args.panel_only = choose('是否让控制台这台机器也参与转发？',
-                                    {'1': '一起安装本机 Agent 并自动接入（推荐）', '2': '仅安装控制台，转发交给其他机器'}) == '2'
-            if not args.panel_only:
-                if not args.local_host:
-                    prior = parse_env(manager.role_paths('panel')[0] / 'panel.env')
-                    default = urllib.parse.urlsplit(args.public_url or prior.get('CHAIN_PUBLIC_URL', '')).hostname or ''
-                    args.local_host = input(f'其他节点访问本机的 IP / 域名 [{default or "必填"}]: ').strip() or default
-                    require(args.local_host, '请填写本机可访问地址。')
-                if not args.local_target:
-                    args.local_target = input('本机 REALITY TLS 目标 [www.microsoft.com:443]: ').strip() or 'www.microsoft.com:443'
+    args.guided = True
     if not args.package and not args.latest:
         if args.action == 'install' and args.component in manager.state()['roles']:
             args.reuse_current = True
-        else:
-            source = choose('安装来源', {'1': '自动选择（本地包优先，否则下载正式版本）',
-                                       '2': '下载最新正式版本', '3': '选择本地安装包'},
-                            '2' if args.action == 'update' else '1')
-            args.latest = source == '2'
-            if source == '3':
-                args.package = Path(input('安装包文件路径: ').strip()).expanduser()
     install_package(manager, args)
 
 
@@ -724,14 +752,15 @@ def make_parser():
   --non-interactive         自动化调用，不打开安装向导
 
 安装脚本同样支持 help 和以上子命令。""")
-    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token'])
+    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token'])
     parser.add_argument('--component', choices=ROLES, default='panel', help='默认 panel；节点机器选择 agent')
     parser.add_argument('--package', type=Path, help='本地发行包，同目录需有 SHA256SUMS')
     parser.add_argument('--latest', action='store_true', help='下载最新正式版本')
     parser.add_argument('--non-interactive', action='store_true', help='不进行交互提问')
-    parser.add_argument('--listen', help='控制台监听地址；交互安装会引导选择')
+    parser.add_argument('--listen', help='高级：指定监听地址；首次交互安装自动选择空闲随机端口')
     parser.add_argument('--secure-cookie', choices=['0', '1'], help='HTTPS 反向代理设为 1')
     parser.add_argument('--public-url', help='浏览器访问地址；不会自动配置反向代理')
+    parser.add_argument('--domain', help='自动配置域名解析检查、Nginx HTTPS 与续期；空字符串使用 IP 访问')
     parser.add_argument('--panel-only', action='store_true', help='仅安装控制台，跳过默认的本机 Agent 自动接入')
     parser.add_argument('--local-host', help='本机节点对其他服务器可达的地址')
     parser.add_argument('--local-target', help='本机 REALITY TLS 目标，默认 www.microsoft.com:443')
@@ -758,6 +787,21 @@ def main(argv=None):
     if args.action == 'menu':
         return menu(args.root)
     manager = Manager(args.root)
+    if args.action == 'setup':
+        installed = manager.state()['roles']
+        retry_agent = (args.component == 'panel' and 'panel' in installed and 'agent' not in installed
+                       and not installed['panel'].get('panel_only', False) and not args.panel_only and manager.live)
+        if args.component in installed and not retry_agent:
+            if args.component == 'panel':
+                manager.show_access()
+            else:
+                args.action = 'status'
+                manager.operate(args)
+            print('已经安装；升级运行 chainctl update，日常管理运行 chainctl。')
+            return
+        require(sys.stdin.isatty() or args.non_interactive,
+                '首次安装需要交互终端；请在 SSH 终端运行，自动化部署使用 install --non-interactive。')
+        args.action = 'install'
     if args.action in ('install', 'update'):
         if sys.stdin.isatty() and not args.non_interactive:
             install_wizard(manager, args)

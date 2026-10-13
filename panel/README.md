@@ -10,11 +10,22 @@
 curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo bash
 ```
 
-选择「安装控制台与本机节点」，按提示选择访问方式和端口。默认一起安装控制台和本机 Agent，并自动把本机接入 Web；也可选择仅安装控制台。向导会准备程序、配置服务，最后显示访问地址和登录令牌。安装过后直接输入 `chainctl` 即可打开管理菜单。
+首次运行直接开始安装，先下载并校验正式包，只询问一个可选输入：
+
+```text
+面板域名（可选，直接回车使用 IP 访问）:
+```
+
+- 留空：自动读取网卡上的公网 IPv4，随机选择未占用端口，最后显示 `http://IP:端口`。检测会排除已占用的 IPv4/IPv6 TCP、UDP 端口；不会查询代理或 NAT 的出口 IP。只有网卡没有公网 IPv4 时，才需要填写 NAT 映射的公网入站地址。HTTP 不加密浏览器到面板的通信。
+- 填写域名：检查公共 DNS 的全部 A/AAAA 记录是否指向本机；正确后复用系统 Nginx，缺少时通过 apt/dnf 安装 Nginx 和 Certbot，申请证书并配置 `https://域名`、443 与自动续期。Nginx 使用独立站点文件，已有网站和占用端口的其他服务不会被接管。域名使用 CDN 代理时，先关闭代理完成解析验证。
+
+默认一起安装控制台和本机 Agent，并自动把本机接入 Web。无需设置账号密码，安装结束显示自动生成的管理令牌。服务器防火墙/云安全组需允许访问面板随机 TCP 端口，或域名方式使用的 TCP 80、443。安装过后直接输入 `chainctl` 即可打开管理菜单。
+
+再次运行同一条安装命令会显示已有登录信息，保留端口、令牌和节点身份；若上次只完成控制台，会重试缺失的本机 Agent。升级运行 `chainctl update`。
 
 已经有源码仓库或解压后的发行包时，运行 `sudo ./scripts/install-server.sh` 即可，向导会优先使用本地包。在线安装依赖维护者发布的 [正式安装包](https://github.com/dovetaill/vless-chain/releases)；尚无正式包时会明确提示，不要求使用者手动编译。
 
-支持 Linux x86_64 / aarch64、systemd、Python 3.10+，发行包会检查 glibc 兼容性。缺少 Python 时脚本尝试通过 apt/dnf 安装；无需自行安装 Node.js、Rust 或 Xray。
+正式包支持 Linux x86_64 / aarch64、glibc 2.35+、systemd 和 Python 3.10+，适用于 Ubuntu 22.04+ / Debian 12+。缺少运行依赖时脚本使用 apt/dnf 安装；无需自行安装 Node.js、Rust 或 Xray。自动 HTTPS 使用系统 Nginx 的 `/etc/nginx/nginx.conf` 和标准 systemd 服务，自编译或自定义 `-c` 部署需要自行适配。
 
 ## 添加服务器
 

@@ -10,7 +10,9 @@
 curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo bash
 ```
 
-按提示安装控制台和本机 Agent，登录 Web 即可看到本机节点。其他服务器可在 Web 填写 SSH 信息直接安装，也可使用脚本粘贴接入码。日常只需输入 `chainctl` 打开菜单，输入 `chainctl help` 查看帮助。
+首次运行直接安装控制台和本机 Agent，只需输入可选的面板域名：留空即通过自动分配的空闲随机端口访问；填写域名则检查解析，通过系统软件源安装 Nginx/Certbot，配置 HTTPS 与自动续期。服务器地址读取网卡公网 IPv4，不使用代理出口 IP。完成后直接显示登录地址和自动生成的管理令牌。
+
+其他服务器可在 Web 填写 SSH 信息直接安装，也可使用脚本粘贴接入码。日常只需输入 `chainctl` 打开菜单；重复执行安装命令保留已有端口和凭据，升级使用 `chainctl update`。[详细安装说明](panel/README.md)。
 
 已有本仓库或解压后的发行包时，直接运行 `sudo ./scripts/install-server.sh`。在线安装需要已有正式 Release；源码构建与发布供维护者使用，见 [高级文档](panel/docs/advanced.md)。
 

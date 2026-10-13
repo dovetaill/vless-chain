@@ -1,0 +1,112 @@
+name: Build and publish release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  build:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    env:
+      RUSTUP_TOOLCHAIN: 1.96.0
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          python3 -B scripts/ci_release.py validate
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.3'
+          package-manager-cache: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Check installer and build native release
+        env:
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: |
+          ./scripts/version-release.sh check
+          ./scripts/version-release.sh build --work-parent "$RUNNER_TEMP" --output "$RUNNER_TEMP/release-$RELEASE_ARCH"
+          python3 -B scripts/ci_release.py smoke --input "$RUNNER_TEMP/release-$RELEASE_ARCH"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release-${{ matrix.arch }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Remove task artifacts
+        if: always()
+        env:
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: rm -rf -- "$RUNNER_TEMP/release-$RELEASE_ARCH"
+
+  publish:
+    name: Verify and publish complete release
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/chain-artifacts
+      - name: Validate both architectures and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B scripts/ci_release.py assemble --input "$RUNNER_TEMP/chain-artifacts" --output "$RUNNER_TEMP/chain-release"
+          python3 -B scripts/ci_release.py publish --input "$RUNNER_TEMP/chain-release"
+      - name: Remove task artifacts
+        if: always()
+        run: |
+          rm -rf -- "$RUNNER_TEMP/chain-artifacts" "$RUNNER_TEMP/chain-release"
+
+  cleanup:
+    name: Remove intermediate workflow artifacts
+    if: always()
+    needs: [build, publish]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete this run's uploaded build artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[].id' |
+            while read -r artifact; do gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"; done
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.total_count')" = 0

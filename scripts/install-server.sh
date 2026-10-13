@@ -30,7 +30,7 @@ cleanup() { if [[ -n "$bootstrap_dir" ]]; then rm -rf -- "$bootstrap_dir"; fi; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [[ ! -f "$script_dir/chain_install.py" || ! -f "$script_dir/chain_common.py" ]]; then
+if [[ ! -f "$script_dir/chain_install.py" || ! -f "$script_dir/chain_common.py" || ! -f "$script_dir/chain_network.py" ]]; then
   bootstrap_dir=$(mktemp -d -t chain-bootstrap-XXXXXXXX)
   python3 -B - "$bootstrap_dir" <<'PY'
 import json, pathlib, re, sys, urllib.request
@@ -41,7 +41,7 @@ with urllib.request.urlopen(request, timeout=30) as response:
     commit = json.load(response)['sha']
 if not re.fullmatch('[0-9a-f]{40}', commit):
     raise SystemExit('安装器版本信息无效。')
-for name in ['chain_common.py', 'chain_install.py']:
+for name in ['chain_common.py', 'chain_install.py', 'chain_network.py']:
     with urllib.request.urlopen(f'https://raw.githubusercontent.com/{repo}/{commit}/scripts/{name}', timeout=30) as response:
         value = response.read(1024 * 1024 + 1)
     if len(value) > 1024 * 1024:
@@ -50,6 +50,7 @@ for name in ['chain_common.py', 'chain_install.py']:
 PY
   script_dir=$bootstrap_dir
 fi
+if (( $# == 0 )); then set -- setup; fi
 if [[ ! -t 0 && -r /dev/tty ]] && { true </dev/tty; } 2>/dev/null; then
   python3 -B "$script_dir/chain_install.py" "$@" </dev/tty
 else

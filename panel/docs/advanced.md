@@ -55,13 +55,25 @@ sudo chainctl token
 
 已有适用发行包时可跳过 `build`，直接安装；输出目录已存在时，重新构建需指定新的 `--output`。使用 root 登录时可省略 `sudo`。`release-output/` 不进入 Git，克隆源码后需要自行构建或复制已有发行包与校验文件。
 
-安装后默认监听 `127.0.0.1:8088`。在自己电脑上运行以下命令，再打开 `http://127.0.0.1:18088`，输入 `chainctl token` 显示的管理令牌：
+首次交互安装自动选择空闲随机端口，只询问可选域名。网卡公网 IPv4 通过 `ip -j address` 获取，并优先采用本机路由选中的已分配公网源地址，不会以外部 IP 查询服务返回的代理出口地址代替入站地址。域名留空时监听 `0.0.0.0:随机端口`；填写域名时仅监听 `127.0.0.1:随机端口`，由 Nginx 提供 HTTPS。
+
+高级非交互安装未指定监听地址时，仍默认 `127.0.0.1:8088`。例如需要 SSH 隧道时可显式这样安装：
+
+```bash
+sudo ./scripts/install-server.sh install --non-interactive --listen 127.0.0.1:8088
+```
+
+在自己电脑上运行以下命令，再打开 `http://127.0.0.1:18088`，输入 `chainctl token` 显示的管理令牌：
 
 ```bash
 ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 ```
 
-按 `Ctrl+C` 关闭隧道。使用域名访问时配置 HTTPS 反向代理；需要直接监听所有 IPv4 地址时，安装命令增加 `--listen 0.0.0.0:8088`，并按需要配置防火墙访问范围。
+按 `Ctrl+C` 关闭隧道。高级自动化可用 `install --domain panel.example.com --non-interactive` 自动配置 HTTPS，或 `--domain '' --non-interactive` 自动选择 IP 和随机端口。NAT 环境通过 `--local-host` 明确公网入站地址。需要固定监听地址时增加 `--listen 0.0.0.0:8088`，并按需要配置防火墙访问范围。
+
+域名安装查询公共 DNS 的 A/AAAA 记录并核对网卡公网地址，使用 Nginx webroot 完成 HTTP-01 验证。自动安装仅调用 apt/dnf；不下载第三方 Nginx/ACME 安装脚本。受管站点为主配置 `http` 块实际包含目录中的 `chain-panel.conf`，证书名为 `chain-panel-域名`，验证目录为 `/var/lib/chain-acme`。签证书前检查真实 HTTP 验证路径；同域名已有站点或 80/443 被其他程序占用时拒绝覆盖。只支持系统 Nginx 主配置及其 systemd 服务。TLS 配置失败恢复原站点与此前服务状态，已签发证书保留供重试。
+
+`chain-panel-cert-renew.timer` 每天检查两次，Certbot 只续期该面板证书；deploy hook 也核对证书路径后才检查并重载 Nginx。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
 
 构建使用本机 Linux x86_64 或 aarch64 GNU 工具链，执行 TypeScript/Vite 构建与 Rust 单元测试后生成 release 二进制。自动下载固定的 Xray v26.3.27 并检查官方 ZIP 的 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
 
@@ -106,7 +118,7 @@ tar -xzf chain-panel-0.1.0-linux-x86_64.tar.gz -C chain-package
 sudo bash chain-package/scripts/install-server.sh install
 ```
 
-SHA256 用于完整性校验，发行包应从自己控制的渠道获取。安装器默认启用并启动所选的新服务；控制台安装后显示令牌文件位置，可用 `sudo chainctl token` 查看。默认本机访问；HTTPS 反向代理部署增加 `--secure-cookie 1`，并保留请求 Host。原有 SSH 管理的 Xray 服务不会被接管。
+SHA256 用于完整性校验，发行包应从自己控制的渠道获取。安装器默认启用并启动新服务；控制台安装后显示登录信息，也可用 `sudo chainctl token` 查看。自动 HTTPS 已设置安全 Cookie；手工反向代理部署增加 `--secure-cookie 1`，并保留包含端口的请求 Host。原有 SSH 管理的 Xray 服务不会被接管。
 
 ```bash
 sudo chainctl status                         # 默认控制台
@@ -121,7 +133,14 @@ sudo chainctl rollback --component panel
 
 升级保留监听地址、令牌、线路数据库及节点配置；修改参数时显式传入对应选项。升级和备份会短暂停止所选组件，以获得一致的私有备份；Agent 停止会使其转发连接重连。备份位于 `/var/backups/chain-panel/`，权限 600。启动检查失败会恢复升级前的程序链接与配置；运行数据和备份保留。`rollback` 回滚程序版本，不将数据库回退到旧备份。Agent 的进程启动检查通过后，还应在 Web 确认心跳。
 
-GitHub 操作需要额外安装并登录 `gh`。构建与安装不会自动推送 Git、上传附件或发布版本；以下命令才会操作指定远端仓库：
+推荐通过 `.github/workflows/release.yml` 发布：提交版本改动后推送 `vX.Y.Z` 标签，Actions 在 Ubuntu 22.04 的 x86_64、aarch64 runner 分别原生构建（glibc 下限 2.35），校验标签与四个版本清单一致。两个架构均成功后合并 `SHA256SUMS`，创建草稿、上传并重新下载校验全部附件，最后公开正式 Release。安装器不读取 Actions 中间产物。单架构失败不会公开半套包；中间 artifact 在工作流结束时删除，Cargo/npm 临时缓存由构建器清理。
+
+```bash
+git tag v0.1.0
+git push origin main v0.1.0
+```
+
+手工发布需要安装并登录 `gh`。本地构建与安装不会自动推送 Git、上传附件或发布版本；以下命令才会操作指定远端仓库（手工脚本一次发布一个架构，双架构应使用 Actions）：
 
 ```bash
 # 先提交并推送对应源码，然后从干净的发行输入重新构建。
@@ -202,7 +221,7 @@ Agent 主动连接控制台，不开放管理监听端口，不需要控制台�
 
 `chainctl` 无参数时打开交互菜单，`chainctl help` 和 `chainctl --help` 无需管理员权限即可查看帮助。非管理员执行实际运维时自动调用 sudo；无终端且无子命令时只打印帮助。自动化调用增加 `--non-interactive`，保留原有 `--component`、`--package`、监听及令牌文件参数。
 
-安装器可单独下载运行；在 curl 管道中会从终端读取交互输入。缺少 Python 时会尝试使用 apt/dnf 安装 Python 和 HTTPS 证书，并校验 Python 3.10+。在线引导从项目 main 的固定提交下载辅助脚本，再从 GitHub Releases 下载本机架构的正式包，检查 SHA256 和文件清单后安装。下载和解压目录在退出时删除。没有正式包、架构缺失或校验失败时终止，不会静默改为源码编译。
+安装器可单独下载运行；在 curl 管道中会从 `/dev/tty` 读取交互输入。无参数脚本执行 `setup`：首次直接安装，已安装时显示登录信息，缺失默认本机 Agent 时重试接入。`chainctl` 无参数仍打开运维菜单。缺少 Python 时使用 apt/dnf 安装并校验 Python 3.10+。在线引导从项目 main 的固定提交下载三个辅助模块，再从 GitHub Releases 下载本机架构的正式包，检查 SHA256、清单和兼容性后才询问可选域名。下载和解压目录在退出时删除。没有正式包、架构缺失或校验失败时终止，不会静默改为源码编译。
 
 维护者需要先推送安装器和前端改动，再按本页发布流程上传对应版本的正式包；此前本机已有包可用安装向导选择。发布兼容较旧系统的包时，应在对应旧版 glibc 环境构建。单次正式发行需要同时提供包、release.json 和 SHA256SUMS。
 
@@ -210,7 +229,7 @@ Agent 主动连接控制台，不开放管理监听端口，不需要控制台�
 
 ## Web 远程安装与本机自动接入
 
-控制台安装默认附带本机 Agent，通过本机 API 创建节点并保存节点凭据；重复安装不覆盖已安装 Agent 的身份。控制台与 Agent 仍有独立服务与升级操作。向导可以选择仅安装控制台，自动化模式使用 `--panel-only`；本机对外地址与 REALITY 目标可用 `--local-host`、`--local-target` 指定。默认 REALITY 目标为 www.microsoft.com:443，需按实际网络确认可达，之后也可在 Web 编辑。
+控制台安装默认附带本机 Agent，通过本机 API 创建节点并保存节点凭据；重复安装不覆盖已安装 Agent 的身份。控制台与 Agent 仍有独立服务与升级操作。只需控制台时使用高级参数 `--panel-only`；本机对外地址与 REALITY 目标可用 `--local-host`、`--local-target` 指定。默认 REALITY 目标为 www.microsoft.com:443，需按实际网络确认可达，之后也可在 Web 编辑。
 
 Web 的「接入服务器」提供 SSH 安装：使用节点记录的 IP/域名，填写 root 密码或无口令私钥，检测并核对 SSH 指纹后安装。服务端以严格主机密钥校验连接，SSH 凭据只写入私有临时目录，任务结束删除，不入数据库；节点令牌通过 SSH 加密通道传递，不放在命令参数中。安装器上传控制台自身校验过的发行文件，所以控制台和节点须为兼容架构、满足包内 glibc 下限。其他架构可在节点上使用在线安装向导获取对应包。
 
