@@ -2,13 +2,17 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -129,8 +133,151 @@ class Network(unittest.TestCase):
             with patch.object(network.urllib.request, 'build_opener') as opener:
                 opener.return_value.open.side_effect = OSError('connection refused')
                 with self.assertRaisesRegex(ValueError, '验证路径不可达'):
-                    site.challenge_check()
+                    site.challenge_check(timeout=0)
             self.assertEqual(list((site.webroot / '.well-known/acme-challenge').iterdir()), [])
+
+    def test_challenge_retries_transient_response_and_keeps_same_probe(self):
+        for failure in (urllib.error.HTTPError('http://panel.example.com', 404, 'Not Found', {}, io.BytesIO()),
+                        urllib.error.URLError(ConnectionRefusedError('not ready')), io.BytesIO(b'old site')):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory(prefix='chain-probe-') as temp:
+                site = network.HttpsSite('panel.example.com', 45000)
+                site.webroot = Path(temp) / 'webroot'
+                calls = []
+
+                def request(url, **kwargs):
+                    calls.append(url)
+                    probe = site.webroot / '.well-known/acme-challenge' / url.rsplit('/', 1)[1]
+                    self.assertTrue(probe.is_file())
+                    if len(calls) == 1:
+                        if isinstance(failure, Exception):
+                            raise failure
+                        return failure
+                    return io.BytesIO(probe.read_bytes())
+
+                with patch.object(network.urllib.request, 'build_opener') as opener, \
+                        patch.object(network.time, 'sleep'):
+                    opener.return_value.open.side_effect = request
+                    site.challenge_check()
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[0], calls[1])
+                self.assertEqual(list((site.webroot / '.well-known/acme-challenge').iterdir()), [])
+                if isinstance(failure, urllib.error.HTTPError):
+                    self.assertTrue(failure.fp.closed)
+
+    def test_challenge_reports_actual_failure_and_cleans_probe(self):
+        cases = [(urllib.error.HTTPError('http://panel.example.com', code, reason, {}, io.BytesIO()), f'HTTP {code}')
+                 for code, reason in ((404, 'Not Found'), (403, 'Forbidden'))]
+        cases += [(urllib.error.URLError(socket.gaierror('DNS unavailable')), 'DNS unavailable'),
+                  (TimeoutError('timed out'), 'timed out'), (io.BytesIO(b'wrong site'), '内容与验证文件不匹配')]
+        for failure, detail in cases:
+            with self.subTest(detail=detail), tempfile.TemporaryDirectory(prefix='chain-probe-') as temp:
+                site = network.HttpsSite('panel.example.com', 45000)
+                site.webroot = Path(temp) / 'webroot'
+                with patch.object(network.urllib.request, 'build_opener') as opener:
+                    if isinstance(failure, Exception):
+                        opener.return_value.open.side_effect = failure
+                    else:
+                        opener.return_value.open.return_value = failure
+                    with self.assertRaises(ValueError) as error:
+                        site.challenge_check(timeout=0)
+                self.assertIn(detail, str(error.exception))
+                self.assertIn('http://panel.example.com/.well-known/acme-challenge/chain-check-', str(error.exception))
+                self.assertNotIn('TCP 80、443', str(error.exception))
+                if detail.startswith('HTTP'):
+                    self.assertNotIn('防火墙', str(error.exception))
+                self.assertEqual(list((site.webroot / '.well-known/acme-challenge').iterdir()), [])
+
+    def test_challenge_deadline_stops_persistent_failure(self):
+        with tempfile.TemporaryDirectory(prefix='chain-probe-') as temp:
+            site = network.HttpsSite('panel.example.com', 45000)
+            site.webroot = Path(temp) / 'webroot'
+            now = [0.0]
+            with patch.object(network.urllib.request, 'build_opener') as opener, \
+                    patch.object(network.time, 'monotonic', side_effect=lambda: now[0]), \
+                    patch.object(network.time, 'sleep', side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+                opener.return_value.open.side_effect = ConnectionRefusedError('not ready')
+                with self.assertRaisesRegex(ValueError, '已等待 1 秒'):
+                    site.challenge_check(timeout=1)
+                self.assertEqual(opener.return_value.open.call_count, 3)
+                self.assertEqual(now[0], 1)
+            self.assertEqual(list((site.webroot / '.well-known/acme-challenge').iterdir()), [])
+
+    @unittest.skipUnless(shutil.which('nginx'), 'Nginx unavailable')
+    def test_challenge_waits_for_real_nginx_reload(self):
+        with tempfile.TemporaryDirectory(prefix='chain-nginx-reload-') as parent:
+            with Workspace(Path(parent)) as work, contextlib.ExitStack() as cleanup:
+                port = network.available_port()
+                site = network.HttpsSite('localhost', 45000)
+                site.webroot = work.root / 'webroot'
+                conf = work.root / 'nginx.conf'
+                prefix = (('user root;\n' if os.geteuid() == 0 else '') +
+                          f'pid {work.root}/nginx.pid;\nerror_log {work.root}/error.log;\n'
+                          'worker_processes 1;\nevents {}\nhttp { access_log off;\n' + ''.join(
+                              f'{name}_temp_path {work.root}/{name};\n'
+                              for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')))
+                old_site = f'server {{ listen 127.0.0.1:{port} default_server; return 404; }}\n'
+                conf.write_text(prefix + old_site + '}\n')
+                command = ['nginx', '-p', str(work.root), '-c', str(conf), '-g', 'daemon off;']
+                if '-e filename' in subprocess.run(['nginx', '-h'], capture_output=True, text=True).stderr:
+                    command += ['-e', str(work.root / 'error.log')]
+                work.manifest.update(next_command=command, command_cwd=str(work.root), ports=[port],
+                                     logs=[str(work.root / 'error.log')])
+                work.record()
+                process = subprocess.Popen(command, cwd=work.root, env=work.env, start_new_session=True,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                def stop_nginx():
+                    # Nginx removes inherited env markers; stop its recorded
+                    # group explicitly, including workers, before Workspace.
+                    for stop_signal in (signal.SIGQUIT, signal.SIGTERM, signal.SIGKILL):
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(process.pid, stop_signal)
+                        try:
+                            process.wait(timeout=3)
+                            break
+                        except subprocess.TimeoutExpired:
+                            pass
+
+                cleanup.callback(stop_nginx)
+                work.children.append(process)
+                work.manifest['groups'].append(process.pid)
+                work.record()
+                client = network.urllib.request.build_opener(network.urllib.request.ProxyHandler({}))
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        client.open(f'http://127.0.0.1:{port}/', timeout=.5).close()
+                    except urllib.error.HTTPError as error:
+                        self.assertEqual(error.code, 404)
+                        error.close()
+                        break
+                    except OSError:
+                        self.assertIsNone(process.poll())
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.05)
+                conf.write_text(prefix + old_site + site.config().replace('listen 80;', f'listen 127.0.0.1:{port};') + '}\n')
+                # Force the first probe to hit the old worker before HUP. The
+                # next attempt must wait for the real new worker and its file.
+                site.domain = f'localhost:{port}'
+                sleep = time.sleep
+                reloaded = []
+
+                def reload_after_first_probe(seconds):
+                    if not reloaded:
+                        process.send_signal(signal.SIGHUP)
+                        reloaded.append(True)
+                    sleep(seconds)
+
+                with patch.object(network.time, 'sleep', side_effect=reload_after_first_probe):
+                    site.challenge_check(timeout=5)
+                self.assertTrue(reloaded)
+                self.assertEqual(list((site.webroot / '.well-known/acme-challenge').iterdir()), [])
+            self.assertIsNotNone(process.poll())
+            self.assertFalse(work.root.exists())
+            with socket.socket() as check:
+                check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                check.bind(('127.0.0.1', port))
+            print(f'CLEANUP real Nginx PGID={process.pid}; TCP {port} released; directory and logs removed.')
 
     def test_certificate_hook_only_reloads_its_own_lineage(self):
         with tempfile.TemporaryDirectory(prefix='chain-renew-test-') as temp:

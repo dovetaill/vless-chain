@@ -71,7 +71,7 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 
 按 `Ctrl+C` 关闭隧道。高级自动化可用 `install --domain panel.example.com --non-interactive` 自动配置 HTTPS，或 `--domain '' --non-interactive` 自动选择 IP 和随机端口。NAT 环境通过 `--local-host` 明确公网入站地址。需要固定监听地址时增加 `--listen 0.0.0.0:8088`，并按需要配置防火墙访问范围。
 
-域名安装查询公共 DNS 的 A/AAAA 记录并核对网卡公网地址，使用 Nginx webroot 完成 HTTP-01 验证。自动安装仅调用 apt/dnf；不下载第三方 Nginx/ACME 安装脚本。受管站点为主配置 `http` 块实际包含目录中的 `chain-panel.conf`，证书名为 `chain-panel-域名`，验证目录为 `/var/lib/chain-acme`。签证书前检查真实 HTTP 验证路径；同域名已有站点或 80/443 被其他程序占用时拒绝覆盖。只支持系统 Nginx 主配置及其 systemd 服务。TLS 配置失败恢复原站点与此前服务状态，已签发证书保留供重试。
+域名安装查询公共 DNS 的 A/AAAA 记录并核对网卡公网地址，使用 Nginx webroot 完成 HTTP-01 验证。自动安装仅调用 apt/dnf；不下载第三方 Nginx/ACME 安装脚本。受管站点为主配置 `http` 块实际包含目录中的 `chain-panel.conf`，证书名为 `chain-panel-域名`，验证目录为 `/var/lib/chain-acme`。签证书前检查真实 HTTP 验证路径，重载后最多等待 15 秒让新站点生效；失败时显示验证 URL、HTTP 状态码或连接错误，HTTP 404/403 不再统一误报为防火墙问题。本机自检通过后仍由证书机构从公网验证 TCP 80；HTTPS 访问使用 TCP 443。同域名已有站点或 80/443 被其他程序占用时拒绝覆盖。只支持系统 Nginx 主配置及其 systemd 服务。TLS 配置失败恢复原站点与此前服务状态，已签发证书保留供重试。
 
 `chain-panel-cert-renew.timer` 每天检查两次，Certbot 只续期该面板证书；deploy hook 也核对证书路径后才检查并重载 Nginx。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
 

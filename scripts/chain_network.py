@@ -12,6 +12,8 @@ import shlex
 import shutil
 import socket
 import subprocess
+import time
+import urllib.error
 import urllib.request
 
 from chain_common import atomic_write, output, require, run
@@ -252,7 +254,7 @@ class HttpsSite:
         active = subprocess.run(['systemctl', 'is-active', '--quiet', 'nginx'], check=False).returncode == 0
         run(['systemctl', 'reload' if active else 'start', 'nginx'])
 
-    def challenge_check(self):
+    def challenge_check(self, timeout=15):
         directory = self.webroot / '.well-known/acme-challenge'
         for path in (self.webroot, self.webroot / '.well-known', directory):
             require(not path.is_symlink(), f'{path} 是已有链接，拒绝接管。')
@@ -260,13 +262,32 @@ class HttpsSite:
             path.chmod(0o755)  # root's umask 077 must not prevent Nginx traversal.
         challenge = directory / ('chain-check-' + secrets.token_hex(16))
         value = secrets.token_hex(32).encode()
+        url = f'http://{self.domain}/.well-known/acme-challenge/{challenge.name}'
         try:
             atomic_write(challenge, value, 0o644)
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(f'http://{self.domain}/.well-known/acme-challenge/{challenge.name}', timeout=15) as response:
-                require(response.read(1024) == value, 'HTTP 验证路径返回内容不匹配。')
-        except OSError as error:
-            raise ValueError('域名的 HTTP 验证路径不可达，请放行服务器防火墙/云安全组 TCP 80、443 后重试。') from error
+            deadline = time.monotonic() + timeout
+            # systemctl reload returns after sending HUP, before Nginx's new
+            # workers necessarily serve this vhost. Keep the same probe alive
+            # while old workers may still return a default site's 404/redirect.
+            while True:
+                try:
+                    with opener.open(url, timeout=max(.1, min(3, deadline - time.monotonic()))) as response:
+                        if response.read(1024) == value:
+                            return
+                        detail = 'HTTP 响应内容与验证文件不匹配，请检查域名是否命中正确站点及代理/CDN 缓存。'
+                except urllib.error.HTTPError as error:
+                    detail = (f'HTTP {error.code} {error.reason}；请求已到达 HTTP 服务。'
+                              '请检查 Nginx 站点是否生效、验证目录权限及代理/CDN 配置。')
+                    error.close()
+                except OSError as error:
+                    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+                    detail = (f'连接错误：{reason}；请检查域名解析、本机到域名的路由及 TCP 80 入站规则。'
+                              '本机自检不能证明公网可达性，证书签发还会从外部验证。')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError(f'HTTP 验证路径不可达或内容异常（已等待 {timeout:g} 秒）：{url}\n{detail}')
+                time.sleep(min(.5, remaining))
         finally:
             challenge.unlink(missing_ok=True)
 
