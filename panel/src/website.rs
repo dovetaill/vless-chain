@@ -111,7 +111,12 @@ pub async fn prepare(specs: &[Spec], dir: &Path, existing_challenge: bool) -> Re
     for sub in ["config", "work", "logs", "web"] {
         std::fs::create_dir_all(dir.join("acme").join(sub))?;
     }
-    let temporary = if !existing_challenge {
+    let shared_webroot = std::env::var_os("CHAIN_ACME_WEBROOT").map(PathBuf::from);
+    let webroot = shared_webroot
+        .clone()
+        .unwrap_or_else(|| dir.join("acme/web"));
+    std::fs::create_dir_all(&webroot)?;
+    let temporary = if !existing_challenge && shared_webroot.is_none() {
         Some(
             challenge_server(dir.to_path_buf(), CancellationToken::new())
                 .await
@@ -140,7 +145,7 @@ pub async fn prepare(specs: &[Spec], dir: &Path, existing_challenge: bool) -> Re
                     &tls.domain,
                     "--webroot-path",
                 ])
-                .arg(dir.join("acme/web"))
+                .arg(&webroot)
                 .arg("--config-dir")
                 .arg(dir.join("acme/config"))
                 .arg("--work-dir")
@@ -390,6 +395,7 @@ pub async fn serve(
         .build()?;
     let needs_challenge = specs.iter().any(|s| s.tls.mode == "auto");
     let challenge_listener = if needs_challenge
+        && std::env::var_os("CHAIN_ACME_WEBROOT").is_none()
         && !specs
             .iter()
             .any(|s| s.kind == Kind::Website && s.port == 80)

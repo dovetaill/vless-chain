@@ -248,12 +248,12 @@ class Harness:
             return {"name": name, "kind": kind, "hops": [{"node_id": nodes[i]["id"], "port": self.port()} for i in path], **extra}
         main = self.request("/api/lines", "POST", line_input("三跳代理", [0, 1, 2]))
         shared = self.request("/api/lines", "POST", line_input("共享入口与出口", [0, 2]))
-        forward = self.request("/api/lines", "POST", line_input("三跳 TCP / UDP", [0, 1, 2], "forward",
-                               target=f"127.0.0.1:{echo_port}", network="tcp,udp"))
+        self.request("/api/lines", "POST", line_input("已移除的端口转发", [0], "forward",
+                     target=f"127.0.0.1:{echo_port}"), status=400)
         bad = line_input("重复节点", [0, 0]); self.request("/api/lines", "POST", bad, status=400)
         bad = line_input("冲突端口", [0]); bad["hops"][0]["port"] = main["hops"][0]["port"]
         self.request("/api/lines", "POST", bad, status=400)
-        assert len(self.state()["lines"]) == 3
+        assert len(self.state()["lines"]) == 2
         preview = self.request("/api/preview", "POST", {})
         assert len(preview["nodes"]) == 3
         self.publish()
@@ -267,8 +267,7 @@ class Harness:
             self.browser()
             return
         self.probe(main); self.probe(shared)
-        self.probe(forward, "tcp_echo"); self.probe(forward, "udp_echo")
-        print("PASS simultaneous shared-node chains, real three-hop VLESS, TCP and UDP", flush=True)
+        print("PASS simultaneous shared-node chains, real three-hop VLESS and removed forwarding rejection", flush=True)
 
         before = next(l for l in self.state()["lines"] if l["id"] == main["id"])["share"]
         edited = {**main, "hops": [main["hops"][0], main["hops"][2]]}
@@ -297,7 +296,7 @@ class Harness:
         self.stop_process(control)
         control = self.launch("control-restart", self.bin_dir / "chain-panel", control_env)
         self.wait(lambda: self.request("/") or True, "controller restart")
-        self.login(); assert len(self.state()["lines"]) == 4
+        self.login(); assert len(self.state()["lines"]) == 3
         self.probe(main)
         print("PASS durable state and continued node traffic across controller restart", flush=True)
 

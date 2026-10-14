@@ -7,6 +7,7 @@ import datetime
 import fcntl
 import getpass
 import grp
+import hashlib
 import ipaddress
 import http.cookiejar
 import json
@@ -173,6 +174,7 @@ class Manager:
         etc, data, _ = self.role_paths(role)
         env = parse_env(etc / (role + '.env'))
         env['CHAIN_XRAY_BIN'] = str(self.base / ('current-' + role) / 'bin/xray')
+        env['CHAIN_ACME_WEBROOT'] = str(self.path('/var/lib/chain-acme') / role)
         token = None
         if role == 'panel':
             env['CHAIN_DATA_DIR'] = str(data)
@@ -234,6 +236,7 @@ class Manager:
                 f'ExecStart={quote(self.base / ("current-" + role) / "bin" / ("chain-" + role))}\n'
                 'Restart=on-failure\nRestartSec=5\nKillMode=control-group\nTimeoutStopSec=50\n'
                 'NoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\n' + capability +
+                f'ReadWritePaths={quote(self.path("/var/lib/chain-acme") / role)}\n' +
                 '\n[Install]\nWantedBy=multi-user.target\n')
 
     def link(self, role, release):
@@ -287,7 +290,11 @@ class Manager:
                 for prefix, source in [('config', etc), ('data', data)]:
                     if source.exists():
                         for path in sorted(source.rglob('*')):
-                            require(not path.is_symlink(), '备份路径包含符号链接，拒绝继续。')
+                            if path.is_symlink():
+                                require(prefix == 'data' and path.relative_to(source).parts[:3] == ('acme', 'config', 'live')
+                                        and not path.readlink().is_absolute()
+                                        and path.resolve().is_relative_to(source / 'acme/config/archive') and path.is_file(),
+                                        '备份路径包含非 Certbot 内部证书链接，拒绝继续。')
                             if path.is_file() and path.name not in ('xray.log', 'process.lock', 'candidate.json'):
                                 bundle.add(path, arcname=prefix + '/' + str(path.relative_to(source)), recursive=False)
         print(f'私有备份：{destination}（权限 600，含连接凭据，请私下保存）')
@@ -313,18 +320,6 @@ class Manager:
         else:
             require(unit.is_file() and OWNER in unit.read_text(), '服务文件归属不匹配。')
         env, token = self.config(role, args)
-        if self.live and role == 'agent' and not shutil.which('certbot'):
-            from chain_network import install_packages
-            install_packages(['certbot'])
-        if self.live and role == 'panel' and any(not shutil.which(name) for name in ('ssh', 'ssh-keyscan', 'tar')):
-            print('正在安装 Web 远程接入所需的 SSH 客户端…')
-            if shutil.which('apt-get'):
-                run(['apt-get', 'update'])
-                run(['apt-get', 'install', '-y', 'openssh-client', 'tar', 'gzip'])
-            elif shutil.which('dnf'):
-                run(['dnf', 'install', '-y', 'openssh-clients', 'tar', 'gzip'])
-            else:
-                raise ValueError('Web 远程安装需要 openssh-client、tar 和 gzip，请先安装这些系统软件。')
         old_env = parse_env(etc / (role + '.env'))
         check_after_stop = False
         if self.live and role == 'panel' and (not self.system.active(role) or old_env.get('CHAIN_LISTEN') != env['CHAIN_LISTEN']):
@@ -333,6 +328,11 @@ class Manager:
             if not check_after_stop:
                 self.check_panel_port(env)  # Never stop a foreign port owner.
         uid, gid = self.account(role)
+        if self.live:
+            from chain_network import install_proxy_acme
+            install_proxy_acme(role, uid, gid)
+        else:
+            (self.path('/var/lib/chain-acme') / role).mkdir(parents=True, exist_ok=True)
         release_id = f'{manifest["version"]}-linux-{manifest["arch"]}-{sha256(source / "release.json")[:12]}'
         release = self.base / 'releases' / release_id
         with self.lock():
@@ -415,7 +415,7 @@ class Manager:
                 if not getattr(args, 'defer_access', False):
                     self.show_access()
             else:
-                print('Agent 已启动，请回到 Web「服务器」页面等待显示在线。排障时输入 chainctl，选择「查看日志」。')
+                print('Agent 已启动，可在 Web「代理」中新建本机代理。排障时输入 chainctl，选择「查看日志」。')
         else:
             print(f'离线安装树已准备：{self.root}；未创建系统账户、未操作 systemd、未启动监听服务。')
 
@@ -537,6 +537,9 @@ def provision_local_agent(manager, source, manifest, args):
         same_host = agent_url.hostname == local_host or (
             agent_url.hostname == 'localhost' and ipaddress.ip_address(local_host).is_loopback)
         if agent_url.scheme == 'http' and same_host and agent_url.port == panel_port:
+            agent = make_parser().parse_args(['update', '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
+            agent.allow_http = True  # The existing endpoint was verified as this local panel.
+            manager.install(source, manifest, agent)
             mark_local_node(manager, agent_env['CHAIN_NODE_ID'])
         return
     etc, data, _ = manager.role_paths('panel')
@@ -558,14 +561,14 @@ def provision_local_agent(manager, source, manifest, args):
     try:
         api('login', {'token': (data / 'admin-token').read_text().strip()})
         public_host = getattr(args, 'local_host', None) or urllib.parse.urlsplit(env.get('CHAIN_PUBLIC_URL', '')).hostname or '127.0.0.1'
-        target = getattr(args, 'local_target', None) or 'www.microsoft.com:443'
+        target = getattr(args, 'local_target', None) or 'www.cloudflare.com:443'
         name = urllib.parse.urlsplit('tcp://' + target).hostname
         node = api('nodes', {'name': '本机节点', 'host': public_host, 'target': target, 'server_name': name})
         agent = make_parser().parse_args(['install', '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
         agent.panel_url, agent.node_id, agent.node_token = base, node['id'], node['token']
         manager.install(source, manifest, agent)
         mark_local_node(manager, node['id'])
-        print('本机 Agent 已安装并自动接入；在 Web「服务器」中查看本机节点即可。')
+        print('本机 Agent 已安装并自动接入；在 Web「代理」中直接新建代理即可。')
     except BaseException:
         if node is not None and 'agent' not in manager.state()['roles']:
             with contextlib.suppress(Exception):
@@ -582,6 +585,13 @@ def mark_local_node(manager, node_id):
     uuid.UUID(node_id)
     path = manager.role_paths('panel')[1] / 'local-system-node'
     atomic_write(path, node_id + '\n')
+    token_file = manager.role_paths('agent')[0] / 'token'
+    if token_file.is_file():
+        recovery = path.with_name('local-system-identity.json')
+        json_write(recovery, {'id': node_id, 'token_hash': hashlib.sha256(token_file.read_text().strip().encode()).hexdigest()})
+        if manager.live:
+            uid, gid = manager.account('panel')
+            os.chown(recovery, uid, gid)
     if manager.live:
         uid, gid = manager.account('panel')
         os.chown(path, uid, gid)
@@ -814,7 +824,7 @@ def make_parser():
     parser.add_argument('--domain', help='自动配置域名解析检查、Nginx HTTPS 与续期；空字符串使用 IP 访问')
     parser.add_argument('--panel-only', action='store_true', help='仅安装控制台，跳过默认的本机 Agent 自动接入')
     parser.add_argument('--local-host', help='本机节点对其他服务器可达的地址')
-    parser.add_argument('--local-target', help='本机 REALITY TLS 目标，默认 www.microsoft.com:443')
+    parser.add_argument('--local-target', help='本机 REALITY TLS 目标，默认 www.cloudflare.com:443')
     parser.add_argument('--panel-url', help='Agent 连接地址；推荐在向导粘贴 Web 接入码')
     parser.add_argument('--node-id', help='高级：Agent 节点 UUID')
     parser.add_argument('--token-file', type=Path, help='高级：权限 600 的节点令牌文件')

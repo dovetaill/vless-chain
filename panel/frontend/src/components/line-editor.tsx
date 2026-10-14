@@ -18,107 +18,71 @@ export function LineEditor({
   line,
   kind,
   state,
-  initialNodeId,
+  initialChain,
   close,
   saved,
-  addServer,
-  addLocalServer,
+  ensureLocalServer,
   importExternal,
 }: {
   line?: Line;
   kind: Line["kind"];
   state: PanelState;
-  initialNodeId?: string;
+  initialChain?: string[];
   close: () => void;
-  addServer?: (done: (node?: NodeInfo) => void) => void;
-  addLocalServer?: (done: (node?: NodeInfo) => void) => void;
+  ensureLocalServer: (host: string) => Promise<NodeInfo>;
   importExternal?: (done: (external?: External) => void) => void;
   saved: (line: Line, draft: boolean) => Promise<void>;
 }) {
-  const forward = kind === "forward";
+  const local = state.nodes.find(n => n.id === state.local_node_id);
+  const existing = state.nodes.find(n => n.id === line?.hops[0]?.node_id);
+  const [host, setHost] = useState(line?.access.host || line?.access.tls.domain || existing?.host || local?.host || location.hostname.replace(/^\[|\]$/g, ""));
+  const [chain, setChain] = useState<string[]>(line?.chain?.length ? line.chain : line?.external_id ? [`external:${line.external_id}`] : initialChain || []);
+  const domain = Boolean(host.trim()) && !host.includes(":") && !/^[\d.]+$/.test(host.trim());
+  const choices = [
+    ...state.externals.map(e => ({ id: `external:${e.id}`, name: e.name })),
+    ...state.lines.filter(l => l.kind === "vless" && l.id !== line?.id && l.enabled && l.published).map(l => ({ id: `line:${l.id}`, name: `${l.name}（本机代理）` })),
+  ];
+  const available = choices.find(c => !chain.includes(c.id));
   const [protocol, setProtocol] = useState<Protocol>(
     line?.access.protocol || "vless",
   );
-  const [tls, setTls] = useState(
-    line?.access.tls.mode || "off",
-  );
-  const [hops, setHops] = useState(
-    line?.hops.map((h) => ({ node_id: h.node_id, port: String(h.port) })) || [
-      { node_id: initialNodeId || state.local_node_id || "", port: "" },
-    ],
-  );
-  const [externalId, setExternalId] = useState(line?.external_id || "");
-  const [targetHost, targetPort] = splitAddress(
-    forward ? line?.target || "" : "",
-  );
-  const update = (i: number, key: "node_id" | "port", value: string) =>
-    setHops((old) => old.map((h, j) => (i === j ? { ...h, [key]: value } : h)));
-  const available = state.nodes.find(
-    (n) => !hops.some((h) => h.node_id === n.id),
-  );
-  const supportsTls = kind === "vless" && ["vless", "trojan"].includes(protocol);
-  const showTls = supportsTls && tls !== "off";
-  const exit = externalId ? `external:${externalId}` : hops.length > 1 ? `node:${hops[hops.length - 1].node_id}` : "direct";
-  const middle = externalId ? hops.slice(1) : hops.slice(1, -1);
-  const nodeName = (id: string) => state.nodes.find((n) => n.id === id)?.name || (id ? "未找到服务器" : "本机");
-  const setExit = (value: string) => {
-    if (value === "direct") {
-      setHops([hops[0]]);
-      setExternalId("");
-    } else if (value.startsWith("external:")) {
-      setHops([hops[0], ...middle]);
-      setExternalId(value.slice(9));
-    } else {
-      const nodeId = value.slice(5);
-      setHops([hops[0], ...middle.filter((h) => h.node_id !== nodeId),
-        { node_id: nodeId, port: hops[hops.length - 1]?.node_id === nodeId ? hops[hops.length - 1].port : "" }]);
-      setExternalId("");
-    }
-  };
+  const [certificate, setCertificate] = useState(line?.access.tls.mode || "auto");
+  const supportsTls = ["vless", "trojan", "http"].includes(protocol);
+  const tls = supportsTls && domain ? certificate : "off";
+  const showTls = supportsTls && domain;
   return (
     <Modal
       wide
-      title={line ? `编辑${forward ? "端口转发" : "代理"}` : forward ? "创建端口转发" : "创建代理"}
-      description=""
-      submit={line ? "保存并应用" : "创建"}
+      title={line ? "编辑代理" : "新建代理"}
+      description="在本机运行，创建后自动生成客户端链接。"
+      submit={line ? "保存并应用" : "创建代理"}
       close={close}
       action={async (data) => {
-        if (kind === "website") throw new Error("不再支持网站反代。");
-        let entryId = hops[0].node_id;
-        if (!entryId) {
-          if (!addLocalServer) throw new Error("请先添加服务器。");
-          const node = await new Promise<NodeInfo | undefined>((resolve) => addLocalServer(resolve));
-          if (!node) return;
-          entryId = node.id;
-          update(0, "node_id", node.id);
-        }
+        if (protocol === "trojan" && !domain) throw new Error("Trojan 需要域名，请填写解析到本机的域名。");
+        if (chain.some(id => !id)) throw new Error("请选择链式代理的落地。");
+        const node = line ? existing : await ensureLocalServer(host.trim());
+        if (!node) throw new Error("本机记录不存在，请先修复本机设置。");
         const changedProtocol = line && line.access.protocol !== protocol;
         const value = await api<Line>("/lines", "POST", {
           id: line?.id,
           kind,
-          name: field(data, "name").trim() || `${nodeName(hops[0].node_id)} ${forward ? "转发" : protocol.toUpperCase()}`.slice(0, 80),
+          name: field(data, "name").trim() || `${protocolNames[protocol]} ${host.trim()}`.slice(0, 80),
           enabled: data.has("enabled"),
-          hops: hops.map((h, i) => ({
-            node_id: i === 0 ? entryId : h.node_id,
-            port: h.port ? Number(h.port) : null,
-          })),
-          external_id: externalId || null,
-          target: forward
-            ? endpoint(field(data, "target_host"), field(data, "target_port"))
-            : "",
-          network: forward ? field(data, "network") : "tcp",
+          hops: line ? line.hops.map((h, i) => ({ node_id: h.node_id, port: i === 0 ? number(data, "port") : h.port })) : [{ node_id: node.id, port: number(data, "port") }],
+          external_id: null, chain, target: "", network: "tcp",
           access: {
+            host: host.trim(),
             protocol: kind === "vless" ? protocol : "vless",
             username: field(data, "username") || line?.access.username || "",
             password:
               field(data, "password") ||
               (changedProtocol ? "" : line?.access.password || ""),
             method: "",
-            public_host: field(data, "public_host"),
-            public_port: number(data, "public_port"),
+            public_host: "",
+            public_port: null,
             tls: {
               mode: supportsTls ? tls : "off",
-              domain: showTls ? field(data, "domain") : "",
+              domain: showTls && tls !== "off" ? host.trim() : "",
               cert: tls === "manual" ? field(data, "cert") : "",
               key: tls === "manual" ? field(data, "key") : "",
             },
@@ -140,95 +104,14 @@ export function LineEditor({
           maxLength={80}
         />
       </Field>
-      <div className="grid gap-4 sm:grid-cols-[1fr_160px]">
-        <Field label="入口服务器">
-          <select
-            className="select"
-            value={hops[0].node_id}
-            onChange={(e) => update(0, "node_id", e.target.value)}
-          >
-            {!state.local_node_id && <option value="">本机（控制台服务器）</option>}
-            {state.nodes.map((n) => (
-              <option
-                key={n.id}
-                value={n.id}
-                disabled={hops.slice(1).some((h) => h.node_id === n.id)}
-              >
-                {n.name}
-                {!n.online ? " · 离线" : ""}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field
-          label="监听端口"
-          hint="留空自动分配"
-        >
-          <Input
-            type="number"
-            min={1}
-            max={65535}
-            aria-label="监听端口"
-            placeholder="自动分配"
-            value={hops[0].port}
-            onChange={(e) => update(0, "port", e.target.value)}
-          />
-        </Field>
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {addServer && <Button type="button" variant="outline"
-          onClick={() => addServer((node) => { if (node) update(0, "node_id", node.id); })}><Plus />添加远程服务器</Button>}
-      </div>
-      {forward && (
-        <section className="rounded-xl border border-blue-100 bg-blue-50/40 p-4">
-          <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-blue-700">
-            <ArrowRight className="size-4" />
-            转发到固定目标
-          </div>
-          <div className="grid gap-4 sm:grid-cols-[1fr_140px]">
-            <Field label="目标地址">
-              <Input
-                name="target_host"
-                defaultValue={targetHost}
-                placeholder="例如 192.0.2.20"
-                required
-              />
-            </Field>
-            <Field label="目标端口">
-              <Input
-                name="target_port"
-                type="number"
-                min={1}
-                max={65535}
-                defaultValue={targetPort}
-                placeholder="例如 3306"
-                required
-              />
-            </Field>
-          </div>
-          <div className="mt-4">
-            <Field label="转发类型">
-              <select
-                className="select"
-                name="network"
-                defaultValue={line?.network || "tcp"}
-              >
-                <option value="tcp">TCP · 网页 / SSH / 数据库</option>
-                <option value="udp">UDP · 游戏 / DNS 等服务</option>
-                <option value="tcp,udp">TCP + UDP</option>
-              </select>
-            </Field>
-          </div>
-        </section>
-      )}
       {kind === "vless" && (
-        <Field label="客户端协议">
+        <Field label="协议">
           <select
             className="select"
             value={protocol}
             onChange={(e) => {
               setProtocol(e.target.value as Protocol);
-              setTls(e.target.value === "trojan" ? "auto" : "off");
+              setCertificate("auto");
             }}
           >
             {Object.entries(protocolNames).map(([id, label]) => (
@@ -239,14 +122,13 @@ export function LineEditor({
           </select>
         </Field>
       )}
-      {kind === "vless" && protocol === "vless" && (
-        <Field label="安全方式">
-          <select className="select" value={tls === "off" ? "off" : "tls"} onChange={(e) => setTls(e.target.value === "off" ? "off" : "auto")}>
-            <option value="off">REALITY + Vision</option>
-            <option value="tls">TLS + Vision</option>
-          </select>
-        </Field>
-      )}
+      <Field label="本机 IP 或域名" hint={showTls ? "自动申请并续期 SSL 证书；域名需解析到本机，TCP 80 需开放。" : protocol === "vless" ? "使用 REALITY，无需域名和证书。" : protocol === "trojan" ? "填写域名后自动申请 SSL 证书。" : "客户端通过此地址连接本机。"}>
+        <Input value={host} onChange={e => { setHost(e.target.value); setCertificate("auto"); }} required placeholder="本机公网 IP 或域名" />
+      </Field>
+      <details className="details">
+        <summary>监听端口 · 自动分配</summary>
+        <Field label="监听端口" hint="留空自动选择空闲端口"><Input name="port" type="number" min={1} max={65535} defaultValue={line?.hops[0]?.port} placeholder="自动分配" /></Field>
+      </details>
       {kind === "vless" && ["http", "socks", "trojan"].includes(protocol) && <details className="details">
         <summary>账号与密码 · 高级</summary>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -276,30 +158,23 @@ export function LineEditor({
       )}
       </details>}
       {showTls && (
-        <section className="space-y-4 rounded-xl border border-border p-4">
-          <Field label="TLS 证书域名">
-            <Input
-              name="domain"
-              defaultValue={line?.access.tls.domain}
-              placeholder="app.example.com"
-              required
-            />
-          </Field>
+        <details className="details"><summary>证书 · 自动申请与续期</summary>
           <Field label="HTTPS / 证书">
             <select
               className="select"
               value={tls}
               onChange={(e) => {
-                setTls(e.target.value);
+                setCertificate(e.target.value);
               }}
             >
               <option value="auto">自动申请与续期证书</option>
               <option value="manual">使用自己的证书</option>
+              {protocol === "vless" && <option value="off">REALITY（无需证书）</option>}
             </select>
           </Field>
           {tls === "auto" && (
             <p className="muted">
-              域名需解析到入口服务器，并放行 TCP 80 和监听端口。
+              域名需解析到本机，并放行 TCP 80 和监听端口。
             </p>
           )}
           {tls === "manual" && (
@@ -325,53 +200,26 @@ export function LineEditor({
               </Field>
             </>
           )}
-        </section>
-      )}
-      <details className="details" open={exit !== "direct" || undefined}>
-          <summary aria-label="代理路径">
-            {hops.map((h, i) => `${nodeName(h.node_id)}${hops.length > 1 ? `（${i === 0 ? "入口" : !externalId && i === hops.length - 1 ? "出口" : "中转"}）` : ""}`).join(" → ")}
-            {externalId && ` → ${state.externals.find((e) => e.id === externalId)?.name || "已有代理"}（出口）`}
-            {forward ? " → 转发目标" : " → 互联网"} · 修改
-          </summary>
-          <div className="space-y-3 pt-4">
-            <Field label={forward ? "经由服务器 / 代理" : "出口"}>
-              <select className="select" value={exit} onChange={(e) => setExit(e.target.value)}>
-                <option value="direct">{forward ? "入口直接连接转发目标" : "入口服务器直接出网"}</option>
-                {state.nodes.filter((n) => n.id !== hops[0].node_id).map((n) => (
-                  <option key={n.id} value={`node:${n.id}`} disabled={Boolean(externalId) && hops.length >= 8 && !middle.some((h) => h.node_id === n.id)}>{n.name}</option>
-                ))}
-                {state.externals.map((e) => <option key={e.id} value={`external:${e.id}`}>已有代理 · {e.name}</option>)}
-              </select>
-            </Field>
-            {importExternal && <Button type="button" variant="outline" onClick={() => importExternal((external) => {
-              if (external) setExit(`external:${external.id}`);
-            })}>粘贴已有代理</Button>}
-            {middle.map((h, index) => (
-              <div key={index} className="flex items-center gap-2">
-                <span className="text-xs text-slate-500">中转 {index + 1}</span>
-                <select className="select flex-1" aria-label={`中转 ${index + 1} 服务器`} value={h.node_id}
-                  onChange={(e) => update(index + 1, "node_id", e.target.value)}>
-                  {state.nodes.map((n) => <option key={n.id} value={n.id}
-                    disabled={hops.some((x, j) => j !== index + 1 && x.node_id === n.id)}>{n.name}</option>)}
-                </select>
-                <Input className="w-28" aria-label={`中转 ${index + 1} 端口`} value={h.port}
-                  type="number" min={1} max={65535} placeholder="自动端口" onChange={(e) => update(index + 1, "port", e.target.value)} />
-                <Button type="button" variant="ghost" size="icon" aria-label={`移除中转 ${index + 1}`}
-                  onClick={() => setHops(hops.filter((_, i) => i !== index + 1))}><X /></Button>
-              </div>
-            ))}
-            {exit !== "direct" && <Button type="button" variant="dashed" className="w-full"
-              disabled={!available || hops.length >= 8} onClick={() => {
-                if (!available) return;
-                const hop = { node_id: available.id, port: "" };
-                setHops(externalId ? [...hops, hop] : [...hops.slice(0, -1), hop, hops[hops.length - 1]]);
-              }}><Plus />添加中转</Button>}
-            {!externalId && hops.length > 1 && <Field label="出口监听端口" hint="留空自动分配">
-              <Input type="number" min={1} max={65535} value={hops[hops.length - 1].port}
-                onChange={(e) => update(hops.length - 1, "port", e.target.value)} />
-            </Field>}
-          </div>
         </details>
+      )}
+      <section className="space-y-3 rounded-xl border border-border p-4">
+        <Field label="出网方式"><select className="select" value={chain.length ? "chain" : "direct"} onChange={e => setChain(e.target.value === "direct" ? [] : [available?.id || ""])}>
+          <option value="direct">直接出网</option><option value="chain">链式代理</option>
+        </select></Field>
+        {chain.map((reference, index) => <div key={index} className="flex items-end gap-2">
+          <div className="min-w-0 flex-1"><Field label={`落地 ${index + 1}`}><select className="select" value={reference} onChange={e => setChain(chain.map((id, i) => i === index ? e.target.value : id))}>
+            <option value="" disabled>选择已有代理，或在下方导入</option>
+            {reference && !choices.some(c => c.id === reference) && <option value={reference}>当前代理不可用，请重新选择</option>}
+            {choices.map(c => <option key={c.id} value={c.id} disabled={chain.some((id, i) => i !== index && id === c.id)}>{c.name}</option>)}
+          </select></Field></div>
+          <Button type="button" variant="ghost" size="icon" aria-label={`移除落地 ${index + 1}`} onClick={() => setChain(chain.filter((_, i) => i !== index))}><X /></Button>
+        </div>)}
+        {chain.length > 0 && <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="outline" disabled={!available || chain.length >= 8} onClick={() => available && setChain([...chain, available.id])}><Plus />添加下一跳</Button>
+          {importExternal && <Button type="button" variant="outline" disabled={chain.filter(Boolean).length >= 8} onClick={() => importExternal(e => { if (e) setChain(old => [...old.filter(Boolean), `external:${e.id}`]); })}>导入落地代理</Button>}
+        </div>}
+        <p className="muted" aria-label="代理路径">客户端 → 本机{chain.map(id => ` → ${choices.find(c => c.id === id)?.name || "待选择落地"}`).join("")} → 互联网</p>
+      </section>
       <details
         className="details"
         open={
@@ -419,35 +267,6 @@ export function LineEditor({
           按入口上传＋下载统计，每月 1 日 UTC 重置；用尽停用。
         </p>
       </details>
-      {kind === "vless" && (
-        <details
-          className="details"
-          open={Boolean(line?.access.public_host) || undefined}
-        >
-          <summary>使用购买的中转入口</summary>
-          <p className="muted mt-3">
-            服务商已配置端口映射时填写，仅替换分享地址。
-          </p>
-          <div className="mt-4 grid gap-4 sm:grid-cols-[1fr_140px]">
-            <Field label="中转入口地址">
-              <Input
-                name="public_host"
-                defaultValue={line?.access.public_host}
-                placeholder="relay.example.com"
-              />
-            </Field>
-            <Field label="中转入口端口">
-              <Input
-                name="public_port"
-                type="number"
-                min={1}
-                max={65535}
-                defaultValue={line?.access.public_port ?? ""}
-              />
-            </Field>
-          </div>
-        </details>
-      )}
       <div className="flex flex-wrap gap-5 text-sm">
         <label className="flex items-center gap-2">
           <input

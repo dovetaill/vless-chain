@@ -173,12 +173,9 @@ def check(args):
             command = [sys.executable, '-B', ROOT / 'panel/scripts/verify.py', '--xray', xray, '--work-parent', work.root]
             if args.browser:
                 command.append('--browser')
-            if args.ssh:
-                command.append('--ssh')
             work.run(command, cwd=ROOT / 'panel')
     else:
         require(not args.browser, '--browser 需要配合 --full。')
-        require(not args.ssh, '--ssh 需要配合 --full。')
     print('所选检查已完成。' if args.full else '脚本检查已完成；完整前后端与链路验证使用 check --full。')
 
 
@@ -321,7 +318,6 @@ def main(argv=None):
         elif action == 'check':
             item.add_argument('--full', action='store_true')
             item.add_argument('--browser', action='store_true')
-            item.add_argument('--ssh', action='store_true', help='隔离 SSH 传包验证，需要 root 与 sshd')
         else:
             item.add_argument('--directory', type=Path)
             item.add_argument('--repo', required=True)

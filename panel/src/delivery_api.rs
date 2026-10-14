@@ -25,6 +25,22 @@ pub async fn export(State(app): State<App>, Path(id): Path<String>) -> ApiResult
         json!({"share":share(line,&doc)?,"node":format!("- {}\n", serde_json::to_string(&node)?)}),
     ))
 }
+pub async fn external_export(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let store = app.store.lock().unwrap();
+    let proxy = store
+        .doc
+        .externals
+        .iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "外部代理不存在"))?;
+    let node = chain_panel::external::mihomo(&proxy.url, &proxy.name)?;
+    Ok(Json(
+        json!({"share":proxy.url,"node":format!("- {}\n", serde_json::to_string(&node)?)}),
+    ))
+}
 #[derive(Deserialize)]
 pub struct SubscriptionInput {
     name: String,

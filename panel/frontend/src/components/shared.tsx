@@ -236,14 +236,11 @@ export function PathView({ line, state }: { line: Line; state: PanelState }) {
   const names = line.hops.map(
     (h) => state.nodes.find((n) => n.id === h.node_id)?.name || "已移除服务器",
   );
-  names.push(
-    line.external_id
-      ? state.externals.find((e) => e.id === line.external_id)?.name ||
-          "外部代理"
-      : line.kind === "vless"
-        ? "互联网"
-        : line.target,
-  );
+  const chain = line.chain?.length ? line.chain : line.external_id ? [`external:${line.external_id}`] : [];
+  names.push(...chain.map(reference => {
+    const [kind, id] = reference.split(":");
+    return (kind === "line" ? state.lines.find(l => l.id === id)?.name : state.externals.find(e => e.id === id)?.name) || "已移除代理";
+  }), "互联网");
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {names.map((name, i) => (

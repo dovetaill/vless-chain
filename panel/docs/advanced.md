@@ -2,19 +2,19 @@
 
 日常安装、接入和运维请先看 [上手指南](../README.md)。本页面向维护者、自动化调用和手工部署。
 
-个人自用的多服务器 Web 管理台。Rust 控制台负责线路编排、SQLite 状态与应用任务；Rust Agent 管理独立的 Xray 子进程以及入口网关，执行限速、配额和网站反代；React + TypeScript 前端使用已购买的 Metronic Tailwind 主题组件与布局。
+个人自用的本机代理 Web 管理台。Rust 控制台负责线路编排、SQLite 状态与应用任务；Rust Agent 管理独立的 Xray 子进程以及入口网关，执行限速、配额和网站反代；React + TypeScript 前端使用已购买的 Metronic Tailwind 主题组件与布局。
 
 本目录是新增功能。不会读取、导入、覆盖或停止原有 SSH 脚本创建的服务。没有复制 3x-ui 源码，也不依赖 3x-ui 运行。
 
 ## 当前能力
 
 - 同时管理多条独立 VLESS + REALITY + Vision 线路，每条 1–8 个受管节点，可共享物理节点，入口端口、UUID 和路径分别保存。
-- TCP、UDP、TCP + UDP 端口转发；多跳通过 Xray 的 VLESS 连接传送，最终节点连接固定目标。
+- 本机代理按顺序引用外部代理或其他本机代理，支持链式出网与循环检查。
 - 受管 HTTP、SOCKS5、SS2022、Trojan/TLS 代理；外部可导入 HTTP(S)、SOCKS5、Shadowsocks、Trojan TCP/TLS 和 VLESS TCP/raw、XHTTP TLS/REALITY 链接。
 - 原生 HTTP/HTTPS 网站反代、同端口多域名、WebSocket、手工证书和 Certbot webroot 自动申请/续期。
 - 默认保存并应用，支持草稿、端口冲突和循环检查、影响范围确认、逐节点应用、运行确认与失败恢复。每个 Agent 管理一个独立 Xray，多条线路共享进程；修改可能使其相关连接短暂重连。仅限速/额度变动支持在线更新。
 - 真实入口 HTTP/HTTPS 探测，以及 TCP/UDP 回显探测。后两者要求目标运行回显服务，不把端口连通当作整链成功。
-- 二维码、协议分享链接、完整 Mihomo YAML / 节点 YAML、可撤销订阅、购买中转入口端点替换。
+- 二维码、协议分享链接、完整 Mihomo YAML / 节点 YAML、可撤销订阅，支持导入单节点 Mihomo YAML / JSON。
 - 入口字节计量、UTC 月额度、上传/下载聚合限速、日流量、服务器指标与告警。限速覆盖整条线路的并发连接，不修改宿主机 qdisc。
 - 管理员密钥轮换、TOTP 与一次性恢复码、WebAuthn Passkey、同源 Cookie 会话、节点专属令牌与本地登录恢复。
 
@@ -93,17 +93,7 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 
 目标服务器需要 Linux、glibc、Python 3.10+、systemd、基础用户管理命令；无需 npm、Rust 或额外安装 Xray。发行包记录构建机的 glibc 版本，安装前会检查架构及 glibc 下限。需要兼容较旧发行版时，请在对应旧环境构建；目前不执行跨架构或 musl 构建。
 
-安装器只管理 `/opt/chain` 下有归属标识的安装、`chain-panel.service`、`chain-agent.service`、各自的 `/etc/chain-*` 与 `/var/lib/chain-*`。遇到同名的非本安装器目录或服务会拒绝覆盖。默认安装控制台并自动接入本机 Agent；只需控制台时使用 `--panel-only`。独立节点机器使用：
-
-```bash
-# 在 Web 创建服务器后，将一次性令牌写入私有文件。
-chmod 600 /root/node-token
-sudo ./scripts/install-server.sh install --component agent \
-  --panel-url https://panel.example.com \
-  --node-id 网页给出的节点UUID --token-file /root/node-token
-```
-
-推荐在 Web 添加服务器后复制接入码，在安装菜单中选择「接入节点」并粘贴；接入码输入不会回显，不需要手动保存令牌文件。以下参数用于自动化部署。控制台机器需要参与线路转发时，可再安装本机 Agent；两个组件独立选择版本、启动和升级。
+安装器只管理 `/opt/chain` 下有归属标识的安装、`chain-panel.service`、`chain-agent.service`、各自的 `/etc/chain-*` 与 `/var/lib/chain-*`。遇到同名的非本安装器目录或服务会拒绝覆盖。默认安装控制台并自动接入本机 Agent；只需控制台时使用 `--panel-only`。其他机器请自行通过 SSH 登录，运行默认安装命令，在该机器面板创建代理后将链接导入本面板；网页不执行 SSH 安装。
 
 安装会优先选择本地发行包，没有本地包时自动下载最新正式版本。`chainctl update` 默认下载最新正式包；本地包可显式指定：
 
@@ -189,36 +179,21 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 修改或删除 `admin-token` 后重启控制台可以轮换管理令牌；已登录会话会失效。控制台重启不会停止远端 Agent 已运行的流量。
 
-## 接入服务器
+## 本机接入
 
-1. 在「服务器与资源 → 我的服务器」添加名称、可达 IP/域名。REALITY 域名、端口和 SNI 位于高级选项，默认端口 443，独立输入。保存时生成密钥和只显示一次的节点令牌。
-2. 将节点令牌写入服务器私有文件，如 `/etc/chain-agent/token`，权限 600。安装二进制至独立路径。
-3. 配置环境变量并启动 Agent：
+安装器默认接入本机 Agent，面板使用安装器保存的身份恢复缺失记录。Agent 主动连接控制台，不开放管理端口。已有远端 Agent 的底层接口保留兼容，网页只管理本机代理与外部链接。
 
-```bash
-CHAIN_PANEL_URL=https://panel.example.com \
-CHAIN_NODE_ID=网页给出的节点UUID \
-CHAIN_NODE_TOKEN_FILE=/etc/chain-agent/token \
-CHAIN_AGENT_DIR=/var/lib/chain-agent \
-CHAIN_XRAY_BIN=/opt/chain/bin/xray \
-/opt/chain/bin/chain-agent
-```
-
-Agent 主动连接控制台，不开放管理监听端口，不需要控制台保存 SSH 密码。除 localhost 外默认要求 HTTPS；明确可信的私网可以设置 `CHAIN_ALLOW_HTTP=1`。同一台服务器多个 Agent 必须使用不同节点 ID、令牌、数据目录和业务监听端口。
-
-启动目录需由运行用户拥有；Agent 拒绝操作其他组件或非空无归属目录。每次应用先执行 `xray run -test -config`，随后只停止自己启动的 Xray。端口被已有服务占用时应用失败并恢复旧配置，不会结束占用者。
-
-手工部署可参考 `deploy/` 的独立 systemd 单元。安装脚本会生成带版本链接与归属标识的独立单元；以上模板无需另行安装。Agent 停止会同时停止其 Xray；断开与控制台的连接则继续使用上次成功配置。
+每次应用先执行 `xray run -test -config`，随后只停止自己启动的 Xray。端口被已有服务占用时应用失败并恢复旧配置，不会结束占用者。
 
 ## 创建与修改线路
 
-在「代理接入」或「端口转发」添加规则；默认单服务器直接出网，需要时展开中转路径，端口留空自动分配。普通转发目标地址与端口分开填写。仅改变后续路径会保留已有入口端口与 UUID，名称变化会改变分享链接名称片段。
+在「代理」新建本机代理；默认直接出网，需要时按顺序选择落地，端口留空自动分配。仅改变后续路径会保留已有入口端口与 UUID，名称变化会改变分享链接名称片段。
 
-默认保存后自动应用；会影响其他共享线路时确认影响范围。需要暂缓时勾选「仅保存草稿」。应用先尝试下游节点，多条交叉路径共享节点时不提供分布式原子切换，相关连接可能重连。API 保留 preview/publish 以兼容自动化。
+默认保存后自动应用；会影响其他共享线路时确认影响范围。应用先尝试下游节点，多条交叉路径共享节点时不提供分布式原子切换，相关连接可能重连。API 保留 preview/publish 以兼容自动化。
 
 失败会按快照恢复已尝试节点。控制台在发布中重启，也会转入恢复流程。离线节点的恢复配置保留，状态显示 `degraded`，待 Agent 回来确认后更新为 `rolled_back`。恢复属于尽力补偿；节点长期离线时不会显示成功。
 
-应用完成后从「接入」扫码、复制链接或下载 Mihomo 配置；转发规则提供原业务入口地址。在更多操作或「监控与告警」按需检查连接。检查与导出使用已应用快照，草稿不会被导出为可用配置。
+应用完成后从「分享」扫码、复制链接或下载 Mihomo 节点。在代理的更多操作中检查连接。检查与导出使用已应用快照，草稿不会被导出为可用配置。
 
 ## 验证
 
@@ -234,7 +209,7 @@ Agent 主动连接控制台，不开放管理监听端口，不需要控制台�
 
 `traffic.json` 持久化线路计量，约每 2 秒写入并在正常退出前保存；`active.json` 保存已应用版本。Agent 上报网关能力和已占用 TCP/UDP 端口，自动端口分配避开这些端口。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
 
-自动证书在 Agent 数据目录的 `acme/` 下，Certbot 使用独立 config/work/logs/web 路径，以 Agent 用户执行；可用 `CHAIN_CERTBOT_BIN` 指定程序位置。自动证书要求 Agent 可以独占 TCP 80（或已运行自己的 80 网站），不会改动已有 Nginx。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
+自动证书在 Agent 数据目录的 `acme/` 下，Certbot 使用独立 config/work/logs/web 路径，以 Agent 用户执行；可用 `CHAIN_CERTBOT_BIN` 指定程序位置。安装器安装 Nginx，由独立 ACME 站点将验证请求路由至 `/var/lib/chain-acme/{agent,panel}`；`CHAIN_ACME_WEBROOT` 指定对应目录，Agent 无需监听 TCP 80。手工部署未设置此变量时仍使用独立挑战监听。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
 
 控制台订阅 token 和恢复码只保存哈希；TOTP 秘钥和业务证书需要在私有数据目录中保留原文。Passkey 使用 webauthn-rs 的挑战、来源、用户验证和签名检查，挑战有有效期且单次使用。管理员密钥轮换会退出全部会话；本地 `chainctl reset-auth` 先备份并停止控制台，再清除登录二步验证配置，保留业务数据。
 
@@ -252,10 +227,8 @@ Agent 主动连接控制台，不开放管理监听端口，不需要控制台�
 
 接入码只是将控制台地址、节点 UUID 和节点令牌合并成一份可复制凭据，不是临时兑换码；它没有单独有效期，节点重置令牌后失效。接入码不进入 shell 参数或历史，只通过隐藏输入交给向导。重新接入会保存新身份并重启 Agent，受其管理的流量可能短暂重连。HTTP 接入需要在向导中明确确认可信私网。
 
-## Web 远程安装与本机自动接入
+## 本机自动接入与升级
 
-控制台安装默认附带本机 Agent，通过本机 API 创建节点并保存节点凭据；重复安装不覆盖已安装 Agent 的身份。控制台与 Agent 仍有独立服务与升级操作。只需控制台时使用高级参数 `--panel-only`；本机对外地址与 REALITY 目标可用 `--local-host`、`--local-target` 指定。默认 REALITY 目标为 www.microsoft.com:443，需按实际网络确认可达，之后也可在 Web 编辑。
+控制台安装默认附带本机 Agent，通过本机 API 创建记录并保存身份。升级同时更新匹配本机控制台的 Agent，保留原节点 ID 和令牌；恢复文件只保存令牌哈希。只需控制台时使用 `--panel-only`；本机对外地址与 REALITY 目标可用 `--local-host`、`--local-target` 指定。
 
-Web 的「接入服务器」提供 SSH 安装：使用节点记录的 IP/域名，填写 root 密码或无口令私钥，检测并核对 SSH 指纹后安装。服务端以严格主机密钥校验连接，SSH 凭据只写入私有临时目录，任务结束删除，不入数据库；节点令牌通过 SSH 加密通道传递，不放在命令参数中。安装器上传控制台自身校验过的发行文件，所以控制台和节点须为兼容架构、满足包内 glibc 下限。其他架构可在节点上使用在线安装向导获取对应包。
-
-控制台安装器会补齐 openssh-client、tar、gzip；运行环境需要 `CHAIN_RELEASE_DIR` 指向完整的已安装发行目录，该变量由安装器配置。直接运行开发二进制时不可使用 Web 传包安装。Web 只确认安装进程成功，最终接入以心跳显示在线为准；SSH 超时或失败时在节点通过 chainctl 查看状态。
+网页 SSH 安装、购买中转入口、端口转发页面已移除。其他服务器由用户自行 SSH 登录安装，再以外部代理链接接入链式路径。

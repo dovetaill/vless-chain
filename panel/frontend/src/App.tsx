@@ -7,7 +7,6 @@ import {
   type FormEvent,
 } from "react";
 import {
-  ArrowLeftRight,
   ArrowRight,
   Bell,
   ChevronLeft,
@@ -31,9 +30,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { api, ApiError } from "./api";
-import { AgentSetup } from "./components/agent-setup";
 import { LineEditor } from "./components/line-editor";
-import { AccessDialog, QR } from "./components/access-dialog";
+import { AccessDialog } from "./components/access-dialog";
 import { SecuritySettings } from "./components/security-settings";
 import {
   Modal,
@@ -62,8 +60,7 @@ import type {
 
 const pages = [
   { id: "lines", label: "代理", icon: Network },
-  { id: "forward", label: "端口转发", icon: ArrowLeftRight },
-  { id: "nodes", label: "服务器", icon: Server },
+  { id: "nodes", label: "外部代理", icon: Server },
   { id: "settings", label: "设置", icon: Settings },
 ] as const;
 type Page = (typeof pages)[number]["id"];
@@ -102,7 +99,7 @@ function ProbeEditor({
   close: () => void;
   saved: () => Promise<void>;
 }) {
-  const [mode, setMode] = useState(line.kind === "forward" ? "tcp" : "http");
+  const [mode, setMode] = useState("http");
   const [result, setResult] = useState<CheckResult | null>(null);
   return (
     <Modal
@@ -129,14 +126,8 @@ function ProbeEditor({
             setResult(null);
           }}
         >
-          <option value="tcp">入口 TCP 连通</option>
+          <option value="tcp">代理端口连通</option>
           <option value="http">HTTP / HTTPS 响应</option>
-          {line.kind === "forward" && (
-            <>
-              <option value="tcp_echo">TCP 回显（需要回显服务）</option>
-              <option value="udp_echo">UDP 回显（需要回显服务）</option>
-            </>
-          )}
         </select>
       </Field>
       {mode === "http" && line.kind !== "website" && (
@@ -151,7 +142,7 @@ function ProbeEditor({
       )}
       <p className="muted">
         TCP 连通只说明端口可连接。HTTP
-        检查会验证实际请求；回显检查需要目标运行相应回显服务。
+        检查会验证实际请求。
       </p>
       {result && (
         <div
@@ -181,10 +172,9 @@ export function App() {
   );
   const [search, setSearch] = useState("");
   const [modal, setModal] = useState<ReactNode>(null);
-  const [editor, setEditor] = useState<{ kind: Line["kind"]; line?: Line; initialNodeId?: string } | null>(null);
+  const [editor, setEditor] = useState<{ kind: Line["kind"]; line?: Line; initialChain?: string[] } | null>(null);
   const [toast, setToast] = useState("");
   const [pendingShare, setPendingShare] = useState<string | null>(null);
-  const [pendingLocal, setPendingLocal] = useState<{ id: string; done: (node?: NodeInfo) => void } | null>(null);
   const [loginError, setLoginError] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
   const [loginNotice, setLoginNotice] = useState("");
@@ -247,15 +237,6 @@ export function App() {
       setPendingShare(null);
     }
   }, [pendingShare, state]);
-  useEffect(() => {
-    if (!pendingLocal || !state) return;
-    const node = state.nodes.find((item) => item.id === pendingLocal.id);
-    if (node?.online) {
-      setPendingLocal(null);
-      setModal(null);
-      pendingLocal.done(node);
-    }
-  }, [pendingLocal, state]);
   const navigate = (next: string) => {
     location.hash = next;
     setMobile(false);
@@ -268,25 +249,11 @@ export function App() {
       setToast(errorText(e));
     }
   };
-  const copy = async (value: string) => {
-    if (navigator.clipboard && window.isSecureContext)
-      await navigator.clipboard.writeText(value);
-    else {
-      const el = document.createElement("textarea");
-      el.value = value;
-      document.body.appendChild(el);
-      el.select();
-      document.execCommand("copy");
-      el.remove();
-    }
-    setToast("已复制");
-  };
   const sessionEnded = (message = "") => {
     setLoginNotice(message);
     setState(null);
     setEditor(null);
     setPendingShare(null);
-    setPendingLocal(null);
     close();
   };
   async function apply(id?: string, share = false) {
@@ -296,7 +263,7 @@ export function App() {
       setModal(
         <Modal
           title="应用这些修改"
-          description="以下代理或转发共用服务器，应用时可能短暂重连。"
+          description="以下代理共用本机，应用时可能短暂重连。"
           submit="确认并应用"
           close={close}
           action={async () => {
@@ -323,197 +290,34 @@ export function App() {
       setToast("正在应用，请在当前页面查看结果。");
     }
   }
-  function editLine(kind: Line["kind"], line?: Line, initialNodeId?: string) {
+  function editLine(kind: Line["kind"], line?: Line, initialChain?: string[]) {
     if (!state) return;
-    setEditor({ kind, line, initialNodeId });
+    setEditor({ kind, line, initialChain });
   }
-  function addLocalServer(done: (node?: NodeInfo) => void) {
-    setModal(<Modal title="设置本机" submit="启用本机" close={() => { close(); done(); }} action={async (data) => {
-      const value = await api<{ id: string }>("/local-node", "POST", { host: field(data, "host") });
-      setPendingLocal({ id: value.id, done });
-      setModal(<Modal title="正在连接本机" close={() => { setPendingLocal(null); close(); done(); }}>
-        <p role="status">等待本机上线…</p>
-        <Button type="button" variant="outline" onClick={() => void refresh()}>刷新状态</Button>
-      </Modal>);
+  async function ensureLocalServer(host: string): Promise<NodeInfo> {
+    const current = state?.nodes.find(n => n.id === state.local_node_id);
+    if (current?.online) return current;
+    const value = await api<{ id: string }>("/local-node", "POST", { host });
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const next = await api<PanelState>("/state");
+      setState(next);
+      const node = next.nodes.find(n => n.id === value.id);
+      if (node?.online) return node;
+      if (node?.report.error) throw new Error(node.report.error);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    throw new Error("本机未能上线，请在本机执行 chainctl 查看服务状态后重试。已填写的代理配置已保留。");
+  }
+  function importExternal(done?: (external?: External) => void) {
+    setModal(<Modal title="导入外部代理" description="粘贴分享链接或单个 Mihomo / Clash YAML、JSON 节点。" submit="导入" close={() => { close(); done?.(); }} action={async data => {
+      const value = await api<External>("/externals", "POST", { name: field(data, "name"), url: field(data, "url") });
       await refresh();
+      if (done) { close(); done(value); return; }
+      setModal(<AccessDialog external={value} state={state!} close={close} />);
     }}>
-      <Field label="本机公网 IP 或域名">
-        <Input name="host" placeholder="例如：203.0.113.10" required />
-      </Field>
+      <Field label="名称" hint="留空使用节点中的名称"><Input name="name" maxLength={80} placeholder="自动识别" /></Field>
+      <Field label="链接或 Mihomo 节点"><textarea className="textarea mono" name="url" rows={7} placeholder={'vless://…\n或 - {name: 落地 A, type: vless, server: …}'} required /></Field>
     </Modal>);
-  }
-  function nodeEditor(node?: NodeInfo, done?: (node?: NodeInfo) => void) {
-    const [host, port] = splitAddress(node?.target || "www.microsoft.com:443");
-    setModal(
-      <Modal
-        title={node ? "编辑服务器" : "添加远程服务器"}
-
-        submit={node ? "保存" : "下一步：SSH 安装"}
-        close={() => { close(); done?.(); }}
-        action={async (data) => {
-          const value = await api<{ id: string; token: string }>(
-            node ? `/nodes/${node.id}` : "/nodes",
-            "POST",
-            {
-              name: field(data, "name"),
-              host: field(data, "host"),
-              target: endpoint(
-                field(data, "target_host"),
-                field(data, "target_port"),
-              ),
-              server_name:
-                field(data, "server_name") || field(data, "target_host"),
-            },
-          );
-          await refresh();
-          if (node) {
-            close();
-            setToast("服务器信息已保存；关联配置修改需应用后生效。");
-          } else
-            setModal(
-              <Modal
-                title="安装并接入服务器"
-
-                close={() => { close(); done?.(); }}
-              >
-                <AgentSetup id={value.id} token={value.token} host={field(data, "host")} copy={copy}
-                  onOnline={done ? async (node) => { await refresh(); close(); done(node); } : undefined} />
-              </Modal>,
-            );
-        }}
-      >
-        <Field label="服务器名称">
-          <Input
-            name="name"
-            defaultValue={node?.name}
-            placeholder="例如：香港服务器"
-            required
-            maxLength={80}
-          />
-        </Field>
-        <Field label="公网 IP 或域名">
-          <Input
-            name="host"
-            defaultValue={node?.host}
-            placeholder="例如：192.0.2.10"
-            required
-          />
-        </Field>
-        <details className="details">
-          <summary>高级：REALITY 伪装站点</summary>
-          <p className="muted mt-3">
-            代理和多服务器中转使用此默认设置。普通单服务器端口转发无需填写。
-          </p>
-          <div className="mt-4 grid gap-4 sm:grid-cols-[1fr_130px]">
-            <Field label="目标域名">
-              <Input name="target_host" defaultValue={host} required />
-            </Field>
-            <Field label="目标端口">
-              <Input
-                name="target_port"
-                type="number"
-                min={1}
-                max={65535}
-                defaultValue={port}
-                required
-              />
-            </Field>
-          </div>
-          <div className="mt-4">
-            <Field label="SNI" hint="留空时使用目标域名。">
-              <Input
-                name="server_name"
-                defaultValue={node?.server_name}
-                placeholder="自动使用目标域名"
-              />
-            </Field>
-          </div>
-        </details>
-      </Modal>,
-    );
-  }
-  function importExternal(relay = false, done?: (external?: External) => void) {
-    setModal(
-      <Modal
-        title={relay ? "使用购买的中转入口" : "导入已有代理"}
-        description={
-          relay
-            ? "先在服务商处配置好转发目标，再用这里生成经过中转的新链接。"
-            : "粘贴已有代理的分享链接。"
-        }
-        submit="导入"
-        close={() => { close(); done?.(); }}
-        action={async (data) => {
-          const value = await api<External>("/externals", "POST", {
-            name: field(data, "name"),
-            url: field(data, "url"),
-            relay_host: field(data, "relay_host"),
-            relay_port: field(data, "relay_port")
-              ? Number(field(data, "relay_port"))
-              : null,
-          });
-          await refresh();
-          if (done) { close(); done(value); return; }
-          setModal(
-            <Modal
-              title="代理已导入"
-              description="可用于客户端，也可选作代理出口。"
-              close={close}
-            >
-              <QR value={value.url} />
-              <textarea
-                className="textarea mono"
-                readOnly
-                rows={4}
-                value={value.url}
-              />
-              <CopyButton value={value.url} label="复制代理链接" />
-            </Modal>,
-          );
-        }}
-      >
-        <Field label="名称">
-          <Input
-            name="name"
-            required
-            maxLength={80}
-            placeholder={relay ? "购买的中转线路" : "已有代理出口"}
-          />
-        </Field>
-        <Field
-          label={relay ? "原节点完整分享链接" : "完整分享链接"}
-          hint="支持 VLESS、HTTP(S)、SOCKS5、Shadowsocks、Trojan。"
-        >
-          <textarea
-            className="textarea mono"
-            name="url"
-            rows={4}
-            placeholder="vless://… 或 socks5://用户名:密码@地址:端口"
-            required
-          />
-        </Field>
-        {relay && (
-          <div className="grid gap-4 sm:grid-cols-[1fr_130px]">
-            <Field label="中转入口地址">
-              <Input
-                name="relay_host"
-                placeholder="relay.example.com"
-                required
-              />
-            </Field>
-            <Field label="中转入口端口">
-              <Input
-                name="relay_port"
-                type="number"
-                min={1}
-                max={65535}
-                required
-              />
-            </Field>
-          </div>
-        )}
-      </Modal>,
-    );
   }
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -652,8 +456,7 @@ export function App() {
       </div>
     );
   const current = pages.find((p) => p.id === page)!;
-  const kind: Line["kind"] =
-    page === "forward" ? "forward" : "vless";
+  const kind: Line["kind"] = "vless";
   const lines = state.lines.filter(
     (l) =>
       l.kind === kind && l.name.toLowerCase().includes(search.toLowerCase()),
@@ -782,10 +585,10 @@ export function App() {
                 {current.label}
               </h1>
             </div>
-            {["lines", "forward"].includes(page) && (
+            {page === "lines" && (
               <Button disabled={state.busy} onClick={() => editLine(kind)}>
                 <Plus />
-                {kind === "vless" ? "创建代理" : "创建转发"}
+                新建代理
               </Button>
             )}
           </div>
@@ -808,11 +611,11 @@ export function App() {
               </p>
             </div>
           )}
-          {["lines", "forward"].includes(page) && (
+          {page === "lines" && (
             <Card>
               <CardHeader>
                 <CardTitle>
-                  {kind === "vless" ? "我的代理" : "端口转发"}{" "}
+                  我的代理{" "}
                   <span className="ms-2 text-sm font-normal text-slate-400">
                     {lines.length}
                   </span>
@@ -905,7 +708,7 @@ export function App() {
                                   )
                                 }
                               >
-                                {l.kind === "forward" ? "入口" : "分享"}
+                                分享
                               </Button>
                               <Button
                                 variant="ghost"
@@ -958,7 +761,7 @@ export function App() {
                                       onSelect={() =>
                                         setModal(
                                           <Modal
-                                            title="删除代理或转发"
+                                            title="删除代理"
                                             description={`删除「${l.name}」并应用配置后，该入口停止服务。`}
                                             submit="删除并应用"
                                             close={close}
@@ -991,15 +794,13 @@ export function App() {
                   title={
                     search
                       ? "没有匹配结果"
-                      : kind === "forward"
-                        ? "暂无端口转发"
-                        : "暂无代理"
+                      : "暂无代理"
                   }
                   action={
                     !search && (
                       <Button onClick={() => editLine(kind)}>
                         <Plus />
-                        {kind === "forward" ? "创建转发" : "创建代理"}
+                        新建代理
                       </Button>
                     )
                   }
@@ -1024,120 +825,10 @@ export function App() {
           )}
           {page === "nodes" && (
             <div className="space-y-6">
-              <div className="flex flex-wrap gap-2">
-                <Button disabled={state.busy} onClick={() => nodeEditor()}><Plus />添加远程服务器</Button>
-                <Button variant="outline" onClick={() => importExternal()}>导入已有代理</Button>
-                <Button variant="ghost" onClick={() => importExternal(true)}>添加中转入口</Button>
-              </div>
-              <div className="grid gap-5 xl:grid-cols-2">
-                {state.nodes.map((n) => (
-                  <Card key={n.id}>
-                    <CardHeader>
-                      <CardTitle className="flex items-center gap-2">
-                        <Server className="size-4 text-blue-600" />
-                        {n.name}
-                      </CardTitle>
-                      <Status tone={n.online ? "good" : "warn"}>
-                        {n.online ? "在线" : "未连接"}
-                      </Status>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                      <p className="mono text-sm text-slate-600">{n.host}</p>
-                      <div className="grid grid-cols-2 gap-4 rounded-lg bg-slate-50 p-3 text-xs">
-                        <div>
-                          <p className="text-slate-400">服务状态</p>
-                          <p className="mt-1.5">
-                            {n.report.running ? "运行中" : "尚未运行"}
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-slate-400">最后心跳</p>
-                          <p className="mt-1.5">{stamp(n.seen)}</p>
-                        </div>
-                      </div>
-                      {n.report.error && (
-                        <p className="text-xs leading-6 text-red-600">
-                          {n.report.error}
-                        </p>
-                      )}
-                      <div className="flex flex-wrap gap-2">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={state.busy}
-                          onClick={() => nodeEditor(n)}
-                        >
-                          编辑信息
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={state.busy || n.id === state.local_node_id}
-                          onClick={() =>
-                            setModal(
-                              <Modal
-                                title="重新接入服务器"
-                                description="将重新配置 SSH 连接，现有连接凭据会失效。"
-                                submit="继续 SSH 连接"
-                                close={close}
-                                action={async () => {
-                                  const result = await api<{ token: string }>(
-                                    `/nodes/${n.id}/token`,
-                                    "POST",
-                                    {},
-                                  );
-                                  setModal(
-                                    <Modal
-                                      title="重新接入服务器"
-                                      description={n.name}
-                                      close={close}
-                                    >
-                                      <AgentSetup
-                                        id={n.id}
-                                        token={result.token}
-                                        host={n.host}
-                                        copy={copy}
-                                      />
-                                    </Modal>,
-                                  );
-                                }}
-                              />,
-                            )
-                          }
-                        >
-                          重新接入
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          aria-label={`删除服务器 ${n.name}`}
-                          disabled={state.busy || n.id === state.local_node_id}
-                          onClick={() =>
-                            setModal(
-                              <Modal
-                                title="删除服务器"
-                                description={`移除「${n.name}」的管理记录。关联规则需先删除并应用。`}
-                                submit="删除服务器"
-                                close={close}
-                                action={async () => {
-                                  await api(`/nodes/${n.id}`, "DELETE");
-                                  await refresh();
-                                  close();
-                                }}
-                              />,
-                            )
-                          }
-                        >
-                          <Trash2 />
-                        </Button>
-                      </div>
-                    </CardContent>
-                  </Card>
-                ))}
-              </div>
+              <Button onClick={() => importExternal()}><Plus />导入外部代理</Button>
               <Card>
                 <CardHeader>
-                  <CardTitle>已有代理</CardTitle>
+                  <CardTitle>外部代理</CardTitle>
                 </CardHeader>
                 <CardContent>
                   {state.externals.length ? (
@@ -1149,11 +840,12 @@ export function App() {
                         <div>
                           <p className="text-sm font-medium">{e.name}</p>
                           <p className="mt-1 text-xs text-slate-400">
-                            {e.url.split(":")[0].toUpperCase()} · 由提供方管理
+                            {e.url.split(":")[0].toUpperCase()} · 已导入
                           </p>
                         </div>
                         <div className="flex gap-2">
-                          <CopyButton value={e.url} label="复制链接" />
+                          <Button variant="outline" onClick={() => setModal(<AccessDialog external={e} state={state} close={close} />)}>链接 / Mihomo</Button>
+                          <Button variant="outline" onClick={() => editLine("vless", undefined, [`external:${e.id}`])}>用于新建代理</Button>
                           <Button
                             variant="ghost"
                             size="icon"
@@ -1203,9 +895,8 @@ export function App() {
       {editor && <LineEditor
         {...editor}
         state={state}
-        addServer={(done) => nodeEditor(undefined, done)}
-        addLocalServer={addLocalServer}
-        importExternal={(done) => importExternal(false, done)}
+        ensureLocalServer={ensureLocalServer}
+        importExternal={importExternal}
         close={() => setEditor(null)}
         saved={async (value) => {
           await refresh();

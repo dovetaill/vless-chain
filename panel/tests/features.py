@@ -65,7 +65,7 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     old = h.request('/api/nodes', 'POST', {'name': '旧版本兼容检查', 'host': '127.0.0.1'})
     h.request(f"/api/agent/{old['id']}/sync", 'POST', {'running': True, 'applied': True, 'revision': '', 'error': ''},
               authenticated=False, headers={'Authorization': 'Bearer ' + old['token']})
-    legacy = h.request('/api/lines', 'POST', {'name': '旧 Agent 保护', 'kind': 'forward', 'target': f'127.0.0.1:{echo_port}',
+    legacy = h.request('/api/lines', 'POST', {'name': '旧 Agent 保护', 'kind': 'vless',
                       'hops': [{'node_id': old['id'], 'port': h.port()}]})
     assert 'Agent' in h.request('/api/publish', 'POST', {}, status=400)['error']
     h.request('/api/lines/' + legacy['id'], 'DELETE')
@@ -89,13 +89,13 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
         "hops": site["hops"], "target": f"http://127.0.0.1:{port}/other",
         "access": {"tls": {"mode": "off", "domain": "other.example.test"}}})
     secure_site = create("HTTPS 网站", "website", target=f"http://127.0.0.1:{port}", access={"tls": tls})
-    limited = create("共享带宽验证", "forward", target=f"127.0.0.1:{echo_port}", network="tcp,udp",
+    limited = create("共享带宽验证", access={"protocol": "socks"},
                      limits={"upload_mbps": 0.8, "download_mbps": 0.8})
-    plain = create("普通端口转发", "forward", target=f"127.0.0.1:{echo_port}", network="tcp,udp")
-    quota = create("月额度验证", "forward", target=f"127.0.0.1:{echo_port}", network="tcp,udp",
-                   limits={"monthly_gib": 1024 / 1073741824})
+    plain = create("普通 SOCKS5 代理", access={"protocol": "socks"})
+    quota = create("月额度验证", access={"protocol": "socks"},
+                   limits={"monthly_gib": 8192 / 1073741824})
     occupied = next(n for n in h.state()['nodes'] if n['id'] == nodes[0]['id'])['report']['system']['listening_ports']
-    automatic = h.request('/api/lines', 'POST', {'name': '自动端口分配', 'kind': 'forward',
+    automatic = h.request('/api/lines', 'POST', {'name': '自动端口分配', 'kind': 'vless',
         'target': f'127.0.0.1:{echo_port}', 'hops': [{'node_id': nodes[0]['id']}]})
     allocated = automatic['hops'][0]['port']
     assert allocated not in occupied, 'Automatic port conflicts with an existing host listener'
@@ -104,7 +104,7 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     h.publish()
     for line in lines:
         h.probe(line)
-    h.probe(automatic, 'tcp_echo')
+    h.probe(automatic)
     print("PASS real HTTP, authenticated SOCKS5 and Shadowsocks 2022 proxy connections", flush=True)
     h.probe(vless_tls)
     print("PASS real VLESS TLS + Vision with certificate verification", flush=True)
@@ -185,6 +185,13 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
 
     def echo(line, count):
         with socket.create_connection(("127.0.0.1", line["hops"][0]["port"]), timeout=15) as sock:
+            sock.sendall(b"\x05\x01\x02")
+            assert receive(sock, 2) == b"\x05\x02"
+            user, password = line["access"]["username"].encode(), line["access"]["password"].encode()
+            sock.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(password)]) + password)
+            assert receive(sock, 2) == b"\x01\x00"
+            sock.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", echo_port))
+            assert receive(sock, 10)[:2] == b"\x05\x00"
             data = b"x" * count
             sock.sendall(data)
             assert receive(sock, count) == data
@@ -196,11 +203,15 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     started = time.monotonic()
     echo(plain, 200000)
     assert time.monotonic() - started < 1.5
-    h.probe(limited, "udp_echo")
-    echo(quota, 512)
+    h.probe(limited)
+    for _ in range(6):
+        try:
+            echo(quota, 1024)
+        except (AssertionError, OSError):
+            break
     def exhausted():
         line = next(l for l in h.state()["lines"] if l["id"] == quota["id"])
-        return line.get("traffic", {}).get("upload", 0) + line.get("traffic", {}).get("download", 0) >= 1024
+        return line.get("traffic", {}).get("upload", 0) + line.get("traffic", {}).get("download", 0) >= 8192
     h.wait(exhausted, "quota measurement")
     with socket.create_connection(("127.0.0.1", quota["hops"][0]["port"]), timeout=3) as sock:
         try:
@@ -222,7 +233,7 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     agents[0] = h.launch("agent-counter-restart", h.bin_dir / "chain-agent", agent_envs[0])
     h.wait(lambda: any(n["id"] == nodes[0]["id"] and n["seen"] > stopped_at and n["report"]["running"] for n in h.state()["nodes"]), "Agent restart")
     h.wait(exhausted, "persisted quota")
-    h.probe(plain, "tcp_echo")
+    h.probe(plain)
     print("PASS 8-connection aggregate bandwidth, unaffected line, TCP/UDP, quota persistence and live limit updates", flush=True)
 
     for line in lines + [trojan, vless_tls]:
@@ -234,9 +245,11 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     assert b'proxies:' in h.request(sub['path'], authenticated=False)
     h.request('/api/subscriptions/' + sub['id'], 'DELETE')
     h.request(sub['path'], status=404, authenticated=False)
-    relay = h.request('/api/externals', 'POST', {'name': '购买的中转入口', 'url': f"trojan://secret@original.example:443?security=tls", 'relay_host': 'relay.example', 'relay_port': 12345})
-    assert 'relay.example:12345' in relay['url'] and 'sni=original.example' in relay['url']
-    print("PASS exports, Mihomo subscription and revocation, bought-port endpoint replacement", flush=True)
+    exported = h.request(f"/api/lines/{lines[2]['id']}/export")
+    external = h.request('/api/externals', 'POST', {'url': exported['node']})
+    imported = h.request(f"/api/externals/{external['id']}/export")
+    assert json.loads(imported['node'][2:])['type'] == 'ss'
+    print("PASS exports, Mihomo import/export, subscription and revocation", flush=True)
     if os.environ.get('CHAIN_TEST_MIHOMO'):
         from mihomo import exercise as test_mihomo
         test_mihomo(h, lines + [trojan, vless_tls])

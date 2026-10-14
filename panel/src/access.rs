@@ -22,6 +22,30 @@ fn b64(s: &str) -> Result<String> {
         .or_else(|_| STANDARD_NO_PAD.decode(s.trim_end_matches('=')))?;
     Ok(String::from_utf8(bytes)?)
 }
+pub fn external_tls(stream: &mut Value, url: &Url) -> Result<()> {
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "allowInsecure" | "insecure" => {
+                ensure!(
+                    matches!(value.as_ref(), "true" | "false" | "1" | "0"),
+                    "allowInsecure 参数无效"
+                );
+                ensure!(
+                    matches!(value.as_ref(), "false" | "0"),
+                    "当前 Xray 不支持跳过证书验证，请使用有效证书并设置 skip-cert-verify: false"
+                );
+            }
+            "alpn" => {
+                stream["tlsSettings"]["alpn"] = json!(value.split(',').collect::<Vec<_>>());
+            }
+            "fp" => {
+                stream["tlsSettings"]["fingerprint"] = json!(value);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 pub fn external(link: &str, tag: &str) -> Result<Value> {
     let mut u = Url::parse(link).context("请输入完整代理链接")?;
     if u.scheme() == "ss" && u.host_str().is_some() && u.username().is_empty() {
@@ -41,7 +65,7 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
     ensure!(port > 0, "端口必须大于 0");
     let user = decode(u.username())?;
     let pass = decode(u.password().unwrap_or_default())?;
-    let result = match u.scheme() {
+    let mut result = match u.scheme() {
         "http" | "https" | "socks" | "socks5" => {
             let mut server = json!({"address":host,"port":port});
             if !user.is_empty() {
@@ -78,7 +102,8 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
         }
         "ss" => {
             ensure!(
-                u.query().is_none_or(|q| q.is_empty()),
+                u.query_pairs()
+                    .all(|(key, _)| matches!(key.as_ref(), "tfo" | "udp")),
                 "暂不支持 Shadowsocks 插件参数"
             );
             let credential = if u.password().is_some() {
@@ -105,10 +130,30 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
         }
         _ => bail!("支持 VLESS、HTTP(S)、SOCKS5、Shadowsocks 和 Trojan 链接"),
     };
+    if result["streamSettings"]["security"] == "tls" {
+        external_tls(&mut result["streamSettings"], &u)?;
+    }
+    for (key, value) in u.query_pairs() {
+        if key == "tfo" {
+            ensure!(
+                matches!(value.as_ref(), "true" | "false" | "1" | "0"),
+                "tfo 参数无效"
+            );
+            if result.get("streamSettings").is_none() {
+                result["streamSettings"] = json!({});
+            }
+            result["streamSettings"]["sockopt"] =
+                json!({"tcpFastOpen":matches!(value.as_ref(), "true" | "1")});
+        }
+    }
     Ok(result)
 }
 
 pub fn validate_line(line: &Line) -> Result<()> {
+    ensure!(
+        line.access.host.is_empty() || host_valid(&line.access.host),
+        "代理访问地址无效"
+    );
     for rate in [line.limits.upload_mbps, line.limits.download_mbps] {
         ensure!(
             rate.is_none_or(|r| r.is_finite() && r >= 0.001 && r <= 1_000_000.0),
@@ -207,40 +252,6 @@ pub fn validate_line(line: &Line) -> Result<()> {
     Ok(())
 }
 
-pub fn relay_link(link: &str, host: &str, port: u16) -> Result<String> {
-    ensure!(host_valid(host) && port > 0, "中转入口地址或端口无效");
-    crate::compiler::external_outbound(link, "check")?;
-    let mut url = Url::parse(link)?;
-    if url.scheme() == "ss" && url.username().is_empty() {
-        let payload = link
-            .trim_start_matches("ss://")
-            .split('#')
-            .next()
-            .unwrap_or_default();
-        url = Url::parse(&format!("ss://{}", b64(payload)?))?;
-    }
-    let original_host = url
-        .host_str()
-        .context("原节点缺少地址")?
-        .trim_matches(['[', ']'])
-        .to_string();
-    if matches!(url.scheme(), "vless" | "trojan" | "https")
-        && !url.query_pairs().any(|(k, _)| k == "sni")
-    {
-        url.query_pairs_mut().append_pair("sni", &original_host);
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        url.set_ip_host(ip)
-            .map_err(|_| anyhow::anyhow!("地址无效"))?;
-    } else {
-        url.set_host(Some(host))?;
-    }
-    url.set_port(Some(port))
-        .map_err(|_| anyhow::anyhow!("端口无效"))?;
-    crate::compiler::external_outbound(url.as_str(), "check")?;
-    Ok(url.to_string())
-}
-
 pub fn fill_credentials(access: &mut Access) {
     if access.username.is_empty() {
         access.username = "chain".into();
@@ -280,8 +291,14 @@ pub fn inbound(line: &Line, hop: &Hop, tag: &str) -> Value {
 
 pub fn endpoint(line: &Line, node: &Node) -> (String, u16) {
     (
-        if line.access.public_host.is_empty() {
-            node.host.clone()
+        if !line.access.host.is_empty() {
+            line.access.host.clone()
+        } else if line.access.public_host.is_empty() {
+            if matches!(line.access.tls.mode.as_str(), "auto" | "manual") {
+                line.access.tls.domain.clone()
+            } else {
+                node.host.clone()
+            }
         } else {
             line.access.public_host.clone()
         },
@@ -407,20 +424,6 @@ pub fn mihomo(lines: &[Line], doc: &Document) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn relays_preserve_original_tls_identity_and_credentials() {
-        let original = format!(
-            "vless://{}@origin.example.com:8443?security=tls&type=tcp#node",
-            id()
-        );
-        let relay = relay_link(&original, "relay.example.com", 20000).unwrap();
-        let out = crate::compiler::external_outbound(&relay, "test").unwrap();
-        assert_eq!(out["settings"]["vnext"][0]["address"], "relay.example.com");
-        assert_eq!(
-            out["streamSettings"]["tlsSettings"]["serverName"],
-            "origin.example.com"
-        );
-    }
     #[test]
     fn supported_external_protocols_parse_and_plugins_are_rejected() {
         assert_eq!(

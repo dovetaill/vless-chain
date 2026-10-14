@@ -65,6 +65,10 @@ pub fn external_outbound(link: &str, tag: &str) -> Result<Value> {
     ensure!(port > 0, "链接端口无效");
     let q: BTreeMap<String, String> = u.query_pairs().into_owned().collect();
     let get = |key: &str, default: &str| q.get(key).cloned().unwrap_or_else(|| default.to_string());
+    ensure!(
+        get("encryption", "none") == "none",
+        "仅支持 encryption=none"
+    );
     let network = get("type", "tcp");
     ensure!(
         matches!(network.as_str(), "tcp" | "raw" | "xhttp"),
@@ -81,16 +85,33 @@ pub fn external_outbound(link: &str, tag: &str) -> Result<Value> {
             );
             stream["realitySettings"] = json!({"serverName": get("sni", ""), "publicKey": key,
                 "shortId": get("sid", ""), "fingerprint": get("fp", "chrome"), "spiderX": get("spx", "/")});
+            if !get("pqv", "").is_empty() {
+                stream["realitySettings"]["mldsa65Verify"] = json!(get("pqv", ""));
+            }
         }
         "tls" => {
             stream["tlsSettings"] =
                 json!({"serverName": get("sni", host), "fingerprint": get("fp", "chrome")});
+            crate::access::external_tls(&mut stream, &u)?;
         }
         _ => bail!("外部落地必须使用 TLS 或 REALITY"),
     }
     if network == "xhttp" {
         stream["xhttpSettings"] =
             json!({"path": get("path", "/"), "host": get("host", ""), "mode": get("mode", "auto")});
+        if let Some(extra) = q.get("extra") {
+            let extra: Value =
+                serde_json::from_str(extra).context("XHTTP extra 必须是 JSON 对象")?;
+            ensure!(extra.is_object(), "XHTTP extra 必须是 JSON 对象");
+            stream["xhttpSettings"]["extra"] = extra;
+        }
+    }
+    if let Some(tfo) = q.get("tfo") {
+        ensure!(
+            matches!(tfo.as_str(), "true" | "false" | "1" | "0"),
+            "tfo 参数无效"
+        );
+        stream["sockopt"] = json!({"tcpFastOpen": matches!(tfo.as_str(), "true" | "1")});
     }
     let flow = get("flow", "");
     ensure!(
@@ -120,8 +141,14 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
     if line.access.protocol != Protocol::Vless {
         return crate::access::share(line, node);
     }
-    let host = if line.access.public_host.is_empty() {
-        &node.host
+    let host = if !line.access.host.is_empty() {
+        &line.access.host
+    } else if line.access.public_host.is_empty() {
+        if matches!(line.access.tls.mode.as_str(), "auto" | "manual") {
+            &line.access.tls.domain
+        } else {
+            &node.host
+        }
     } else {
         &line.access.public_host
     };
@@ -170,6 +197,40 @@ fn vless_out(node: &Node, hop: &Hop, tag: &str) -> Value {
             "publicKey":node.reality.public_key,"shortId":node.reality.short_id,"fingerprint":"chrome"}}})
 }
 pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
+    fn check_chain(line: &Line, doc: &Document, visited: &mut BTreeSet<String>) -> Result<()> {
+        ensure!(
+            visited.len() < 16 && visited.insert(line.id.clone()),
+            "链式代理不能循环引用"
+        );
+        let chain = line.proxy_chain();
+        ensure!(chain.len() <= 8, "最多选择 8 个链式代理");
+        let mut unique = BTreeSet::new();
+        for reference in chain {
+            ensure!(
+                unique.insert(reference.clone()),
+                "链式代理不能重复选择同一个代理"
+            );
+            if let Some(id) = reference.strip_prefix("line:") {
+                let next = doc
+                    .lines
+                    .iter()
+                    .find(|l| l.id == id && l.kind == Kind::Vless)
+                    .context("引用的代理不存在")?;
+                ensure!(
+                    !line.enabled || next.enabled,
+                    "请先移除对已停用代理的链式引用"
+                );
+                check_chain(next, doc, visited)?;
+            } else {
+                ensure!(reference.starts_with("external:"), "链式代理引用无效");
+            }
+        }
+        visited.remove(&line.id);
+        Ok(())
+    }
+    for line in &doc.lines {
+        check_chain(line, doc, &mut BTreeSet::new())?;
+    }
     let mut configs: BTreeMap<String, Value> = doc
         .nodes
         .iter()
@@ -234,16 +295,36 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         } else {
             None
         };
-        let ext = if let Some(id) = &line.external_id {
-            let e = doc
-                .externals
-                .iter()
-                .find(|e| &e.id == id)
-                .context("外部节点不存在")?;
-            Some(external_outbound(&e.url, "external")?)
-        } else {
-            None
-        };
+        let chain = line.proxy_chain();
+        let mut external = Vec::new();
+        for (index, reference) in chain.iter().enumerate() {
+            let link = if let Some(id) = reference.strip_prefix("external:") {
+                doc.externals
+                    .iter()
+                    .find(|e| e.id == id)
+                    .context("外部代理不存在")?
+                    .url
+                    .clone()
+            } else {
+                let next = doc
+                    .lines
+                    .iter()
+                    .find(|l| Some(l.id.as_str()) == reference.strip_prefix("line:"))
+                    .context("引用的代理不存在")?;
+                share(next, doc)?
+            };
+            let tag = if index + 1 == chain.len() {
+                format!("line-{}-out", line.id)
+            } else {
+                format!("line-{}-chain-{index}", line.id)
+            };
+            let mut outbound = external_outbound(&link, &tag)?;
+            if index > 0 {
+                outbound["streamSettings"]["sockopt"]["dialerProxy"] =
+                    json!(format!("line-{}-chain-{}", line.id, index - 1));
+            }
+            external.push(outbound);
+        }
         crate::access::validate_line(line)?;
         if !line.enabled {
             continue;
@@ -282,10 +363,8 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     next,
                     &out_tag,
                 )
-            } else if let Some(external) = &ext {
-                let mut e = external.clone();
-                e["tag"] = json!(out_tag);
-                e
+            } else if let Some(last) = external.last() {
+                last.clone()
             } else {
                 json!({"tag":out_tag,"protocol":"freedom"})
             };
@@ -311,6 +390,12 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             }
             config["inbounds"].as_array_mut().unwrap().push(inbound);
             config["outbounds"].as_array_mut().unwrap().push(outbound);
+            if i + 1 == line.hops.len() && external.len() > 1 {
+                config["outbounds"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend_from_slice(&external[..external.len() - 1]);
+            }
             config["routing"]["rules"]
                 .as_array_mut()
                 .unwrap()
@@ -350,6 +435,7 @@ mod tests {
                 })
                 .collect(),
             external_id: None,
+            chain: vec![],
             target: String::new(),
             network: "tcp".into(),
             enabled: true,
@@ -357,6 +443,34 @@ mod tests {
             limits: Limits::default(),
         });
         d
+    }
+    #[test]
+    fn ordered_proxy_chain_uses_each_transport_and_rejects_cycles() {
+        let mut d = fixture();
+        d.lines[0].hops.truncate(1);
+        for name in ["one", "two"] {
+            d.externals.push(External {
+                id: name.into(),
+                name: name.into(),
+                url: format!(
+                    "vless://{}@{name}.example.com:443?security=tls&type=tcp",
+                    id()
+                ),
+            });
+        }
+        d.lines[0].chain = vec!["external:one".into(), "external:two".into()];
+        let c = compile(&d).unwrap();
+        let out = &c["a"]["outbounds"];
+        assert_eq!(out[1]["settings"]["vnext"][0]["address"], "two.example.com");
+        assert_eq!(out[2]["settings"]["vnext"][0]["address"], "one.example.com");
+        assert_eq!(
+            out[1]["streamSettings"]["sockopt"]["dialerProxy"],
+            out[2]["tag"]
+        );
+        d.lines[0].chain = vec![format!("line:{}", d.lines[0].id)];
+        assert!(compile(&d).unwrap_err().to_string().contains("循环"));
+        d.lines[0].chain = vec!["external:one".into(), "external:one".into()];
+        assert!(compile(&d).is_err());
     }
     #[test]
     fn legacy_documents_keep_vless_defaults_and_credentials() {

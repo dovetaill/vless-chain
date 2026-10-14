@@ -66,10 +66,14 @@ pub async fn validate(binary: &Path, config: &Path) -> Result<()> {
     ensure!(
         output.status.success(),
         "Xray 配置校验失败: {}",
-        String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .take(1200)
-            .collect::<String>()
+        String::from_utf8_lossy(if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        })
+        .chars()
+        .take(1200)
+        .collect::<String>()
     );
     Ok(())
 }

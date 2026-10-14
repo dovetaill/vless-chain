@@ -11,7 +11,7 @@ import {
   endpoint,
 } from "./shared";
 import { api } from "../api";
-import type { Line, PanelState } from "../types";
+import type { Line, PanelState, External } from "../types";
 export function QR({ value }: { value: string }) {
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
@@ -47,10 +47,12 @@ export function QR({ value }: { value: string }) {
 }
 export function AccessDialog({
   line,
+  external,
   state,
   close,
 }: {
-  line: Line;
+  line?: Line;
+  external?: External;
   state: PanelState;
   close: () => void;
 }) {
@@ -61,10 +63,10 @@ export function AccessDialog({
   } | null>(null);
   const [error, setError] = useState("");
   useEffect(() => {
-    if (line.kind !== "vless") return;
+    if (!line && !external) return;
     let alive = true;
     void api<{ share: string; node: string }>(
-      `/lines/${line.id}/export`,
+      external ? `/externals/${external.id}/export` : `/lines/${line!.id}/export`,
     )
       .then((v) => {
         if (alive) setValue(v);
@@ -75,35 +77,10 @@ export function AccessDialog({
     return () => {
       alive = false;
     };
-  }, [line.id, line.kind]);
-  const node = state.nodes.find((n) => n.id === line.hops[0].node_id);
-  const entry = endpoint(node?.host || "", line.hops[0].port);
-  const websiteUrl = `${["auto", "manual"].includes(line.access.tls.mode) ? "https" : "http"}://${endpoint(line.access.tls.domain, line.hops[0].port)}/`;
+  }, [line?.id, external?.id]);
   return (
-    <Modal
-      title={
-        line.kind === "vless"
-          ? "分享代理"
-          : line.kind === "forward"
-            ? "转发入口"
-            : "访问网站"
-      }
-      description={line.name}
-      close={close}
-    >
-      <PathView line={line} state={state} />
-      {line.kind !== "vless" ? (
-        <>
-          <pre className="secret">
-            {line.kind === "website" ? websiteUrl : entry}
-          </pre>
-          <CopyButton
-            value={line.kind === "website" ? websiteUrl : entry}
-            label="复制入口"
-          />
-        </>
-      ) : (
-        <>
+    <Modal title={external ? "外部代理配置" : "分享代理"} description={external?.name || line?.name} close={close}>
+      {line && <PathView line={line} state={state} />}
           <div className="flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1">
             {[
               ["node", "Mihomo 节点"],
@@ -155,8 +132,6 @@ export function AccessDialog({
               </div>
             </>
           )}
-        </>
-      )}
     </Modal>
   );
 }

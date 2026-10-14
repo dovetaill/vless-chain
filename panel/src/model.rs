@@ -131,6 +131,8 @@ pub struct Tls {
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Access {
     #[serde(default)]
+    pub host: String,
+    #[serde(default)]
     pub protocol: Protocol,
     #[serde(default)]
     pub username: String,
@@ -189,6 +191,8 @@ pub struct Line {
     #[serde(default)]
     pub external_id: Option<String>,
     #[serde(default)]
+    pub chain: Vec<String>,
+    #[serde(default)]
     pub target: String,
     #[serde(default = "default_network")]
     pub network: String,
@@ -198,6 +202,19 @@ pub struct Line {
     pub access: Access,
     #[serde(default)]
     pub limits: Limits,
+}
+
+impl Line {
+    pub fn proxy_chain(&self) -> Vec<String> {
+        if self.chain.is_empty() {
+            self.external_id
+                .iter()
+                .map(|id| format!("external:{id}"))
+                .collect()
+        } else {
+            self.chain.clone()
+        }
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]

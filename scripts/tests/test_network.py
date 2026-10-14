@@ -21,6 +21,32 @@ from chain_common import Workspace
 
 
 class Network(unittest.TestCase):
+    def test_proxy_acme_upgrades_only_owned_panel_challenge_route(self):
+        with tempfile.TemporaryDirectory(prefix='chain-proxy-acme-') as temporary:
+            root = Path(temporary)
+            panel = root / 'chain-panel.conf'
+            original = network.SITE_OWNER + '\nserver { location / { return 301 https://panel; } location /.well-known/acme-challenge/ { try_files $uri =404; } }\n'
+            panel.write_text(original)
+            with patch.object(network, 'HttpsSite') as site_type, \
+                    patch.object(network, 'Path', side_effect=lambda p: root / 'web' if p == '/var/lib/chain-acme' else Path(p)), \
+                    patch.object(network, 'server_addresses', return_value={'192.0.2.1'}), \
+                    patch.object(network, 'run'):
+                site_type.return_value.site = panel
+                network.install_proxy_acme('agent', os.geteuid(), os.getegid())
+                self.assertEqual(panel.read_text(), original.replace('try_files $uri =404;', 'try_files $uri /agent$uri /panel$uri =404;'))
+                self.assertEqual((root / 'chain-proxy-acme.conf').read_text(), network.proxy_acme_config())
+                self.assertTrue((root / 'web/agent/.well-known/acme-challenge').is_dir())
+                dump = '# configuration file ' + str(root / 'chain-proxy-acme.conf') + ':\n' + network.proxy_acme_config()
+                self.assertIsNone(network.conflicting_site(dump, 'chain-proxy-acme.invalid', panel))
+                self.assertTrue(network.conflicting_site(dump.replace('return 404', 'return 200'), 'chain-proxy-acme.invalid', panel))
+
+    def test_proxy_acme_routes_only_challenges_to_service_webroots(self):
+        config = network.proxy_acme_config(True)
+        self.assertIn('listen [::]:80;', config)
+        self.assertIn('location ^~ /.well-known/acme-challenge/', config)
+        self.assertIn('try_files /agent$uri /panel$uri =404;', config)
+        self.assertIn('location / { return 404; }', config)
+        self.assertNotIn('proxy_pass', config)
     def test_nic_address_does_not_use_proxy_egress(self):
         interfaces = [
             {'ifname': 'eth0', 'flags': ['UP'], 'addr_info': [{'local': '8.8.4.4'}, {'local': '2606:4700::1111'}]},

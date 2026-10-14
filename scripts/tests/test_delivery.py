@@ -4,6 +4,7 @@ import argparse
 import base64
 import contextlib
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,27 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def test_backup_preserves_certbot_links_but_rejects_escape(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        data = self.manager.role_paths('panel')[1]
+        archive = data / 'acme/config/archive/proxy.example'
+        live = data / 'acme/config/live/proxy.example'
+        archive.mkdir(parents=True)
+        live.mkdir(parents=True)
+        (archive / 'cert1.pem').write_text('fixture certificate')
+        link = live / 'cert.pem'
+        link.symlink_to('../../archive/proxy.example/cert1.pem')
+        backup = self.manager.backup_files('panel')
+        with tarfile.open(backup) as bundle:
+            member = bundle.getmember('data/acme/config/live/proxy.example/cert.pem')
+            self.assertTrue(member.issym())
+            self.assertEqual(member.linkname, '../../archive/proxy.example/cert1.pem')
+        link.unlink()
+        link.symlink_to('/etc/passwd')
+        with self.assertRaisesRegex(ValueError, 'Certbot'):
+            self.manager.backup_files('panel')
+
     def test_local_security_recovery_preserves_token_and_business_data(self):
         import sqlite3
         source, manifest = self.package()
@@ -186,6 +208,7 @@ class Delivery(unittest.TestCase):
         self.manager.live = True
         events = []
         with patch.object(self.manager, 'account', return_value=(os.geteuid(), os.getegid())), \
+                patch('chain_network.install_proxy_acme'), \
                 patch.object(self.manager.system, 'active', return_value=True), \
                 patch.object(self.manager.system, 'autostart', return_value=True), \
                 patch.object(self.manager.system, 'call', side_effect=lambda *args, **kwargs: events.append(args[0])), \
@@ -268,6 +291,8 @@ class Delivery(unittest.TestCase):
                 self.assertEqual(marker.exists(), expected)
                 if expected:
                     self.assertEqual(marker.read_text().strip(), node_id)
+                    recovery = json.loads(marker.with_name('local-system-identity.json').read_text())
+                    self.assertEqual(recovery, {'id': node_id, 'token_hash': hashlib.sha256(b'a' * 64).hexdigest()})
         with patch.object(self.manager, 'live', True), patch.object(self.manager, 'install'), \
                 patch.object(installer, 'provision_local_agent') as provision:
             installer.install_components(self.manager, source, manifest, self.args(action='update', panel_only=True))

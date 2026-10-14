@@ -54,6 +54,7 @@ export interface TLS {
   key: string;
 }
 export interface Access {
+  host: string;
   protocol: Protocol;
   username: string;
   password: string;
@@ -75,6 +76,7 @@ export interface Line {
   enabled: boolean;
   published: boolean;
   external_id: string | null;
+  chain: string[];
   target: string;
   network: string;
   share: string | null;

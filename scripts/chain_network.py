@@ -174,6 +174,9 @@ def conflicting_site(dump, domain, owned):
         filename, _, body = section.partition('\n')
         if filename.rstrip(':') == str(owned):
             continue
+        if filename.rstrip(':') == str(owned.with_name('chain-proxy-acme.conf')) and body.strip() in (
+                proxy_acme_config().strip(), proxy_acme_config(True).strip()):
+            continue
         body = re.sub(r'#[^\n]*', '', body)
         for names in re.findall(r'\bserver_name\s+([^;]+);', body):
             for name in names.split():
@@ -188,6 +191,55 @@ def conflicting_site(dump, domain, owned):
                 if matches:
                     return filename.rstrip(':')
     return None
+
+
+def proxy_acme_config(ipv6=False):
+    ipv6_listener = '    listen [::]:80;\n' if ipv6 else ''
+    return (f'{SITE_OWNER}\nserver {{\n    listen 80;\n{ipv6_listener}'
+            '    server_name ~^.+$;\n'
+            '    location ^~ /.well-known/acme-challenge/ {\n'
+            '        root /var/lib/chain-acme;\n'
+            '        default_type text/plain;\n'
+            '        try_files /agent$uri /panel$uri =404;\n'
+            '    }\n    location / { return 404; }\n}\n')
+
+
+def install_proxy_acme(role, uid, gid):
+    """Provision HTTP-01 once at installation; the panel never controls Nginx."""
+    site = HttpsSite('chain-proxy-acme.invalid', 0)
+    site.prepare()
+    panel_site = site.site
+    panel_previous = panel_site.read_bytes() if panel_site.exists() else None
+    site.site = site.site.with_name('chain-proxy-acme.conf')
+    require(not site.site.is_symlink() and (not site.site.exists() or site.site.read_text().startswith(SITE_OWNER + '\n')),
+            f'{site.site} 不归本安装器管理，拒绝覆盖。')
+    root = Path('/var/lib/chain-acme')
+    require(not root.is_symlink(), f'{root} 不能是符号链接。')
+    root.mkdir(mode=0o755, exist_ok=True)
+    root.chmod(0o755)
+    for path in [root / role, root / role / '.well-known', root / role / '.well-known/acme-challenge']:
+        require(not path.is_symlink() and (not path.exists() or path.stat().st_uid == uid), f'{path} 归属不匹配。')
+        path.mkdir(mode=0o755, exist_ok=True)
+        path.chmod(0o755)
+        os.chown(path, uid, gid)
+    previous = site.site.read_bytes() if site.site.exists() else None
+    try:
+        if panel_previous is not None:
+            migrated = panel_previous.replace(b'try_files $uri =404;', b'try_files $uri /agent$uri /panel$uri =404;')
+            if migrated != panel_previous:
+                atomic_write(panel_site, migrated, 0o644)
+        atomic_write(site.site, proxy_acme_config(any(':' in address for address in server_addresses())), 0o644)
+        site.reload()
+        run(['systemctl', 'enable', 'nginx'])
+    except BaseException:
+        if panel_previous is not None:
+            atomic_write(panel_site, panel_previous, 0o644)
+        if previous is None:
+            site.site.unlink(missing_ok=True)
+        else:
+            atomic_write(site.site, previous, 0o644)
+        site.reload()
+        raise
 
 
 class HttpsSite:
@@ -231,7 +283,7 @@ class HttpsSite:
         ipv6_http = '    listen [::]:80;\n' if self.ipv6 else ''
         text = (f'{SITE_OWNER}\nserver {{\n    listen 80;\n{ipv6_http}    server_name {self.domain};\n'
                 f'    location ^~ /.well-known/acme-challenge/ {{\n        root {self.webroot};\n'
-                '        default_type text/plain;\n        try_files $uri =404;\n    }\n')
+                '        default_type text/plain;\n        try_files $uri /agent$uri /panel$uri =404;\n    }\n')
         text += (f'    location / {{ return 301 https://{self.domain}$request_uri; }}\n' if tls else
                  '    location / { return 404; }\n')
         text += '}\n'

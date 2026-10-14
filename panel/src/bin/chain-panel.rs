@@ -276,9 +276,14 @@ fn snapshot(doc: &Document) -> Value {
 }
 async fn state(State(app): State<App>) -> Json<Value> {
     let mut value = snapshot(&app.store.lock().unwrap().doc);
-    value["local_node_id"] = json!(chain_panel::local_agent::node_id(
-        app.token_file.parent().unwrap()
-    ));
+    let id = chain_panel::local_agent::node_id(app.token_file.parent().unwrap());
+    value["local_node_id"] = json!(id.filter(|id| {
+        value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == *id)
+    }));
     Json(value)
 }
 #[derive(Deserialize)]
@@ -310,10 +315,46 @@ async fn local_node(
             .any(|n| n.id == id)
         {
             if dir.join("local-system-node").exists() {
-                return Err(error(
-                    StatusCode::CONFLICT,
-                    "本机身份对应的服务器记录已丢失，请恢复控制台数据",
-                ));
+                let recovery = std::fs::read(dir.join("local-system-identity.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .ok_or_else(|| {
+                        error(
+                            StatusCode::CONFLICT,
+                            "本机接入记录缺失，请在本机运行 chainctl install 更新接入信息后重试",
+                        )
+                    })?;
+                let hash = recovery["token_hash"]
+                    .as_str()
+                    .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .filter(|_| recovery["id"] == id)
+                    .ok_or_else(|| {
+                        error(
+                            StatusCode::CONFLICT,
+                            "本机恢复信息无效，请在本机运行 chainctl install",
+                        )
+                    })?;
+                let node = NodeInput {
+                    name: "本机".into(),
+                    host: input.host.clone(),
+                    target: default_target(),
+                    server_name: default_server_name(),
+                };
+                validate_node(&node)?;
+                edit(&app, |doc| {
+                    doc.nodes.push(Node {
+                        id: id.clone(),
+                        name: node.name,
+                        host: node.host,
+                        reality: Reality::new(node.target, node.server_name),
+                        token_hash: hash.into(),
+                        seen: 0,
+                        report: Report::default(),
+                        desired: None,
+                    });
+                    Ok(())
+                })?;
+                return Ok(Json(json!({"id":id})));
             }
             local.stop().await;
             std::fs::remove_file(dir.join("local-agent.json"))?;
@@ -369,10 +410,10 @@ struct NodeInput {
     server_name: String,
 }
 fn default_target() -> String {
-    "www.microsoft.com:443".into()
+    "www.cloudflare.com:443".into()
 }
 fn default_server_name() -> String {
-    "www.microsoft.com".into()
+    "www.cloudflare.com".into()
 }
 fn validate_node(n: &NodeInput) -> Result<()> {
     ensure!(
@@ -407,57 +448,6 @@ async fn add_node(State(app): State<App>, Json(input): Json<NodeInput>) -> ApiRe
     Ok(Json(json!({"id":node_id,"token":token})))
 }
 
-static SSH_INSTALLS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-#[derive(Deserialize)]
-struct SshPort {
-    port: u16,
-}
-async fn ssh_keys(
-    State(app): State<App>,
-    Path(id): Path<String>,
-    Json(input): Json<SshPort>,
-) -> ApiResult<Json<Value>> {
-    let host = app
-        .store
-        .lock()
-        .unwrap()
-        .doc
-        .nodes
-        .iter()
-        .find(|n| n.id == id)
-        .map(|n| n.host.clone())
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "节点不存在"))?;
-    let _permit = SSH_INSTALLS
-        .try_acquire()
-        .map_err(|_| error(StatusCode::CONFLICT, "已有 SSH 安装任务，请稍后重试"))?;
-    Ok(Json(
-        json!({"keys": chain_panel::deploy::scan(&host, input.port).await?}),
-    ))
-}
-async fn install_agent(
-    State(app): State<App>,
-    Path(id): Path<String>,
-    Json(input): Json<chain_panel::deploy::Install>,
-) -> ApiResult<Json<Value>> {
-    let host = {
-        let store = app.store.lock().unwrap();
-        let node = store
-            .doc
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .ok_or_else(|| error(StatusCode::NOT_FOUND, "节点不存在"))?;
-        if !equal(&digest(&input.token), &node.token_hash) {
-            return Err(error(StatusCode::BAD_REQUEST, "接入码已失效，请重新生成"));
-        }
-        node.host.clone()
-    };
-    let _permit = SSH_INSTALLS
-        .try_acquire()
-        .map_err(|_| error(StatusCode::CONFLICT, "已有 SSH 安装任务，请稍后重试"))?;
-    chain_panel::deploy::install(&host, &id, &input).await?;
-    Ok(Json(json!({"installed": true})))
-}
 async fn update_node(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -523,28 +513,28 @@ async fn rotate_node(State(app): State<App>, Path(id): Path<String>) -> ApiResul
     Ok(Json(json!({"token":token})))
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExternalInput {
+    #[serde(default)]
     name: String,
     url: String,
-    #[serde(default)]
-    relay_host: String,
-    #[serde(default)]
-    relay_port: Option<u16>,
 }
 async fn add_external(
     State(app): State<App>,
     Json(mut input): Json<ExternalInput>,
 ) -> ApiResult<Json<Value>> {
-    if !input.relay_host.is_empty() {
-        input.url = chain_panel::access::relay_link(
-            &input.url,
-            &input.relay_host,
-            input
-                .relay_port
-                .ok_or_else(|| error(StatusCode::BAD_REQUEST, "请输入中转端口"))?,
-        )?;
+    let (url, name) = chain_panel::external::import(&input.url)?;
+    input.url = url;
+    if input.name.trim().is_empty() {
+        input.name = if name.is_empty() {
+            url::Url::parse(&input.url)?
+                .host_str()
+                .unwrap_or("代理")
+                .to_owned()
+        } else {
+            name
+        };
     }
-    external_outbound(&input.url, "check")?;
     if input.name.trim().is_empty() || input.name.len() > 120 {
         return Err(error(StatusCode::BAD_REQUEST, "名称无效"));
     }
@@ -565,7 +555,7 @@ async fn remove_external(State(app): State<App>, Path(id): Path<String>) -> ApiR
             !d.lines
                 .iter()
                 .chain(d.applied_lines.iter())
-                .any(|l| l.external_id.as_ref() == Some(&id)),
+                .any(|l| l.proxy_chain().contains(&format!("external:{id}"))),
             "外部节点仍被草稿或已发布线路引用"
         );
         d.externals.retain(|e| e.id != id);
@@ -589,6 +579,8 @@ struct LineInput {
     #[serde(default)]
     external_id: Option<String>,
     #[serde(default)]
+    chain: Vec<String>,
+    #[serde(default)]
     target: String,
     #[serde(default = "tcp")]
     network: String,
@@ -606,6 +598,19 @@ fn yes() -> bool {
     true
 }
 async fn save_line(State(app): State<App>, Json(input): Json<LineInput>) -> ApiResult<Json<Value>> {
+    if input.kind == Kind::Forward {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "仅支持创建代理，端口转发已移除",
+        ));
+    }
+    if input
+        .access
+        .as_ref()
+        .is_some_and(|a| !a.public_host.is_empty() || a.public_port.is_some())
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "购买中转入口功能已移除"));
+    }
     let line = edit(&app, |d| {
         let existing = input
             .id
@@ -660,6 +665,7 @@ async fn save_line(State(app): State<App>, Json(input): Json<LineInput>) -> ApiR
             kind: input.kind,
             hops,
             external_id: input.external_id.filter(|s| !s.is_empty()),
+            chain: input.chain,
             target: input.target,
             network: input.network,
             enabled: input.enabled,
@@ -680,6 +686,13 @@ async fn save_line(State(app): State<App>, Json(input): Json<LineInput>) -> ApiR
 async fn remove_line(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     edit(&app, |d| {
         ensure!(d.lines.iter().any(|l| l.id == id), "线路不存在");
+        ensure!(
+            !d.lines
+                .iter()
+                .chain(d.applied_lines.iter())
+                .any(|l| l.id != id && l.proxy_chain().contains(&format!("line:{id}"))),
+            "该代理仍被链式代理引用，请先移除引用并应用"
+        );
         d.lines.retain(|l| l.id != id);
         d.checks.remove(&id);
         Ok(())
@@ -1190,10 +1203,12 @@ async fn main() -> Result<()> {
         .route("/api/nodes", post(add_node))
         .route("/api/nodes/{id}", post(update_node).delete(remove_node))
         .route("/api/nodes/{id}/token", post(rotate_node))
-        .route("/api/nodes/{id}/ssh-keys", post(ssh_keys))
-        .route("/api/nodes/{id}/install", post(install_agent))
         .route("/api/externals", post(add_external))
         .route("/api/externals/{id}", delete(remove_external))
+        .route(
+            "/api/externals/{id}/export",
+            get(delivery_api::external_export),
+        )
         .route("/api/lines", post(save_line))
         .route("/api/lines/{id}", delete(remove_line))
         .route("/api/lines/{id}/probe", post(diagnose))
