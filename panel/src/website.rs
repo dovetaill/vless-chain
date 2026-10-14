@@ -115,7 +115,7 @@ pub async fn prepare(specs: &[Spec], dir: &Path, existing_challenge: bool) -> Re
         Some(
             challenge_server(dir.to_path_buf(), CancellationToken::new())
                 .await
-                .context("自动证书需要 TCP 80；该端口可能已由其他服务占用")?,
+                .context("无法监听证书验证端口 TCP 80（权限不足或端口占用），请使用手动证书")?,
         )
     } else {
         None

@@ -187,12 +187,10 @@ pub fn validate_line(line: &Line) -> Result<()> {
         matches!(tls.mode.as_str(), "" | "off" | "auto" | "manual"),
         "TLS 模式无效"
     );
-    if line.kind == Kind::Forward
-        || line.access.protocol == Protocol::Vless && line.kind == Kind::Vless
-    {
+    if line.kind == Kind::Forward {
         ensure!(
             tls.mode.is_empty() || tls.mode == "off",
-            "原始转发和 VLESS/REALITY 不应另外终止 TLS"
+            "原始转发不应终止 TLS"
         );
     }
     if matches!(tls.mode.as_str(), "manual" | "auto") {
@@ -343,10 +341,14 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
             v["tls"] = json!(true);
             v["udp"] = json!(true);
             v["network"] = json!("tcp");
-            v["servername"] = json!(node.reality.server_name);
             v["client-fingerprint"] = json!("chrome");
-            v["reality-opts"] =
-                json!({"public-key":node.reality.public_key,"short-id":node.reality.short_id});
+            if matches!(a.tls.mode.as_str(), "auto" | "manual") {
+                v["servername"] = json!(a.tls.domain);
+            } else {
+                v["servername"] = json!(node.reality.server_name);
+                v["reality-opts"] =
+                    json!({"public-key":node.reality.public_key,"short-id":node.reality.short_id});
+            }
         }
         Protocol::Http | Protocol::Socks => {
             v["type"] = json!(if a.protocol == Protocol::Http {

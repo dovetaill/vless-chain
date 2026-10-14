@@ -80,6 +80,7 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     tls = {"mode": "manual", "domain": "localhost", "cert": (h.root / "cert.pem").read_text(),
            "key": (h.root / "key.pem").read_text()}
     trojan = create("Trojan TLS", access={"protocol": "trojan", "tls": tls})
+    vless_tls = create("VLESS TLS Vision", access={"protocol": "vless", "tls": tls})
     port = h.port()
     h.server(http.server.ThreadingHTTPServer(("127.0.0.1", port), WebsiteBackend))
     site = create("演示网站", "website", target=f"http://127.0.0.1:{port}/app",
@@ -105,6 +106,8 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
         h.probe(line)
     h.probe(automatic, 'tcp_echo')
     print("PASS real HTTP, authenticated SOCKS5 and Shadowsocks 2022 proxy connections", flush=True)
+    h.probe(vless_tls)
+    print("PASS real VLESS TLS + Vision with certificate verification", flush=True)
 
     context = ssl.create_default_context(cafile=str(h.root / "cert.pem"))
     with context.wrap_socket(socket.create_connection(("127.0.0.1", trojan["hops"][0]["port"]), timeout=8), server_hostname="localhost") as sock:
@@ -222,9 +225,11 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     h.probe(plain, "tcp_echo")
     print("PASS 8-connection aggregate bandwidth, unaffected line, TCP/UDP, quota persistence and live limit updates", flush=True)
 
-    for line in lines + [trojan]:
+    for line in lines + [trojan, vless_tls]:
         export = h.request(f"/api/lines/{line['id']}/export")
-        assert export['share'] and 'proxies:' in export['config'] and 'MATCH' in export['config']
+        assert export['share'] and export['node'].startswith('- ') and 'config' not in export
+        node = json.loads(export['node'][2:])
+        assert node['name'] == line['name'] and node['port'] == line['hops'][0]['port']
     sub = h.request('/api/subscriptions', 'POST', {'name': '测试订阅', 'line_ids': [l['id'] for l in lines]})
     assert b'proxies:' in h.request(sub['path'], authenticated=False)
     h.request('/api/subscriptions/' + sub['id'], 'DELETE')
@@ -234,7 +239,7 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     print("PASS exports, Mihomo subscription and revocation, bought-port endpoint replacement", flush=True)
     if os.environ.get('CHAIN_TEST_MIHOMO'):
         from mihomo import exercise as test_mihomo
-        test_mihomo(h, lines + [trojan])
+        test_mihomo(h, lines + [trojan, vless_tls])
 
     token = (h.root / 'control/admin-token').read_text().strip()
     setup = h.request('/api/security/totp/start', 'POST', {'token': token})

@@ -44,7 +44,7 @@ export function splitAddress(s: string): [string, string] {
   }
 }
 export const protocolNames = {
-  vless: "VLESS / REALITY",
+  vless: "VLESS",
   http: "HTTP 代理",
   socks: "SOCKS5",
   shadowsocks: "Shadowsocks 2022",
@@ -117,7 +117,7 @@ export function Modal({
   wide,
 }: {
   title: string;
-  description: string;
+  description?: string;
   children?: ReactNode;
   submit?: string;
   action?: (data: FormData) => Promise<void>;
@@ -148,13 +148,14 @@ export function Modal({
       }}
     >
       <DialogContent
+        {...(!description ? { "aria-describedby": undefined } : {})}
         className={`max-h-[92dvh] w-[calc(100%-2rem)] ${wide ? "max-w-3xl" : "max-w-2xl"} overflow-y-auto rounded-xl p-6 sm:p-7`}
       >
         <DialogHeader>
           <DialogTitle className="pe-6">{title}</DialogTitle>
-          <DialogDescription className="pt-2 leading-relaxed">
+          {description && <DialogDescription className="pt-2 leading-relaxed">
             {description}
-          </DialogDescription>
+          </DialogDescription>}
         </DialogHeader>
         <form onSubmit={save} className="space-y-5">
           {children}
@@ -240,7 +241,7 @@ export function PathView({ line, state }: { line: Line; state: PanelState }) {
       ? state.externals.find((e) => e.id === line.external_id)?.name ||
           "外部代理"
       : line.kind === "vless"
-        ? "Internet"
+        ? "互联网"
         : line.target,
   );
   return (
@@ -265,7 +266,7 @@ export function Empty({
   action,
 }: {
   title: string;
-  children: ReactNode;
+  children?: ReactNode;
   action?: ReactNode;
 }) {
   return (

@@ -240,6 +240,44 @@ class Delivery(unittest.TestCase):
         with patch('urllib.request.build_opener', side_effect=AssertionError('must not re-register')):
             installer.provision_local_agent(self.manager, source, manifest, self.args())
 
+    def test_panel_upgrade_marks_only_existing_matching_local_agent(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        node_id = 'a94a6794-c60a-4c51-a094-b9164ddaaabc'
+        token = self.root / 'token'
+        token.write_text('a' * 64)
+        token.chmod(0o600)
+        self.manager.install(source, manifest, self.args(component='agent',
+            panel_url='http://127.0.0.1:8088', node_id=node_id, token_file=token))
+        marker = self.manager.role_paths('panel')[1] / 'local-system-node'
+        panel_env_path = self.manager.role_paths('panel')[0] / 'panel.env'
+        agent_env_path = self.manager.role_paths('agent')[0] / 'agent.env'
+        for listen, url, expected in [
+                ('127.0.0.1:8088', 'http://127.0.0.1:8088', True),
+                ('0.0.0.0:8088', 'http://localhost:8088', True),
+                ('192.0.2.10:8088', 'http://192.0.2.10:8088', True),
+                ('192.0.2.10:8088', 'http://127.0.0.1:8088', False),
+                ('127.0.0.1:8088', 'http://127.0.0.1:8099', False),
+                ('127.0.0.1:8088', 'https://remote.example.com:8088', False)]:
+            with self.subTest(listen=listen, url=url):
+                marker.unlink(missing_ok=True)
+                installer.write_env(panel_env_path, {'CHAIN_LISTEN': listen})
+                installer.write_env(agent_env_path, {'CHAIN_PANEL_URL': url, 'CHAIN_NODE_ID': node_id})
+                with patch('urllib.request.build_opener', side_effect=AssertionError('must not register')):
+                    installer.provision_local_agent(self.manager, source, manifest, self.args(action='update'))
+                self.assertEqual(marker.exists(), expected)
+                if expected:
+                    self.assertEqual(marker.read_text().strip(), node_id)
+        with patch.object(self.manager, 'live', True), patch.object(self.manager, 'install'), \
+                patch.object(installer, 'provision_local_agent') as provision:
+            installer.install_components(self.manager, source, manifest, self.args(action='update', panel_only=True))
+            provision.assert_called_once()
+        with patch.object(self.manager, 'live', True), patch.object(self.manager, 'install'), \
+                patch.object(self.manager, 'state', return_value={'roles': {'panel': {}}}), \
+                patch.object(installer, 'provision_local_agent') as provision:
+            installer.install_components(self.manager, source, manifest, self.args(action='update', panel_only=True))
+            provision.assert_not_called()
+
     def test_local_agent_auto_registration_and_failed_install_cleanup(self):
         source, manifest = self.package()
         self.manager.install(source, manifest, self.args(secure_cookie='1'))

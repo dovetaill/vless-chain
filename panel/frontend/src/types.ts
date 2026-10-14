@@ -101,6 +101,7 @@ export interface Security {
   passkeys: { id: string; name: string; created: number }[];
 }
 export interface PanelState {
+  local_node_id: string | null;
   nodes: NodeInfo[];
   externals: External[];
   lines: Line[];

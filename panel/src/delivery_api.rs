@@ -22,7 +22,7 @@ pub async fn export(State(app): State<App>, Path(id): Path<String>) -> ApiResult
     );
     let node = chain_panel::access::mihomo_node(line, &doc)?;
     Ok(Json(
-        json!({"share":share(line,&doc)?,"node":serde_yaml_ng::to_string(&json!({"proxies":[node]}))?,"config":chain_panel::access::mihomo(std::slice::from_ref(line),&doc)?}),
+        json!({"share":share(line,&doc)?,"node":format!("- {}\n", serde_json::to_string(&node)?)}),
     ))
 }
 #[derive(Deserialize)]

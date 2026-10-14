@@ -78,7 +78,9 @@ def main():
             run(['npm', 'install', '--no-audit', '--no-fund'], directory)
             run(['node', 'node_modules/playwright/cli.js', 'install', 'chromium'], directory)
             env['CHAIN_TEST_BROWSER'] = str(directory / 'node_modules' / 'playwright')
+            run(['node', 'tests/resource-flow.cjs', str(root / 'frontend' / 'dist')])
         run(['python3', 'tests/smoke.py'])
+        run(['python3', '-B', 'tests/local_web.py'])
         print('Checks passed; verifying cleanup.', flush=True)
     finally:
         # Stop only children carrying this invocation's ownership marker.

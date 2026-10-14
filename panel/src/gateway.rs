@@ -421,7 +421,7 @@ impl Gateway {
                             let spec=spec.clone();let lane=lane.clone();let dir=dir.clone();let peers=peers.clone();
                             children.spawn(async move {
                                 let _=stream.set_nodelay(true);
-                                if matches!(spec.tls.mode.as_str(),"manual"|"auto") {
+                                if matches!(spec.tls.mode.as_str(),"manual"|"auto") && spec.protocol != Protocol::Vless {
                                     if let Ok(config)=crate::website::load_tls(&spec.tls,&dir) {
                                         if let Ok(Ok(tls))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=connection(tls,spec,lane,peers,peer.ip()).await;}
                                     }

@@ -45,6 +45,8 @@ struct App {
     xray: PathBuf,
     probe_lock: Arc<tokio::sync::Mutex<()>>,
     apply_timeout: u64,
+    local_agent: Arc<tokio::sync::Mutex<chain_panel::local_agent::LocalAgent>>,
+    local_url: String,
 }
 fn digest(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -273,7 +275,89 @@ fn snapshot(doc: &Document) -> Value {
     json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc)})
 }
 async fn state(State(app): State<App>) -> Json<Value> {
-    Json(snapshot(&app.store.lock().unwrap().doc))
+    let mut value = snapshot(&app.store.lock().unwrap().doc);
+    value["local_node_id"] = json!(chain_panel::local_agent::node_id(
+        app.token_file.parent().unwrap()
+    ));
+    Json(value)
+}
+#[derive(Deserialize)]
+struct LocalInput {
+    host: String,
+    #[serde(default)]
+    name: String,
+}
+async fn local_node(
+    State(app): State<App>,
+    Json(input): Json<LocalInput>,
+) -> ApiResult<Json<Value>> {
+    let dir = app.token_file.parent().unwrap();
+    let mut local = app.local_agent.lock().await;
+    if dir.join("local-system-node").exists() && chain_panel::local_agent::node_id(dir).is_none() {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "系统本机身份文件无效，请修复 local-system-node",
+        ));
+    }
+    if let Some(id) = chain_panel::local_agent::node_id(dir) {
+        if !app
+            .store
+            .lock()
+            .unwrap()
+            .doc
+            .nodes
+            .iter()
+            .any(|n| n.id == id)
+        {
+            if dir.join("local-system-node").exists() {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "本机身份对应的服务器记录已丢失，请恢复控制台数据",
+                ));
+            }
+            local.stop().await;
+            std::fs::remove_file(dir.join("local-agent.json"))?;
+        } else {
+            local.ensure(dir, &app.local_url, &app.xray).await?;
+            return Ok(Json(json!({"id":id})));
+        }
+    }
+    let input = NodeInput {
+        name: if input.name.trim().is_empty() {
+            "控制台本机".into()
+        } else {
+            input.name
+        },
+        host: input.host,
+        target: default_target(),
+        server_name: default_server_name(),
+    };
+    validate_node(&input)?;
+    chain_panel::local_agent::binary()?;
+    let identity = chain_panel::local_agent::Identity {
+        id: id(),
+        token: secret(),
+    };
+    let saved = edit(&app, |d| {
+        d.nodes.push(Node {
+            id: identity.id.clone(),
+            name: input.name,
+            host: input.host,
+            reality: Reality::new(input.target, input.server_name),
+            token_hash: digest(&identity.token),
+            seen: 0,
+            report: Report::default(),
+            desired: None,
+        });
+        chain_panel::local_agent::save(dir, &identity)?;
+        Ok(())
+    });
+    if let Err(error) = saved {
+        let _ = std::fs::remove_file(dir.join("local-agent.json"));
+        return Err(error);
+    }
+    local.ensure(dir, &app.local_url, &app.xray).await?;
+    Ok(Json(json!({"id":identity.id})))
 }
 #[derive(Deserialize)]
 struct NodeInput {
@@ -396,6 +480,14 @@ async fn update_node(
     Ok(Json(json!({"ok":true})))
 }
 async fn remove_node(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    if chain_panel::local_agent::node_id(app.token_file.parent().unwrap()).as_deref()
+        == Some(id.as_str())
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "本机由控制台管理，不能删除服务器记录；可删除其代理",
+        ));
+    }
     edit(&app, |d| {
         ensure!(
             !d.lines
@@ -411,6 +503,14 @@ async fn remove_node(State(app): State<App>, Path(id): Path<String>) -> ApiResul
     Ok(Json(json!({"ok":true})))
 }
 async fn rotate_node(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    if chain_panel::local_agent::node_id(app.token_file.parent().unwrap()).as_deref()
+        == Some(id.as_str())
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "本机凭据由控制台管理，无需重新接入",
+        ));
+    }
     let token = secret();
     edit(&app, |d| {
         d.nodes
@@ -989,6 +1089,18 @@ async fn web_asset(uri: Uri) -> Response {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let listen = std::env::var("CHAIN_LISTEN").unwrap_or_else(|_| "127.0.0.1:8088".into());
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("无法监听 {listen}；不会停止任何现有服务"))?;
+    let mut local_address = listener.local_addr()?;
+    if local_address.ip().is_unspecified() {
+        local_address.set_ip(if local_address.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
     let dir = PathBuf::from(std::env::var("CHAIN_DATA_DIR").unwrap_or_else(|_| "data".into()));
     private_dir(&dir, "chain-panel")?;
     let _lock = lock_dir(&dir)?;
@@ -1022,6 +1134,10 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(240),
+        local_agent: Arc::new(tokio::sync::Mutex::new(
+            chain_panel::local_agent::LocalAgent::default(),
+        )),
+        local_url: format!("http://{local_address}"),
     };
     let interrupted: Vec<Job> = app
         .store
@@ -1070,6 +1186,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/logout", post(logout))
         .route("/api/state", get(state))
+        .route("/api/local-node", post(local_node))
         .route("/api/nodes", post(add_node))
         .route("/api/nodes/{id}", post(update_node).delete(remove_node))
         .route("/api/nodes/{id}/token", post(rotate_node))
@@ -1089,21 +1206,41 @@ async fn main() -> Result<()> {
         .route("/api/agent/{id}/sync", post(sync))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
-        .with_state(app);
-    let listen = std::env::var("CHAIN_LISTEN").unwrap_or_else(|_| "127.0.0.1:8088".into());
-    let listener = tokio::net::TcpListener::bind(&listen)
-        .await
-        .with_context(|| format!("无法监听 {listen}；不会停止任何现有服务"))?;
+        .with_state(app.clone());
+    let local_app = app.clone();
+    let local_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if let Err(error) = local_app
+                .local_agent
+                .lock()
+                .await
+                .ensure(
+                    local_app.token_file.parent().unwrap(),
+                    &local_app.local_url,
+                    &local_app.xray,
+                )
+                .await
+            {
+                eprintln!("本机 Agent: {error:#}");
+            }
+        }
+    });
     eprintln!(
         "Chain Panel: http://{listen}；首次登录令牌位于 {}",
         token_file.display()
     );
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let mut sig =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
             tokio::select! {_=tokio::signal::ctrl_c()=>{},_=sig.recv()=>{}}
         })
-        .await?;
+        .await;
+    local_task.abort();
+    let _ = local_task.await;
+    app.local_agent.lock().await.stop().await;
+    result?;
     Ok(())
 }

@@ -527,6 +527,17 @@ def local_packages():
 
 def provision_local_agent(manager, source, manifest, args):
     if 'agent' in manager.state()['roles']:
+        agent_env = parse_env(manager.role_paths('agent')[0] / 'agent.env')
+        panel_env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
+        if 'CHAIN_LISTEN' not in panel_env:
+            return
+        agent_url = urllib.parse.urlsplit(agent_env.get('CHAIN_PANEL_URL', ''))
+        panel_host, panel_port = listen_address(panel_env['CHAIN_LISTEN'])
+        local_host = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(panel_host, panel_host)
+        same_host = agent_url.hostname == local_host or (
+            agent_url.hostname == 'localhost' and ipaddress.ip_address(local_host).is_loopback)
+        if agent_url.scheme == 'http' and same_host and agent_url.port == panel_port:
+            mark_local_node(manager, agent_env['CHAIN_NODE_ID'])
         return
     etc, data, _ = manager.role_paths('panel')
     env = parse_env(etc / 'panel.env')
@@ -553,6 +564,7 @@ def provision_local_agent(manager, source, manifest, args):
         agent = make_parser().parse_args(['install', '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
         agent.panel_url, agent.node_id, agent.node_token = base, node['id'], node['token']
         manager.install(source, manifest, agent)
+        mark_local_node(manager, node['id'])
         print('本机 Agent 已安装并自动接入；在 Web「服务器」中查看本机节点即可。')
     except BaseException:
         if node is not None and 'agent' not in manager.state()['roles']:
@@ -566,9 +578,20 @@ def provision_local_agent(manager, source, manifest, args):
                 api('logout', {})
 
 
+def mark_local_node(manager, node_id):
+    uuid.UUID(node_id)
+    path = manager.role_paths('panel')[1] / 'local-system-node'
+    atomic_write(path, node_id + '\n')
+    if manager.live:
+        uid, gid = manager.account('panel')
+        os.chown(path, uid, gid)
+
+
 def install_components(manager, source, manifest, args):
     manager.install(source, manifest, args)
-    if manager.live and args.component == 'panel' and args.action == 'install' and not getattr(args, 'panel_only', False):
+    if manager.live and args.component == 'panel' and (
+            (args.action == 'install' and not getattr(args, 'panel_only', False)) or
+            (args.action == 'update' and 'agent' in manager.state()['roles'])):
         provision_local_agent(manager, source, manifest, args)
 
 
@@ -593,7 +616,9 @@ def install_package(manager, args):
             manager.install(source, manifest, args)
         # HTTPS and the panel are now committed. An Agent failure must not undo
         # the working panel URL; rerunning setup retries the missing local node.
-        if manager.live and args.component == 'panel' and args.action == 'install' and not args.panel_only:
+        if manager.live and args.component == 'panel' and (
+                (args.action == 'install' and not args.panel_only) or
+                (args.action == 'update' and 'agent' in manager.state()['roles'])):
             provision_local_agent(manager, source, manifest, args)
         if manager.live and args.component == 'panel':
             manager.show_access()

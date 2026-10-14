@@ -54,19 +54,16 @@ export function AccessDialog({
   state: PanelState;
   close: () => void;
 }) {
-  const [tab, setTab] = useState("qr");
+  const [tab, setTab] = useState("node");
   const [value, setValue] = useState<{
     share: string;
     node: string;
-    config: string;
   } | null>(null);
   const [error, setError] = useState("");
-  const [subscription, setSubscription] = useState("");
-  const [busy, setBusy] = useState(false);
   useEffect(() => {
     if (line.kind !== "vless") return;
     let alive = true;
-    void api<{ share: string; node: string; config: string }>(
+    void api<{ share: string; node: string }>(
       `/lines/${line.id}/export`,
     )
       .then((v) => {
@@ -86,7 +83,7 @@ export function AccessDialog({
     <Modal
       title={
         line.kind === "vless"
-          ? "连接这条代理"
+          ? "分享代理"
           : line.kind === "forward"
             ? "转发入口"
             : "访问网站"
@@ -104,19 +101,13 @@ export function AccessDialog({
             value={line.kind === "website" ? websiteUrl : entry}
             label="复制入口"
           />
-          <p className="muted">
-            {line.kind === "website"
-              ? "使用浏览器访问此网址。"
-              : `使用原业务客户端连接此入口，协议为 ${line.network.toUpperCase()}。端口转发不生成 VLESS 账号。`}
-          </p>
         </>
       ) : (
         <>
           <div className="flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1">
             {[
-              ["qr", "扫码 / 链接"],
-              ["config", "Mihomo 配置"],
-              ["subscription", "订阅"],
+              ["node", "Mihomo 节点"],
+              ["qr", "链接 / 二维码"],
             ].map(([id, label]) => (
               <button
                 type="button"
@@ -145,73 +136,23 @@ export function AccessDialog({
                 value={value.share}
               />
               <CopyButton value={value.share} label="复制分享链接" />
-              <p className="muted">
-                二维码在浏览器本地生成。请使用支持此协议的客户端扫码或导入链接。
-              </p>
             </>
           )}
-          {value && tab === "config" && (
+          {value && tab === "node" && (
             <>
+              <textarea
+                className="textarea mono"
+                readOnly
+                aria-label="Mihomo 节点配置"
+                rows={7}
+                value={value.node}
+              />
               <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  onClick={() => download("chain-panel.yaml", value.config)}
-                >
-                  <Download />
-                  下载完整配置
+                <CopyButton value={value.node} label="复制节点配置" />
+                <Button type="button" variant="outline" onClick={() => download("proxy.yaml", value.node)}>
+                  <Download />下载
                 </Button>
-                <CopyButton value={value.node} label="复制节点 YAML" />
               </div>
-              <pre className="secret max-h-64 overflow-auto">
-                {value.config}
-              </pre>
-              <p className="muted">
-                适用于 Mihomo / Clash Meta。完整配置可直接导入；节点 YAML
-                用于合并到自己的配置中。
-              </p>
-            </>
-          )}
-          {value && tab === "subscription" && (
-            <>
-              <p className="muted">
-                订阅会随已应用的线路配置更新。它使用独立凭据，可在设置中撤销。
-              </p>
-              {subscription ? (
-                <>
-                  <QR value={subscription} />
-                  <textarea
-                    className="textarea mono"
-                    readOnly
-                    aria-label="订阅链接"
-                    value={subscription}
-                    rows={3}
-                  />
-                  <CopyButton value={subscription} label="复制订阅链接" />
-                  <p className="muted">链接仅在创建时显示，请保存到客户端。</p>
-                </>
-              ) : (
-                <Button
-                  type="button"
-                  disabled={busy}
-                  onClick={async () => {
-                    setBusy(true);
-                    try {
-                      const result = await api<{ path: string }>(
-                        "/subscriptions",
-                        "POST",
-                        { name: `${line.name}订阅`, line_ids: [line.id] },
-                      );
-                      setSubscription(location.origin + result.path);
-                    } catch (e) {
-                      setError(errorText(e));
-                    } finally {
-                      setBusy(false);
-                    }
-                  }}
-                >
-                  创建此线路订阅
-                </Button>
-              )}
             </>
           )}
         </>

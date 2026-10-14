@@ -217,7 +217,8 @@ class Harness:
         control_port = self.port()
         self.base = f"http://127.0.0.1:{control_port}"
         control_env = {"CHAIN_DATA_DIR": str(self.root / "control"), "CHAIN_LISTEN": f"127.0.0.1:{control_port}",
-                       "CHAIN_XRAY_BIN": str(self.xray), "CHAIN_APPLY_TIMEOUT": "9", "CHAIN_XRAY_LOG_LEVEL": "debug"}
+                       "CHAIN_XRAY_BIN": str(self.xray), "CHAIN_APPLY_TIMEOUT": "9", "CHAIN_XRAY_LOG_LEVEL": "debug",
+                       "SSL_CERT_FILE": str(cert)}
         control = self.launch("control", self.bin_dir / "chain-panel", control_env)
         self.wait(lambda: self.request("/") or True, "controller start")
         self.request("/api/state", status=401, authenticated=False)

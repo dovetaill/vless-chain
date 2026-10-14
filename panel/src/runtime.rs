@@ -87,6 +87,19 @@ pub fn spawn_xray(binary: &Path, config: &Path, log: &Path) -> Result<Child> {
         .stdout(output.try_clone()?)
         .stderr(output)
         .kill_on_drop(true);
+    let parent = unsafe { libc::getpid() };
+    // Xray must exit even when its owning Agent is killed before cleanup can run.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(std::io::Error::other("Agent 已退出"));
+            }
+            Ok(())
+        });
+    }
     Ok(cmd
         .spawn()
         .with_context(|| format!("无法启动 Xray: {}", binary.display()))?)
@@ -147,11 +160,33 @@ impl ManagedXray {
                 .map(|c| matches!(c.try_wait(), Ok(None)))
                 .unwrap_or(false)
     }
+    fn xray_config(&self, config: &Value) -> Result<Value> {
+        let mut value = crate::gateway::xray_config(config);
+        for spec in crate::gateway::specs(config)? {
+            if spec.kind == Kind::Vless
+                && spec.protocol == Protocol::Vless
+                && spec.tls.mode == "auto"
+            {
+                let live = self.dir.join("acme/config/live").join(&spec.tls.domain);
+                let inbound = value["inbounds"]
+                    .as_array_mut()
+                    .context("缺少入站配置")?
+                    .iter_mut()
+                    .find(|inbound| inbound["tag"] == format!("line-{}-in", spec.id))
+                    .context("TLS 入口配置不存在")?;
+                inbound["streamSettings"]["tlsSettings"]["certificates"] = json!([{
+                    "certificateFile":live.join("fullchain.pem"),
+                    "keyFile":live.join("privkey.pem")
+                }]);
+            }
+        }
+        Ok(value)
+    }
     async fn start_config(&mut self, config: &Value) -> Result<()> {
         let path = self.dir.join("xray.json");
         atomic_write(
             &path,
-            &serde_json::to_vec_pretty(&crate::gateway::xray_config(config))?,
+            &serde_json::to_vec_pretty(&self.xray_config(config)?)?,
         )?;
         self.child = Some(spawn_xray(&self.binary, &path, &self.dir.join("xray.log"))?);
         tokio::time::sleep(Duration::from_millis(450)).await;
@@ -170,15 +205,30 @@ impl ManagedXray {
         Ok(())
     }
     pub async fn apply(&mut self, desired: &Desired) -> Result<()> {
+        let specs = crate::gateway::specs(&desired.config)?;
+        let existing_challenge = self
+            .active
+            .as_ref()
+            .and_then(|d| crate::gateway::specs(&d.config).ok())
+            .is_some_and(|s| {
+                s.iter()
+                    .any(|s| s.tls.mode == "auto" || s.kind == Kind::Website && s.port == 80)
+            });
+        // Vision terminates TLS in Xray, so its certificates must exist before validation.
+        let native_tls = specs.iter().any(|s| {
+            s.kind == Kind::Vless && s.protocol == Protocol::Vless && s.tls.mode == "auto"
+        });
+        if native_tls {
+            crate::website::prepare(&specs, &self.dir, existing_challenge).await?;
+        }
         let candidate = self.dir.join("candidate.json");
         atomic_write(
             &candidate,
-            &serde_json::to_vec_pretty(&crate::gateway::xray_config(&desired.config))?,
+            &serde_json::to_vec_pretty(&self.xray_config(&desired.config)?)?,
         )?;
         let result = validate(&self.binary, &candidate).await;
         let _ = std::fs::remove_file(&candidate);
         result?;
-        let specs = crate::gateway::specs(&desired.config)?;
         if self.active.as_ref().is_some_and(|old| {
             crate::gateway::xray_config(&old.config) == crate::gateway::xray_config(&desired.config)
         }) && self.running()
@@ -190,15 +240,9 @@ impl ManagedXray {
                 return Ok(());
             }
         }
-        let existing_challenge = self
-            .active
-            .as_ref()
-            .and_then(|d| crate::gateway::specs(&d.config).ok())
-            .is_some_and(|s| {
-                s.iter()
-                    .any(|s| s.tls.mode == "auto" || s.kind == Kind::Website && s.port == 80)
-            });
-        crate::website::prepare(&specs, &self.dir, existing_challenge).await?;
+        if !native_tls {
+            crate::website::prepare(&specs, &self.dir, existing_challenge).await?;
+        }
         let old = self.active.clone();
         self.stop_all().await;
         if let Err(error) = self.start_config(&desired.config).await {

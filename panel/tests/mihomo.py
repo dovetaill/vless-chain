@@ -1,5 +1,6 @@
 """Optional compatibility check using a separately verified official Mihomo binary."""
 import http.client
+import json
 import os
 import subprocess
 
@@ -11,8 +12,10 @@ def exercise(h, lines):
         directory = h.root / f'mihomo-{index}'
         directory.mkdir()
         port = h.port()
-        config = export['config'].replace('mixed-port: 7890', f'mixed-port: {port}')
-        assert f'mixed-port: {port}' in config
+        assert 'config' not in export and export['node'].startswith('- ')
+        node = json.loads(export['node'][2:])
+        config = (f'mixed-port: {port}\nmode: rule\nproxies:\n'
+                  f"  {export['node'].strip()}\nrules:\n  - {json.dumps('MATCH,' + node['name'])}\n")
         path = directory / 'config.yaml'
         path.write_text(config)
         # The fixture's private CA is trusted only by this test-owned process.
@@ -36,4 +39,4 @@ def exercise(h, lines):
             h.wait(request, 'Mihomo listener and exported proxy connection')
         finally:
             h.stop_process(process)
-    print('PASS unmodified exported YAML parsed and used by real Mihomo for VLESS, HTTP, SOCKS5, SS2022 and Trojan', flush=True)
+    print('PASS exported proxy YAML parsed and used by real Mihomo for VLESS, HTTP, SOCKS5, SS2022 and Trojan', flush=True)

@@ -130,16 +130,28 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
         h.uuid,
         address(host, line.access.public_port.unwrap_or(h.port))
     ))?;
+    let tls = matches!(line.access.tls.mode.as_str(), "auto" | "manual");
     u.query_pairs_mut().extend_pairs([
         ("type", "tcp"),
-        ("security", "reality"),
+        ("security", if tls { "tls" } else { "reality" }),
         ("flow", "xtls-rprx-vision"),
         ("encryption", "none"),
-        ("sni", &node.reality.server_name),
-        ("pbk", &node.reality.public_key),
-        ("sid", &node.reality.short_id),
+        (
+            "sni",
+            if tls {
+                &line.access.tls.domain
+            } else {
+                &node.reality.server_name
+            },
+        ),
         ("fp", "chrome"),
     ]);
+    if !tls {
+        u.query_pairs_mut().extend_pairs([
+            ("pbk", &node.reality.public_key),
+            ("sid", &node.reality.short_id),
+        ]);
+    }
     u.set_fragment(Some(&line.name));
     Ok(u.to_string())
 }
@@ -250,6 +262,20 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             } else {
                 vless_in(node, hop, &in_tag)
             };
+            if i == 0
+                && line.kind == Kind::Vless
+                && line.access.protocol == Protocol::Vless
+                && matches!(line.access.tls.mode.as_str(), "auto" | "manual")
+            {
+                let tls = &line.access.tls;
+                let certificates = if tls.mode == "manual" {
+                    json!([{"certificate":tls.cert.lines().collect::<Vec<_>>(),"key":tls.key.lines().collect::<Vec<_>>() }])
+                } else {
+                    json!([])
+                };
+                inbound["streamSettings"] = json!({"network":"tcp","security":"tls",
+                    "tlsSettings":{"minVersion":"1.2","certificates":certificates}});
+            }
             let outbound = if let Some(next) = line.hops.get(i + 1) {
                 vless_out(
                     doc.nodes.iter().find(|n| n.id == next.node_id).unwrap(),
@@ -407,6 +433,44 @@ mod tests {
             parsed["settings"]["vnext"][0]["users"][0]["id"],
             d.lines[0].hops[0].uuid
         );
+    }
+    #[test]
+    fn tls_vision_entry_keeps_internal_reality_chain_and_exports_tls() {
+        let mut d = fixture();
+        d.lines[0].access.tls = Tls {
+            mode: "auto".into(),
+            domain: "entry.example.com".into(),
+            ..Tls::default()
+        };
+        let configs = compile(&d).unwrap();
+        assert_eq!(
+            configs["a"]["inbounds"][0]["streamSettings"]["security"],
+            "tls"
+        );
+        assert_eq!(
+            configs["b"]["inbounds"][0]["streamSettings"]["security"],
+            "reality"
+        );
+        assert_eq!(
+            configs["a"]["outbounds"][1]["streamSettings"]["security"],
+            "reality"
+        );
+        let link = share(&d.lines[0], &d).unwrap();
+        let outbound = external_outbound(&link, "test").unwrap();
+        assert_eq!(outbound["streamSettings"]["security"], "tls");
+        assert_eq!(
+            outbound["streamSettings"]["tlsSettings"]["serverName"],
+            "entry.example.com"
+        );
+        assert!(!link.contains("pbk=") && !link.contains("sid="));
+        let node = crate::access::mihomo_node(&d.lines[0], &d).unwrap();
+        assert_eq!(node["servername"], "entry.example.com");
+        assert_eq!(node["flow"], "xtls-rprx-vision");
+        assert!(node.get("reality-opts").is_none());
+        d.lines[0].access.tls.domain = "127.0.0.1".into();
+        assert!(compile(&d).is_err());
+        d.lines[0].access.tls.mode = "manual".into();
+        assert!(compile(&d).is_err());
     }
     #[test]
     fn rejects_plaintext_external_and_bad_destination() {

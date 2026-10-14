@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import signal
 import socket
 import subprocess
@@ -15,7 +16,9 @@ import time
 def main():
     if os.geteuid() != 0 or not Path('/usr/sbin/sshd').exists():
         raise SystemExit('SSH 集成测试需要 root 和 sshd；不会修改系统 SSH 配置。')
-    with tempfile.TemporaryDirectory(prefix='chain-ssh-test-', dir=os.environ['CHAIN_TEST_ROOT']) as directory:
+    # StrictModes rejects authorized_keys beneath world-writable /tmp or /var/tmp.
+    with tempfile.TemporaryDirectory(prefix='.chain-ssh-keys-', dir=pwd.getpwuid(0).pw_dir) as key_directory, \
+            tempfile.TemporaryDirectory(prefix='chain-ssh-test-', dir=os.environ['CHAIN_TEST_ROOT']) as directory:
         root = Path(directory)
         (root / 'data').mkdir()
         release = root / 'release'
@@ -34,19 +37,20 @@ def main():
         (release / 'release.json').write_text(json.dumps(manifest))
         for name in ('hostkey', 'identity'):
             subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(root / name)], check=True)
-        (root / 'authorized_keys').write_bytes((root / 'identity.pub').read_bytes())
-        (root / 'authorized_keys').chmod(0o600)
+        authorized_keys = Path(key_directory) / 'authorized_keys'
+        authorized_keys.write_bytes((root / 'identity.pub').read_bytes())
+        authorized_keys.chmod(0o600)
         with socket.socket() as reserved:
             reserved.bind(('127.0.0.1', 0))
             port = reserved.getsockname()[1]
         (root / 'port').write_text(str(port))
         config = root / 'sshd_config'
         config.write_text(f'Port {port}\nListenAddress 127.0.0.1\nHostKey {root}/hostkey\nPidFile {root}/sshd.pid\n'
-                          f'AuthorizedKeysFile {root}/authorized_keys\nStrictModes yes\nPasswordAuthentication no\n'
+                          f'AuthorizedKeysFile {authorized_keys}\nStrictModes yes\nPasswordAuthentication no\n'
                           'KbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\nUsePAM no\n'
-                          'AllowUsers root\nAllowTcpForwarding no\nX11Forwarding no\nLogLevel ERROR\n')
+                          'AllowUsers root\nAllowTcpForwarding no\nX11Forwarding no\nLogLevel VERBOSE\n')
         log = (root / 'sshd.log').open('wb')
-        record = {'cwd': str(root), 'port': port, 'root': str(root), 'pid': None}
+        record = {'cwd': str(root), 'port': port, 'root': str(root), 'key_directory': key_directory, 'pid': None}
         (root / 'ownership.json').write_text(json.dumps(record))
         daemon = subprocess.Popen(['/usr/sbin/sshd', '-D', '-e', '-f', str(config)], cwd=root,
                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -67,6 +71,9 @@ def main():
             subprocess.run(['cargo', 'test', '--locked', '--lib', 'real_ssh_transfer_and_host_identity', '--', '--ignored', '--nocapture'], env=env, check=True)
             remote = Path((root / 'remote-path').read_text())
             assert not remote.exists(), f'remote temporary directory remains: {remote}'
+        except BaseException:
+            print((root / 'sshd.log').read_text(errors='replace'), flush=True)
+            raise
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(daemon.pid, signal.SIGTERM)
@@ -81,6 +88,7 @@ def main():
                 check.bind(('127.0.0.1', port))
             print(f'CLEANUP sshd PGID={daemon.pid}; port={port} released; fixture files removed on exit.', flush=True)
     assert not root.exists()
+    assert not Path(key_directory).exists()
 
 
 if __name__ == '__main__':

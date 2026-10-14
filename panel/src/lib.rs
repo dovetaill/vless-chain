@@ -2,6 +2,7 @@ pub mod access;
 pub mod compiler;
 pub mod deploy;
 pub mod gateway;
+pub mod local_agent;
 pub mod model;
 pub mod runtime;
 pub mod security;

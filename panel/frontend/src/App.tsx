@@ -7,18 +7,12 @@ import {
   type FormEvent,
 } from "react";
 import {
-  Activity,
-  ArrowDownLeft,
   ArrowLeftRight,
   ArrowRight,
-  ArrowUpRight,
   Bell,
-  BookOpen,
   ChevronLeft,
   ChevronRight,
   Fingerprint,
-  Globe2,
-  LayoutDashboard,
   LogOut,
   Menu,
   MoreHorizontal,
@@ -27,12 +21,10 @@ import {
   Search,
   Server,
   Settings,
-  ShieldCheck,
   Trash2,
   X,
   Zap,
   KeyRound,
-  Cable,
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { Button } from "@/components/ui/button";
@@ -42,7 +34,6 @@ import { api, ApiError } from "./api";
 import { AgentSetup } from "./components/agent-setup";
 import { LineEditor } from "./components/line-editor";
 import { AccessDialog, QR } from "./components/access-dialog";
-import { Dashboard } from "./components/dashboard";
 import { SecuritySettings } from "./components/security-settings";
 import {
   Modal,
@@ -63,64 +54,21 @@ import { loginPasskey } from "./passkey";
 import type {
   PanelState,
   NodeInfo,
+  External,
   Line,
   Preview,
   Check as CheckResult,
 } from "./types";
 
 const pages = [
-  {
-    id: "overview",
-    label: "总览",
-    icon: LayoutDashboard,
-    description: "查看网络状态、流量和需要关注的事项。",
-  },
-  {
-    id: "lines",
-    label: "代理接入",
-    icon: Network,
-    description: "给客户端创建代理，或通过多台服务器中转出网。",
-  },
-  {
-    id: "forward",
-    label: "端口转发",
-    icon: ArrowLeftRight,
-    description: "把一个入口端口转发到固定目标。",
-  },
-  {
-    id: "websites",
-    label: "网站反代",
-    icon: Globe2,
-    description: "通过域名访问后端网站，管理 HTTPS 与 WebSocket。",
-  },
-  {
-    id: "nodes",
-    label: "服务器与资源",
-    icon: Server,
-    description: "接入自己的服务器，或使用已有代理和中转入口。",
-  },
-  {
-    id: "monitor",
-    label: "监控与告警",
-    icon: Activity,
-    description: "查看用量、带宽上限、连接检查和操作记录。",
-  },
-  {
-    id: "settings",
-    label: "登录与安全",
-    icon: Settings,
-    description: "管理登录密钥、二步验证、Passkey 和订阅。",
-  },
-  {
-    id: "help",
-    label: "使用手册",
-    icon: BookOpen,
-    description: "从你要完成的事情开始，找到对应的操作步骤。",
-  },
+  { id: "lines", label: "代理", icon: Network },
+  { id: "forward", label: "端口转发", icon: ArrowLeftRight },
+  { id: "nodes", label: "服务器", icon: Server },
+  { id: "settings", label: "设置", icon: Settings },
 ] as const;
 type Page = (typeof pages)[number]["id"];
 const pageFromHash = (): Page =>
-  pages.find((p) => p.id === location.hash.slice(1))?.id || "overview";
+  pages.find((p) => p.id === location.hash.slice(1))?.id || "lines";
 const jobNames: Record<string, string> = {
   publishing: "正在应用",
   rolling_back: "正在恢复",
@@ -222,103 +170,6 @@ function ProbeEditor({
     </Modal>
   );
 }
-function Help() {
-  const guides = [
-    [
-      "给客户端建代理",
-      "代理接入",
-      "选择入口服务器、客户端协议和监听端口，点击「保存并应用」。应用完成后点击「接入」，扫码、复制链接或下载完整 Mihomo 配置。",
-      "客户端 → 你的服务器 → Internet",
-    ],
-    [
-      "只转发一个端口",
-      "端口转发",
-      "选择入口服务器，分别填写监听端口、目标地址、目标端口，选择 TCP/UDP 后保存。业务客户端仍使用原来的协议和账号，连接地址换为转发入口。",
-      "客户端 → A:20000 → B:3306",
-    ],
-    [
-      "使用购买的中转端口",
-      "服务器与资源",
-      "若已有完整代理链接，选择「购买的中转入口」并填写原链接、服务商给的地址和端口。若它转发到自己创建的代理，在该代理编辑窗口展开同名设置。服务商处需先配置好映射。",
-      "客户端 → 服务商入口:端口 → 原代理节点",
-    ],
-    [
-      "多台服务器中转",
-      "代理接入 / 端口转发",
-      "先把自己的服务器接入，再在编辑窗口展开「经过其他服务器」。按入口、中转、出口顺序添加，内部隧道会自动配置。",
-      "客户端 → A → B → C → 目标",
-    ],
-    [
-      "让域名访问一个网站",
-      "网站反代",
-      "填写域名和后端 HTTP/HTTPS 地址。使用自动证书前，将域名解析到入口服务器并放行 TCP 80、443。需要时也可以上传自己的证书。",
-      "浏览器 → https://app.example.com → http://后端:3000",
-    ],
-    [
-      "限制用量与速度",
-      "规则编辑 → 流量额度与带宽上限",
-      "上传和下载上限分别填写 Mbps，所有并发连接共享上限。月额度使用 GiB，按入口上传＋下载合计，每月 1 日 UTC 重置。留空表示不限制。",
-      "监控显示用量 · 限速控制持续速度 · 配额控制总量",
-    ],
-  ];
-  return (
-    <div className="space-y-5">
-      <div className="rounded-xl border border-blue-100 bg-blue-50 p-5 text-sm leading-7 text-blue-900">
-        <strong>服务器是运行程序的机器，线路是数据经过的路径。</strong>
-        <p>
-          想在 Web 创建和管理服务器上的代理，才需要接入 Agent；控制台本机通常已自动接入。
-          也可以先在 B 自行搭建 VLESS，再导入分享链接，无需提供 SSH 或安装 Agent。
-        </p>
-      </div>
-      {guides.map(([title, location, text, path], i) => (
-        <Card key={title}>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-3">
-              <span className="flex size-7 items-center justify-center rounded-lg bg-blue-50 text-sm text-blue-600">
-                {i + 1}
-              </span>
-              {title}
-            </CardTitle>
-            <Status>{location}</Status>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm leading-7 text-slate-600">{text}</p>
-            <p className="mono mt-4 rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
-              {path}
-            </p>
-          </CardContent>
-        </Card>
-      ))}
-      <Card>
-        <CardHeader>
-          <CardTitle>连接失败时从哪里查</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3 text-sm leading-7 text-slate-600">
-          <p>
-            先看服务器是否在线、规则是否已应用，再检查防火墙和云安全组是否放行监听端口。代理客户端需要支持相应协议，并使用最新导出的配置。
-          </p>
-          <p>
-            REALITY 的伪装站点端口通常为
-            443；它与客户端连接的监听端口是两个不同设置。普通转发不会自动穿透目标的
-            NAT，目标必须能从入口服务器访问。
-          </p>
-          <p>
-            修改共享服务器上的规则可能使其他连接短暂重连。应用失败会尝试恢复旧配置；离线服务器尚未确认恢复时，页面会明确显示。
-          </p>
-          <a
-            className="text-blue-600 underline"
-            href="https://github.com/dovetaill/vless-chain/blob/main/panel/README.md"
-            target="_blank"
-            rel="noreferrer"
-          >
-            打开完整图文手册
-          </a>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
 export function App() {
   const [state, setState] = useState<PanelState | null>(null);
   const [loading, setLoading] = useState(true);
@@ -330,7 +181,10 @@ export function App() {
   );
   const [search, setSearch] = useState("");
   const [modal, setModal] = useState<ReactNode>(null);
+  const [editor, setEditor] = useState<{ kind: Line["kind"]; line?: Line; initialNodeId?: string } | null>(null);
   const [toast, setToast] = useState("");
+  const [pendingShare, setPendingShare] = useState<string | null>(null);
+  const [pendingLocal, setPendingLocal] = useState<{ id: string; done: (node?: NodeInfo) => void } | null>(null);
   const [loginError, setLoginError] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
   const [loginNotice, setLoginNotice] = useState("");
@@ -346,6 +200,7 @@ export function App() {
       if (e instanceof ApiError && e.status === 401) {
         setState(null);
         setModal(null);
+        setEditor(null);
       } else setConnected(false);
     } finally {
       setLoading(false);
@@ -382,6 +237,25 @@ export function App() {
       return () => clearTimeout(timer);
     }
   }, [toast]);
+  useEffect(() => {
+    if (!pendingShare || !state || state.busy) return;
+    const line = state.lines.find((item) => item.id === pendingShare);
+    if (state.jobs[0]?.state === "applied" && line?.published && line.enabled) {
+      setPendingShare(null);
+      setModal(<AccessDialog line={line} state={state} close={() => setModal(null)} />);
+    } else if (["rolled_back", "degraded"].includes(state.jobs[0]?.state)) {
+      setPendingShare(null);
+    }
+  }, [pendingShare, state]);
+  useEffect(() => {
+    if (!pendingLocal || !state) return;
+    const node = state.nodes.find((item) => item.id === pendingLocal.id);
+    if (node?.online) {
+      setPendingLocal(null);
+      setModal(null);
+      pendingLocal.done(node);
+    }
+  }, [pendingLocal, state]);
   const navigate = (next: string) => {
     location.hash = next;
     setMobile(false);
@@ -410,21 +284,25 @@ export function App() {
   const sessionEnded = (message = "") => {
     setLoginNotice(message);
     setState(null);
+    setEditor(null);
+    setPendingShare(null);
+    setPendingLocal(null);
     close();
   };
-  async function apply(id?: string) {
+  async function apply(id?: string, share = false) {
     const preview = await api<Preview>("/preview", "POST", {});
     const otherLines = preview.affected_line_ids.filter((n) => n !== id);
     if (otherLines.length) {
       setModal(
         <Modal
           title="应用这些修改"
-          description="以下线路共享受影响的服务器，应用时可能短暂重连。"
+          description="以下代理或转发共用服务器，应用时可能短暂重连。"
           submit="确认并应用"
           close={close}
           action={async () => {
             await api("/publish", "POST", {});
             await refresh();
+            if (share && id) setPendingShare(id);
             close();
             setToast("正在应用，请在当前页面查看结果。");
           }}
@@ -440,80 +318,38 @@ export function App() {
     } else {
       await api("/publish", "POST", {});
       await refresh();
+      if (share && id) setPendingShare(id);
       close();
       setToast("正在应用，请在当前页面查看结果。");
     }
   }
   function editLine(kind: Line["kind"], line?: Line, initialNodeId?: string) {
     if (!state) return;
-    if (!state.nodes.length) {
-      navigate("nodes");
-      setToast("先接入一台自己的服务器，即可创建。");
-      return;
-    }
-    setModal(
-      <LineEditor
-        kind={kind}
-        line={line}
-        state={state}
-        initialNodeId={initialNodeId}
-        close={close}
-        saved={async (value, draft) => {
-          await refresh();
-          if (draft) {
-            close();
-            setToast("草稿已保存，可稍后应用。");
-          } else await apply(value.id);
-        }}
-      />,
-    );
+    setEditor({ kind, line, initialNodeId });
   }
-  function useLocalServer() {
-    if (!state) return;
-    setModal(
-      <Modal
-        title="使用控制台本机"
-        description="本机指运行控制台的服务器，不是你打开浏览器的电脑。正常安装已自动接入本机，无需重复添加或 SSH。"
-        close={close}
-        submit={state.nodes.length ? "在此服务器创建代理" : undefined}
-        action={async (data) => {
-          const id = field(data, "node_id");
-          const current = await api<PanelState>("/state");
-          if (!current.nodes.some((node) => node.id === id && node.online))
-            throw new Error("所选服务器尚未在线，请先检查 Agent 状态；无需重新创建服务器记录。");
-          editLine("vless", undefined, id);
-        }}
-      >
-        {state.nodes.length > 0 && (
-          <Field label="选择已接入的本机节点" hint="请按名称和地址确认哪一台是控制台所在服务器；这里列出所有已接入记录，不根据域名猜测本机。">
-            <select className="select" name="node_id" defaultValue="" required>
-              <option value="" disabled>选择控制台所在服务器</option>
-              {state.nodes.map((node) => (
-                <option key={node.id} value={node.id}>
-                  {node.name} · {node.host} · {node.online ? "在线" : "离线"}
-                </option>
-              ))}
-            </select>
-          </Field>
-        )}
-        <div className="rounded-lg border border-border p-4 text-sm leading-6">
-          <strong>{state.nodes.length ? "找不到本机节点？" : "还没有已接入的节点"}</strong>
-          <p>安装向导默认创建“本机节点”。旧版本、仅安装控制台或自动接入失败时，可能没有这条记录。</p>
-          <p>当前控制台没有安装系统服务的权限，暂不支持网页补装本机 Agent。需要管理员在控制台服务器的 chainctl 菜单选择“安装 / 配置控制台与本机节点”。无需重新下载安装脚本。</p>
-          <p>如果本机已经有可用的 VLESS 等代理，直接导入分享链接即可。</p>
-        </div>
-        <Button type="button" variant="outline" onClick={() => importExternal()}>导入已有代理</Button>
-      </Modal>,
-    );
+  function addLocalServer(done: (node?: NodeInfo) => void) {
+    setModal(<Modal title="设置本机" submit="启用本机" close={() => { close(); done(); }} action={async (data) => {
+      const value = await api<{ id: string }>("/local-node", "POST", { host: field(data, "host") });
+      setPendingLocal({ id: value.id, done });
+      setModal(<Modal title="正在连接本机" close={() => { setPendingLocal(null); close(); done(); }}>
+        <p role="status">等待本机上线…</p>
+        <Button type="button" variant="outline" onClick={() => void refresh()}>刷新状态</Button>
+      </Modal>);
+      await refresh();
+    }}>
+      <Field label="本机公网 IP 或域名">
+        <Input name="host" placeholder="例如：203.0.113.10" required />
+      </Field>
+    </Modal>);
   }
-  function nodeEditor(node?: NodeInfo) {
+  function nodeEditor(node?: NodeInfo, done?: (node?: NodeInfo) => void) {
     const [host, port] = splitAddress(node?.target || "www.microsoft.com:443");
     setModal(
       <Modal
-        title={node ? "编辑服务器" : "接入另一台服务器"}
-        description={node ? "修改服务器信息；不会重新安装 Agent。" : "填写目标服务器 B 的地址。接入后，可在 Web 上创建和管理 B 的代理；B 已有分享链接时也可以直接导入。"}
-        submit={node ? "保存服务器" : "创建并获取接入方式"}
-        close={close}
+        title={node ? "编辑服务器" : "添加远程服务器"}
+
+        submit={node ? "保存" : "下一步：SSH 安装"}
+        close={() => { close(); done?.(); }}
         action={async (data) => {
           const value = await api<{ id: string; token: string }>(
             node ? `/nodes/${node.id}` : "/nodes",
@@ -537,10 +373,11 @@ export function App() {
             setModal(
               <Modal
                 title="安装并接入服务器"
-                description="安装到刚填写的服务器 B。以下两种方式任选一种，完成后回到这里等待上线。"
-                close={close}
+
+                close={() => { close(); done?.(); }}
               >
-                <AgentSetup id={value.id} token={value.token} host={field(data, "host")} copy={copy} />
+                <AgentSetup id={value.id} token={value.token} host={field(data, "host")} copy={copy}
+                  onOnline={done ? async (node) => { await refresh(); close(); done(node); } : undefined} />
               </Modal>,
             );
         }}
@@ -595,19 +432,19 @@ export function App() {
       </Modal>,
     );
   }
-  function importExternal(relay = false) {
+  function importExternal(relay = false, done?: (external?: External) => void) {
     setModal(
       <Modal
         title={relay ? "使用购买的中转入口" : "导入已有代理"}
         description={
           relay
             ? "先在服务商处配置好转发目标，再用这里生成经过中转的新链接。"
-            : "可以先在 B 服务器自行搭建 VLESS，再把分享链接粘贴到这里。无需 SSH 或 Agent；可直接供客户端使用，也可作为线路出口，但不能在此修改 B 的服务配置。"
+            : "粘贴已有代理的分享链接。"
         }
         submit="导入"
-        close={close}
+        close={() => { close(); done?.(); }}
         action={async (data) => {
-          const value = await api<{ url: string }>("/externals", "POST", {
+          const value = await api<External>("/externals", "POST", {
             name: field(data, "name"),
             url: field(data, "url"),
             relay_host: field(data, "relay_host"),
@@ -616,10 +453,11 @@ export function App() {
               : null,
           });
           await refresh();
+          if (done) { close(); done(value); return; }
           setModal(
             <Modal
               title="代理已导入"
-              description="可以复制到客户端，也可以在创建线路时选择它作为外部出口。"
+              description="可用于客户端，也可选作代理出口。"
               close={close}
             >
               <QR value={value.url} />
@@ -634,7 +472,7 @@ export function App() {
           );
         }}
       >
-        <Field label="资源名称">
+        <Field label="名称">
           <Input
             name="name"
             required
@@ -714,37 +552,7 @@ export function App() {
               Chain Panel
             </span>
           </div>
-          <div className="my-auto py-16">
-            <span className="rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-xs tracking-wider text-blue-100">
-              PERSONAL NETWORK CONSOLE
-            </span>
-            <h1 className="mt-7 max-w-md text-4xl font-semibold leading-tight tracking-tight">
-              你的服务器。
-              <br />
-              你的连接方式。
-            </h1>
-            <p className="mt-6 max-w-sm text-sm leading-8 text-blue-100">
-              在一个控制台里管理代理、端口转发和网站访问，让复杂网络回到清楚的日常操作。
-            </p>
-            <div className="mt-10 space-y-4 text-sm text-blue-100">
-              {[
-                [Network, "多种代理协议，快速连接客户端"],
-                [ArrowLeftRight, "简单端口转发，按需增加中转"],
-                [ShieldCheck, "流量控制与安全登录"],
-              ].map(([Icon, text], i) => {
-                const I = Icon as typeof Network;
-                return (
-                  <p key={i} className="flex items-center gap-3">
-                    <I className="size-4 text-blue-300" />
-                    {String(text)}
-                  </p>
-                );
-              })}
-            </div>
-          </div>
-          <p className="text-xs text-blue-200/60">
-            Chain Panel · 个人多服务器控制台
-          </p>
+          <h1 className="my-auto py-16 text-4xl font-semibold">代理与中转</h1>
         </section>
         <main className="flex min-h-screen flex-1 items-center justify-center p-6 sm:p-12">
           <div className="w-full max-w-sm">
@@ -845,7 +653,7 @@ export function App() {
     );
   const current = pages.find((p) => p.id === page)!;
   const kind: Line["kind"] =
-    page === "forward" ? "forward" : page === "websites" ? "website" : "vless";
+    page === "forward" ? "forward" : "vless";
   const lines = state.lines.filter(
     (l) =>
       l.kind === kind && l.name.toLowerCase().includes(search.toLowerCase()),
@@ -876,47 +684,21 @@ export function App() {
             <X className="size-5" />
           </button>
         </div>
-        <div className="sidebar-workspace">
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-blue-100 text-xs font-semibold text-blue-600">
-            CP
-          </span>
-          <div className="sidebar-label">
-            <p className="text-xs font-semibold">我的工作空间</p>
-            <p className="mt-1 text-[10px] text-slate-400">个人网络控制台</p>
-          </div>
-        </div>
-        <p className="sidebar-label px-6 pb-2 pt-6 text-[10px] font-semibold tracking-widest text-slate-400">
-          工作空间
-        </p>
         <nav className="flex-1 space-y-1 px-3 py-2">
-          {pages.map((p, i) => (
+          {pages.map((p) => (
             <button
               key={p.id}
                 aria-label={p.label}
               title={collapsed ? p.label : undefined}
-              className={`nav-item ${page === p.id ? "active" : ""} ${i === 6 ? "mt-7!" : ""}`}
+              className={`nav-item ${page === p.id ? "active" : ""} `}
               onClick={() => navigate(p.id)}
             >
               <p.icon className="size-[18px] shrink-0" />
               <span className="sidebar-label">{p.label}</span>
-              {p.id === "monitor" && state.alerts.length > 0 && (
-                <span className="sidebar-label ms-auto rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-800">
-                  {state.alerts.length}
-                </span>
-              )}
             </button>
           ))}
         </nav>
         <div className="sidebar-footer">
-          <div className="sidebar-label mb-4 rounded-lg border border-border bg-slate-50 p-3">
-            <p className="flex items-center gap-2 text-xs font-medium">
-              <ShieldCheck className="size-4 text-emerald-600" />
-              私人控制台
-            </p>
-            <p className="mt-2 text-[11px] leading-5 text-slate-400">
-              仅管理已接入的服务器与规则。
-            </p>
-          </div>
           <button
             className="nav-item w-full"
             onClick={() =>
@@ -962,8 +744,6 @@ export function App() {
             >
               <Menu />
             </Button>
-            <span className="text-xs text-slate-400">工作空间</span>
-            <ChevronRight className="size-3 text-slate-300" />
             <span className="text-xs font-medium">{current.label}</span>
           </div>
           <div className="flex items-center gap-4">
@@ -976,7 +756,14 @@ export function App() {
             <button
               className="relative text-slate-500"
               aria-label="查看告警"
-              onClick={() => navigate("monitor")}
+              onClick={() => setModal(<Modal title="运行状态" close={close}>
+                {state.alerts.map((alert) => <p key={alert.id} role="alert">{alert.message}</p>)}
+                {!state.alerts.length && <p>暂无告警</p>}
+                {state.jobs.map((job) => <details key={job.id}>
+                  <summary>{jobNames[job.state] || job.state} · {stamp(job.started)}</summary>
+                  {job.events.map((event, i) => <p key={i} className="muted">{event.message}</p>)}
+                </details>)}
+              </Modal>)}
             >
               <Bell className="size-[18px]" />
               {state.alerts.length > 0 && (
@@ -994,18 +781,11 @@ export function App() {
               <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
                 {current.label}
               </h1>
-              <p className="mt-2 text-sm leading-6 text-slate-500">
-                {current.description}
-              </p>
             </div>
-            {["lines", "forward", "websites"].includes(page) && (
+            {["lines", "forward"].includes(page) && (
               <Button disabled={state.busy} onClick={() => editLine(kind)}>
                 <Plus />
-                {kind === "vless"
-                  ? "创建代理"
-                  : kind === "forward"
-                    ? "创建转发"
-                    : "添加网站"}
+                {kind === "vless" ? "创建代理" : "创建转发"}
               </Button>
             )}
           </div>
@@ -1028,18 +808,11 @@ export function App() {
               </p>
             </div>
           )}
-          {page === "overview" && (
-            <Dashboard state={state} create={editLine} navigate={navigate} />
-          )}
-          {["lines", "forward", "websites"].includes(page) && (
+          {["lines", "forward"].includes(page) && (
             <Card>
               <CardHeader>
                 <CardTitle>
-                  {kind === "vless"
-                    ? "我的代理"
-                    : kind === "forward"
-                      ? "转发规则"
-                      : "我的网站"}{" "}
+                  {kind === "vless" ? "我的代理" : "端口转发"}{" "}
                   <span className="ms-2 text-sm font-normal text-slate-400">
                     {lines.length}
                   </span>
@@ -1080,9 +853,7 @@ export function App() {
                             <p className="text-xs font-medium">
                               {l.kind === "vless"
                                 ? protocolNames[l.access.protocol]
-                                : l.kind === "website"
-                                  ? "网站反代"
-                                  : l.network.toUpperCase()}
+                                : l.network.toUpperCase()}
                             </p>
                             <p className="mono mt-2 text-xs text-slate-400">
                               端口 {l.hops[0].port}
@@ -1106,6 +877,19 @@ export function App() {
                           <td>
                             <div className="flex items-center justify-end gap-1">
                               <Button
+                                variant="ghost"
+                                size="sm"
+                                role="switch"
+                                aria-checked={l.enabled}
+                                aria-label={`${l.enabled ? "停用" : "启用"} ${l.name}`}
+                                disabled={state.busy}
+                                onClick={() => void run(async () => {
+                                  await api("/lines", "POST", { ...l, enabled: !l.enabled });
+                                  await refresh();
+                                  await apply(l.id);
+                                })}
+                              >{l.enabled ? "停用" : "启用"}</Button>
+                              <Button
                                 variant="outline"
                                 size="sm"
                                 disabled={
@@ -1121,7 +905,7 @@ export function App() {
                                   )
                                 }
                               >
-                                {l.kind === "website" ? "访问" : "接入"}
+                                {l.kind === "forward" ? "入口" : "分享"}
                               </Button>
                               <Button
                                 variant="ghost"
@@ -1174,7 +958,7 @@ export function App() {
                                       onSelect={() =>
                                         setModal(
                                           <Modal
-                                            title="删除规则"
+                                            title="删除代理或转发"
                                             description={`删除「${l.name}」并应用配置后，该入口停止服务。`}
                                             submit="删除并应用"
                                             close={close}
@@ -1190,7 +974,7 @@ export function App() {
                                         )
                                       }
                                     >
-                                      删除规则
+                                      删除
                                     </DropdownMenu.Item>
                                   </DropdownMenu.Content>
                                 </DropdownMenu.Portal>
@@ -1206,31 +990,24 @@ export function App() {
                 <Empty
                   title={
                     search
-                      ? "没有找到匹配的规则"
+                      ? "没有匹配结果"
                       : kind === "forward"
-                        ? "从一个端口开始"
-                        : kind === "website"
-                          ? "让网站拥有自己的访问入口"
-                          : "创建第一条代理"
+                        ? "暂无端口转发"
+                        : "暂无代理"
                   }
                   action={
                     !search && (
                       <Button onClick={() => editLine(kind)}>
                         <Plus />
-                        开始创建
+                        {kind === "forward" ? "创建转发" : "创建代理"}
                       </Button>
                     )
                   }
                 >
-                  {kind === "forward"
-                    ? "选择服务器和目标地址，无需填写 VLESS、UUID 或 REALITY 参数。"
-                    : kind === "website"
-                      ? "填写域名和后端地址，配置 HTTPS 后即可访问。"
-                      : "选择入口服务器和协议，其余复杂设置按需展开。"}
                 </Empty>
               )}
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-4 text-xs text-slate-400">
-                <span>保存并应用后，即可使用入口。</span>
+                <span>{lines.length} 条</span>
                 {state.lines.some((l) => !l.published) && (
                   <Button
                     variant="outline"
@@ -1247,48 +1024,10 @@ export function App() {
           )}
           {page === "nodes" && (
             <div className="space-y-6">
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                {[
-                  {
-                    icon: Server,
-                    title: "使用控制台本机",
-                    text: "复用已接入的本机节点，无需重复安装。",
-                    action: () => useLocalServer(),
-                  },
-                  {
-                    icon: Server,
-                    title: "接入另一台服务器",
-                    text: "在 B 安装一次 Agent，以后在 Web 创建代理。",
-                    action: () => nodeEditor(),
-                  },
-                  {
-                    icon: Network,
-                    title: "导入已有代理",
-                    text: "B 已搭建 VLESS 等代理？粘贴链接即可。",
-                    action: () => importExternal(),
-                  },
-                  {
-                    icon: Cable,
-                    title: "购买的中转入口",
-                    text: "把服务商的端口用于已有节点。",
-                    action: () => importExternal(true),
-                  },
-                ].map((r) => (
-                  <button
-                    key={r.title}
-                    className="quick-task"
-                    onClick={r.action}
-                  >
-                    <r.icon className="size-6 shrink-0 text-blue-600" />
-                    <span className="text-left">
-                      <strong className="text-sm">{r.title}</strong>
-                      <span className="mt-1 block text-xs leading-5 text-slate-500">
-                        {r.text}
-                      </span>
-                    </span>
-                    <Plus className="ms-auto size-4 text-slate-300" />
-                  </button>
-                ))}
+              <div className="flex flex-wrap gap-2">
+                <Button disabled={state.busy} onClick={() => nodeEditor()}><Plus />添加远程服务器</Button>
+                <Button variant="outline" onClick={() => importExternal()}>导入已有代理</Button>
+                <Button variant="ghost" onClick={() => importExternal(true)}>添加中转入口</Button>
               </div>
               <div className="grid gap-5 xl:grid-cols-2">
                 {state.nodes.map((n) => (
@@ -1333,13 +1072,13 @@ export function App() {
                         <Button
                           size="sm"
                           variant="outline"
-                          disabled={state.busy}
+                          disabled={state.busy || n.id === state.local_node_id}
                           onClick={() =>
                             setModal(
                               <Modal
                                 title="重新接入服务器"
-                                description="生成新接入码后，旧凭据失效。请在目标服务器重新接入。"
-                                submit="生成新接入码"
+                                description="将重新配置 SSH 连接，现有连接凭据会失效。"
+                                submit="继续 SSH 连接"
                                 close={close}
                                 action={async () => {
                                   const result = await api<{ token: string }>(
@@ -1372,7 +1111,7 @@ export function App() {
                           size="icon"
                           variant="ghost"
                           aria-label={`删除服务器 ${n.name}`}
-                          disabled={state.busy}
+                          disabled={state.busy || n.id === state.local_node_id}
                           onClick={() =>
                             setModal(
                               <Modal
@@ -1398,7 +1137,7 @@ export function App() {
               </div>
               <Card>
                 <CardHeader>
-                  <CardTitle>外部代理资源</CardTitle>
+                  <CardTitle>已有代理</CardTitle>
                 </CardHeader>
                 <CardContent>
                   {state.externals.length ? (
@@ -1449,209 +1188,6 @@ export function App() {
               </Card>
             </div>
           )}
-          {page === "monitor" && (
-            <div className="space-y-6">
-              <Card>
-                <CardHeader>
-                  <CardTitle>当前告警</CardTitle>
-                  <Status tone={state.alerts.length ? "warn" : "good"}>
-                    {state.alerts.length || "正常"}
-                  </Status>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  {state.alerts.length ? (
-                    state.alerts.map((a) => (
-                      <div
-                        key={a.id}
-                        className={`rounded-lg p-3 text-sm leading-6 ${a.level === "error" ? "bg-red-50 text-red-800" : "bg-amber-50 text-amber-800"}`}
-                      >
-                        {a.message}
-                      </div>
-                    ))
-                  ) : (
-                    <p className="muted">当前没有需要处理的异常。</p>
-                  )}
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle>线路用量与限制</CardTitle>
-                  <span className="text-xs text-slate-400">
-                    入口计量 · UTC 月周期
-                  </span>
-                </CardHeader>
-                <div className="overflow-x-auto">
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th>线路</th>
-                        <th>当前上传 / 下载</th>
-                        <th>本月用量 / 额度</th>
-                        <th>带宽上限</th>
-                        <th>操作</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {state.lines.map((l) => {
-                        const live = state.nodes.find(
-                          (n) => n.id === l.hops[0]?.node_id,
-                        )?.online;
-                        return (
-                          <tr key={l.id}>
-                            <td>
-                              <p className="text-sm font-medium">{l.name}</p>
-                              <p className="mt-2">
-                                <LineStatus line={l} state={state} />
-                              </p>
-                            </td>
-                            <td>
-                              {l.traffic && live ? (
-                                <div className="space-y-2 text-xs">
-                                  <p className="flex items-center gap-1">
-                                    <ArrowUpRight className="size-3 text-violet-500" />
-                                    {bytes(l.traffic.upload_bps)}/s
-                                  </p>
-                                  <p className="flex items-center gap-1">
-                                    <ArrowDownLeft className="size-3 text-blue-500" />
-                                    {bytes(l.traffic.download_bps)}/s
-                                  </p>
-                                </div>
-                              ) : (
-                                <span className="text-xs text-slate-400">
-                                  {live ? "尚未采集" : "服务器离线"}
-                                </span>
-                              )}
-                            </td>
-                            <td>
-                              <p className="text-xs">
-                                {l.traffic
-                                  ? bytes(l.traffic.upload + l.traffic.download)
-                                  : "尚未采集"}{" "}
-                                /{" "}
-                                {l.limits.monthly_gib
-                                  ? `${l.limits.monthly_gib} GiB`
-                                  : "不限量"}
-                              </p>
-                              {l.limits.monthly_gib && l.traffic && (
-                                <div className="mt-2 h-1.5 w-32 overflow-hidden rounded-full bg-slate-100">
-                                  <div
-                                    className="h-full rounded-full bg-blue-500"
-                                    style={{
-                                      width: `${Math.min(100, ((l.traffic.upload + l.traffic.download) / (l.limits.monthly_gib * 1073741824)) * 100)}%`,
-                                    }}
-                                  />
-                                </div>
-                              )}
-                            </td>
-                            <td className="text-xs leading-6">
-                              <p>
-                                上传{" "}
-                                {l.limits.upload_mbps
-                                  ? `${l.limits.upload_mbps} Mbps`
-                                  : "不限速"}
-                              </p>
-                              <p>
-                                下载{" "}
-                                {l.limits.download_mbps
-                                  ? `${l.limits.download_mbps} Mbps`
-                                  : "不限速"}
-                              </p>
-                              <p className="text-slate-400">
-                                {l.published ? "策略已应用" : "策略待应用"}
-                              </p>
-                            </td>
-                            <td>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={state.busy}
-                                onClick={() => editLine(l.kind, l)}
-                              >
-                                调整限制
-                              </Button>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle>连接检查</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  {state.lines.map((l) => (
-                    <div
-                      key={l.id}
-                      className="flex items-center justify-between gap-4 border-b border-border pb-4 last:border-0"
-                    >
-                      <div>
-                        <p className="text-sm font-medium">{l.name}</p>
-                        <p className="muted mt-1">
-                          {state.checks[l.id]
-                            ? `${state.checks[l.id].ok ? "通过" : "未通过"} · ${stamp(state.checks[l.id].checked_at)}`
-                            : "尚未检查"}
-                        </p>
-                      </div>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={!l.published || state.busy || !l.enabled}
-                        onClick={() =>
-                          setModal(
-                            <ProbeEditor
-                              line={l}
-                              state={state}
-                              close={close}
-                              saved={refresh}
-                            />,
-                          )
-                        }
-                      >
-                        检查连接
-                      </Button>
-                    </div>
-                  ))}
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle>最近操作</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  {state.jobs.length ? (
-                    state.jobs.map((j) => (
-                      <details
-                        key={j.id}
-                        className="border-b border-border py-4 last:border-0"
-                      >
-                        <summary className="flex cursor-pointer items-center justify-between gap-3 text-sm">
-                          <span>{jobNames[j.state] || j.state}</span>
-                          <span className="text-xs text-slate-400">
-                            {stamp(j.started)}
-                          </span>
-                        </summary>
-                        <div className="mt-3 space-y-2 border-l-2 border-blue-100 pl-4">
-                          {j.events.map((e, i) => (
-                            <p
-                              key={i}
-                              className="text-xs leading-6 text-slate-500"
-                            >
-                              {stamp(e.at)} · {e.message}
-                            </p>
-                          ))}
-                        </div>
-                      </details>
-                    ))
-                  ) : (
-                    <p className="muted py-6">应用配置后，这里会记录结果。</p>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
-          )}
           {page === "settings" && (
             <SecuritySettings
               state={state}
@@ -1659,13 +1195,24 @@ export function App() {
               sessionEnded={sessionEnded}
             />
           )}
-          {page === "help" && <Help />}
           <footer className="mt-10 flex items-center justify-between border-t border-border pt-5 text-[11px] text-slate-400">
             <span>Chain Panel · 个人网络控制台</span>
-            <button onClick={() => navigate("help")}>使用手册</button>
           </footer>
         </main>
       </div>
+      {editor && <LineEditor
+        {...editor}
+        state={state}
+        addServer={(done) => nodeEditor(undefined, done)}
+        addLocalServer={addLocalServer}
+        importExternal={(done) => importExternal(false, done)}
+        close={() => setEditor(null)}
+        saved={async (value) => {
+          await refresh();
+          await apply(value.id, value.kind === "vless");
+          setEditor(null);
+        }}
+      />}
       {modal}
       {toast && (
         <div
