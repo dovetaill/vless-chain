@@ -67,7 +67,18 @@ def source_status():
     return output(['git', 'status', '--porcelain', '--untracked-files=normal', '--', *SHIPPED], cwd=ROOT)
 
 
-def release_wizard():
+def push_release(tag):
+    print(f'将推送 main 和 {tag}，触发版本构建。')
+    answer = input('现在推送？[Y/n]（回车推送，n 仅保留本地）: ').strip().lower()
+    require(answer in ('', 'y', 'yes', 'n', 'no'), '未识别的选项，未推送；本地提交与标签保留。')
+    if answer in ('n', 'no'):
+        print(f'{tag} 已保留在本地，尚未推送。稍后选择菜单 10「单独推送已有版本」。')
+        return
+    run(['git', 'push', '--atomic', 'origin', 'main', 'refs/tags/' + tag], cwd=ROOT)
+    print(f'{tag} 已推送；等待 Actions 构建完成并公开正式 Release 后，再运行 sudo chainctl update。')
+
+
+def release_wizard(push_only=False):
     require(sys.stdin.isatty(), '请在终端打开发布向导，确认变更后再推送。')
     paths = [*SHIPPED, '.github']
     def git(*args):
@@ -88,15 +99,12 @@ def release_wizard():
     remote_tags = git('ls-remote', '--tags', 'origin')
     remote_names = {line.split('\t')[1] for line in remote_tags.splitlines()}
     # Resume a failed push without creating another version or rewriting a commit.
-    if current_tag in local_tags and f'refs/tags/{current_tag}' not in remote_names:
-        require(not status and git('rev-parse', current_tag + '^{commit}') == git('rev-parse', 'HEAD'),
-                f'{current_tag} 尚未推送且工作区或提交已变化，请先处理该标签，避免重复发布。')
-        print(f'发现尚未推送的 {current_tag}，将继续推送原提交。')
-        git_args = ['git', 'push', '--atomic', 'origin', 'main', 'refs/tags/' + current_tag]
-        print(' '.join(git_args))
-        if input('确认继续推送？输入 y: ').strip().lower() == 'y':
-            run(git_args, cwd=ROOT)
-            print('已推送；等待 Actions 构建完成并公开正式 Release 后再升级。')
+    if push_only or (current_tag in local_tags and f'refs/tags/{current_tag}' not in remote_names):
+        require(current_tag in local_tags, f'本地没有 {current_tag}，请先通过菜单 9 创建版本。')
+        require(git('rev-parse', current_tag + '^{commit}') == git('rev-parse', 'HEAD'),
+                f'{current_tag} 未指向当前提交，请先处理版本与提交的对应关系；不会自动移动标签。')
+        print(f'推送已有版本 {current_tag}，不递增版本或创建提交。')
+        push_release(current_tag)
         return
     major, minor, patch = map(int, old.split('.'))
     suggested = f'{major}.{minor}.{patch + 1}'
@@ -114,9 +122,9 @@ def release_wizard():
                '影响范围：仅四份版本文件，不修改业务逻辑；业务变更说明和验证记录见此前提交。\n\n'
                '验证：通过 Git 差异空白、四份版本一致性、远端历史及标签冲突检查。\n'
                '本次仅修改版本元数据，不重复运行业务测试；完整构建和安装验证由发布 CI 执行，结果以 CI 为准。\n\n'
-               '发布方式：创建附注标签并原子推送 main 和标签，触发 Actions；不会升级运行中的服务。\n')
+               '发布方式：创建附注标签，随后可选择原子推送 main 和标签以触发 Actions；不会升级运行中的服务。\n')
     print('\n' + message)
-    if input(f'确认提交并推送 {tag}？输入 y: ').strip().lower() != 'y':
+    if input(f'确认创建版本提交和标签 {tag}？输入 y: ').strip().lower() != 'y':
         print('已取消，未修改版本、提交或推送。')
         return
     try:
@@ -126,12 +134,11 @@ def release_wizard():
         require(version() == value, '版本校验失败。')
         run(['git', 'commit', '-F', '-'], cwd=ROOT, input=message, text=True)
         run(['git', 'tag', '-a', tag, '-m', f'发布 {tag}：同步版本文件并发布已提交的业务代码。'], cwd=ROOT)
-        run(['git', 'push', '--atomic', 'origin', 'main', 'refs/tags/' + tag], cwd=ROOT)
+        push_release(tag)
     except (ValueError, OSError, subprocess.CalledProcessError):
         print('发布未完成，已产生的版本改动、提交及标签均保留，不自动回退或覆盖。\n'
               '若仅推送失败，重新进入此向导可继续推送；其他失败请先检查 git status。', file=sys.stderr)
         raise
-    print(f'{tag} 已推送；等待 Actions 构建完成并公开正式 Release 后，再运行 sudo chainctl update。')
 
 
 def fetch_xray(work, destination):
@@ -285,11 +292,12 @@ def menu():
               '1) 构建发行包（含前端、Rust 程序与 Xray）\n2) 检查脚本与安装流程\n'
               '3) 完整前后端和真实链路验证\n4) 查看版本与 Git 状态\n5) 设置下一版本\n'
               '6) 创建 GitHub Release 草稿\n7) 发布已有 GitHub 草稿\n8) 本机安装与运维\n'
-              '9) 发布已提交的代码（默认：递增版本、提交版本文件、打标签、推送）\n0) 退出')
+              '9) 发布已提交的代码（默认：递增版本、提交版本文件、打标签，可选推送）\n'
+              '10) 单独推送已有版本（不递增版本）\n0) 退出')
         choice = input('选择 [9]: ').strip() or '9'
         if choice == '0':
             return
-        command = {'1': ['build'], '2': ['check'], '3': ['check', '--full'], '4': ['status'], '8': ['ops'], '9': ['release']}.get(choice)
+        command = {'1': ['build'], '2': ['check'], '3': ['check', '--full'], '4': ['status'], '8': ['ops'], '9': ['release'], '10': ['push']}.get(choice)
         if choice == '5':
             command = ['version', '--set', input('新版本 X.Y.Z: ').strip()]
         if choice in ('6', '7'):
@@ -319,6 +327,7 @@ def main(argv=None):
             item.add_argument('--repo', required=True)
     sub.add_parser('status')
     sub.add_parser('release', help='发布已提交的代码：递增版本、提交版本文件、打标签并推送')
+    sub.add_parser('push', help='单独推送当前已有版本，不递增版本或创建提交')
     sub.add_parser('version').add_argument('--set')
     sub.add_parser('ops').add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -332,6 +341,8 @@ def main(argv=None):
         set_version(vars(args)['set']) if vars(args)['set'] else print(version())
     elif args.action == 'release':
         release_wizard()
+    elif args.action == 'push':
+        release_wizard(push_only=True)
     elif args.action == 'status':
         print(f'版本：{version()}\n架构：{architecture()}\n默认发行目录：{default_output()}')
         run(['git', 'status', '--short'], cwd=ROOT)

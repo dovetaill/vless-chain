@@ -410,14 +410,14 @@ class Delivery(unittest.TestCase):
         git('commit', '-m', '提交业务改动')
         (repo / 'unrelated.txt').write_text('keep\n')
         (repo / 'theme.zip').write_bytes(b'keep')
-        answers = ['', 'y']
+        answers = ['', 'y', '']
         with patch.object(release, 'ROOT', repo), patch.object(release.sys.stdin, 'isatty', return_value=True):
             before = git('rev-parse', 'HEAD')
             old = release.version()
             parts = old.split('.')
             expected = '.'.join([*parts[:2], str(int(parts[2]) + 1)])
             tag = 'v' + expected
-            with patch('builtins.input', side_effect=[*answers[:-1], 'n']):
+            with patch('builtins.input', side_effect=['', 'n']):
                 release.release_wizard()
             self.assertEqual(release.version(), old)
             self.assertEqual(git('rev-parse', 'HEAD'), before)
@@ -475,11 +475,34 @@ class Delivery(unittest.TestCase):
     def test_release_wizard_custom_version(self):
         repo, git = self.release_repo()
         with patch.object(release, 'ROOT', repo), patch.object(release.sys.stdin, 'isatty', return_value=True):
-            with patch('builtins.input', side_effect=['98.1.0', 'y']):
+            with patch('builtins.input', side_effect=['98.1.0', 'y', '']):
                 release.release_wizard()
             self.assertEqual(release.version(), '98.1.0')
             commit = git('rev-parse', 'HEAD')
             self.assertIn(commit + '\trefs/tags/v98.1.0^{}', git('ls-remote', '--tags', 'origin'))
+
+    def test_release_skip_then_push_existing_version(self):
+        repo, git = self.release_repo()
+        with patch.object(release, 'ROOT', repo), patch.object(release.sys.stdin, 'isatty', return_value=True):
+            with self.assertRaisesRegex(ValueError, '本地没有'):
+                release.main(['push'])
+            before = git('rev-parse', 'HEAD')
+            with patch('builtins.input', side_effect=['98.2.0', 'y', 'n']):
+                release.release_wizard()
+            commit = git('rev-parse', 'HEAD')
+            self.assertNotEqual(before, commit)
+            self.assertEqual(git('rev-parse', 'v98.2.0^{commit}'), commit)
+            self.assertFalse(git('ls-remote', '--tags', 'origin'))
+            self.assertIn(before + '\trefs/heads/main', git('ls-remote', 'origin', 'refs/heads/main'))
+            with patch('builtins.input', return_value='n'):
+                release.main(['push'])
+            self.assertFalse(git('ls-remote', '--tags', 'origin'))
+            with patch('builtins.input', return_value='') as prompt:
+                release.main(['push'])
+            self.assertEqual(prompt.call_count, 1)
+            self.assertEqual(release.version(), '98.2.0')
+            self.assertEqual(git('rev-parse', 'HEAD'), commit)
+            self.assertIn(commit + '\trefs/tags/v98.2.0^{}', git('ls-remote', '--tags', 'origin'))
 
     def test_dual_arch_release_aggregation_rejects_dirty_builds(self):
         source, manifest = self.package()

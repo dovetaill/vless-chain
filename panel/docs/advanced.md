@@ -140,9 +140,9 @@ sudo chainctl rollback --component panel
 
 日常发布先自行完成业务代码的 Git 提交，再运行 `./scripts/version-release.sh`。菜单直接回车进入默认的 **9「发布已提交的代码」**；版本号再次回车默认递增补丁版本，例如 `0.2.1 → 0.2.2`，也可以输入指定版本，例如 `0.3.0`。查看版本文件、已有未推送提交和自动生成的中文提交正文，再输入 `y` 确认，无需重新填写业务更新说明。
 
-向导只同步并提交 `panel/Cargo.toml`、`panel/Cargo.lock`、`panel/frontend/package.json`、`panel/frontend/package-lock.json`，随后创建附注标签，原子推送 `main` 和标签。业务代码必须提前提交：`panel/`、`scripts/`、`README.md`、`.gitignore`、`.github/` 中存在未提交改动或未忽略的新文件时停止；范围外文件保持不动。仅接受 `main` 且暂存区为空，远端存在本地未包含的提交、标签冲突或版本倒退时停止。不会自动合并、强推或部署服务器。
+向导只同步并提交 `panel/Cargo.toml`、`panel/Cargo.lock`、`panel/frontend/package.json`、`panel/frontend/package-lock.json`，随后创建附注标签。最后询问「现在推送？[Y/n]」：回车默认原子推送 `main` 和标签，输入 `n` 只保留本地版本提交与标签。业务代码必须提前提交：`panel/`、`scripts/`、`README.md`、`.gitignore`、`.github/` 中存在未提交改动或未忽略的新文件时停止；范围外文件保持不动。仅接受 `main` 且暂存区为空，远端存在本地未包含的提交、标签冲突或版本倒退时停止。不会自动合并、强推或部署服务器。
 
-仅推送失败时，再选 9 会识别当前提交上未推送的版本标签，确认后继续推送，不再递增版本。其他失败保留现场，需先检查 `git status`。向导不代替测试，必须等 Actions 构建成功并公开正式 Release 后，服务器才能通过 `sudo chainctl update` 获取新版。也可用 `./scripts/version-release.sh release` 直接进入向导。
+选择不推送或仅推送失败后，可选 **10「单独推送已有版本」**，或运行 `./scripts/version-release.sh push`；只推送 `main` 和当前版本标签，不递增版本、不创建新提交。标签必须指向当前提交，不会自动移动已有标签。再次选择 9 也会识别未推送的当前版本并进入推送步骤。其他失败保留现场，需先检查 `git status`。向导不代替测试，必须等 Actions 构建成功并公开正式 Release 后，服务器才能通过 `sudo chainctl update` 获取新版。也可用 `./scripts/version-release.sh release` 直接进入创建版本向导。
 
 需要手工操作时：
 
