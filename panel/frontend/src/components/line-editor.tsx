@@ -18,12 +18,14 @@ export function LineEditor({
   line,
   kind,
   state,
+  initialNodeId,
   close,
   saved,
 }: {
   line?: Line;
   kind: Line["kind"];
   state: PanelState;
+  initialNodeId?: string;
   close: () => void;
   saved: (line: Line, draft: boolean) => Promise<void>;
 }) {
@@ -37,7 +39,7 @@ export function LineEditor({
   );
   const [hops, setHops] = useState(
     line?.hops.map((h) => ({ node_id: h.node_id, port: String(h.port) })) || [
-      { node_id: state.nodes[0].id, port: website ? "443" : "" },
+      { node_id: initialNodeId || state.nodes[0].id, port: website ? "443" : "" },
     ],
   );
   const [draft, setDraft] = useState(false);

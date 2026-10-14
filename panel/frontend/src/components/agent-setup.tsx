@@ -5,10 +5,10 @@ import { Input } from '@/components/ui/input';
 import { api } from '@/api';
 import type { PanelState } from '@/types';
 
-const installCommand = 'curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo bash';
+const installCommand = 'curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo bash -s -- install --component agent';
 const isLoopback = (host: string) => host === 'localhost' || host === '[::1]' || /^127\./.test(host);
 
-export function AgentSetup({ id, token, copy }: { id: string; token: string; copy: (value: string) => Promise<void> }) {
+export function AgentSetup({ id, token, host, copy }: { id: string; token: string; host?: string; copy: (value: string) => Promise<void> }) {
   const [address, setAddress] = useState(isLoopback(location.hostname) ? '' : location.origin);
   const [online, setOnline] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
@@ -71,7 +71,16 @@ export function AgentSetup({ id, token, copy }: { id: string; token: string; cop
   } catch { /* Keep the copy action disabled until a reachable URL is entered. */ }
   return <div className="space-y-5">
     <section className="space-y-3">
-      <h3 className="text-sm font-semibold">1. 确认控制台地址</h3>
+      <h3 className="text-sm font-semibold">1. 选择如何安装到目标服务器{host ? ` ${host}` : ''}</h3>
+      <p className="muted">任选一种即可。脚本在目标服务器 B 执行；SSH 方式由控制台代你连接 B 安装。</p>
+      <div className="flex flex-wrap gap-2">
+        <Button type="button" disabled={busy} variant={method === 'script' ? 'primary' : 'outline'} onClick={() => setMethod('script')}>在 B 的终端安装</Button>
+        <Button type="button" disabled={busy} variant={method === 'web' ? 'primary' : 'outline'} onClick={() => setMethod('web')}>通过 SSH 远程安装到 B</Button>
+      </div>
+    </section>
+    <section className="space-y-3 border-t border-border pt-4">
+      <h3 className="text-sm font-semibold">2. 确认控制台地址</h3>
+      <p className="muted">这是 B 安装后回连的控制台地址，不是 B 的服务器地址。</p>
       <label className="field">节点可以访问的控制台地址
         <Input disabled={busy} value={address} onChange={event => { setAddress(event.target.value); setAllowHttp(false); }} placeholder="https://panel.example.com" />
       </label>
@@ -84,15 +93,11 @@ export function AgentSetup({ id, token, copy }: { id: string; token: string; cop
       </>}
     </section>
     <section className="space-y-3 border-t border-border pt-4">
-      <h3 className="text-sm font-semibold">2. 选择安装方式</h3>
-      <div className="flex flex-wrap gap-2">
-        <Button type="button" disabled={busy} variant={method === 'web' ? 'primary' : 'outline'} onClick={() => setMethod('web')}>在 Web 安装</Button>
-        <Button type="button" disabled={busy} variant={method === 'script' ? 'primary' : 'outline'} onClick={() => setMethod('script')}>使用脚本安装</Button>
-      </div>
+      <h3 className="text-sm font-semibold">3. {method === 'script' ? '在 B 的终端执行' : '填写 B 的 SSH 登录信息'}</h3>
       {method === 'script' ? <>
         <pre className="secret">{installCommand}</pre>
         <Button type="button" variant="outline" onClick={() => void copy(installCommand)}><Copy />复制安装命令</Button>
-        <p className="muted">选择「接入节点」，按提示粘贴接入码。已经安装过的服务器直接输入 <code>chainctl</code> 即可。</p>
+        <p className="muted">登录 B 的终端后执行上述命令，直接进入节点安装向导，按提示粘贴上面的接入码。B 已安装过时，直接输入 <code>chainctl</code>，选择「接入 / 重新接入节点」，无需重复下载脚本。</p>
       </> : <div className="space-y-3">
         <p className="muted">连接此节点的 SSH，以 root 安装。控制台直接传送自己的已校验安装包；节点需与控制台架构兼容。SSH 凭据仅用于本次操作，不保存到数据库。</p>
         <label className="field">SSH 端口<Input type="number" min={1} max={65535} value={port} disabled={busy} onChange={event => { setPort(event.target.value); setKeys([]); setConfirmed(false); }} /></label>
@@ -112,7 +117,7 @@ export function AgentSetup({ id, token, copy }: { id: string; token: string; cop
       </div>}
     </section>
     <section aria-live="polite" className={`rounded-lg border p-4 text-sm ${online ? 'border-green-200 bg-green-50 text-green-800' : 'border-border bg-slate-50'}`}>
-      <strong>{online ? '节点已在线，可以创建线路了' : unavailable ? '暂时无法查询，请检查控制台连接' : '3. 等待节点连接…'}</strong>
+      <strong>{online ? '节点已在线，可以创建线路了' : unavailable ? '暂时无法查询，请检查控制台连接' : '4. 等待 B 连接控制台…'}</strong>
       {!online && <p className="mt-2 text-xs">安装完成后这里会自动更新。连接异常时，在节点的 chainctl 菜单选择「查看日志」。</p>}
     </section>
   </div>;

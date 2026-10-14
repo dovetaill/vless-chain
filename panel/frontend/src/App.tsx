@@ -266,8 +266,8 @@ function Help() {
       <div className="rounded-xl border border-blue-100 bg-blue-50 p-5 text-sm leading-7 text-blue-900">
         <strong>服务器是运行程序的机器，线路是数据经过的路径。</strong>
         <p>
-          拥有 VPS 才需要安装
-          Agent。已有代理链接和购买的转发端口属于外部资源，无需提供它们的 SSH。
+          想在 Web 创建和管理服务器上的代理，才需要接入 Agent；控制台本机通常已自动接入。
+          也可以先在 B 自行搭建 VLESS，再导入分享链接，无需提供 SSH 或安装 Agent。
         </p>
       </div>
       {guides.map(([title, location, text, path], i) => (
@@ -444,7 +444,7 @@ export function App() {
       setToast("正在应用，请在当前页面查看结果。");
     }
   }
-  function editLine(kind: Line["kind"], line?: Line) {
+  function editLine(kind: Line["kind"], line?: Line, initialNodeId?: string) {
     if (!state) return;
     if (!state.nodes.length) {
       navigate("nodes");
@@ -456,6 +456,7 @@ export function App() {
         kind={kind}
         line={line}
         state={state}
+        initialNodeId={initialNodeId}
         close={close}
         saved={async (value, draft) => {
           await refresh();
@@ -467,12 +468,50 @@ export function App() {
       />,
     );
   }
+  function useLocalServer() {
+    if (!state) return;
+    setModal(
+      <Modal
+        title="使用控制台本机"
+        description="本机指运行控制台的服务器，不是你打开浏览器的电脑。正常安装已自动接入本机，无需重复添加或 SSH。"
+        close={close}
+        submit={state.nodes.length ? "在此服务器创建代理" : undefined}
+        action={async (data) => {
+          const id = field(data, "node_id");
+          const current = await api<PanelState>("/state");
+          if (!current.nodes.some((node) => node.id === id && node.online))
+            throw new Error("所选服务器尚未在线，请先检查 Agent 状态；无需重新创建服务器记录。");
+          editLine("vless", undefined, id);
+        }}
+      >
+        {state.nodes.length > 0 && (
+          <Field label="选择已接入的本机节点" hint="请按名称和地址确认哪一台是控制台所在服务器；这里列出所有已接入记录，不根据域名猜测本机。">
+            <select className="select" name="node_id" defaultValue="" required>
+              <option value="" disabled>选择控制台所在服务器</option>
+              {state.nodes.map((node) => (
+                <option key={node.id} value={node.id}>
+                  {node.name} · {node.host} · {node.online ? "在线" : "离线"}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+        <div className="rounded-lg border border-border p-4 text-sm leading-6">
+          <strong>{state.nodes.length ? "找不到本机节点？" : "还没有已接入的节点"}</strong>
+          <p>安装向导默认创建“本机节点”。旧版本、仅安装控制台或自动接入失败时，可能没有这条记录。</p>
+          <p>当前控制台没有安装系统服务的权限，暂不支持网页补装本机 Agent。需要管理员在控制台服务器的 chainctl 菜单选择“安装 / 配置控制台与本机节点”。无需重新下载安装脚本。</p>
+          <p>如果本机已经有可用的 VLESS 等代理，直接导入分享链接即可。</p>
+        </div>
+        <Button type="button" variant="outline" onClick={() => importExternal()}>导入已有代理</Button>
+      </Modal>,
+    );
+  }
   function nodeEditor(node?: NodeInfo) {
     const [host, port] = splitAddress(node?.target || "www.microsoft.com:443");
     setModal(
       <Modal
-        title={node ? "编辑服务器" : "接入我的服务器"}
-        description="服务器是你拥有并能安装程序的机器。只需安装一次 Agent，以后在此管理。"
+        title={node ? "编辑服务器" : "接入另一台服务器"}
+        description={node ? "修改服务器信息；不会重新安装 Agent。" : "填写目标服务器 B 的地址。接入后，可在 Web 上创建和管理 B 的代理；B 已有分享链接时也可以直接导入。"}
         submit={node ? "保存服务器" : "创建并获取接入方式"}
         close={close}
         action={async (data) => {
@@ -498,10 +537,10 @@ export function App() {
             setModal(
               <Modal
                 title="安装并接入服务器"
-                description="选择复制安装命令，或使用 Web SSH 自动安装。"
+                description="安装到刚填写的服务器 B。以下两种方式任选一种，完成后回到这里等待上线。"
                 close={close}
               >
-                <AgentSetup id={value.id} token={value.token} copy={copy} />
+                <AgentSetup id={value.id} token={value.token} host={field(data, "host")} copy={copy} />
               </Modal>,
             );
         }}
@@ -563,7 +602,7 @@ export function App() {
         description={
           relay
             ? "先在服务商处配置好转发目标，再用这里生成经过中转的新链接。"
-            : "粘贴完整链接，可作为线路的外部出口，无需 SSH 或安装 Agent。"
+            : "可以先在 B 服务器自行搭建 VLESS，再把分享链接粘贴到这里。无需 SSH 或 Agent；可直接供客户端使用，也可作为线路出口，但不能在此修改 B 的服务配置。"
         }
         submit="导入"
         close={close}
@@ -1208,18 +1247,24 @@ export function App() {
           )}
           {page === "nodes" && (
             <div className="space-y-6">
-              <div className="grid gap-4 md:grid-cols-3">
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                 {[
                   {
                     icon: Server,
-                    title: "我的服务器",
-                    text: "拥有 VPS，安装 Agent 后统一管理。",
+                    title: "使用控制台本机",
+                    text: "复用已接入的本机节点，无需重复安装。",
+                    action: () => useLocalServer(),
+                  },
+                  {
+                    icon: Server,
+                    title: "接入另一台服务器",
+                    text: "在 B 安装一次 Agent，以后在 Web 创建代理。",
                     action: () => nodeEditor(),
                   },
                   {
                     icon: Network,
-                    title: "已有代理",
-                    text: "导入完整链接，无需 SSH。",
+                    title: "导入已有代理",
+                    text: "B 已搭建 VLESS 等代理？粘贴链接即可。",
                     action: () => importExternal(),
                   },
                   {
@@ -1311,6 +1356,7 @@ export function App() {
                                       <AgentSetup
                                         id={n.id}
                                         token={result.token}
+                                        host={n.host}
                                         copy={copy}
                                       />
                                     </Modal>,
