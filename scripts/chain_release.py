@@ -67,6 +67,73 @@ def source_status():
     return output(['git', 'status', '--porcelain', '--untracked-files=normal', '--', *SHIPPED], cwd=ROOT)
 
 
+def release_wizard():
+    require(sys.stdin.isatty(), '请在终端打开发布向导，确认变更后再推送。')
+    paths = [*SHIPPED, '.github']
+    def git(*args):
+        return output(['git', *args], cwd=ROOT)
+    require(git('branch', '--show-current') == 'main', '请切换到 main 分支后发布。')
+    require(not git('diff', '--cached', '--name-only'), '暂存区已有改动，请先提交或取消暂存后重试；向导不会改动已有暂存内容。')
+    require(not git('ls-files', '-u'), '请先解决 Git 合并冲突。')
+    status = git('status', '--porcelain', '--untracked-files=all', '--', *paths)
+    require(not status, '请先提交发行源码，再运行发布向导；以下文件尚未提交：\n' + status)
+    remote = git('remote', 'get-url', '--push', 'origin')
+    require(remote == git('remote', 'get-url', 'origin'), 'origin 的拉取与推送地址不同，请先统一地址，确保检查的是发布目标。')
+    print(f'发布目标：{remote}；分支：main', flush=True)
+    run(['git', 'fetch', 'origin', 'main'], cwd=ROOT)
+    run(['git', 'merge-base', '--is-ancestor', 'FETCH_HEAD', 'HEAD'], cwd=ROOT)
+    old = version()
+    current_tag = 'v' + old
+    local_tags = git('tag', '--list').splitlines()
+    remote_tags = git('ls-remote', '--tags', 'origin')
+    remote_names = {line.split('\t')[1] for line in remote_tags.splitlines()}
+    # Resume a failed push without creating another version or rewriting a commit.
+    if current_tag in local_tags and f'refs/tags/{current_tag}' not in remote_names:
+        require(not status and git('rev-parse', current_tag + '^{commit}') == git('rev-parse', 'HEAD'),
+                f'{current_tag} 尚未推送且工作区或提交已变化，请先处理该标签，避免重复发布。')
+        print(f'发现尚未推送的 {current_tag}，将继续推送原提交。')
+        git_args = ['git', 'push', '--atomic', 'origin', 'main', 'refs/tags/' + current_tag]
+        print(' '.join(git_args))
+        if input('确认继续推送？输入 y: ').strip().lower() == 'y':
+            run(git_args, cwd=ROOT)
+            print('已推送；等待 Actions 构建完成并公开正式 Release 后再升级。')
+        return
+    major, minor, patch = map(int, old.split('.'))
+    suggested = f'{major}.{minor}.{patch + 1}'
+    value = input(f'下一版本 [{suggested}]（回车自动递增）: ').strip() or suggested
+    require(re.fullmatch(VERSION_RE, value), '版本须为 X.Y.Z。')
+    require(tuple(map(int, value.split('.'))) > (major, minor, patch), '新版本必须大于当前版本。')
+    tag = 'v' + value
+    require(tag not in local_tags and f'refs/tags/{tag}' not in remote_names, '该标签已经存在，请使用新版本。')
+    manifests = ['panel/Cargo.toml', 'panel/Cargo.lock', 'panel/frontend/package.json', 'panel/frontend/package-lock.json']
+    print('\n仅同步并提交版本文件：\n' + '\n'.join(manifests))
+    print('\n一并推送的已有提交：')
+    run(['git', '--no-pager', 'log', '--oneline', 'FETCH_HEAD..HEAD'], cwd=ROOT)
+    message = (f'chore: 发布 {tag}\n\n背景与目的：为已提交的业务代码创建正式版本，供安装器获取。\n\n'
+               f'具体修改：同步 Cargo/npm 清单及锁文件，从 {old} 升级到 {value}。\n'
+               '影响范围：仅四份版本文件，不修改业务逻辑；业务变更说明和验证记录见此前提交。\n\n'
+               '验证：通过 Git 差异空白、四份版本一致性、远端历史及标签冲突检查。\n'
+               '本次仅修改版本元数据，不重复运行业务测试；完整构建和安装验证由发布 CI 执行，结果以 CI 为准。\n\n'
+               '发布方式：创建附注标签并原子推送 main 和标签，触发 Actions；不会升级运行中的服务。\n')
+    print('\n' + message)
+    if input(f'确认提交并推送 {tag}？输入 y: ').strip().lower() != 'y':
+        print('已取消，未修改版本、提交或推送。')
+        return
+    try:
+        set_version(value)
+        run(['git', 'add', '--', *manifests], cwd=ROOT)
+        run(['git', 'diff', '--cached', '--check'], cwd=ROOT)
+        require(version() == value, '版本校验失败。')
+        run(['git', 'commit', '-F', '-'], cwd=ROOT, input=message, text=True)
+        run(['git', 'tag', '-a', tag, '-m', f'发布 {tag}：同步版本文件并发布已提交的业务代码。'], cwd=ROOT)
+        run(['git', 'push', '--atomic', 'origin', 'main', 'refs/tags/' + tag], cwd=ROOT)
+    except (ValueError, OSError, subprocess.CalledProcessError):
+        print('发布未完成，已产生的版本改动、提交及标签均保留，不自动回退或覆盖。\n'
+              '若仅推送失败，重新进入此向导可继续推送；其他失败请先检查 git status。', file=sys.stderr)
+        raise
+    print(f'{tag} 已推送；等待 Actions 构建完成并公开正式 Release 后，再运行 sudo chainctl update。')
+
+
 def fetch_xray(work, destination):
     name, digest = XRAY_ASSETS[architecture()]
     archive = work.root / name
@@ -217,11 +284,12 @@ def menu():
         print(f'\nChain Panel v{version()} · 构建与发布\n'
               '1) 构建发行包（含前端、Rust 程序与 Xray）\n2) 检查脚本与安装流程\n'
               '3) 完整前后端和真实链路验证\n4) 查看版本与 Git 状态\n5) 设置下一版本\n'
-              '6) 创建 GitHub Release 草稿\n7) 发布已有 GitHub 草稿\n8) 本机安装与运维\n0) 退出')
-        choice = input('选择 [1]: ').strip() or '1'
+              '6) 创建 GitHub Release 草稿\n7) 发布已有 GitHub 草稿\n8) 本机安装与运维\n'
+              '9) 发布已提交的代码（默认：递增版本、提交版本文件、打标签、推送）\n0) 退出')
+        choice = input('选择 [9]: ').strip() or '9'
         if choice == '0':
             return
-        command = {'1': ['build'], '2': ['check'], '3': ['check', '--full'], '4': ['status'], '8': ['ops']}.get(choice)
+        command = {'1': ['build'], '2': ['check'], '3': ['check', '--full'], '4': ['status'], '8': ['ops'], '9': ['release']}.get(choice)
         if choice == '5':
             command = ['version', '--set', input('新版本 X.Y.Z: ').strip()]
         if choice in ('6', '7'):
@@ -250,6 +318,7 @@ def main(argv=None):
             item.add_argument('--directory', type=Path)
             item.add_argument('--repo', required=True)
     sub.add_parser('status')
+    sub.add_parser('release', help='发布已提交的代码：递增版本、提交版本文件、打标签并推送')
     sub.add_parser('version').add_argument('--set')
     sub.add_parser('ops').add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -261,6 +330,8 @@ def main(argv=None):
         check(args)
     elif args.action == 'version':
         set_version(vars(args)['set']) if vars(args)['set'] else print(version())
+    elif args.action == 'release':
+        release_wizard()
     elif args.action == 'status':
         print(f'版本：{version()}\n架构：{architecture()}\n默认发行目录：{default_output()}')
         run(['git', 'status', '--short'], cwd=ROOT)
@@ -274,5 +345,5 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         main()
-    except (ValueError, OSError, subprocess.CalledProcessError, KeyboardInterrupt) as error:
+    except (ValueError, OSError, subprocess.CalledProcessError, KeyboardInterrupt, EOFError) as error:
         raise SystemExit(str(error) or '操作已中断。')

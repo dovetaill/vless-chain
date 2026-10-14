@@ -138,12 +138,20 @@ sudo chainctl rollback --component panel
 
 推荐通过 `.github/workflows/release.yml` 发布：提交版本改动后推送 `vX.Y.Z` 标签，Actions 在 Ubuntu 22.04 的 x86_64、aarch64 runner 分别原生构建（glibc 下限 2.35），校验标签与四个版本清单一致。两个架构均成功后合并 `SHA256SUMS`，创建草稿、上传并重新下载校验全部附件，最后公开正式 Release。安装器不读取 Actions 中间产物。单架构失败不会公开半套包；中间 artifact 在工作流结束时删除，Cargo/npm 临时缓存由构建器清理。
 
+日常发布先自行完成业务代码的 Git 提交，再运行 `./scripts/version-release.sh`。菜单直接回车进入默认的 **9「发布已提交的代码」**；版本号再次回车默认递增补丁版本，例如 `0.2.1 → 0.2.2`，也可以输入指定版本，例如 `0.3.0`。查看版本文件、已有未推送提交和自动生成的中文提交正文，再输入 `y` 确认，无需重新填写业务更新说明。
+
+向导只同步并提交 `panel/Cargo.toml`、`panel/Cargo.lock`、`panel/frontend/package.json`、`panel/frontend/package-lock.json`，随后创建附注标签，原子推送 `main` 和标签。业务代码必须提前提交：`panel/`、`scripts/`、`README.md`、`.gitignore`、`.github/` 中存在未提交改动或未忽略的新文件时停止；范围外文件保持不动。仅接受 `main` 且暂存区为空，远端存在本地未包含的提交、标签冲突或版本倒退时停止。不会自动合并、强推或部署服务器。
+
+仅推送失败时，再选 9 会识别当前提交上未推送的版本标签，确认后继续推送，不再递增版本。其他失败保留现场，需先检查 `git status`。向导不代替测试，必须等 Actions 构建成功并公开正式 Release 后，服务器才能通过 `sudo chainctl update` 获取新版。也可用 `./scripts/version-release.sh release` 直接进入向导。
+
+需要手工操作时：
+
 ```bash
 git tag v0.1.0
 git push origin main v0.1.0
 ```
 
-手工发布需要安装并登录 `gh`。本地构建与安装不会自动推送 Git、上传附件或发布版本；以下命令才会操作指定远端仓库（手工脚本一次发布一个架构，双架构应使用 Actions）：
+手工上传发行包需要安装并登录 `gh`。本地构建与安装不会自动推送 Git、上传附件或发布版本；上述一键向导通过推送标签触发 Actions，以下命令则直接操作指定远端的 Release（手工脚本一次发布一个架构，双架构应使用 Actions）：
 
 ```bash
 # 先提交并推送对应源码，然后从干净的发行输入重新构建。

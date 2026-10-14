@@ -377,6 +377,110 @@ class Delivery(unittest.TestCase):
                 release.set_version('bad; version')
             self.assertEqual((repo / 'panel/Cargo.toml').read_bytes(), before)
 
+    def release_repo(self):
+        repo = self.root / 'release-repo'
+        repo.mkdir()
+        def git(*args):
+            return common.output(['git', *args], cwd=repo)
+        git('init', '-b', 'main')
+        git('config', 'user.name', 'Release Test')
+        git('config', 'user.email', 'release@example.invalid')
+        git('config', 'commit.gpgsign', 'false')
+        git('config', 'tag.gpgsign', 'false')
+        for name in ['panel/Cargo.toml', 'panel/Cargo.lock', 'panel/frontend/package.json', 'panel/frontend/package-lock.json']:
+            destination = repo / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(release.ROOT / name, destination)
+        for name in ['README.md', '.gitignore', 'scripts/fixture.py', '.github/fixture.yml', 'unrelated.txt']:
+            destination = repo / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text('fixture\n')
+        git('add', '.')
+        git('commit', '-m', '测试初始提交')
+        remote = self.root / 'origin.git'
+        common.output(['git', 'init', '--bare', remote])
+        git('remote', 'add', 'origin', str(remote))
+        git('push', 'origin', 'main')
+        return repo, git
+
+    def test_release_wizard_cancel_publish_and_retry(self):
+        repo, git = self.release_repo()
+        (repo / 'panel/new.txt').write_text('new\n')
+        git('add', 'panel/new.txt')
+        git('commit', '-m', '提交业务改动')
+        (repo / 'unrelated.txt').write_text('keep\n')
+        (repo / 'theme.zip').write_bytes(b'keep')
+        answers = ['', 'y']
+        with patch.object(release, 'ROOT', repo), patch.object(release.sys.stdin, 'isatty', return_value=True):
+            before = git('rev-parse', 'HEAD')
+            old = release.version()
+            parts = old.split('.')
+            expected = '.'.join([*parts[:2], str(int(parts[2]) + 1)])
+            tag = 'v' + expected
+            with patch('builtins.input', side_effect=[*answers[:-1], 'n']):
+                release.release_wizard()
+            self.assertEqual(release.version(), old)
+            self.assertEqual(git('rev-parse', 'HEAD'), before)
+            self.assertFalse(git('diff', '--cached', '--name-only'))
+            original_run = release.run
+            def fail_push(command, **kwargs):
+                if command[:2] == ['git', 'push']:
+                    raise subprocess.CalledProcessError(1, command)
+                return original_run(command, **kwargs)
+            with patch('builtins.input', side_effect=answers), patch.object(release, 'run', side_effect=fail_push):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    release.release_wizard()
+            self.assertEqual(release.version(), expected)
+            commit = git('rev-parse', 'HEAD')
+            self.assertEqual(git('rev-parse', tag + '^{commit}'), commit)
+            self.assertNotIn(tag, git('ls-remote', '--tags', 'origin'))
+            with patch('builtins.input', return_value='y') as prompt:
+                release.release_wizard()
+            self.assertEqual(prompt.call_count, 1)
+            self.assertEqual(git('rev-parse', 'HEAD'), commit)
+            self.assertIn(commit + '\trefs/heads/main', git('ls-remote', 'origin', 'refs/heads/main'))
+            self.assertIn(commit + '\trefs/tags/' + tag + '^{}', git('ls-remote', '--tags', 'origin'))
+            names = git('show', '--pretty=format:', '--name-only', 'HEAD')
+            self.assertEqual(set(names.splitlines()), {'panel/Cargo.toml', 'panel/Cargo.lock',
+                                                     'panel/frontend/package.json', 'panel/frontend/package-lock.json'})
+            self.assertEqual(git('show', 'HEAD:panel/new.txt'), 'new')
+            self.assertNotIn('unrelated.txt', names)
+            self.assertNotIn('theme.zip', names)
+            self.assertIn('背景与目的', git('log', '-1', '--format=%B'))
+            self.assertIn('unrelated.txt', git('status', '--porcelain'))
+
+    def test_release_wizard_rejects_staging_and_existing_tag(self):
+        repo, git = self.release_repo()
+        with patch.object(release, 'ROOT', repo), patch.object(release.sys.stdin, 'isatty', return_value=True):
+            (repo / 'unrelated.txt').write_text('staged\n')
+            git('add', 'unrelated.txt')
+            with self.assertRaisesRegex(ValueError, '暂存区'):
+                release.release_wizard()
+            self.assertEqual(git('diff', '--cached', '--name-only'), 'unrelated.txt')
+            git('reset', 'HEAD', '--', 'unrelated.txt')
+            (repo / 'panel/pending.txt').write_text('not committed\n')
+            with patch('builtins.input', side_effect=AssertionError('must reject before prompting')):
+                with self.assertRaisesRegex(ValueError, '请先提交发行源码'):
+                    release.release_wizard()
+            (repo / 'panel/pending.txt').unlink()
+            git('config', 'remote.origin.pushurl', str(self.root / 'different.git'))
+            with self.assertRaisesRegex(ValueError, '拉取与推送地址不同'):
+                release.release_wizard()
+            git('config', '--unset', 'remote.origin.pushurl')
+            git('tag', 'v99.0.0')
+            with patch('builtins.input', return_value='99.0.0'):
+                with self.assertRaisesRegex(ValueError, '标签已经存在'):
+                    release.release_wizard()
+
+    def test_release_wizard_custom_version(self):
+        repo, git = self.release_repo()
+        with patch.object(release, 'ROOT', repo), patch.object(release.sys.stdin, 'isatty', return_value=True):
+            with patch('builtins.input', side_effect=['98.1.0', 'y']):
+                release.release_wizard()
+            self.assertEqual(release.version(), '98.1.0')
+            commit = git('rev-parse', 'HEAD')
+            self.assertIn(commit + '\trefs/tags/v98.1.0^{}', git('ls-remote', '--tags', 'origin'))
+
     def test_dual_arch_release_aggregation_rejects_dirty_builds(self):
         source, manifest = self.package()
         incoming = self.root / 'incoming'
