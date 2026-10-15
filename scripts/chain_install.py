@@ -561,7 +561,7 @@ def provision_local_agent(manager, source, manifest, args):
     try:
         api('login', {'token': (data / 'admin-token').read_text().strip()})
         public_host = getattr(args, 'local_host', None) or urllib.parse.urlsplit(env.get('CHAIN_PUBLIC_URL', '')).hostname or '127.0.0.1'
-        target = getattr(args, 'local_target', None) or 'www.cloudflare.com:443'
+        target = getattr(args, 'local_target', None) or 'www.microsoft.com:443'
         name = urllib.parse.urlsplit('tcp://' + target).hostname
         node = api('nodes', {'name': '本机节点', 'host': public_host, 'target': target, 'server_name': name})
         agent = make_parser().parse_args(['install', '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
@@ -830,7 +830,7 @@ def make_parser():
     parser.add_argument('--domain', help='自动配置域名解析检查、Nginx HTTPS 与续期；空字符串使用 IP 访问')
     parser.add_argument('--panel-only', action='store_true', help='仅安装控制台，跳过默认的本机 Agent 自动接入')
     parser.add_argument('--local-host', help='本机节点对其他服务器可达的地址')
-    parser.add_argument('--local-target', help='本机 REALITY TLS 目标，默认 www.cloudflare.com:443')
+    parser.add_argument('--local-target', help='本机 REALITY TLS 目标，默认 www.microsoft.com:443')
     parser.add_argument('--panel-url', help='Agent 连接地址；推荐在向导粘贴 Web 接入码')
     parser.add_argument('--node-id', help='高级：Agent 节点 UUID')
     parser.add_argument('--token-file', type=Path, help='高级：权限 600 的节点令牌文件')

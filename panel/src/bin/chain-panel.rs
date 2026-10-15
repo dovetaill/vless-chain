@@ -410,10 +410,10 @@ struct NodeInput {
     server_name: String,
 }
 fn default_target() -> String {
-    "www.cloudflare.com:443".into()
+    "www.microsoft.com:443".into()
 }
 fn default_server_name() -> String {
-    "www.cloudflare.com".into()
+    "www.microsoft.com".into()
 }
 fn validate_node(n: &NodeInput) -> Result<()> {
     ensure!(

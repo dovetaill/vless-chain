@@ -54,8 +54,8 @@ export function LineEditor({
   const [batch, setBatch] = useState(false);
   const [combinations, setCombinations] = useState(["tcp-reality", "tcp-tls"]);
   const [transport, setTransport] = useState(line?.access.transport?.network || "tcp");
-  const [realityTarget, setRealityTarget] = useState(line?.access.reality?.target || existing?.target || local?.target || "www.cloudflare.com:443");
-  const [sni, setSni] = useState(line?.access.reality?.server_name || existing?.server_name || local?.server_name || "www.cloudflare.com");
+  const [realityTarget, setRealityTarget] = useState(line?.access.reality?.target || existing?.target || local?.target || "www.microsoft.com:443");
+  const [sni, setSni] = useState(line?.access.reality?.server_name || existing?.server_name || local?.server_name || "www.microsoft.com");
   const [shared, setShared] = useState(line?.access.shared_port || false);
   const [checking, setChecking] = useState(false);
   const [check, setCheck] = useState("");
