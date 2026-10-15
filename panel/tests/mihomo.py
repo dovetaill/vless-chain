@@ -7,7 +7,7 @@ import socket
 import struct
 
 
-def udp_echo(port, destination):
+def udp_echo(port, destination, marker=b'chain-protocol-udp-ok'):
     def receive(sock, size):
         data = b''
         while len(data) < size:
@@ -24,11 +24,10 @@ def udp_echo(port, destination):
         assert head[:2] == b'\x05\x00' and head[3] == 1, head
         address = socket.inet_ntoa(receive(control, 4))
         relay = struct.unpack('!H', receive(control, 2))[0]
-        marker = b'chain-protocol-udp-ok'
         packet = b'\0\0\0\x01' + socket.inet_aton('127.0.0.1') + struct.pack('!H', destination) + marker
         udp.sendto(packet, ('127.0.0.1' if address == '0.0.0.0' else address, relay))
-        response = udp.recv(2048)
-        assert response == packet, response
+        response = udp.recv(65536)
+        assert response == packet, f'UDP payload differs ({len(marker)} bytes sent, {len(response)-10} received)'
 
 
 def exercise(h, lines, udp_port=None):

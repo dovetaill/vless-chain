@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/
 
 | 协议 | 设置 |
 | --- | --- |
-| VLESS | 默认 TCP + REALITY + Vision，IP 和域名均适用；可显式选择 TLS + Vision |
+| VLESS | REALITY + Vision、TLS + Vision、REALITY + XHTTP、TLS + XHTTP；默认 REALITY + Vision |
 | Shadowsocks 2022 | 自动生成密钥，使用 `2022-blake3-aes-128-gcm` |
 | Trojan | TLS，需要域名和证书，密码可自动生成 |
 | VMess AEAD | TCP，alterId 为 0；域名默认使用 TLS，自动生成 UUID |
@@ -29,9 +29,33 @@ curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/
 | TUIC v5 | QUIC + TLS，需要证书，自动生成 UUID 和密码；放行 UDP 监听端口 |
 | HTTP / SOCKS5 | 用户名密码；普通入口不加密 |
 
-TLS 模式可自动申请证书，也可填写自己的 PEM 证书链与私钥。REALITY 使用服务器的伪装站点设置，无需自己的证书。
+TLS 模式可自动申请证书，也可填写自己的 PEM 证书链与私钥。REALITY 无需申请自己的证书：在表单填写目标地址（域名/IP 加端口）和该目标证书覆盖的 SNI。「检测目标与 SNI」从控制台所在机器检查 TLS 1.3、证书/SNI、H2 和耗时；检查通过不等于所有客户端网络均可达。
 
-TUIC v5 及包含 TUIC 的外部代理链由发行包内的 Mihomo 内核运行，随 Agent 启停；仍使用面板的流量统计、限速和出网链路。其他接入协议使用 Xray。升级时需同时更新控制台与 Agent。
+Hysteria 2、TUIC v5 接入及包含 TUIC、Hysteria 2、Shadowsocks 或 HTTPS 的出网链由发行包内的 Mihomo 内核运行，随 Agent 启停；每条链独立配置连接路径，仍使用面板的流量统计、限速和出网链路。其他接入协议使用 Xray。升级时需同时更新控制台与 Agent。当前 Xray 的 REALITY 启动包含目标采样，Agent 为此预留 6 秒再开放入口；这不代替目标可用性检查，目标网络异常仍会导致连接失败。
+
+### 一次创建多种 VLESS 组合
+
+勾选「一次创建多种组合」，选择所需组合。默认分别分配端口；TLS 组合需要解析到本机的域名和有效证书。批量保存是原子的，任意一条无效时不保存其他条。应用成功后在列表逐条点击「分享」，取得对应链接、二维码或 Mihomo 节点。
+
+XHTTP 可设置路径、Host 和模式；其分享配置不带 Vision 的 `flow`。REALITY 组合包含公钥、short-id 和所选 SNI。批量创建沿用同一组 REALITY 目标/SNI 和 TLS 域名。
+
+### 网站回落与统一 443
+
+TCP + TLS + Vision 可在「TLS 网站回落」填写 `builtin` 显示内置主页，或填写自己的 HTTP/HTTPS 网站地址；留空关闭。普通浏览器使用该代理域名访问同一端口即可看到网站。REALITY 的非认证连接由 Xray 交给所选目标网站；这里的 TLS 网站回落不用于 XHTTP。
+
+本机已有 Nginx HTTPS 网站时，先安装包含此功能的控制台及 Agent，在服务器执行：
+
+```bash
+sudo chainctl ingress-enable
+```
+
+也可在 `chainctl` 菜单选择「启用统一 443」。随后展开代理表单的监听端口，勾选「使用统一 443 入口」。Nginx 使用 `ssl_preread` 读取 SNI，不解密代理 TLS；已存在的网站转到本机内部 TLS 端口，继续使用原证书和站点配置，并通过 PROXY protocol 保留客户端 IP。TCP 80 的证书验证及 UDP 443 不迁移。
+
+每个 SNI 对应一个入口。REALITY 与 TLS 可以使用不同 SNI 共用 443；同一个 SNI 的 TCP 和 XHTTP 请使用独立端口，或分别创建并填写不同 SNI。不能使用现有网站的域名抢占它的入口。
+
+自动接管支持系统 Nginx 的普通 IPv4 HTTPS 监听（及其 IPv6 监听）；已有 `stream`、自定义真实 IP 信任配置、指定 IP 的 443 绑定会明确拒绝，避免覆盖。缺少 stream 模块时由系统软件包安装。启用前保存配置，校验或重载失败恢复原文件；后续手工修改受管文件会阻止自动恢复，需先核对差异。
+
+先停用或改回独立端口并应用共享入口代理，再执行 `sudo chainctl ingress-disable` 恢复原 Nginx 监听。正在使用共享入口时关闭分流会使这些代理断开。
 
 ## 本机与外部代理
 
@@ -44,6 +68,12 @@ TUIC v5 及包含 TUIC 的外部代理链由发行包内的 Mihomo 内核运行�
 ## 链式代理
 
 例如「客户端 → 本机 → 落地 A → 落地 B → 互联网」：新建或编辑代理，选择「链式代理」，依次选择 A、B。可选择外部代理或其他已启用、已应用的本机代理；禁止循环引用。可以同时创建多条独立本机代理，各自使用不同端口和路径。
+
+HTTP/HTTPS 出口仅支持 TCP；经它连接 Shadowsocks 或 SOCKS5 时也不支持 UDP。VLESS、VMess、Trojan 可通过 TCP 隧道传递 UDP。Hysteria 2、TUIC 连接本身需要 UDP，前置路径不支持 UDP 时会拒绝保存，不能靠换证书或打开客户端 UDP 开关解决。
+
+分享和订阅会按整条路径（含本机代理引用）标记 UDP 能力；仅支持 TCP 的节点导出 `udp: false`，导入后也会保留此限制。
+
+当前 Mihomo 的 Hysteria 2 实现限制单个 UDP 数据报为 4096 字节，后续 UDP 协议的封装也计入此上限。因此 Hysteria 2 → SS2022（本项目默认 AES-128、IPv4 目标）双向业务载荷上限为 4038 字节，Hysteria 2 → SOCKS5（IPv4 目标）为 4086 字节；地址格式、加密算法或更多封装会改变可用大小。超限数据报会丢弃，`udp: true` 不代表支持任意大小的数据报。这是[当前内核限制](https://github.com/MetaCubeX/sing-quic/blob/1c242664697a/hysteria2/internal/protocol/proxy.go#L25)，不是可通过面板开关提高的额度。
 
 修改或删除被引用的代理前先处理引用关系。端口转发和购买中转入口功能已移除。
 

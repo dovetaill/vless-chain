@@ -201,13 +201,17 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 提供 `CHAIN_TEST_MIHOMO=/已校验的/mihomo` 时，集成测试还会用真实 Mihomo 验证五类导出配置并请求本机测试站点。兼容验证使用 v1.19.32；只替换本地客户端监听端口，代理配置保持导出原样，测试 TLS CA 仅注入测试进程。
 
+专项链式回归使用 `tests/chain_matrix.py`：在独立的 `CHAIN_TEST_ROOT` 中，配合 `CHAIN_TEST_BIN_DIR`、`CHAIN_TEST_XRAY`、`CHAIN_TEST_MIHOMO` 和 `CHAIN_MIHOMO_BIN`，检查 13 种入口、169 种中间跳/出口组合及两条四跳混合链。检查首次 TCP 响应全文、UDP 小包/4 KiB 大包，以及 TCP、UDP 各自的逐跳流量；HTTP 前置无法承载 QUIC 的组合必须被拒绝。可重复传入 `--case` 运行指定用例；`--case 'exports and probes'` 检查面板探测、嵌套引用导出与订阅。脚本回收测试服务和端口，构建目录仍须由拥有它的验证工作区回收。
+
+同时提供 `CHAIN_TEST_STREAM_MODULE=/与系统Nginx匹配的/ngx_stream_module.so` 时，验证脚本追加 `fronting.py`：检查 REALITY 目标/SNI、四种 VLESS 组合、批量保存失败的原子性、网站回落，以及独立 Nginx 中的 SNI 分流、网站保留、域名冲突回滚和路由删除。需已有 Nginx、OpenSSL、支持 HTTP/2 的 curl 和上述 Mihomo；测试不会安装系统模块或改动生产 Nginx。
+
 集成测试使用本机独立控制台、三个 Agent、真实 Xray、TLS 目标和 TCP/UDP 回显服务；覆盖多跳共享节点、稳定入口、外部出口、端口占用回滚、离线恢复；新增 features.py 验证 HTTP/SOCKS/SS/Trojan、HTTPS/WebSocket、多域名、SOCKS UDP 认证生命周期、八连接聚合限速、配额持久化、在线限速变更、导出/订阅、TOTP 和密钥轮换。browser.cjs 使用 Chromium 虚拟 CTAP2 验证 Passkey 注册/登录/撤销，检查桌面、手机和真实保存流程，并生成手册截图。测试不连接已有生产服务，进程组、端口和临时文件有归属记录，退出检查清理。
 
 ## Agent 入口网关与数据
 
-编译配置的 `_chain` 元数据记录公共入口、限速、额度、网站与证书；Agent 在传给 Xray 前移除此字段。代理/转发的 Xray 入口绑定 127.0.0.1 的内部端口，公共端口由 Agent 网关监听。内部中转仍为 Xray 的 VLESS/REALITY，不增加第二套代理内核。
+编译配置的 `_chain` 元数据记录公共入口、限速、额度、网站与证书；Agent 在传给 Xray 前移除此字段。代理/转发的内核入口绑定 127.0.0.1 的内部端口，公共端口由 Agent 网关监听。原生节点间中转使用 Xray 的 VLESS/REALITY；Hysteria 2、TUIC 接入和包含 Hysteria 2、TUIC、Shadowsocks、HTTPS 的出网链由 Agent 管理的 Mihomo 执行。
 
-`traffic.json` 持久化线路计量，约每 2 秒写入并在正常退出前保存；`active.json` 保存已应用版本。Agent 上报网关能力和已占用 TCP/UDP 端口，自动端口分配避开这些端口。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
+`traffic.json` 持久化线路计量，约每 2 秒写入并在正常退出前保存；`active.json` 保存已应用版本。Agent 上报网关能力、已占用 TCP/UDP 端口及系统临时连接端口范围；内部端口分配避开临时范围，防止与出站连接或 TIME_WAIT 冲突。旧 Agent 未上报范围时按 Linux 默认 32768–60999 处理。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
 
 自动证书在 Agent 数据目录的 `acme/` 下，Certbot 使用独立 config/work/logs/web 路径，以 Agent 用户执行；可用 `CHAIN_CERTBOT_BIN` 指定程序位置。安装器安装 Nginx，由独立 ACME 站点将验证请求路由至 `/var/lib/chain-acme/{agent,panel}`；`CHAIN_ACME_WEBROOT` 指定对应目录，Agent 无需监听 TCP 80。手工部署未设置此变量时仍使用独立挑战监听。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
 

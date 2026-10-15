@@ -134,6 +134,14 @@ pub struct Tls {
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Access {
     #[serde(default)]
+    pub transport: Transport,
+    #[serde(default)]
+    pub reality: Option<RealityTarget>,
+    #[serde(default)]
+    pub shared_port: bool,
+    #[serde(default)]
+    pub fallback: String,
+    #[serde(default)]
     pub host: String,
     #[serde(default)]
     pub protocol: Protocol,
@@ -149,6 +157,51 @@ pub struct Access {
     pub public_port: Option<u16>,
     #[serde(default)]
     pub tls: Tls,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+pub struct Transport {
+    #[serde(default = "default_network")]
+    pub network: String,
+    #[serde(default = "default_path")]
+    pub path: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+impl Default for Transport {
+    fn default() -> Self {
+        Self {
+            network: default_network(),
+            path: default_path(),
+            host: String::new(),
+            mode: default_mode(),
+        }
+    }
+}
+fn default_path() -> String {
+    "/".into()
+}
+fn default_mode() -> String {
+    "auto".into()
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+pub struct RealityTarget {
+    pub target: String,
+    pub server_name: String,
+}
+impl Access {
+    pub fn server_name<'a>(&'a self, node: &'a Node) -> &'a str {
+        if matches!(self.tls.mode.as_str(), "auto" | "manual") {
+            &self.tls.domain
+        } else {
+            self.reality
+                .as_ref()
+                .map(|r| r.server_name.as_str())
+                .unwrap_or(&node.reality.server_name)
+        }
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]

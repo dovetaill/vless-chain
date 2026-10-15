@@ -54,6 +54,10 @@ export interface TLS {
   key: string;
 }
 export interface Access {
+  transport: { network: "tcp" | "xhttp"; path: string; host: string; mode: string };
+  reality: { target: string; server_name: string } | null;
+  shared_port: boolean;
+  fallback: string;
   host: string;
   protocol: Protocol;
   username: string;

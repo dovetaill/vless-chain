@@ -27,6 +27,8 @@ const assets = path.resolve(process.argv[2]);
           const data = request.postDataJSON(); writes.push({ path: url.pathname, body: data });
           if (url.pathname === '/api/local-node') { state.local_node_id = 'local'; state.nodes = [{ ...node, host: data.host }]; body = { id: 'local' }; }
           else if (url.pathname === '/api/lines') { body = { ...data, id: data.id || String(state.lines.length + 1), published: false, traffic: null }; state.lines = [...state.lines.filter(l => l.id !== body.id), body]; }
+          else if (url.pathname === '/api/lines/batch') { body = data.map((line, index) => ({ ...line, id: String(state.lines.length + index + 1), published: false, traffic: null })); state.lines.push(...body); }
+          else if (url.pathname === '/api/reality/check') body = { ok: true, detail: 'TLS 1.3、证书/SNI 与 H2 检查通过', latency_ms: 12 };
           else if (url.pathname === '/api/preview') body = { affected_line_ids: [], affected_lines: [], message: '', nodes: [] };
           else if (url.pathname === '/api/publish') { state.lines.forEach(l => l.published = true); state.jobs = [{ id: 'job', state: 'applied', events: [] }]; body = { job_id: 'job' }; }
           else if (url.pathname === '/api/externals') { body = { id: 'imported', name: data.name || 'Mihomo 落地', url: state.externals[0].url }; state.externals.push(body); }
@@ -93,6 +95,32 @@ const assets = path.resolve(process.argv[2]);
       assert.equal(body.access.tls.mode, 'auto');
       assert.equal(body.access.tls.domain, 'proxy.example.com');
     }
+    await create('多组合');
+    await page.getByLabel('一次创建多种组合').check();
+    await page.getByLabel('本机 IP 或域名').fill('batch.example.com');
+    await page.getByLabel('REALITY + XHTTP', { exact: true }).check();
+    await page.getByLabel('TLS + XHTTP', { exact: true }).check();
+    await page.getByLabel('REALITY 目标地址', { exact: true }).fill('cover.example.com:443');
+    await page.getByLabel('REALITY SNI', { exact: true }).fill('cover.example.com');
+    await button('检测目标与 SNI').click();
+    await page.getByText('通过：TLS 1.3、证书/SNI 与 H2 检查通过（12 ms）').waitFor();
+    await page.getByLabel('XHTTP 路径', { exact: true }).fill('/batch-path');
+    await page.getByText('监听端口 · 自动分配', { exact: true }).click();
+    await page.getByLabel('使用统一 443 入口（按 SNI 分流）').check();
+    await button('创建所选组合').click();
+    await page.getByText('相同 SNI 无法同时分流 TCP 和 XHTTP；请选择一种传输，或使用独立端口。', { exact: true }).waitFor();
+    assert.equal(writes.filter(w => w.path === '/api/lines/batch').length, 0);
+    await page.getByLabel('使用统一 443 入口（按 SNI 分流）').uncheck();
+    assert.equal(await page.getByLabel('TLS 网站回落', { exact: true }).inputValue(), 'builtin');
+    await page.getByLabel('TLS 网站回落', { exact: true }).fill('');
+    await button('创建所选组合').click();
+    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    const batch = writes.find(w => w.path === '/api/lines/batch').body;
+    assert.equal(batch.length, 4);
+    assert.deepEqual(batch.map(l => [l.access.transport.network, l.access.tls.mode]), [['tcp', 'off'], ['tcp', 'auto'], ['xhttp', 'off'], ['xhttp', 'auto']]);
+    assert.equal(batch[2].access.reality.server_name, 'cover.example.com');
+    assert.equal(batch[2].access.transport.path, '/batch-path');
+    assert.equal(batch[1].access.fallback, '');
     await page.locator('aside nav').getByRole('button', { name: '外部代理', exact: true }).click();
     assert.equal(await button('添加中转入口').count(), 0);
     await button('链接 / Mihomo').first().click();
@@ -117,8 +145,13 @@ const assets = path.resolve(process.argv[2]);
     assert.equal(writes.filter(w => w.path === '/api/lines').at(-1).body.hops[0].node_id, 'local');
     await create('手机布局');
     await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByLabel('本机 IP 或域名').fill('mobile.example.com');
+    await page.getByText('传输安全 · REALITY', { exact: true }).click();
+    await page.getByLabel('HTTPS / 证书').selectOption('auto');
+    const hint = await page.getByText('域名需解析到本机，并放行 TCP 80 和监听端口。', { exact: true }).boundingBox();
     const box = await page.getByRole('dialog').boundingBox();
     assert.ok(box.x >= 0 && box.x + box.width <= 390);
+    assert.ok(hint.x > box.x + 10 && hint.x + hint.width < box.x + box.width - 10);
     await close();
     assert.deepEqual(errors, []);
     console.log('PASS local defaults, domain REALITY, explicit TLS preserved, ordered chain, Mihomo import/export, orphan local identity and mobile form');

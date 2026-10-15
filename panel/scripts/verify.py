@@ -79,6 +79,8 @@ def main():
         run(['python3', 'tests/smoke.py'])
         run(['python3', '-B', 'tests/local_web.py'])
         run(['python3', '-B', 'tests/proxy_flow.py'])
+        if os.environ.get('CHAIN_TEST_STREAM_MODULE') and os.environ.get('CHAIN_TEST_MIHOMO'):
+            run(['python3', '-B', 'tests/fronting.py'])
         print('Checks passed; verifying cleanup.', flush=True)
     finally:
         # Stop only children carrying this invocation's ownership marker.

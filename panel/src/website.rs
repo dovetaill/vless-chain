@@ -259,6 +259,11 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
     if !lane.available() {
         return (StatusCode::TOO_MANY_REQUESTS, "本站本月流量额度已用尽").into_response();
     }
+    if spec.kind == Kind::Vless && spec.target == "builtin" {
+        return axum::response::Html("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>欢迎访问</title><style>body{max-width:46rem;margin:12vh auto;padding:24px;font:18px/1.8 system-ui;color:#334155;background:#f8fafc}h1{color:#0f172a}</style><h1>欢迎访问</h1><p>网站已上线，更多内容正在准备中。</p></html>").into_response();
+    }
+    // A fallback is already accounted for by its outer VLESS listener.
+    let account = spec.kind == Kind::Website;
     let result = async {
         let mut upstream = url::Url::parse(&spec.target)?;
         let path = format!(
@@ -297,7 +302,11 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
             let lane = upload_lane.clone();
             async move {
                 let bytes = chunk.map_err(std::io::Error::other)?;
-                let n = lane.charge(bytes.len(), true, false).await?;
+                let n = if account {
+                    lane.charge(bytes.len(), true, false).await?
+                } else {
+                    bytes.len()
+                };
                 if n != bytes.len() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
@@ -322,24 +331,32 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
             let cancel = state.cancel.clone();
             state.upgrades.spawn(async move {
                 let transfer = async {
-                    let (a, b) = tokio::try_join!(
+                    let (a, mut b) = tokio::try_join!(
                         async { Ok::<_, anyhow::Error>(incoming.await?) },
                         async { Ok::<_, anyhow::Error>(response.upgrade().await?) }
                     )?;
-                    relay(TokioIo::new(a), b, lane).await?;
+                    if account {
+                        relay(TokioIo::new(a), b, lane).await?;
+                    } else {
+                        tokio::io::copy_bidirectional(&mut TokioIo::new(a), &mut b).await?;
+                    }
                     Ok::<(), anyhow::Error>(())
                 };
                 tokio::select! {_=cancel.cancelled()=>{},_=transfer=>{}}
             });
             Body::empty()
         } else {
-            let connection = lane.connection();
+            let connection = account.then(|| lane.connection());
             let output = response.bytes_stream().then(move |chunk| {
                 let lane = lane.clone();
                 let _keep = &connection;
                 async move {
                     let bytes = chunk.map_err(std::io::Error::other)?;
-                    let n = lane.charge(bytes.len(), false, false).await?;
+                    let n = if account {
+                        lane.charge(bytes.len(), false, false).await?
+                    } else {
+                        bytes.len()
+                    };
                     if n != bytes.len() {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
@@ -369,8 +386,18 @@ pub async fn serve(
     cancel: CancellationToken,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut groups: BTreeMap<u16, Vec<Spec>> = BTreeMap::new();
-    for s in specs.iter().filter(|s| s.kind == Kind::Website) {
-        groups.entry(s.port).or_default().push(s.clone());
+    for s in specs {
+        if s.kind == Kind::Website {
+            groups.entry(s.port).or_default().push(s.clone());
+        }
+        if let Some(port) = s.fallback_port {
+            let mut fallback = s.clone();
+            fallback.port = port;
+            fallback.listen = "127.0.0.1".into();
+            fallback.tls.mode = "off".into();
+            fallback.target = s.fallback_target.clone();
+            groups.entry(port).or_default().push(fallback);
+        }
     }
     // Bind all before spawning so a conflict cannot leave a half-created server behind.
     let mut listeners = vec![];
@@ -382,7 +409,7 @@ pub async fn serve(
             site_tls(&sites, dir)?;
         }
         listeners.push((
-            TcpListener::bind(("0.0.0.0", port))
+            TcpListener::bind((sites[0].listen.as_str(), port))
                 .await
                 .with_context(|| format!("网站端口 {port} 已占用"))?,
             sites,

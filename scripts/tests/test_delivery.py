@@ -87,7 +87,7 @@ class Delivery(unittest.TestCase):
         (root / 'scripts').mkdir()
         for name in ['chain-panel', 'chain-agent', 'xray']:
             (root / 'bin' / name).write_text('fixture-' + version)
-        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'install-server.sh']:
+        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'install-server.sh']:
             shutil.copy2(Path(__file__).resolve().parents[1] / name, root / 'scripts' / name)
         files = {str(p.relative_to(root)): {'sha256': common.sha256(p), 'mode': 0o755 if p.parent.name == 'bin' or p.suffix == '.sh' else 0o644}
                  for p in root.rglob('*') if p.is_file()}

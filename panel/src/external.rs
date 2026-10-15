@@ -168,7 +168,7 @@ pub fn import(input: &str) -> Result<(String, String)> {
             text(&node, field, "")?;
         }
         flag(&node, "tfo", false)?;
-        ensure!(flag(&node, "udp", true)?, "VMess 导入暂不支持关闭 UDP");
+        flag(&node, "udp", true)?;
         ensure!(
             !flag(&node, "skip-cert-verify", false)?,
             "不支持跳过证书验证"
@@ -297,11 +297,7 @@ pub fn import(input: &str) -> Result<(String, String)> {
     for key in ["tfo", "udp"] {
         if node.get(key).is_some() {
             if matches!(kind, "hysteria2" | "tuic") {
-                ensure!(
-                    key == "udp" && flag(&node, key, true)?,
-                    "QUIC 节点不支持此参数：{key}"
-                );
-                continue;
+                ensure!(key == "udp", "QUIC 节点不支持此参数：{key}");
             }
             url.query_pairs_mut().append_pair(
                 key,
@@ -322,7 +318,12 @@ pub fn import(input: &str) -> Result<(String, String)> {
 pub fn mihomo(link: &str, name: &str) -> Result<Value> {
     let out = external_outbound(link, "export")?;
     let q: std::collections::BTreeMap<String, String> = if link.starts_with("vmess://") {
-        Default::default()
+        let value: Value =
+            serde_json::from_str(&crate::access::b64(link.trim_start_matches("vmess://"))?)?;
+        value["udp"]
+            .as_bool()
+            .map(|udp| [("udp".into(), udp.to_string())].into_iter().collect())
+            .unwrap_or_default()
     } else {
         Url::parse(link)?.query_pairs().into_owned().collect()
     };
@@ -459,6 +460,10 @@ mod tests {
                 external_outbound(&again, "x").unwrap(),
                 external_outbound(&link, "x").unwrap()
             );
+            let mut disabled = node;
+            disabled["udp"] = json!(false);
+            let (link, _) = import(&disabled.to_string()).unwrap();
+            assert_eq!(mihomo(&link, "test").unwrap()["udp"], false);
         }
     }
 }

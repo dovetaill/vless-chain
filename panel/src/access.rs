@@ -15,7 +15,7 @@ use url::Url;
 fn decode(s: &str) -> Result<String> {
     Ok(percent_decode_str(s).decode_utf8()?.into_owned())
 }
-fn b64(s: &str) -> Result<String> {
+pub(crate) fn b64(s: &str) -> Result<String> {
     let bytes = URL_SAFE_NO_PAD
         .decode(s.trim_end_matches('='))
         .or_else(|_| STANDARD.decode(s))
@@ -49,6 +49,10 @@ pub fn external_tls(stream: &mut Value, url: &Url) -> Result<()> {
 pub fn external(link: &str, tag: &str) -> Result<Value> {
     if let Some(encoded) = link.strip_prefix("vmess://") {
         let v: Value = serde_json::from_str(&b64(encoded)?)?;
+        ensure!(
+            v["udp"].is_null() || v["udp"].is_boolean(),
+            "VMess udp 参数无效"
+        );
         for field in ["net", "type", "scy", "tls", "sni", "fp", "alpn"] {
             ensure!(
                 v[field].is_null() || v[field].is_string(),
@@ -128,12 +132,18 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
     ensure!(port > 0, "端口必须大于 0");
     let user = decode(u.username())?;
     let pass = decode(u.password().unwrap_or_default())?;
+    for (key, value) in u.query_pairs().filter(|(key, _)| key == "udp") {
+        ensure!(
+            matches!(value.as_ref(), "true" | "false" | "1" | "0"),
+            "{key} 参数无效"
+        );
+    }
     let mut result = match u.scheme() {
         "hysteria2" | "hy2" | "tuic" => {
             let q: std::collections::BTreeMap<_, _> = u.query_pairs().into_owned().collect();
             for key in q.keys() {
                 ensure!(
-                    ["sni", "alpn", "insecure", "allowInsecure"].contains(&key.as_str())
+                    ["sni", "alpn", "insecure", "allowInsecure", "udp"].contains(&key.as_str())
                         || (u.scheme() == "tuic"
                             && ["congestion_control", "udp_relay_mode"].contains(&key.as_str())),
                     "暂不支持此 QUIC 参数：{key}"
@@ -160,7 +170,7 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
                     "TUIC 参数无效"
                 );
                 return Ok(
-                    json!({"tag":tag,"protocol":"tuic","settings":{"type":"tuic","server":host,"port":port,"uuid":uuid,"password":pass,"sni":sni,"alpn":stream["tlsSettings"]["alpn"],"skip-cert-verify":false,"udp":true,"congestion-controller":congestion,"udp-relay-mode":relay}}),
+                    json!({"tag":tag,"protocol":"tuic","settings":{"type":"tuic","server":host,"port":port,"uuid":uuid,"password":pass,"sni":sni,"alpn":stream["tlsSettings"]["alpn"],"skip-cert-verify":false,"udp":!matches!(q.get("udp").map(String::as_str),Some("false" | "0")),"congestion-controller":congestion,"udp-relay-mode":relay}}),
                 );
             }
             ensure!(!user.is_empty(), "Hysteria 2 密码不能为空");
@@ -279,6 +289,68 @@ pub fn validate_line(line: &Line) -> Result<()> {
         "购买的中转入口需要同时填写地址和端口"
     );
     if line.kind == Kind::Vless {
+        let a = &line.access;
+        ensure!(
+            matches!(a.transport.network.as_str(), "tcp" | "xhttp"),
+            "仅支持 TCP / XHTTP 传输"
+        );
+        ensure!(
+            a.transport.network == "tcp" || a.protocol == Protocol::Vless,
+            "XHTTP 传输仅用于 VLESS"
+        );
+        if a.transport.network == "xhttp" {
+            ensure!(
+                a.transport.path.starts_with('/')
+                    && a.transport.path.len() <= 256
+                    && !a
+                        .transport
+                        .path
+                        .chars()
+                        .any(|c| c.is_control() || matches!(c, '?' | '#')),
+                "XHTTP 路径必须以 / 开头，不含查询、片段或控制字符"
+            );
+            ensure!(
+                a.transport.host.is_empty() || host_valid(&a.transport.host),
+                "XHTTP Host 无效"
+            );
+            ensure!(
+                matches!(
+                    a.transport.mode.as_str(),
+                    "auto" | "packet-up" | "stream-up" | "stream-one"
+                ),
+                "XHTTP 模式无效"
+            );
+        }
+        if let Some(r) = &a.reality {
+            crate::compiler::target(&r.target)?;
+            ensure!(host_valid(&r.server_name), "REALITY SNI 无效");
+        }
+        if a.shared_port {
+            ensure!(
+                a.protocol == Protocol::Vless && line.hops.first().is_some_and(|h| h.port == 443),
+                "统一 443 入口仅用于 VLESS，监听端口必须为 443"
+            );
+        }
+        if !a.fallback.is_empty() {
+            ensure!(
+                a.protocol == Protocol::Vless
+                    && a.transport.network == "tcp"
+                    && matches!(a.tls.mode.as_str(), "auto" | "manual"),
+                "网站回落用于 VLESS TCP + TLS；REALITY 自动回落到目标站点"
+            );
+            if a.fallback != "builtin" {
+                let url = Url::parse(&a.fallback)?;
+                ensure!(
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none(),
+                    "回落网站需为不含认证、查询和片段的 HTTP/HTTPS 地址"
+                );
+            }
+        }
         match line.access.protocol {
             Protocol::Http | Protocol::Socks => {
                 ensure!(
@@ -385,11 +457,7 @@ pub fn inbound(line: &Line, hop: &Hop, tag: &str) -> Value {
         ),
         Protocol::Trojan => ("trojan", json!({"clients":[{"password":a.password}]})),
         Protocol::Vmess => ("vmess", json!({"clients":[{"id":hop.uuid,"alterId":0}]})),
-        Protocol::Hysteria2 => (
-            "hysteria",
-            json!({"version":2,"clients":[{"auth":a.password}]}),
-        ),
-        Protocol::Tuic => (
+        Protocol::Hysteria2 | Protocol::Tuic => (
             "socks",
             json!({"auth":"noauth","udp":true,"ip":"127.0.0.1"}),
         ),
@@ -414,12 +482,12 @@ pub fn endpoint(line: &Line, node: &Node) -> (String, u16) {
         line.access.public_port.unwrap_or(line.hops[0].port),
     )
 }
-pub fn share(line: &Line, node: &Node) -> Result<String> {
+pub fn share(line: &Line, node: &Node, udp: bool) -> Result<String> {
     let a = &line.access;
     let (host, port) = endpoint(line, node);
     if a.protocol == Protocol::Vmess {
         return vmess_link(
-            &json!({"name":line.name,"server":host,"port":port,"uuid":line.hops[0].uuid,"tls":matches!(a.tls.mode.as_str(),"auto"|"manual"),"servername":a.tls.domain}),
+            &json!({"name":line.name,"server":host,"port":port,"uuid":line.hops[0].uuid,"tls":matches!(a.tls.mode.as_str(),"auto"|"manual"),"servername":a.tls.domain,"udp":udp}),
         );
     }
     let scheme = match a.protocol {
@@ -437,6 +505,9 @@ pub fn share(line: &Line, node: &Node) -> Result<String> {
         Protocol::Http | Protocol::Socks => {
             u.set_username(&a.username).ok();
             u.set_password(Some(&a.password)).ok();
+            if scheme == "https" {
+                u.query_pairs_mut().append_pair("sni", &a.tls.domain);
+            }
         }
         Protocol::Trojan => {
             u.set_username(&a.password).ok();
@@ -471,12 +542,15 @@ pub fn share(line: &Line, node: &Node) -> Result<String> {
         }
         _ => {}
     }
+    if !udp && a.protocol != Protocol::Http {
+        u.query_pairs_mut().append_pair("udp", "false");
+    }
     u.set_fragment(Some(&line.name));
     Ok(u.to_string())
 }
 
 pub fn vmess_link(node: &Value) -> Result<String> {
-    let v = json!({"v":"2","ps":node["name"],"add":node["server"],"port":node["port"],"id":node["uuid"],"aid":node.get("alterId").cloned().unwrap_or(json!(0)),"scy":node["cipher"].as_str().unwrap_or("auto"),"net":node["network"].as_str().unwrap_or("tcp"),"type":"none","tls":if node["tls"] == true {"tls"} else {""},"sni":node["servername"].as_str().unwrap_or(""),"fp":node["client-fingerprint"].as_str().unwrap_or("chrome"),"alpn":node["alpn"].as_array().map(|v|v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default(),"tfo":node.get("tfo"),"allowInsecure":node.get("skip-cert-verify")});
+    let v = json!({"v":"2","ps":node["name"],"add":node["server"],"port":node["port"],"id":node["uuid"],"aid":node.get("alterId").cloned().unwrap_or(json!(0)),"scy":node["cipher"].as_str().unwrap_or("auto"),"net":node["network"].as_str().unwrap_or("tcp"),"type":"none","tls":if node["tls"] == true {"tls"} else {""},"sni":node["servername"].as_str().unwrap_or(""),"fp":node["client-fingerprint"].as_str().unwrap_or("chrome"),"alpn":node["alpn"].as_array().map(|v|v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default(),"tfo":node.get("tfo"),"udp":node.get("udp"),"allowInsecure":node.get("skip-cert-verify")});
     Ok(format!(
         "vmess://{}",
         STANDARD.encode(serde_json::to_vec(&v)?)
@@ -497,15 +571,21 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
         Protocol::Vless => {
             v["type"] = json!("vless");
             v["uuid"] = json!(line.hops[0].uuid);
-            v["flow"] = json!("xtls-rprx-vision");
+            if a.transport.network == "tcp" {
+                v["flow"] = json!("xtls-rprx-vision");
+            }
             v["tls"] = json!(true);
             v["udp"] = json!(true);
-            v["network"] = json!("tcp");
+            v["network"] = json!(a.transport.network);
+            v["packet-encoding"] = json!("xudp");
+            if a.transport.network == "xhttp" {
+                v["xhttp-opts"] = json!({"path":a.transport.path,"host":a.transport.host,"mode":a.transport.mode});
+            }
             v["client-fingerprint"] = json!("chrome");
             if matches!(a.tls.mode.as_str(), "auto" | "manual") {
                 v["servername"] = json!(a.tls.domain);
             } else {
-                v["servername"] = json!(node.reality.server_name);
+                v["servername"] = json!(a.server_name(node));
                 v["reality-opts"] =
                     json!({"public-key":node.reality.public_key,"short-id":node.reality.short_id});
             }
@@ -567,6 +647,9 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
                 v["udp-relay-mode"] = json!("native");
             }
         }
+    }
+    if v.get("udp").is_some() {
+        v["udp"] = json!(crate::compiler::udp_supported(line, doc)?);
     }
     Ok(v)
 }

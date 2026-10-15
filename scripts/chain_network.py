@@ -299,6 +299,10 @@ class HttpsSite:
                      '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
                      '        proxy_set_header X-Forwarded-Proto https;\n'
                      '        proxy_read_timeout 120s;\n    }\n}\n')
+        ingress = Path('/var/lib/chain-ingress/state.json')
+        if tls and ingress.is_file():
+            from chain_ingress import migrate
+            text = migrate(text, json.loads(ingress.read_text())['port'])
         return text
 
     def reload(self):
@@ -412,6 +416,8 @@ class HttpsSite:
             self.renewal()
             run(['systemctl', 'enable', 'nginx'])
             yield
+            from chain_ingress import refresh_panel_site
+            refresh_panel_site(self.site)
         except BaseException:
             if site_written:
                 if previous is None:

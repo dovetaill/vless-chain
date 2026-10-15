@@ -21,6 +21,14 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Spec {
+    #[serde(default)]
+    pub proxy_protocol: bool,
+    #[serde(default = "all_interfaces")]
+    pub listen: String,
+    #[serde(default)]
+    pub fallback_port: Option<u16>,
+    #[serde(default)]
+    pub fallback_target: String,
     pub id: String,
     pub port: u16,
     pub backend: u16,
@@ -30,6 +38,27 @@ pub struct Spec {
     pub limits: Limits,
     pub tls: Tls,
     pub target: String,
+}
+fn all_interfaces() -> String {
+    "0.0.0.0".into()
+}
+async fn proxy_peer(stream: &mut TcpStream) -> Result<std::net::IpAddr> {
+    let mut header = Vec::new();
+    while header.len() < 108 && !header.ends_with(b"\r\n") {
+        header.push(stream.read_u8().await?);
+    }
+    ensure!(header.ends_with(b"\r\n"), "PROXY 头过长");
+    let text = std::str::from_utf8(&header)?;
+    let fields: Vec<_> = text.split_whitespace().collect();
+    ensure!(
+        fields.len() == 6 && fields[0] == "PROXY" && matches!(fields[1], "TCP4" | "TCP6"),
+        "PROXY 头无效"
+    );
+    let source = fields[2].parse::<std::net::IpAddr>()?;
+    fields[3].parse::<std::net::IpAddr>()?;
+    fields[4].parse::<u16>()?;
+    fields[5].parse::<u16>()?;
+    Ok(source)
 }
 
 pub struct Book {
@@ -402,7 +431,7 @@ impl Gateway {
             let lane = self.lanes[&spec.id].clone();
             let peers: Peers = Arc::new(Mutex::new(BTreeMap::new()));
             if spec.network.contains("tcp") {
-                let listener = TcpListener::bind(("0.0.0.0", spec.port))
+                let listener = TcpListener::bind((spec.listen.as_str(), spec.port))
                     .await
                     .with_context(|| format!("入口 TCP {} 已占用", spec.port))?;
                 let spec = spec.clone();
@@ -420,12 +449,17 @@ impl Gateway {
                             if children.len()>=1024 {continue;}
                             let spec=spec.clone();let lane=lane.clone();let dir=dir.clone();let peers=peers.clone();
                             children.spawn(async move {
+                                let mut stream=stream;
                                 let _=stream.set_nodelay(true);
+                                let peer = if spec.proxy_protocol {
+                                    let Ok(Ok(peer)) = tokio::time::timeout(Duration::from_secs(3),proxy_peer(&mut stream)).await else { return; };
+                                    peer
+                                } else { peer.ip() };
                                 if matches!(spec.tls.mode.as_str(),"manual"|"auto") && spec.protocol != Protocol::Vless {
                                     if let Ok(config)=crate::website::load_tls(&spec.tls,&dir) {
-                                        if let Ok(Ok(tls))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=connection(tls,spec,lane,peers,peer.ip()).await;}
+                                        if let Ok(Ok(tls))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=connection(tls,spec,lane,peers,peer).await;}
                                     }
-                                } else {let _=connection(stream,spec,lane,peers,peer.ip()).await;}
+                                } else {let _=connection(stream,spec,lane,peers,peer).await;}
                             });
                         }
                     }}
@@ -549,6 +583,7 @@ pub fn xray_config(config: &serde_json::Value) -> serde_json::Value {
     let mut v = config.clone();
     if let Some(m) = v.as_object_mut() {
         m.remove("_chain");
+        m.remove("_ingress");
         m.remove("_mihomo");
     }
     v
@@ -603,7 +638,12 @@ pub fn system_metrics() -> serde_json::Value {
             }
         }
     }
-    serde_json::json!({"gateway_version":1,"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"listening_ports":listening_ports,"sampled_at":now()})
+    let ephemeral: Vec<u16> = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    serde_json::json!({"gateway_version":1,"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(test)]
@@ -611,6 +651,10 @@ mod tests {
     use super::*;
     fn spec(limits: Limits) -> Spec {
         Spec {
+            proxy_protocol: false,
+            listen: all_interfaces(),
+            fallback_port: None,
+            fallback_target: String::new(),
             id: id(),
             port: 20000,
             backend: 50000,

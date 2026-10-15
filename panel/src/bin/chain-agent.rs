@@ -78,6 +78,14 @@ async fn main() -> Result<()> {
             report.traffic = runtime.traffic.snapshot();
             runtime.traffic.save()?;
             report.system = chain_panel::gateway::system_metrics();
+            let ingress_status = std::env::var_os("CHAIN_INGRESS_STATUS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/var/lib/chain-ingress/status.json"));
+            if let Ok(bytes) = std::fs::read(ingress_status) {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    report.system["ingress"] = value;
+                }
+            }
             if let Ok(bytes) = std::fs::read(dir.join("certificate-status.json")) {
                 if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     report.system["certificate"] = status;

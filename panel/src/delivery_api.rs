@@ -97,10 +97,14 @@ pub async fn subscription(
         .iter()
         .find(|s| equal(&s.token_hash, &digest(&token)))
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "订阅不存在或已撤销"))?;
-    let mut doc = applied(&store.doc);
-    doc.lines
-        .retain(|l| s.line_ids.contains(&l.id) && l.enabled);
-    let yaml = chain_panel::access::mihomo(&doc.lines, &doc)?;
+    let doc = applied(&store.doc);
+    let lines: Vec<_> = doc
+        .lines
+        .iter()
+        .filter(|l| s.line_ids.contains(&l.id) && l.enabled)
+        .cloned()
+        .collect();
+    let yaml = chain_panel::access::mihomo(&lines, &doc)?;
     let mut response = yaml.into_response();
     response.headers_mut().insert(
         "content-type",

@@ -9,7 +9,7 @@
 | 管理买来的代理链接 | 外部代理 | 导入分享链接或单节点 Mihomo YAML / JSON |
 | 修改密钥、绑定 TOTP / Passkey | 设置 | 当前密钥、验证器或设备凭据 |
 
-支持 VLESS/REALITY、HTTP、SOCKS5、Shadowsocks 2022、Trojan/TLS；分享提供链接、二维码和 Mihomo 节点。VLESS、HTTP、Trojan 填写域名时默认自动申请和续期 SSL 证书，其他参数按需展开。
+支持 VLESS/REALITY、HTTP、SOCKS5、Shadowsocks 2022、Trojan/TLS；分享提供链接、二维码和 Mihomo 节点。VLESS 默认使用 REALITY，可批量创建 Vision / XHTTP 与 REALITY / TLS 的组合；TLS 模式支持自动申请和续期证书。网站回落和 Nginx 统一 443 的配置见[使用说明](panel/README.md#网站回落与统一-443)。
 
 **[打开使用手册](panel/README.md)**：本机创建、外部代理导入、链式路径、证书与排错。
 

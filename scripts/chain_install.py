@@ -383,7 +383,7 @@ class Manager:
                 json_write(self.state_file, state)
                 manager = self.base / 'manager'
                 manager.mkdir(exist_ok=True)
-                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py']:
+                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py']:
                     atomic_write(manager / name, (release / 'scripts' / name).read_bytes(), 0o644)
                 atomic_write(wrapper, f'#!/usr/bin/env bash\n# {OWNER}\nset -Eeuo pipefail\nexec python3 -B {shlex.quote(str(manager / "chain_install.py"))} "$@"\n', 0o755)
             except BaseException:
@@ -773,12 +773,17 @@ def menu(root):
             '1': '安装 / 配置控制台与本机节点', '2': '接入 / 重新接入节点', '3': '更新到最新版本',
             '4': '查看状态', '5': '查看日志', '6': '重启服务', '7': '备份数据',
             '8': '回滚上一版本', '9': '查看登录信息', '10': '启动服务', '11': '停止服务',
-            '12': '查看命令帮助', '13': '重置登录安全（TOTP / Passkey）', '0': '退出'}, '4' if installed else '1')
+            '12': '查看命令帮助', '13': '重置登录安全（TOTP / Passkey）', '14': '启用统一 443（保留已有网站）', '15': '关闭统一 443', '0': '退出'}, '4' if installed else '1')
         if choice == '0':
             return
         try:
             if choice == '12':
                 make_parser().print_help()
+                continue
+            if choice in ('14', '15'):
+                from chain_ingress import Ingress
+                require(manager.live, '统一 443 仅用于实际系统安装。')
+                Ingress().operate('enable' if choice == '14' else 'disable')
                 continue
             role = 'panel' if choice in ('1', '9', '13') else 'agent' if choice == '2' else select_role(manager)
             action = {'1': 'install', '2': 'install', '3': 'update', '4': 'status', '5': 'logs',
@@ -808,12 +813,13 @@ def make_parser():
   backup / rollback         私有备份 / 回滚程序版本
   access / token            查看登录信息 / 仅输出管理令牌
   reset-auth                本机恢复登录，清除 TOTP / Passkey（保留管理员密钥）
+  ingress-enable / ingress-disable   启用 / 关闭统一 443，保留已有 HTTPS 网站
   --component agent         操作节点 Agent，默认操作控制台
   --package 文件.tar.gz      使用本地发行包，旁边需有 SHA256SUMS
   --non-interactive         自动化调用，不打开安装向导
 
 安装脚本同样支持 help 和以上子命令。""")
-    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token', 'reset-auth'])
+    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token', 'reset-auth', 'ingress-enable', 'ingress-disable'])
     parser.add_argument('--component', choices=ROLES, default='panel', help='默认 panel；节点机器选择 agent')
     parser.add_argument('--package', type=Path, help='本地发行包，同目录需有 SHA256SUMS')
     parser.add_argument('--latest', action='store_true', help='下载最新正式版本')
@@ -848,6 +854,11 @@ def main(argv=None):
     if args.action == 'menu':
         return menu(args.root)
     manager = Manager(args.root)
+    if args.action in ('ingress-enable', 'ingress-disable'):
+        require(manager.live, '统一 443 仅用于实际系统安装。')
+        from chain_ingress import Ingress
+        Ingress().operate(args.action.removeprefix('ingress-'))
+        return
     if args.action == 'setup':
         installed = manager.state()['roles']
         retry_agent = (args.component == 'panel' and 'panel' in installed and 'agent' not in installed

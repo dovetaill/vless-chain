@@ -10,6 +10,7 @@ import {
   number,
   splitAddress,
   protocolNames,
+  errorText,
 } from "./shared";
 import { api } from "../api";
 import type { Line, PanelState, Protocol, NodeInfo, External } from "../types";
@@ -31,7 +32,7 @@ export function LineEditor({
   close: () => void;
   ensureLocalServer: (host: string) => Promise<NodeInfo>;
   importExternal?: (done: (external?: External) => void) => void;
-  saved: (line: Line, draft: boolean) => Promise<void>;
+  saved: (lines: Line[]) => Promise<void>;
 }) {
   const local = state.nodes.find(n => n.id === state.local_node_id);
   const existing = state.nodes.find(n => n.id === line?.hops[0]?.node_id);
@@ -50,12 +51,24 @@ export function LineEditor({
   const supportsTls = ["vless", "trojan", "http", "vmess", "hysteria2", "tuic"].includes(protocol);
   const tls = supportsTls && domain ? certificate : "off";
   const showTls = supportsTls && domain;
+  const [batch, setBatch] = useState(false);
+  const [combinations, setCombinations] = useState(["tcp-reality", "tcp-tls"]);
+  const [transport, setTransport] = useState(line?.access.transport?.network || "tcp");
+  const [realityTarget, setRealityTarget] = useState(line?.access.reality?.target || existing?.target || local?.target || "www.cloudflare.com:443");
+  const [sni, setSni] = useState(line?.access.reality?.server_name || existing?.server_name || local?.server_name || "www.cloudflare.com");
+  const [shared, setShared] = useState(line?.access.shared_port || false);
+  const [checking, setChecking] = useState(false);
+  const [check, setCheck] = useState("");
+  const usesReality = protocol === "vless" && (batch ? combinations.some(c => c.endsWith("reality")) : tls === "off");
+  const usesTls = protocol === "vless" && (batch ? combinations.some(c => c.endsWith("tls")) : tls !== "off");
+  const usesXhttp = protocol === "vless" && (batch ? combinations.some(c => c.startsWith("xhttp")) : transport === "xhttp");
+  const names: Record<string, string> = { "tcp-reality": "REALITY + Vision", "tcp-tls": "TLS + Vision", "xhttp-reality": "REALITY + XHTTP", "xhttp-tls": "TLS + XHTTP" };
   return (
     <Modal
       wide
       title={line ? "编辑代理" : "新建代理"}
       description="在本机运行，创建后自动生成客户端链接。"
-      submit={line ? "保存并应用" : "创建代理"}
+      submit={line ? "保存并应用" : batch ? "创建所选组合" : "创建代理"}
       close={close}
       action={async (data) => {
         if (["trojan", "hysteria2", "tuic"].includes(protocol) && !domain) throw new Error(`${protocolNames[protocol]} 需要 TLS，请填写解析到本机的域名。`);
@@ -63,14 +76,20 @@ export function LineEditor({
         const node = line ? existing : await ensureLocalServer(host.trim());
         if (!node) throw new Error("本机记录不存在，请先修复本机设置。");
         const changedProtocol = line && line.access.protocol !== protocol;
-        const value = await api<Line>("/lines", "POST", {
+        if (batch && (!combinations.length || usesTls && !domain)) throw new Error("请选择组合；TLS 组合需要解析到本机的域名。");
+        if (batch && shared && (combinations.filter(c => c.endsWith("tls")).length > 1 || combinations.filter(c => c.endsWith("reality")).length > 1)) throw new Error("相同 SNI 无法同时分流 TCP 和 XHTTP；请选择一种传输，或使用独立端口。");
+        const payload = {
           id: line?.id,
           kind,
           name: field(data, "name").trim() || `${protocolNames[protocol]} ${host.trim()}`.slice(0, 80),
           enabled: data.has("enabled"),
-          hops: line ? line.hops.map((h, i) => ({ node_id: h.node_id, port: i === 0 ? number(data, "port") : h.port })) : [{ node_id: node.id, port: number(data, "port") }],
+          hops: line ? line.hops.map((h, i) => ({ node_id: h.node_id, port: i === 0 ? shared ? 443 : number(data, "port") : h.port })) : [{ node_id: node.id, port: shared ? 443 : batch ? null : number(data, "port") }],
           external_id: null, chain, target: "", network: "tcp",
           access: {
+            transport: { network: protocol === "vless" ? transport : "tcp", path: field(data, "xhttp_path") || "/", host: field(data, "xhttp_host"), mode: field(data, "xhttp_mode") || "auto" },
+            reality: usesReality ? { target: realityTarget.trim(), server_name: sni.trim() } : null,
+            shared_port: protocol === "vless" && shared,
+            fallback: usesTls && transport === "tcp" ? field(data, "fallback") : "",
             host: host.trim(),
             protocol: kind === "vless" ? protocol : "vless",
             username: field(data, "username") || line?.access.username || "",
@@ -92,8 +111,20 @@ export function LineEditor({
             download_mbps: number(data, "download"),
             monthly_gib: number(data, "quota"),
           },
-        });
-        await saved(value, false);
+        };
+        if (batch) {
+          const rows = combinations.map(combination => {
+            const [network, security] = combination.split("-");
+            return { ...payload, name: `${payload.name} · ${names[combination]}`, access: { ...payload.access,
+              transport: { ...payload.access.transport, network }, reality: security === "reality" ? { target: realityTarget.trim(), server_name: sni.trim() } : null,
+              tls: security === "tls" ? { mode: certificate === "manual" ? "manual" : "auto", domain: host.trim(), cert: field(data, "cert"), key: field(data, "key") } : { mode: "off", domain: "", cert: "", key: "" },
+              fallback: security === "tls" && network === "tcp" ? field(data, "fallback") : "",
+            } };
+          });
+          await saved(await api<Line[]>("/lines/batch", "POST", rows));
+        } else {
+          await saved([await api<Line>("/lines", "POST", payload)]);
+        }
       }}
     >
       <Field label="名称">
@@ -111,6 +142,7 @@ export function LineEditor({
             value={protocol}
             onChange={(e) => {
               setProtocol(e.target.value as Protocol);
+              setBatch(false); setShared(false);
               setCertificate(e.target.value === "vless" ? "off" : "auto");
             }}
           >
@@ -122,13 +154,30 @@ export function LineEditor({
           </select>
         </Field>
       )}
-      <Field label="本机 IP 或域名" hint={protocol === "vless" && tls === "off" ? "使用 REALITY，无需证书；填写域名时需解析到本机。" : showTls ? "TLS 使用有效证书；自动申请需域名解析到本机并开放 TCP 80。" : ["trojan", "hysteria2", "tuic"].includes(protocol) ? "填写域名后自动申请 SSL 证书。" : "客户端通过此地址连接本机。"}>
+      {protocol === "vless" && !line && <section className="space-y-3">
+        <label className="flex items-center gap-2"><input type="checkbox" checked={batch} onChange={e => { setBatch(e.target.checked); if (e.target.checked) setCertificate("auto"); }} />一次创建多种组合</label>
+        {batch && <div className="grid gap-3 sm:grid-cols-2">{Object.entries(names).map(([value, name]) => <label key={value} className="flex items-center gap-2"><input type="checkbox" checked={combinations.includes(value)} onChange={e => setCombinations(old => e.target.checked ? [...old, value] : old.filter(v => v !== value))} />{name}</label>)}</div>}
+      </section>}
+      <Field label="本机 IP 或域名" hint={usesReality && !usesTls ? "使用 REALITY，无需证书；填写域名时需解析到本机。" : showTls ? "TLS 使用有效证书；自动申请需域名解析到本机并开放 TCP 80。" : ["trojan", "hysteria2", "tuic"].includes(protocol) ? "填写域名后自动申请 SSL 证书。" : "客户端通过此地址连接本机。"}>
         <Input value={host} onChange={e => setHost(e.target.value)} required placeholder="本机公网 IP 或域名" />
       </Field>
       <details className="details">
         <summary>监听端口 · 自动分配</summary>
-        <Field label="监听端口" hint={["hysteria2", "tuic"].includes(protocol) ? "留空自动分配；需放行此 UDP 端口。" : "留空自动选择空闲端口"}><Input name="port" type="number" min={1} max={65535} defaultValue={line?.hops[0]?.port} placeholder="自动分配" /></Field>
+        {protocol === "vless" && <label className="my-3 flex items-center gap-2"><input type="checkbox" checked={shared} onChange={e => setShared(e.target.checked)} />使用统一 443 入口（按 SNI 分流）</label>}
+        {shared ? <p className="muted">需先在本机运行 chainctl ingress-enable；保留已有 HTTPS 网站。每个 SNI 对应一种入口。</p> : batch ? <p className="muted mt-3">为每个组合自动分配独立端口。</p> : <Field label="监听端口" hint={["hysteria2", "tuic"].includes(protocol) ? "留空自动分配；需放行此 UDP 端口。" : "留空自动选择空闲端口"}><Input name="port" type="number" min={1} max={65535} defaultValue={line?.hops[0]?.port} placeholder="自动分配" /></Field>}
       </details>
+      {protocol === "vless" && !batch && <Field label="传输方式"><select className="select" value={transport} onChange={e => setTransport(e.target.value as "tcp" | "xhttp")}><option value="tcp">TCP + Vision</option><option value="xhttp">XHTTP</option></select></Field>}
+      {usesXhttp && <section className="space-y-4 rounded-xl border border-border p-4">
+        <Field label="XHTTP 路径"><Input name="xhttp_path" defaultValue={line?.access.transport?.path || "/"} required /></Field>
+        <Field label="XHTTP Host" hint="留空不限制 Host；与 REALITY SNI 或证书域名是不同设置。"><Input name="xhttp_host" defaultValue={line?.access.transport?.host || ""} /></Field>
+        <Field label="XHTTP 模式"><select name="xhttp_mode" className="select" defaultValue={line?.access.transport?.mode || "auto"}>{["auto", "packet-up", "stream-up", "stream-one"].map(mode => <option key={mode}>{mode}</option>)}</select></Field>
+      </section>}
+      {usesReality && <section className="space-y-4 rounded-xl border border-border p-4">
+        <Field label="REALITY 目标地址" hint="目标网站的域名或 IP 加端口，需支持 TLS 1.3 与 H2；无需解析到本机。"><Input value={realityTarget} readOnly={checking} onChange={e => { setRealityTarget(e.target.value); setCheck(""); }} required /></Field>
+        <Field label="REALITY SNI" hint="必须是目标网站证书覆盖的域名。无需申请自己的证书。"><Input value={sni} readOnly={checking} onChange={e => { setSni(e.target.value); setCheck(""); }} required /></Field>
+        <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await api<{ ok: boolean; detail: string; latency_ms: number }>("/reality/check", "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测目标与 SNI"}</Button>
+        {check && <p className="muted" role="status">{check}</p>}
+      </section>}
       {kind === "vless" && ["http", "socks", "trojan", "hysteria2", "tuic"].includes(protocol) && <details className="details">
         <summary>账号与密码 · 高级</summary>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -157,9 +206,9 @@ export function LineEditor({
         </p>
       )}
       </details>}
-      {showTls && (
+      {showTls && (!batch || usesTls) && (
         <details className="details"><summary>传输安全 · {tls === "off" ? protocol === "vless" ? "REALITY" : protocol === "vmess" ? "VMess AEAD" : "未启用 TLS" : "TLS 证书"}</summary>
-          <Field label="HTTPS / 证书">
+          <Field label="HTTPS / 证书" hint={tls === "auto" ? "域名需解析到本机，并放行 TCP 80 和监听端口。" : undefined}>
             <select
               className="select"
               value={tls}
@@ -169,15 +218,10 @@ export function LineEditor({
             >
               <option value="auto">自动申请与续期证书</option>
               <option value="manual">使用自己的证书</option>
-              {protocol === "vless" && <option value="off">REALITY（无需证书）</option>}
+              {protocol === "vless" && !batch && <option value="off">REALITY（无需证书）</option>}
               {protocol === "vmess" && <option value="off">VMess AEAD（不加 TLS）</option>}
             </select>
           </Field>
-          {tls === "auto" && (
-            <p className="muted">
-              域名需解析到本机，并放行 TCP 80 和监听端口。
-            </p>
-          )}
           {tls === "manual" && (
             <>
               <Field label="证书 PEM">
@@ -203,6 +247,7 @@ export function LineEditor({
           )}
         </details>
       )}
+      {usesTls && (batch ? combinations.includes("tcp-tls") : transport === "tcp") && <Field label="TLS 网站回落" hint="普通浏览器访问会显示此网站。留空关闭；builtin 使用内置主页，也可填写自己的 HTTP/HTTPS 网站地址。"><Input name="fallback" defaultValue={line?.access.fallback ?? "builtin"} placeholder="builtin 或 https://你的站点" /></Field>}
       <section className="space-y-3 rounded-xl border border-border p-4">
         <Field label="出网方式"><select className="select" value={chain.length ? "chain" : "direct"} onChange={e => setChain(e.target.value === "direct" ? [] : [available?.id || ""])}>
           <option value="direct">直接出网</option><option value="chain">链式代理</option>
@@ -220,6 +265,7 @@ export function LineEditor({
           {importExternal && <Button type="button" variant="outline" disabled={chain.filter(Boolean).length >= 8} onClick={() => importExternal(e => { if (e) setChain(old => [...old.filter(Boolean), `external:${e.id}`]); })}>导入落地代理</Button>}
         </div>}
         <p className="muted" aria-label="代理路径">客户端 → 本机{chain.map(id => ` → ${choices.find(c => c.id === id)?.name || "待选择落地"}`).join("")} → 互联网</p>
+        {chain.length > 0 && <p className="muted">HTTP/HTTPS 出口仅支持 TCP；经它连接 Shadowsocks 或 SOCKS5 时也不支持 UDP。Hysteria 2、TUIC 的前置路径必须支持 UDP。</p>}
       </section>
       <details
         className="details"

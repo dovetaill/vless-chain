@@ -256,9 +256,9 @@ export function App() {
     setPendingShare(null);
     close();
   };
-  async function apply(id?: string, share = false) {
+  async function apply(id?: string, share = false, created: string[] = []) {
     const preview = await api<Preview>("/preview", "POST", {});
-    const otherLines = preview.affected_line_ids.filter((n) => n !== id);
+    const otherLines = preview.affected_line_ids.filter((n) => n !== id && !created.includes(n));
     if (otherLines.length) {
       setModal(
         <Modal
@@ -900,7 +900,7 @@ export function App() {
         close={() => setEditor(null)}
         saved={async (value) => {
           await refresh();
-          await apply(value.id, value.kind === "vless");
+          await apply(value[0].id, value.length === 1 && value[0].kind === "vless", value.map(line => line.id));
           setEditor(null);
         }}
       />}

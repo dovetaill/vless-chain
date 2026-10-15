@@ -64,6 +64,12 @@ pub fn external_outbound(link: &str, tag: &str) -> Result<Value> {
     let port = u.port().context("链接缺少端口")?;
     ensure!(port > 0, "链接端口无效");
     let q: BTreeMap<String, String> = u.query_pairs().into_owned().collect();
+    if let Some(udp) = q.get("udp") {
+        ensure!(
+            matches!(udp.as_str(), "true" | "false" | "1" | "0"),
+            "udp 参数无效"
+        );
+    }
     let get = |key: &str, default: &str| q.get(key).cloned().unwrap_or_else(|| default.to_string());
     ensure!(
         get("encryption", "none") == "none",
@@ -139,7 +145,7 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
         .find(|n| n.id == h.node_id)
         .context("入口节点不存在")?;
     if line.access.protocol != Protocol::Vless {
-        return crate::access::share(line, node);
+        return crate::access::share(line, node, udp_supported(line, doc)?);
     }
     let host = if !line.access.host.is_empty() {
         &line.access.host
@@ -159,25 +165,36 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
     ))?;
     let tls = matches!(line.access.tls.mode.as_str(), "auto" | "manual");
     u.query_pairs_mut().extend_pairs([
-        ("type", "tcp"),
+        ("type", line.access.transport.network.as_str()),
         ("security", if tls { "tls" } else { "reality" }),
-        ("flow", "xtls-rprx-vision"),
         ("encryption", "none"),
         (
             "sni",
             if tls {
                 &line.access.tls.domain
             } else {
-                &node.reality.server_name
+                line.access.server_name(node)
             },
         ),
         ("fp", "chrome"),
     ]);
+    if line.access.transport.network == "tcp" {
+        u.query_pairs_mut().append_pair("flow", "xtls-rprx-vision");
+    } else {
+        u.query_pairs_mut().extend_pairs([
+            ("path", line.access.transport.path.as_str()),
+            ("host", line.access.transport.host.as_str()),
+            ("mode", line.access.transport.mode.as_str()),
+        ]);
+    }
     if !tls {
         u.query_pairs_mut().extend_pairs([
             ("pbk", &node.reality.public_key),
             ("sid", &node.reality.short_id),
         ]);
+    }
+    if !udp_supported(line, doc)? {
+        u.query_pairs_mut().append_pair("udp", "false");
     }
     u.set_fragment(Some(&line.name));
     Ok(u.to_string())
@@ -196,15 +213,83 @@ fn vless_out(node: &Node, hop: &Hop, tag: &str) -> Value {
         "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":node.reality.server_name,
             "publicKey":node.reality.public_key,"shortId":node.reality.short_id,"fingerprint":"chrome"}}})
 }
-fn backend_port(reserved: &mut BTreeSet<(String, u16)>, node: &str) -> Result<u16> {
+fn backend_port(reserved: &mut BTreeSet<(String, u16)>, node: &Node) -> Result<u16> {
+    let range = &node.report.system["ephemeral_port_range"];
+    let ephemeral = range[0]
+        .as_u64()
+        .zip(range[1].as_u64())
+        .filter(|(low, high)| *low > 0 && low <= high && *high <= 65535)
+        .unwrap_or((32768, 60999));
     let port = (50000..65535)
-        .find(|p| !reserved.iter().any(|(_, used)| used == p))
-        .context("没有可供内部接入使用的端口")?;
-    reserved.insert((node.into(), port));
+        .find(|p| {
+            !(ephemeral.0..=ephemeral.1).contains(&u64::from(*p))
+                && !reserved.iter().any(|(_, used)| used == p)
+        })
+        .context("没有可供内部接入使用的端口：50000–65534 必须避开已用端口及系统临时端口范围")?;
+    reserved.insert((node.id.clone(), port));
     Ok(port)
 }
 fn mihomo_config(config: &mut Value) -> &mut Value {
     config.as_object_mut().unwrap().entry("_mihomo").or_insert_with(|| json!({"mode":"rule","log-level":"warning","listeners":[],"proxies":[],"rules":["MATCH,REJECT"]}))
+}
+pub fn needs_mihomo(outbound: &Value) -> bool {
+    // Keep SS handshakes, QUIC sessions and nested HTTPS TLS in the same core.
+    matches!(
+        outbound["protocol"].as_str(),
+        Some("tuic" | "hysteria" | "shadowsocks")
+    ) || outbound["protocol"] == "http" && outbound["streamSettings"]["security"] == "tls"
+}
+fn udp_after(udp: bool, protocol: &str, supported: bool, index: usize) -> Result<bool> {
+    if matches!(protocol, "hysteria2" | "tuic") {
+        ensure!(
+            udp,
+            "第 {} 跳 {} 需要 UDP，前面的代理路径仅支持 TCP；请调整链式顺序",
+            index + 1,
+            protocol
+        );
+    }
+    Ok(supported
+        && match protocol {
+            "http" => false,
+            "socks" | "socks5" | "shadowsocks" | "ss" => udp,
+            _ => true,
+        })
+}
+pub fn udp_supported(line: &Line, doc: &Document) -> Result<bool> {
+    fn visit(line: &Line, doc: &Document, depth: usize) -> Result<bool> {
+        ensure!(depth < 16, "链式代理不能循环引用或超过 16 层");
+        let mut udp = true;
+        for (index, reference) in line.proxy_chain().iter().enumerate() {
+            let (protocol, supported) = if let Some(id) = reference.strip_prefix("line:") {
+                let next = doc
+                    .lines
+                    .iter()
+                    .find(|l| l.id == id)
+                    .context("引用的代理不存在")?;
+                (
+                    serde_json::to_value(&next.access.protocol)?
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    visit(next, doc, depth + 1)?,
+                )
+            } else {
+                let proxy = doc
+                    .externals
+                    .iter()
+                    .find(|e| Some(e.id.as_str()) == reference.strip_prefix("external:"))
+                    .context("外部代理不存在")?;
+                let proxy = crate::external::mihomo(&proxy.url, "capability")?;
+                (
+                    proxy["type"].as_str().unwrap().to_owned(),
+                    proxy["udp"].as_bool().unwrap_or(true),
+                )
+            };
+            udp = udp_after(udp, &protocol, supported, index)?;
+        }
+        Ok(udp && line.access.protocol != Protocol::Http)
+    }
+    visit(line, doc, 0)
 }
 pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
     fn check_chain(line: &Line, doc: &Document, visited: &mut BTreeSet<String>) -> Result<()> {
@@ -247,6 +332,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         .map(|n| (n.id.clone(), empty_config()))
         .collect();
     let mut ports = BTreeSet::new();
+    let mut shared_names = BTreeSet::new();
     let mut websites: BTreeMap<(String, u16), (bool, BTreeSet<String>)> = BTreeMap::new();
     let mut ids = BTreeSet::new();
     let mut reserved: BTreeSet<(String, u16)> = doc
@@ -296,6 +382,26 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     domains.insert(line.access.tls.domain.to_ascii_lowercase()),
                     "同一监听端口的网站域名重复"
                 );
+            } else if line.access.shared_port
+                && line
+                    .hops
+                    .first()
+                    .is_some_and(|first| std::ptr::eq(first, h))
+            {
+                ensure!(
+                    !doc.lines.iter().any(|other| !other.access.shared_port
+                        && other
+                            .hops
+                            .iter()
+                            .any(|hop| hop.node_id == h.node_id && hop.port == h.port)),
+                    "443 已被独立入口占用"
+                );
+                let node = doc.nodes.iter().find(|n| n.id == h.node_id).unwrap();
+                let name = line.access.server_name(node).to_ascii_lowercase();
+                ensure!(
+                    shared_names.insert((h.node_id.clone(), name.clone())),
+                    "统一 443 的 SNI {name} 重复；不同传输请使用不同 SNI 或独立端口"
+                );
             } else {
                 ensure!(fresh, "同一节点端口 {} 被多条线路占用", h.port);
             }
@@ -337,9 +443,8 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             external.push(outbound);
             links.push(link);
         }
-        let tuic_chain = external
-            .iter()
-            .any(|outbound| outbound["protocol"] == "tuic");
+        udp_supported(line, doc)?;
+        let sidecar_chain = external.iter().any(needs_mihomo);
         crate::access::validate_line(line)?;
         if !line.enabled {
             continue;
@@ -360,7 +465,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             };
             if i == 0
                 && line.kind == Kind::Vless
-                && matches!(line.access.protocol, Protocol::Vless | Protocol::Hysteria2)
+                && line.access.protocol == Protocol::Vless
                 && matches!(line.access.tls.mode.as_str(), "auto" | "manual")
             {
                 let tls = &line.access.tls;
@@ -371,11 +476,6 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 };
                 inbound["streamSettings"] = json!({"network":"tcp","security":"tls",
                     "tlsSettings":{"minVersion":"1.2","certificates":certificates}});
-                if line.access.protocol == Protocol::Hysteria2 {
-                    inbound["streamSettings"]["network"] = json!("hysteria");
-                    inbound["streamSettings"]["hysteriaSettings"] = json!({"version":2});
-                    inbound["streamSettings"]["tlsSettings"]["alpn"] = json!(["h3"]);
-                }
             }
             let mut outbound = if let Some(next) = line.hops.get(i + 1) {
                 vless_out(
@@ -389,9 +489,9 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 json!({"tag":out_tag,"protocol":"freedom"})
             };
             let config = configs.get_mut(&node.id).unwrap();
-            if i + 1 == line.hops.len() && tuic_chain {
-                // A TUIC chain needs only one SOCKS bridge into its managed core.
-                let port = backend_port(&mut reserved, &node.id)?;
+            if i + 1 == line.hops.len() && sidecar_chain {
+                // One bridge per chain keeps each hop's dialer and QUIC sessions isolated.
+                let port = backend_port(&mut reserved, node)?;
                 let sidecar = mihomo_config(config);
                 for (index, (link, original)) in links.iter().zip(&external).enumerate() {
                     let mut proxy =
@@ -408,21 +508,70 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 outbound = json!({"tag":out_tag,"protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":port}]}});
             }
             if i == 0 {
-                let backend = backend_port(&mut reserved, &node.id)?;
+                if line.kind == Kind::Vless && line.access.protocol == Protocol::Vless {
+                    if let Some(reality) = &line.access.reality {
+                        if inbound["streamSettings"]["security"] == "reality" {
+                            inbound["streamSettings"]["realitySettings"]["target"] =
+                                json!(reality.target);
+                            inbound["streamSettings"]["realitySettings"]["serverNames"] =
+                                json!([reality.server_name]);
+                        }
+                    }
+                    if line.access.transport.network == "xhttp" {
+                        inbound["settings"]["clients"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("flow");
+                        inbound["streamSettings"]["network"] = json!("xhttp");
+                        inbound["streamSettings"]["xhttpSettings"] = json!({"path":line.access.transport.path,"host":line.access.transport.host,"mode":"auto"});
+                    }
+                }
+                let fallback_port = if !line.access.fallback.is_empty() {
+                    let port = backend_port(&mut reserved, node)?;
+                    inbound["settings"]["fallbacks"] =
+                        json!([{"dest":format!("127.0.0.1:{port}"),"xver":0}]);
+                    inbound["streamSettings"]["tlsSettings"]["alpn"] = json!(["h2", "http/1.1"]);
+                    Some(port)
+                } else {
+                    None
+                };
+                let port = if line.access.shared_port {
+                    let port = backend_port(&mut reserved, node)?;
+                    if config.get("_ingress").is_none() {
+                        config["_ingress"] = json!([]);
+                    }
+                    config["_ingress"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"sni":line.access.server_name(node),"port":port}));
+                    port
+                } else {
+                    hop.port
+                };
+                let backend = backend_port(&mut reserved, node)?;
                 inbound["listen"] = json!("127.0.0.1");
                 inbound["port"] = json!(backend);
-                if line.access.protocol == Protocol::Tuic && line.kind == Kind::Vless {
-                    let socks = backend_port(&mut reserved, &node.id)?;
+                if matches!(line.access.protocol, Protocol::Tuic | Protocol::Hysteria2)
+                    && line.kind == Kind::Vless
+                {
+                    let socks = backend_port(&mut reserved, node)?;
                     inbound["port"] = json!(socks);
                     let sidecar = mihomo_config(config);
-                    sidecar["listeners"].as_array_mut().unwrap().push(json!({"name":in_tag,"type":"tuic","listen":"127.0.0.1","port":backend,"users":{&hop.uuid:&line.access.password},"certificate":line.access.tls.cert,"private-key":line.access.tls.key,"alpn":["h3"],"congestion-controller":"bbr","proxy":in_tag}));
+                    let mut listener = json!({"name":in_tag,"type":if line.access.protocol == Protocol::Tuic {"tuic"} else {"hysteria2"},"listen":"127.0.0.1","port":backend,"users":{&hop.uuid:&line.access.password},"certificate":line.access.tls.cert,"private-key":line.access.tls.key,"alpn":["h3"],"proxy":in_tag});
+                    if line.access.protocol == Protocol::Tuic {
+                        listener["congestion-controller"] = json!("bbr");
+                    }
+                    sidecar["listeners"].as_array_mut().unwrap().push(listener);
                     sidecar["proxies"].as_array_mut().unwrap().push(json!({"name":in_tag,"type":"socks5","server":"127.0.0.1","port":socks,"udp":true}));
                 }
                 if config.get("_chain").is_none() {
                     config["_chain"] = json!([]);
                 }
                 config["_chain"].as_array_mut().unwrap().push(json!({
-                    "id":line.id,"port":hop.port,"backend":backend,"kind":line.kind,
+                    "id":line.id,"port":port,"backend":backend,"kind":line.kind,
+                    "listen":if line.access.shared_port {"127.0.0.1"} else {"0.0.0.0"},
+                    "proxy_protocol":line.access.shared_port,
+                    "fallback_port":fallback_port,"fallback_target":line.access.fallback,
                     "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
                     "limits":line.limits,"tls":line.access.tls,"target":line.target,
                 }));
@@ -432,7 +581,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             }
             config["inbounds"].as_array_mut().unwrap().push(inbound);
             config["outbounds"].as_array_mut().unwrap().push(outbound);
-            if i + 1 == line.hops.len() && external.len() > 1 && !tuic_chain {
+            if i + 1 == line.hops.len() && external.len() > 1 && !sidecar_chain {
                 config["outbounds"]
                     .as_array_mut()
                     .unwrap()
@@ -485,6 +634,187 @@ mod tests {
             limits: Limits::default(),
         });
         d
+    }
+    #[test]
+    fn backend_ports_cannot_collide_with_kernel_ephemeral_connections() {
+        let mut d = fixture();
+        let mut reserved = BTreeSet::new();
+        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 61000);
+        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 61001);
+        d.nodes[0].report.system = json!({"ephemeral_port_range":[60000,65535]});
+        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 50000);
+        d.nodes[0].report.system["ephemeral_port_range"] = json!([40000, 65535]);
+        assert!(
+            backend_port(&mut reserved, &d.nodes[0])
+                .unwrap_err()
+                .to_string()
+                .contains("系统临时端口")
+        );
+    }
+    #[test]
+    fn udp_capability_follows_local_references_and_exports() {
+        let mut d = fixture();
+        d.lines[0].hops.truncate(1);
+        d.externals.push(External {
+            id: "http".into(),
+            name: "http".into(),
+            url: "http://proxy.example:8080".into(),
+        });
+        d.externals.push(External {
+            id: "hy2".into(),
+            name: "hy2".into(),
+            url: "hysteria2://secret@quic.example:443".into(),
+        });
+        d.lines[0].chain = vec!["external:http".into()];
+        assert!(!udp_supported(&d.lines[0], &d).unwrap());
+        assert_eq!(
+            crate::access::mihomo_node(&d.lines[0], &d).unwrap()["udp"],
+            false
+        );
+        assert_eq!(
+            crate::external::mihomo(&share(&d.lines[0], &d).unwrap(), "test").unwrap()["udp"],
+            false
+        );
+        let mut second = d.lines[0].clone();
+        second.id = id();
+        second.hops[0].port += 1;
+        second.chain = vec![format!("line:{}", d.lines[0].id), "external:hy2".into()];
+        d.lines.push(second);
+        assert!(compile(&d).unwrap_err().to_string().contains("需要 UDP"));
+        d.lines[0].chain.clear();
+        assert!(udp_supported(&d.lines[1], &d).unwrap());
+        assert!(compile(&d).is_ok());
+    }
+    #[test]
+    fn quic_ingress_uses_udp_listener_and_loopback_socks_bridge() {
+        for (protocol, kind) in [(Protocol::Hysteria2, "hysteria2"), (Protocol::Tuic, "tuic")] {
+            let mut d = fixture();
+            d.lines[0].hops.truncate(1);
+            d.lines[0].access.protocol = protocol;
+            d.lines[0].access.password = "test-password".into();
+            d.lines[0].access.tls.mode = "auto".into();
+            d.lines[0].access.tls.domain = "cert.example.com".into();
+            let c = compile(&d).unwrap();
+            let listener = &c["a"]["_mihomo"]["listeners"][0];
+            assert_eq!(listener["type"], kind);
+            assert_eq!(listener["listen"], "127.0.0.1");
+            assert_eq!(listener["port"], c["a"]["_chain"][0]["backend"]);
+            assert_eq!(c["a"]["inbounds"][0]["protocol"], "socks");
+            assert_eq!(
+                c["a"]["inbounds"][0]["port"],
+                c["a"]["_mihomo"]["proxies"][0]["port"]
+            );
+            assert_eq!(c["a"]["_chain"][0]["network"], "udp");
+        }
+    }
+    #[test]
+    fn quic_requires_udp_from_the_complete_preceding_path() {
+        let http = udp_after(true, "http", true, 0).unwrap();
+        let socks = udp_after(http, "socks", true, 1).unwrap();
+        let vless = udp_after(http, "vless", true, 1).unwrap();
+        for protocol in ["hysteria2", "tuic"] {
+            assert!(udp_after(http, protocol, true, 1).is_err());
+            assert!(udp_after(socks, protocol, true, 2).is_err());
+            assert!(udp_after(vless, protocol, true, 2).unwrap());
+        }
+        assert!(!socks);
+        assert!(!udp_after(true, "vless", false, 0).unwrap());
+    }
+    #[test]
+    fn https_export_preserves_sni_and_uses_managed_chain() {
+        let mut d = fixture();
+        d.lines[0].hops.truncate(1);
+        d.lines[0].access.protocol = Protocol::Http;
+        d.lines[0].access.host = "192.0.2.1".into();
+        d.lines[0].access.username = "user".into();
+        d.lines[0].access.password = "password".into();
+        d.lines[0].access.tls.mode = "auto".into();
+        d.lines[0].access.tls.domain = "cert.example.com".into();
+        let link = share(&d.lines[0], &d).unwrap();
+        let out = external_outbound(&link, "test").unwrap();
+        assert_eq!(out["settings"]["servers"][0]["address"], "192.0.2.1");
+        assert_eq!(
+            out["streamSettings"]["tlsSettings"]["serverName"],
+            "cert.example.com"
+        );
+        assert_eq!(
+            crate::external::mihomo(&link, "test").unwrap()["sni"],
+            "cert.example.com"
+        );
+        d.externals.push(External {
+            id: "https".into(),
+            name: "https".into(),
+            url: link,
+        });
+        d.lines[0].chain = vec!["external:https".into()];
+        let c = compile(&d).unwrap();
+        assert_eq!(c["a"]["outbounds"][1]["protocol"], "socks");
+        assert_eq!(c["a"]["_mihomo"]["proxies"][0]["sni"], "cert.example.com");
+        for protocol in ["shadowsocks", "hysteria", "tuic"] {
+            assert!(needs_mihomo(&json!({"protocol":protocol})));
+        }
+        assert!(!needs_mihomo(&json!({"protocol":"vless"})));
+    }
+    #[test]
+    fn xhttp_and_custom_reality_roundtrip_without_vision_flow() {
+        let mut d = fixture();
+        d.lines[0].hops.truncate(1);
+        d.lines[0].access.transport = Transport {
+            network: "xhttp".into(),
+            path: "/proxy/test".into(),
+            host: "cover.example.com".into(),
+            mode: "packet-up".into(),
+        };
+        d.lines[0].access.reality = Some(RealityTarget {
+            target: "cover.example.com:8443".into(),
+            server_name: "cover.example.com".into(),
+        });
+        let c = compile(&d).unwrap();
+        let inbound = &c["a"]["inbounds"][0];
+        assert_eq!(inbound["streamSettings"]["network"], "xhttp");
+        assert_eq!(
+            inbound["streamSettings"]["realitySettings"]["target"],
+            "cover.example.com:8443"
+        );
+        assert!(inbound["settings"]["clients"][0].get("flow").is_none());
+        let node = crate::access::mihomo_node(&d.lines[0], &d).unwrap();
+        assert_eq!(node["servername"], "cover.example.com");
+        assert_eq!(node["xhttp-opts"]["path"], "/proxy/test");
+        assert!(node.get("flow").is_none());
+        let link = share(&d.lines[0], &d).unwrap();
+        assert!(!link.contains("flow="));
+        let outbound = external_outbound(&link, "test").unwrap();
+        assert_eq!(
+            outbound["streamSettings"]["xhttpSettings"]["mode"],
+            "packet-up"
+        );
+    }
+    #[test]
+    fn shared_443_keeps_unique_sni_and_loopback_backends() {
+        let mut d = fixture();
+        d.lines[0].hops.truncate(1);
+        d.lines[0].hops[0].port = 443;
+        d.lines[0].access.shared_port = true;
+        let mut tls = d.lines[0].clone();
+        tls.id = id();
+        tls.access.tls = Tls {
+            mode: "auto".into(),
+            domain: "own.example.com".into(),
+            ..Default::default()
+        };
+        tls.access.fallback = "builtin".into();
+        d.lines.push(tls);
+        let c = compile(&d).unwrap();
+        assert_eq!(c["a"]["_ingress"].as_array().unwrap().len(), 2);
+        for spec in crate::gateway::specs(&c["a"]).unwrap() {
+            assert_eq!(spec.listen, "127.0.0.1");
+            assert_ne!(spec.port, 443);
+        }
+        let duplicate = d.lines[0].access.clone();
+        d.lines[1].access = duplicate;
+        assert!(compile(&d).unwrap_err().to_string().contains("SNI"));
+        d.lines[1].access.shared_port = false;
+        assert!(compile(&d).is_err());
     }
     #[test]
     fn ordered_proxy_chain_uses_each_transport_and_rejects_cycles() {

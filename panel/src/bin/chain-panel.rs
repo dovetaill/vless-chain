@@ -598,90 +598,122 @@ fn yes() -> bool {
     true
 }
 async fn save_line(State(app): State<App>, Json(input): Json<LineInput>) -> ApiResult<Json<Value>> {
-    if input.kind == Kind::Forward {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "仅支持创建代理，端口转发已移除",
-        ));
-    }
-    if input
-        .access
-        .as_ref()
-        .is_some_and(|a| !a.public_host.is_empty() || a.public_port.is_some())
-    {
-        return Err(error(StatusCode::BAD_REQUEST, "购买中转入口功能已移除"));
-    }
     let line = edit(&app, |d| {
-        let existing = input
-            .id
-            .as_ref()
-            .and_then(|id| d.lines.iter().find(|l| &l.id == id))
-            .cloned();
-        ensure!(input.id.is_none() || existing.is_some(), "线路不存在");
-        let line_id = existing.as_ref().map(|l| l.id.clone()).unwrap_or_else(id);
-        let mut used: BTreeSet<(String, u16)> = d
-            .lines
-            .iter()
-            .filter(|l| l.id != line_id)
-            .flat_map(|l| l.hops.iter().map(|h| (h.node_id.clone(), h.port)))
-            .collect();
-        let mut hops = vec![];
-        for h in input.hops {
-            let occupied: BTreeSet<u16> = d
-                .nodes
-                .iter()
-                .find(|n| n.id == h.node_id)
-                .and_then(|n| n.report.system["listening_ports"].as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|p| p.as_u64().and_then(|p| u16::try_from(p).ok()))
-                .collect();
-            let old = existing
-                .as_ref()
-                .and_then(|l| l.hops.iter().find(|o| o.node_id == h.node_id));
-            let port = h
-                .port
-                .or(old.map(|h| h.port))
-                .or_else(|| {
-                    (20000..50000)
-                        .find(|p| !used.contains(&(h.node_id.clone(), *p)) && !occupied.contains(p))
-                })
-                .context("没有可分配的端口")?;
-            used.insert((h.node_id.clone(), port));
-            hops.push(Hop {
-                node_id: h.node_id,
-                port,
-                uuid: old.map(|h| h.uuid.clone()).unwrap_or_else(id),
-            });
-        }
-        let mut access = input
-            .access
-            .or_else(|| existing.as_ref().map(|l| l.access.clone()))
-            .unwrap_or_default();
-        chain_panel::access::fill_credentials(&mut access);
-        let line = Line {
-            id: line_id.clone(),
-            name: input.name,
-            kind: input.kind,
-            hops,
-            external_id: input.external_id.filter(|s| !s.is_empty()),
-            chain: input.chain,
-            target: input.target,
-            network: input.network,
-            enabled: input.enabled,
-            access,
-            limits: input
-                .limits
-                .or_else(|| existing.as_ref().map(|l| l.limits.clone()))
-                .unwrap_or_default(),
-        };
-        d.lines.retain(|l| l.id != line_id);
-        d.lines.push(line.clone());
+        let line = put_line(d, input)?;
         compile(d)?;
-        d.checks.remove(&line_id);
         Ok(line)
     })?;
     Ok(Json(json!(line)))
+}
+async fn save_lines(
+    State(app): State<App>,
+    Json(inputs): Json<Vec<LineInput>>,
+) -> ApiResult<Json<Value>> {
+    if inputs.is_empty() || inputs.len() > 16 || inputs.iter().any(|input| input.id.is_some()) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "批量创建接受 1–16 条新代理，不接受已有线路 ID",
+        ));
+    }
+    let lines = edit(&app, |d| {
+        let lines = inputs
+            .into_iter()
+            .map(|input| put_line(d, input))
+            .collect::<Result<Vec<_>>>()?;
+        compile(d)?;
+        Ok(lines)
+    })?;
+    Ok(Json(json!(lines)))
+}
+fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
+    ensure!(
+        input.kind != Kind::Forward,
+        "仅支持创建代理，端口转发已移除"
+    );
+    ensure!(
+        !input
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.public_host.is_empty() || a.public_port.is_some()),
+        "购买中转入口功能已移除"
+    );
+    let existing = input
+        .id
+        .as_ref()
+        .and_then(|id| d.lines.iter().find(|l| &l.id == id))
+        .cloned();
+    ensure!(input.id.is_none() || existing.is_some(), "线路不存在");
+    let line_id = existing.as_ref().map(|l| l.id.clone()).unwrap_or_else(id);
+    let mut used: BTreeSet<(String, u16)> = d
+        .lines
+        .iter()
+        .filter(|l| l.id != line_id)
+        .flat_map(|l| l.hops.iter().map(|h| (h.node_id.clone(), h.port)))
+        .collect();
+    let mut hops = vec![];
+    for h in input.hops {
+        let occupied: BTreeSet<u16> = d
+            .nodes
+            .iter()
+            .find(|n| n.id == h.node_id)
+            .and_then(|n| n.report.system["listening_ports"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_u64().and_then(|p| u16::try_from(p).ok()))
+            .collect();
+        let old = existing
+            .as_ref()
+            .and_then(|l| l.hops.iter().find(|o| o.node_id == h.node_id));
+        let port = h
+            .port
+            .or(old.map(|h| h.port))
+            .or_else(|| {
+                (20000..50000)
+                    .find(|p| !used.contains(&(h.node_id.clone(), *p)) && !occupied.contains(p))
+            })
+            .context("没有可分配的端口")?;
+        used.insert((h.node_id.clone(), port));
+        hops.push(Hop {
+            node_id: h.node_id,
+            port,
+            uuid: old.map(|h| h.uuid.clone()).unwrap_or_else(id),
+        });
+    }
+    let mut access = input
+        .access
+        .or_else(|| existing.as_ref().map(|l| l.access.clone()))
+        .unwrap_or_default();
+    chain_panel::access::fill_credentials(&mut access);
+    let line = Line {
+        id: line_id.clone(),
+        name: input.name,
+        kind: input.kind,
+        hops,
+        external_id: input.external_id.filter(|s| !s.is_empty()),
+        chain: input.chain,
+        target: input.target,
+        network: input.network,
+        enabled: input.enabled,
+        access,
+        limits: input
+            .limits
+            .or_else(|| existing.as_ref().map(|l| l.limits.clone()))
+            .unwrap_or_default(),
+    };
+    d.lines.retain(|l| l.id != line_id);
+    d.lines.push(line.clone());
+    d.checks.remove(&line_id);
+    Ok(line)
+}
+async fn check_reality(
+    State(app): State<App>,
+    Json(input): Json<RealityTarget>,
+) -> ApiResult<Json<Value>> {
+    let _guard = app
+        .probe_lock
+        .try_lock()
+        .map_err(|_| error(StatusCode::CONFLICT, "已有检测正在运行"))?;
+    Ok(Json(chain_panel::runtime::check_reality(&input).await?))
 }
 async fn remove_line(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     edit(&app, |d| {
@@ -1211,6 +1243,8 @@ async fn main() -> Result<()> {
             get(delivery_api::external_export),
         )
         .route("/api/lines", post(save_line))
+        .route("/api/lines/batch", post(save_lines))
+        .route("/api/reality/check", post(check_reality))
         .route("/api/lines/{id}", delete(remove_line))
         .route("/api/lines/{id}/probe", post(diagnose))
         .route("/api/lines/{id}/export", get(delivery_api::export))
