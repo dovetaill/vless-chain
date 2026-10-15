@@ -78,21 +78,23 @@ pub async fn validate(binary: &Path, config: &Path) -> Result<()> {
     Ok(())
 }
 pub fn spawn_xray(binary: &Path, config: &Path, log: &Path) -> Result<Child> {
+    let mut cmd = Command::new(binary);
+    cmd.args(["run", "-config"]).arg(config);
+    spawn_core(cmd, log)
+}
+fn spawn_core(mut cmd: Command, log: &Path) -> Result<Child> {
     let output = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .mode(0o600)
         .open(log)?;
-    let mut cmd = Command::new(binary);
-    cmd.args(["run", "-config"])
-        .arg(config)
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output)
         .kill_on_drop(true);
     let parent = unsafe { libc::getpid() };
-    // Xray must exit even when its owning Agent is killed before cleanup can run.
+    // Managed cores must exit even when their owning Agent is killed.
     unsafe {
         cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
@@ -104,9 +106,38 @@ pub fn spawn_xray(binary: &Path, config: &Path, log: &Path) -> Result<Child> {
             Ok(())
         });
     }
-    Ok(cmd
-        .spawn()
-        .with_context(|| format!("无法启动 Xray: {}", binary.display()))?)
+    Ok(cmd.spawn().context("无法启动代理内核")?)
+}
+fn mihomo_command(xray: &Path, config: &Path, dir: &Path) -> Command {
+    let binary = std::env::var_os("CHAIN_MIHOMO_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| xray.with_file_name("mihomo"));
+    let mut cmd = Command::new(binary);
+    cmd.arg("-f")
+        .arg(config)
+        .arg("-d")
+        .arg(dir)
+        .env(
+            "SAFE_PATHS",
+            dir.parent().unwrap_or(dir).join("acme/config"),
+        )
+        .kill_on_drop(true);
+    cmd
+}
+async fn validate_mihomo(xray: &Path, config: &Path, dir: &Path) -> Result<()> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        mihomo_command(xray, config, dir).arg("-t").output(),
+    )
+    .await
+    .context("Mihomo 校验超时")??;
+    ensure!(
+        output.status.success(),
+        "Mihomo 配置校验失败：{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 pub async fn stop(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
@@ -129,6 +160,7 @@ pub struct ManagedXray {
     pub binary: PathBuf,
     pub dir: PathBuf,
     pub child: Option<Child>,
+    mihomo: Option<Child>,
     pub active: Option<Desired>,
     pub traffic: std::sync::Arc<crate::gateway::Book>,
     gateway: Option<crate::gateway::Gateway>,
@@ -147,6 +179,7 @@ impl ManagedXray {
             binary,
             dir,
             child: None,
+            mihomo: None,
             active: None,
             traffic,
             gateway: None,
@@ -159,6 +192,10 @@ impl ManagedXray {
     pub fn running(&mut self) -> bool {
         self.gateway.as_ref().is_none_or(|g| g.running())
             && self
+                .mihomo
+                .as_mut()
+                .is_none_or(|c| matches!(c.try_wait(), Ok(None)))
+            && self
                 .child
                 .as_mut()
                 .map(|c| matches!(c.try_wait(), Ok(None)))
@@ -168,7 +205,7 @@ impl ManagedXray {
         let mut value = crate::gateway::xray_config(config);
         for spec in crate::gateway::specs(config)? {
             if spec.kind == Kind::Vless
-                && spec.protocol == Protocol::Vless
+                && matches!(spec.protocol, Protocol::Vless | Protocol::Hysteria2)
                 && spec.tls.mode == "auto"
             {
                 let live = self.dir.join("acme/config/live").join(&spec.tls.domain);
@@ -186,6 +223,26 @@ impl ManagedXray {
         }
         Ok(value)
     }
+    fn mihomo_config(&self, config: &Value) -> Result<Option<Value>> {
+        let Some(mut value) = config.get("_mihomo").cloned() else {
+            return Ok(None);
+        };
+        for spec in crate::gateway::specs(config)?
+            .iter()
+            .filter(|s| s.protocol == Protocol::Tuic && s.tls.mode == "auto")
+        {
+            let live = self.dir.join("acme/config/live").join(&spec.tls.domain);
+            let listener = value["listeners"]
+                .as_array_mut()
+                .context("缺少 TUIC 入口")?
+                .iter_mut()
+                .find(|l| l["name"] == format!("line-{}-in", spec.id))
+                .context("缺少 TUIC 入口")?;
+            listener["certificate"] = json!(live.join("fullchain.pem"));
+            listener["private-key"] = json!(live.join("privkey.pem"));
+        }
+        Ok(Some(value))
+    }
     async fn start_config(&mut self, config: &Value) -> Result<()> {
         let path = self.dir.join("xray.json");
         atomic_write(
@@ -193,11 +250,55 @@ impl ManagedXray {
             &serde_json::to_vec_pretty(&self.xray_config(config)?)?,
         )?;
         self.child = Some(spawn_xray(&self.binary, &path, &self.dir.join("xray.log"))?);
+        if let Some(value) = self.mihomo_config(config)? {
+            let dir = self.dir.join("mihomo");
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join("config.json");
+            atomic_write(&path, &serde_json::to_vec_pretty(&value)?)?;
+            self.mihomo = Some(spawn_core(
+                mihomo_command(&self.binary, &path, &dir),
+                &dir.join("mihomo.log"),
+            )?);
+        }
         tokio::time::sleep(Duration::from_millis(450)).await;
         ensure!(
             self.running(),
-            "Xray 启动失败；请查看 Agent 数据目录中的 xray.log"
+            "代理内核启动失败；请查看 Agent 数据目录中的 xray.log / mihomo/mihomo.log"
         );
+        if let Some(child) = &self.mihomo {
+            let pid = child.id().context("Mihomo 已退出")?;
+            let sockets: std::collections::BTreeSet<_> =
+                std::fs::read_dir(format!("/proc/{pid}/fd"))?
+                    .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                    .collect();
+            let log = std::fs::read_to_string(self.dir.join("mihomo/mihomo.log"))?;
+            ensure!(!log.contains("listen err:"), "Mihomo 监听启动失败：{log}");
+            for listener in config["_mihomo"]["listeners"].as_array().unwrap() {
+                let table = if listener["type"] == "tuic" {
+                    "udp"
+                } else {
+                    "tcp"
+                };
+                let address = format!("0100007F:{:04X}", listener["port"].as_u64().unwrap());
+                let bound = std::fs::read_to_string(format!("/proc/{pid}/net/{table}"))?
+                    .lines()
+                    .skip(1)
+                    .any(|line| {
+                        let fields: Vec<_> = line.split_whitespace().collect();
+                        fields.get(1) == Some(&address.as_str())
+                            && fields.get(9).is_some_and(|inode| {
+                                sockets.contains(&PathBuf::from(format!("socket:[{inode}]")))
+                            })
+                            && (table == "udp" || fields.get(3) == Some(&"0A"))
+                    });
+                ensure!(
+                    bound,
+                    "Mihomo 监听未就绪：{} {}",
+                    listener["name"],
+                    listener["port"]
+                );
+            }
+        }
         self.gateway = Some(
             crate::gateway::Gateway::start(
                 crate::gateway::specs(config)?,
@@ -218,9 +319,14 @@ impl ManagedXray {
                 s.iter()
                     .any(|s| s.tls.mode == "auto" || s.kind == Kind::Website && s.port == 80)
             });
-        // Vision terminates TLS in Xray, so its certificates must exist before validation.
+        // Native TLS/QUIC listeners need certificates before core validation.
         let native_tls = specs.iter().any(|s| {
-            s.kind == Kind::Vless && s.protocol == Protocol::Vless && s.tls.mode == "auto"
+            s.kind == Kind::Vless
+                && matches!(
+                    s.protocol,
+                    Protocol::Vless | Protocol::Hysteria2 | Protocol::Tuic
+                )
+                && s.tls.mode == "auto"
         });
         if native_tls {
             crate::website::prepare(&specs, &self.dir, existing_challenge).await?;
@@ -233,8 +339,18 @@ impl ManagedXray {
         let result = validate(&self.binary, &candidate).await;
         let _ = std::fs::remove_file(&candidate);
         result?;
+        if let Some(value) = self.mihomo_config(&desired.config)? {
+            let dir = self.dir.join("mihomo");
+            std::fs::create_dir_all(&dir)?;
+            let candidate = dir.join("candidate.json");
+            atomic_write(&candidate, &serde_json::to_vec(&value)?)?;
+            let result = validate_mihomo(&self.binary, &candidate, &dir).await;
+            let _ = std::fs::remove_file(&candidate);
+            result?;
+        }
         if self.active.as_ref().is_some_and(|old| {
             crate::gateway::xray_config(&old.config) == crate::gateway::xray_config(&desired.config)
+                && old.config.get("_mihomo") == desired.config.get("_mihomo")
         }) && self.running()
         {
             if self.gateway.as_ref().is_some_and(|g| g.limits_only(&specs)) {
@@ -281,6 +397,7 @@ impl ManagedXray {
             gateway.close().await;
         }
         stop(&mut self.child).await;
+        stop(&mut self.mihomo).await;
     }
 }
 
@@ -397,11 +514,26 @@ pub async fn probe(
             } else {
                 json!({"tag":"probe","protocol":"freedom","settings":{"redirect":endpoint}})
             };
-            let config = json!({"log":{"loglevel":log_level()},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[outbound]});
+            let tuic = outbound["protocol"] == "tuic";
+            let config = if tuic {
+                let mut proxy = outbound["settings"].clone();
+                proxy["name"] = json!("probe");
+                json!({"listeners":[{"name":"probe-in","type":"socks","listen":"127.0.0.1","port":port,"proxy":"probe"}],"proxies":[proxy],"mode":"rule","rules":["MATCH,REJECT"],"log-level":"warning"})
+            } else {
+                json!({"log":{"loglevel":log_level()},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[outbound]})
+            };
             let file = temp.path().join("probe.json");
             atomic_write(&file, &serde_json::to_vec(&config)?)?;
-            validate(binary, &file).await?;
-            let mut child = Some(spawn_xray(binary, &file, &temp.path().join("probe.log"))?);
+            let mut child = Some(if tuic {
+                validate_mihomo(binary, &file, temp.path()).await?;
+                spawn_core(
+                    mihomo_command(binary, &file, temp.path()),
+                    &temp.path().join("probe.log"),
+                )?
+            } else {
+                validate(binary, &file).await?;
+                spawn_xray(binary, &file, &temp.path().join("probe.log"))?
+            });
             let result = async {
                 for _ in 0..40 {
                     if child.as_mut().unwrap().try_wait()?.is_some() {

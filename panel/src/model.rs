@@ -114,6 +114,9 @@ pub enum Protocol {
     Socks,
     Shadowsocks,
     Trojan,
+    Vmess,
+    Hysteria2,
+    Tuic,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]

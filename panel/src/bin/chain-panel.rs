@@ -727,6 +727,7 @@ async fn preview(State(app): State<App>) -> ApiResult<Json<Value>> {
             let Some(old) = &n.desired else { return true };
             chain_panel::gateway::xray_config(&old.config)
                 != chain_panel::gateway::xray_config(&configs[&n.id])
+                || old.config.get("_mihomo") != configs[&n.id].get("_mihomo")
                 || !chain_panel::gateway::same_listeners(
                     &chain_panel::gateway::specs(&old.config).unwrap_or_default(),
                     &chain_panel::gateway::specs(&configs[&n.id]).unwrap_or_default(),

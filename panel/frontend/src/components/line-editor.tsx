@@ -46,8 +46,8 @@ export function LineEditor({
   const [protocol, setProtocol] = useState<Protocol>(
     line?.access.protocol || "vless",
   );
-  const [certificate, setCertificate] = useState(line?.access.tls.mode || "auto");
-  const supportsTls = ["vless", "trojan", "http"].includes(protocol);
+  const [certificate, setCertificate] = useState(line?.access.tls.mode || (protocol === "vless" ? "off" : "auto"));
+  const supportsTls = ["vless", "trojan", "http", "vmess", "hysteria2", "tuic"].includes(protocol);
   const tls = supportsTls && domain ? certificate : "off";
   const showTls = supportsTls && domain;
   return (
@@ -58,7 +58,7 @@ export function LineEditor({
       submit={line ? "保存并应用" : "创建代理"}
       close={close}
       action={async (data) => {
-        if (protocol === "trojan" && !domain) throw new Error("Trojan 需要域名，请填写解析到本机的域名。");
+        if (["trojan", "hysteria2", "tuic"].includes(protocol) && !domain) throw new Error(`${protocolNames[protocol]} 需要 TLS，请填写解析到本机的域名。`);
         if (chain.some(id => !id)) throw new Error("请选择链式代理的落地。");
         const node = line ? existing : await ensureLocalServer(host.trim());
         if (!node) throw new Error("本机记录不存在，请先修复本机设置。");
@@ -111,7 +111,7 @@ export function LineEditor({
             value={protocol}
             onChange={(e) => {
               setProtocol(e.target.value as Protocol);
-              setCertificate("auto");
+              setCertificate(e.target.value === "vless" ? "off" : "auto");
             }}
           >
             {Object.entries(protocolNames).map(([id, label]) => (
@@ -122,17 +122,17 @@ export function LineEditor({
           </select>
         </Field>
       )}
-      <Field label="本机 IP 或域名" hint={showTls ? "自动申请并续期 SSL 证书；域名需解析到本机，TCP 80 需开放。" : protocol === "vless" ? "使用 REALITY，无需域名和证书。" : protocol === "trojan" ? "填写域名后自动申请 SSL 证书。" : "客户端通过此地址连接本机。"}>
-        <Input value={host} onChange={e => { setHost(e.target.value); setCertificate("auto"); }} required placeholder="本机公网 IP 或域名" />
+      <Field label="本机 IP 或域名" hint={protocol === "vless" && tls === "off" ? "使用 REALITY，无需证书；填写域名时需解析到本机。" : showTls ? "TLS 使用有效证书；自动申请需域名解析到本机并开放 TCP 80。" : ["trojan", "hysteria2", "tuic"].includes(protocol) ? "填写域名后自动申请 SSL 证书。" : "客户端通过此地址连接本机。"}>
+        <Input value={host} onChange={e => setHost(e.target.value)} required placeholder="本机公网 IP 或域名" />
       </Field>
       <details className="details">
         <summary>监听端口 · 自动分配</summary>
-        <Field label="监听端口" hint="留空自动选择空闲端口"><Input name="port" type="number" min={1} max={65535} defaultValue={line?.hops[0]?.port} placeholder="自动分配" /></Field>
+        <Field label="监听端口" hint={["hysteria2", "tuic"].includes(protocol) ? "留空自动分配；需放行此 UDP 端口。" : "留空自动选择空闲端口"}><Input name="port" type="number" min={1} max={65535} defaultValue={line?.hops[0]?.port} placeholder="自动分配" /></Field>
       </details>
-      {kind === "vless" && ["http", "socks", "trojan"].includes(protocol) && <details className="details">
+      {kind === "vless" && ["http", "socks", "trojan", "hysteria2", "tuic"].includes(protocol) && <details className="details">
         <summary>账号与密码 · 高级</summary>
         <div className="grid gap-4 sm:grid-cols-2">
-          {protocol !== "trojan" && (
+          {["http", "socks"].includes(protocol) && (
             <Field label="用户名" hint="留空生成默认用户名">
               <Input
                 name="username"
@@ -158,7 +158,7 @@ export function LineEditor({
       )}
       </details>}
       {showTls && (
-        <details className="details"><summary>证书 · 自动申请与续期</summary>
+        <details className="details"><summary>传输安全 · {tls === "off" ? protocol === "vless" ? "REALITY" : protocol === "vmess" ? "VMess AEAD" : "未启用 TLS" : "TLS 证书"}</summary>
           <Field label="HTTPS / 证书">
             <select
               className="select"
@@ -170,6 +170,7 @@ export function LineEditor({
               <option value="auto">自动申请与续期证书</option>
               <option value="manual">使用自己的证书</option>
               {protocol === "vless" && <option value="off">REALITY（无需证书）</option>}
+              {protocol === "vmess" && <option value="off">VMess AEAD（不加 TLS）</option>}
             </select>
           </Field>
           {tls === "auto" && (

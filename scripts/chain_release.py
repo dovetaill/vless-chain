@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import gzip
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,11 @@ XRAY_VERSION = '26.3.27'
 XRAY_ASSETS = {
     'x86_64': ('Xray-linux-64.zip', '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae'),
     'aarch64': ('Xray-linux-arm64-v8a.zip', '4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c'),
+}
+MIHOMO_VERSION = '1.19.32'
+MIHOMO_ASSETS = {
+    'x86_64': ('amd64-compatible', 'ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20'),
+    'aarch64': ('arm64', '9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0'),
 }
 SHIPPED = ['panel', 'scripts', 'README.md', '.gitignore']
 
@@ -141,6 +147,24 @@ def release_wizard(push_only=False):
         raise
 
 
+def fetch_mihomo(work, destination):
+    arch, digest = MIHOMO_ASSETS[architecture()]
+    name = f'mihomo-linux-{arch}-v{MIHOMO_VERSION}.gz'
+    archive = work.root / name
+    url = f'https://github.com/MetaCubeX/mihomo/releases/download/v{MIHOMO_VERSION}/{name}'
+    with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as stream:
+        shutil.copyfileobj(response, stream)
+    require(sha256(archive) == digest, 'Mihomo 下载校验失败。')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(archive, 'rb') as source, destination.open('wb') as output:
+        shutil.copyfileobj(source, output)
+    destination.chmod(0o755)
+    license_path = destination.parent.parent / 'share/Mihomo-LICENSE'
+    license_path.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(f'https://raw.githubusercontent.com/MetaCubeX/mihomo/v{MIHOMO_VERSION}/LICENSE', timeout=30) as response:
+        license_path.write_bytes(response.read())
+
+
 def fetch_xray(work, destination):
     name, digest = XRAY_ASSETS[architecture()]
     archive = work.root / name
@@ -210,6 +234,8 @@ def build(args):
             shutil.copy2(work.root / 'target' / target / 'release' / binary, stage / 'bin' / binary)
         fetch_xray(work, stage / 'bin/xray')
         work.run([stage / 'bin/xray', 'version'])
+        fetch_mihomo(work, stage / 'bin/mihomo')
+        work.run([stage / 'bin/mihomo', '-v'])
         for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py']:
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
@@ -227,7 +253,7 @@ def build(args):
                 files[name] = {'sha256': sha256(file), 'mode': mode}
         glibc = output(['getconf', 'GNU_LIBC_VERSION']).split()[-1]
         manifest = {'format': 1, 'version': ver, 'arch': arch, 'target': target, 'glibc_min': glibc,
-                    'commit': commit, 'dirty': dirty, 'xray': XRAY_VERSION, 'files': files,
+                    'commit': commit, 'dirty': dirty, 'xray': XRAY_VERSION, 'mihomo': MIHOMO_VERSION, 'files': files,
                     'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
         json_write(stage / 'release.json', manifest, 0o644)
         name = f'chain-panel-{ver}-linux-{arch}.tar.gz'

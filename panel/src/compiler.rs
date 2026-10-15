@@ -196,6 +196,16 @@ fn vless_out(node: &Node, hop: &Hop, tag: &str) -> Value {
         "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":node.reality.server_name,
             "publicKey":node.reality.public_key,"shortId":node.reality.short_id,"fingerprint":"chrome"}}})
 }
+fn backend_port(reserved: &mut BTreeSet<(String, u16)>, node: &str) -> Result<u16> {
+    let port = (50000..65535)
+        .find(|p| !reserved.iter().any(|(_, used)| used == p))
+        .context("没有可供内部接入使用的端口")?;
+    reserved.insert((node.into(), port));
+    Ok(port)
+}
+fn mihomo_config(config: &mut Value) -> &mut Value {
+    config.as_object_mut().unwrap().entry("_mihomo").or_insert_with(|| json!({"mode":"rule","log-level":"warning","listeners":[],"proxies":[],"rules":["MATCH,REJECT"]}))
+}
 pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
     fn check_chain(line: &Line, doc: &Document, visited: &mut BTreeSet<String>) -> Result<()> {
         ensure!(
@@ -297,6 +307,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         };
         let chain = line.proxy_chain();
         let mut external = Vec::new();
+        let mut links = Vec::new();
         for (index, reference) in chain.iter().enumerate() {
             let link = if let Some(id) = reference.strip_prefix("external:") {
                 doc.externals
@@ -324,7 +335,11 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     json!(format!("line-{}-chain-{}", line.id, index - 1));
             }
             external.push(outbound);
+            links.push(link);
         }
+        let tuic_chain = external
+            .iter()
+            .any(|outbound| outbound["protocol"] == "tuic");
         crate::access::validate_line(line)?;
         if !line.enabled {
             continue;
@@ -345,7 +360,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             };
             if i == 0
                 && line.kind == Kind::Vless
-                && line.access.protocol == Protocol::Vless
+                && matches!(line.access.protocol, Protocol::Vless | Protocol::Hysteria2)
                 && matches!(line.access.tls.mode.as_str(), "auto" | "manual")
             {
                 let tls = &line.access.tls;
@@ -356,8 +371,13 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 };
                 inbound["streamSettings"] = json!({"network":"tcp","security":"tls",
                     "tlsSettings":{"minVersion":"1.2","certificates":certificates}});
+                if line.access.protocol == Protocol::Hysteria2 {
+                    inbound["streamSettings"]["network"] = json!("hysteria");
+                    inbound["streamSettings"]["hysteriaSettings"] = json!({"version":2});
+                    inbound["streamSettings"]["tlsSettings"]["alpn"] = json!(["h3"]);
+                }
             }
-            let outbound = if let Some(next) = line.hops.get(i + 1) {
+            let mut outbound = if let Some(next) = line.hops.get(i + 1) {
                 vless_out(
                     doc.nodes.iter().find(|n| n.id == next.node_id).unwrap(),
                     next,
@@ -369,19 +389,41 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 json!({"tag":out_tag,"protocol":"freedom"})
             };
             let config = configs.get_mut(&node.id).unwrap();
+            if i + 1 == line.hops.len() && tuic_chain {
+                // A TUIC chain needs only one SOCKS bridge into its managed core.
+                let port = backend_port(&mut reserved, &node.id)?;
+                let sidecar = mihomo_config(config);
+                for (index, (link, original)) in links.iter().zip(&external).enumerate() {
+                    let mut proxy =
+                        crate::external::mihomo(link, original["tag"].as_str().unwrap())?;
+                    if proxy["type"] != "http" && proxy.get("udp").is_none() {
+                        proxy["udp"] = json!(true);
+                    }
+                    if index > 0 {
+                        proxy["dialer-proxy"] = external[index - 1]["tag"].clone();
+                    }
+                    sidecar["proxies"].as_array_mut().unwrap().push(proxy);
+                }
+                sidecar["listeners"].as_array_mut().unwrap().push(json!({"name":out_tag,"type":"socks","listen":"127.0.0.1","port":port,"udp":true,"proxy":out_tag}));
+                outbound = json!({"tag":out_tag,"protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":port}]}});
+            }
             if i == 0 {
-                let backend = (50000..65535)
-                    .find(|p| !reserved.iter().any(|(_, used)| used == p))
-                    .context("没有可供内部接入使用的端口")?;
-                reserved.insert((node.id.clone(), backend));
+                let backend = backend_port(&mut reserved, &node.id)?;
                 inbound["listen"] = json!("127.0.0.1");
                 inbound["port"] = json!(backend);
+                if line.access.protocol == Protocol::Tuic && line.kind == Kind::Vless {
+                    let socks = backend_port(&mut reserved, &node.id)?;
+                    inbound["port"] = json!(socks);
+                    let sidecar = mihomo_config(config);
+                    sidecar["listeners"].as_array_mut().unwrap().push(json!({"name":in_tag,"type":"tuic","listen":"127.0.0.1","port":backend,"users":{&hop.uuid:&line.access.password},"certificate":line.access.tls.cert,"private-key":line.access.tls.key,"alpn":["h3"],"congestion-controller":"bbr","proxy":in_tag}));
+                    sidecar["proxies"].as_array_mut().unwrap().push(json!({"name":in_tag,"type":"socks5","server":"127.0.0.1","port":socks,"udp":true}));
+                }
                 if config.get("_chain").is_none() {
                     config["_chain"] = json!([]);
                 }
                 config["_chain"].as_array_mut().unwrap().push(json!({
                     "id":line.id,"port":hop.port,"backend":backend,"kind":line.kind,
-                    "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
+                    "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
                     "limits":line.limits,"tls":line.access.tls,"target":line.target,
                 }));
                 if line.kind == Kind::Website {
@@ -390,7 +432,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             }
             config["inbounds"].as_array_mut().unwrap().push(inbound);
             config["outbounds"].as_array_mut().unwrap().push(outbound);
-            if i + 1 == line.hops.len() && external.len() > 1 {
+            if i + 1 == line.hops.len() && external.len() > 1 && !tuic_chain {
                 config["outbounds"]
                     .as_array_mut()
                     .unwrap()
@@ -585,6 +627,29 @@ mod tests {
         assert!(compile(&d).is_err());
         d.lines[0].access.tls.mode = "manual".into();
         assert!(compile(&d).is_err());
+    }
+    #[test]
+    fn domain_entry_defaults_to_reality_and_exports_matching_keys() {
+        let mut d = fixture();
+        d.lines[0].access.host = "proxy.example.com".into();
+        let c = compile(&d).unwrap();
+        assert_eq!(
+            c["a"]["inbounds"][0]["streamSettings"]["security"],
+            "reality"
+        );
+        let node = crate::access::mihomo_node(&d.lines[0], &d).unwrap();
+        assert_eq!(node["server"], "proxy.example.com");
+        assert_eq!(node["servername"], d.nodes[0].reality.server_name);
+        assert_eq!(
+            node["reality-opts"]["public-key"],
+            d.nodes[0].reality.public_key
+        );
+        assert_eq!(
+            node["reality-opts"]["short-id"],
+            d.nodes[0].reality.short_id
+        );
+        let out = external_outbound(&share(&d.lines[0], &d).unwrap(), "test").unwrap();
+        assert_eq!(out["streamSettings"]["security"], "reality");
     }
     #[test]
     fn rejects_plaintext_external_and_bad_destination() {

@@ -549,6 +549,7 @@ pub fn xray_config(config: &serde_json::Value) -> serde_json::Value {
     let mut v = config.clone();
     if let Some(m) = v.as_object_mut() {
         m.remove("_chain");
+        m.remove("_mihomo");
     }
     v
 }

@@ -49,6 +49,9 @@ export const protocolNames = {
   socks: "SOCKS5",
   shadowsocks: "Shadowsocks 2022",
   trojan: "Trojan / TLS",
+  vmess: "VMess AEAD",
+  hysteria2: "Hysteria 2",
+  tuic: "TUIC v5",
 };
 export function Field({
   label,

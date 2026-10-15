@@ -47,6 +47,66 @@ pub fn external_tls(stream: &mut Value, url: &Url) -> Result<()> {
     Ok(())
 }
 pub fn external(link: &str, tag: &str) -> Result<Value> {
+    if let Some(encoded) = link.strip_prefix("vmess://") {
+        let v: Value = serde_json::from_str(&b64(encoded)?)?;
+        for field in ["net", "type", "scy", "tls", "sni", "fp", "alpn"] {
+            ensure!(
+                v[field].is_null() || v[field].is_string(),
+                "VMess {field} 必须是文本"
+            );
+        }
+        let host = v["add"].as_str().context("VMess 缺少地址")?;
+        ensure!(host_valid(host), "VMess 地址无效");
+        let port = v["port"]
+            .as_u64()
+            .or_else(|| v["port"].as_str()?.parse().ok())
+            .filter(|p| *p > 0 && *p <= 65535)
+            .context("VMess 端口无效")?;
+        let uuid = uuid::Uuid::parse_str(v["id"].as_str().unwrap_or_default())?;
+        ensure!(
+            matches!(v["aid"].as_u64(), Some(0))
+                || matches!(v["aid"].as_str(), Some("0"))
+                || v["aid"].is_null(),
+            "仅支持 VMess AEAD（alterId: 0）"
+        );
+        ensure!(
+            matches!(v["net"].as_str(), None | Some("tcp" | "raw")),
+            "VMess 目前支持 TCP 传输"
+        );
+        ensure!(
+            matches!(v["type"].as_str(), None | Some("" | "none")),
+            "VMess 不支持此 TCP 伪装"
+        );
+        let cipher = v["scy"].as_str().unwrap_or("auto");
+        ensure!(
+            matches!(cipher, "auto" | "aes-128-gcm" | "chacha20-poly1305"),
+            "VMess 加密方式无效"
+        );
+        let tls = v["tls"].as_str().unwrap_or("");
+        ensure!(matches!(tls, "" | "none" | "tls"), "VMess TLS 模式无效");
+        ensure!(
+            matches!(v["allowInsecure"], Value::Null | Value::Bool(false))
+                || matches!(v["allowInsecure"].as_str(), Some("false" | "0")),
+            "不支持跳过证书验证"
+        );
+        let mut stream = json!({"network":"tcp","security":if tls == "tls" {"tls"} else {"none"}});
+        if tls == "tls" {
+            stream["tlsSettings"] = json!({"serverName":v["sni"].as_str().filter(|s|!s.is_empty()).unwrap_or(host),"fingerprint":v["fp"].as_str().unwrap_or("chrome")});
+            if let Some(alpn) = v["alpn"].as_str().filter(|s| !s.is_empty()) {
+                stream["tlsSettings"]["alpn"] = json!(alpn.split(',').collect::<Vec<_>>());
+            }
+        }
+        ensure!(
+            v["tfo"].is_null() || v["tfo"].is_boolean(),
+            "VMess tfo 参数无效"
+        );
+        if let Some(tfo) = v["tfo"].as_bool() {
+            stream["sockopt"] = json!({"tcpFastOpen":tfo});
+        }
+        return Ok(
+            json!({"tag":tag,"protocol":"vmess","settings":{"vnext":[{"address":host,"port":port,"users":[{"id":uuid,"security":cipher,"alterId":0}]}]},"streamSettings":stream}),
+        );
+    }
     let mut u = Url::parse(link).context("请输入完整代理链接")?;
     if u.scheme() == "ss" && u.host_str().is_some() && u.username().is_empty() {
         let payload = link
@@ -61,11 +121,51 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
         .context("链接缺少地址")?
         .trim_matches(['[', ']']);
     ensure!(host_valid(host), "代理地址无效");
-    let port = u.port_or_known_default().context("链接缺少端口")?;
+    let port = u
+        .port_or_known_default()
+        .or_else(|| matches!(u.scheme(), "hysteria2" | "hy2" | "tuic").then_some(443))
+        .context("链接缺少端口")?;
     ensure!(port > 0, "端口必须大于 0");
     let user = decode(u.username())?;
     let pass = decode(u.password().unwrap_or_default())?;
     let mut result = match u.scheme() {
+        "hysteria2" | "hy2" | "tuic" => {
+            let q: std::collections::BTreeMap<_, _> = u.query_pairs().into_owned().collect();
+            for key in q.keys() {
+                ensure!(
+                    ["sni", "alpn", "insecure", "allowInsecure"].contains(&key.as_str())
+                        || (u.scheme() == "tuic"
+                            && ["congestion_control", "udp_relay_mode"].contains(&key.as_str())),
+                    "暂不支持此 QUIC 参数：{key}"
+                );
+            }
+            let sni = q.get("sni").map(String::as_str).unwrap_or(host);
+            ensure!(host_valid(sni), "TLS server name 无效");
+            let mut stream = json!({"network":"hysteria","security":"tls","tlsSettings":{"serverName":sni,"alpn":["h3"]},"hysteriaSettings":{"version":2,"auth":if u.password().is_some() {format!("{user}:{pass}")} else {user.clone()}}});
+            external_tls(&mut stream, &u)?;
+            if u.scheme() == "tuic" {
+                let uuid = uuid::Uuid::parse_str(&user)?;
+                ensure!(!pass.is_empty(), "TUIC v5 密码不能为空");
+                let congestion = q
+                    .get("congestion_control")
+                    .map(String::as_str)
+                    .unwrap_or("bbr");
+                let relay = q
+                    .get("udp_relay_mode")
+                    .map(String::as_str)
+                    .unwrap_or("native");
+                ensure!(
+                    matches!(congestion, "bbr" | "cubic" | "new_reno")
+                        && matches!(relay, "native" | "quic"),
+                    "TUIC 参数无效"
+                );
+                return Ok(
+                    json!({"tag":tag,"protocol":"tuic","settings":{"type":"tuic","server":host,"port":port,"uuid":uuid,"password":pass,"sni":sni,"alpn":stream["tlsSettings"]["alpn"],"skip-cert-verify":false,"udp":true,"congestion-controller":congestion,"udp-relay-mode":relay}}),
+                );
+            }
+            ensure!(!user.is_empty(), "Hysteria 2 密码不能为空");
+            json!({"tag":tag,"protocol":"hysteria","settings":{"version":2,"address":host,"port":port},"streamSettings":stream})
+        }
         "http" | "https" | "socks" | "socks5" => {
             let mut server = json!({"address":host,"port":port});
             if !user.is_empty() {
@@ -128,7 +228,7 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
             ensure!(!password.is_empty(), "Shadowsocks 密码不能为空");
             json!({"tag":tag,"protocol":"shadowsocks","settings":{"servers":[{"address":host,"port":port,"method":method,"password":password}]}})
         }
-        _ => bail!("支持 VLESS、HTTP(S)、SOCKS5、Shadowsocks 和 Trojan 链接"),
+        _ => bail!("不支持此代理协议"),
     };
     if result["streamSettings"]["security"] == "tls" {
         external_tls(&mut result["streamSettings"], &u)?;
@@ -200,11 +300,11 @@ pub fn validate_line(line: &Line) -> Result<()> {
                     "SS2022 密钥须为 16 字节的 Base64"
                 );
             }
-            Protocol::Trojan => {
-                ensure!(!line.access.password.is_empty(), "Trojan 密码不能为空");
+            Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic => {
+                ensure!(!line.access.password.is_empty(), "代理密码不能为空");
                 ensure!(
                     matches!(line.access.tls.mode.as_str(), "auto" | "manual"),
-                    "Trojan 需要 TLS 证书"
+                    "Trojan / Hysteria 2 / TUIC 需要 TLS 证书"
                 );
             }
             _ => {}
@@ -284,6 +384,15 @@ pub fn inbound(line: &Line, hop: &Hop, tag: &str) -> Value {
             json!({"method":a.method,"password":a.password,"network":"tcp,udp"}),
         ),
         Protocol::Trojan => ("trojan", json!({"clients":[{"password":a.password}]})),
+        Protocol::Vmess => ("vmess", json!({"clients":[{"id":hop.uuid,"alterId":0}]})),
+        Protocol::Hysteria2 => (
+            "hysteria",
+            json!({"version":2,"clients":[{"auth":a.password}]}),
+        ),
+        Protocol::Tuic => (
+            "socks",
+            json!({"auth":"noauth","udp":true,"ip":"127.0.0.1"}),
+        ),
         Protocol::Vless => unreachable!(),
     };
     json!({"tag":tag,"listen":"0.0.0.0","port":hop.port,"protocol":protocol,"settings":settings})
@@ -308,12 +417,19 @@ pub fn endpoint(line: &Line, node: &Node) -> (String, u16) {
 pub fn share(line: &Line, node: &Node) -> Result<String> {
     let a = &line.access;
     let (host, port) = endpoint(line, node);
+    if a.protocol == Protocol::Vmess {
+        return vmess_link(
+            &json!({"name":line.name,"server":host,"port":port,"uuid":line.hops[0].uuid,"tls":matches!(a.tls.mode.as_str(),"auto"|"manual"),"servername":a.tls.domain}),
+        );
+    }
     let scheme = match a.protocol {
         Protocol::Http if matches!(a.tls.mode.as_str(), "auto" | "manual") => "https",
         Protocol::Http => "http",
         Protocol::Socks => "socks5",
         Protocol::Shadowsocks => "ss",
         Protocol::Trojan => "trojan",
+        Protocol::Hysteria2 => "hysteria2",
+        Protocol::Tuic => "tuic",
         _ => bail!("VLESS 由 REALITY 导出器处理"),
     };
     let mut u = Url::parse(&format!("{scheme}://{}", address(&host, port)))?;
@@ -330,6 +446,25 @@ pub fn share(line: &Line, node: &Node) -> Result<String> {
                 ("type", "tcp"),
             ]);
         }
+        Protocol::Hysteria2 | Protocol::Tuic => {
+            u.set_username(if a.protocol == Protocol::Tuic {
+                &line.hops[0].uuid
+            } else {
+                &a.password
+            })
+            .map_err(|_| anyhow::anyhow!("认证参数无效"))?;
+            if a.protocol == Protocol::Tuic {
+                u.set_password(Some(&a.password))
+                    .map_err(|_| anyhow::anyhow!("密码无效"))?;
+                u.query_pairs_mut()
+                    .append_pair("congestion_control", "bbr")
+                    .append_pair("udp_relay_mode", "native");
+            }
+            u.query_pairs_mut()
+                .append_pair("sni", &a.tls.domain)
+                .append_pair("alpn", "h3")
+                .append_pair("insecure", "0");
+        }
         Protocol::Shadowsocks => {
             u.set_username(&URL_SAFE_NO_PAD.encode(format!("{}:{}", a.method, a.password)))
                 .ok();
@@ -338,6 +473,14 @@ pub fn share(line: &Line, node: &Node) -> Result<String> {
     }
     u.set_fragment(Some(&line.name));
     Ok(u.to_string())
+}
+
+pub fn vmess_link(node: &Value) -> Result<String> {
+    let v = json!({"v":"2","ps":node["name"],"add":node["server"],"port":node["port"],"id":node["uuid"],"aid":node.get("alterId").cloned().unwrap_or(json!(0)),"scy":node["cipher"].as_str().unwrap_or("auto"),"net":node["network"].as_str().unwrap_or("tcp"),"type":"none","tls":if node["tls"] == true {"tls"} else {""},"sni":node["servername"].as_str().unwrap_or(""),"fp":node["client-fingerprint"].as_str().unwrap_or("chrome"),"alpn":node["alpn"].as_array().map(|v|v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default(),"tfo":node.get("tfo"),"allowInsecure":node.get("skip-cert-verify")});
+    Ok(format!(
+        "vmess://{}",
+        STANDARD.encode(serde_json::to_vec(&v)?)
+    ))
 }
 
 pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
@@ -395,6 +538,35 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
             v["sni"] = json!(a.tls.domain);
             v["udp"] = json!(true);
         }
+        Protocol::Vmess => {
+            v["type"] = json!("vmess");
+            v["uuid"] = json!(line.hops[0].uuid);
+            v["alterId"] = json!(0);
+            v["cipher"] = json!("auto");
+            v["network"] = json!("tcp");
+            v["udp"] = json!(true);
+            v["tls"] = json!(matches!(a.tls.mode.as_str(), "auto" | "manual"));
+            if v["tls"] == true {
+                v["servername"] = json!(a.tls.domain);
+            }
+        }
+        Protocol::Hysteria2 | Protocol::Tuic => {
+            v["type"] = json!(if a.protocol == Protocol::Tuic {
+                "tuic"
+            } else {
+                "hysteria2"
+            });
+            v["password"] = json!(a.password);
+            v["sni"] = json!(a.tls.domain);
+            v["alpn"] = json!(["h3"]);
+            v["skip-cert-verify"] = json!(false);
+            v["udp"] = json!(true);
+            if a.protocol == Protocol::Tuic {
+                v["uuid"] = json!(line.hops[0].uuid);
+                v["congestion-controller"] = json!("bbr");
+                v["udp-relay-mode"] = json!("native");
+            }
+        }
     }
     Ok(v)
 }
@@ -424,6 +596,47 @@ pub fn mihomo(lines: &[Line], doc: &Document) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vmess_and_quic_validate_credentials_and_transport() {
+        let uuid = id();
+        let node = json!({"name":"test","server":"proxy.example","port":443,"uuid":uuid,"tls":true,"servername":"origin.example"});
+        let link = vmess_link(&node).unwrap();
+        let out = external(&link, "test").unwrap();
+        assert_eq!(out["protocol"], "vmess");
+        assert_eq!(out["streamSettings"]["security"], "tls");
+        for (key, value) in [
+            ("aid", json!(1)),
+            ("net", json!("ws")),
+            ("tls", json!(true)),
+            ("allowInsecure", json!(1)),
+            ("allowInsecure", json!(true)),
+            ("port", json!(65536)),
+        ] {
+            let mut data: Value =
+                serde_json::from_str(&b64(link.strip_prefix("vmess://").unwrap()).unwrap())
+                    .unwrap();
+            data[key] = value;
+            assert!(
+                external(
+                    &format!("vmess://{}", STANDARD.encode(data.to_string())),
+                    "test"
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        for scheme in ["hy2", "hysteria2", "tuic"] {
+            let auth = if scheme == "tuic" {
+                format!("{uuid}:password")
+            } else {
+                "password".into()
+            };
+            let link = format!("{scheme}://{auth}@proxy.example:443?sni=origin.example");
+            assert!(external(&link, "test").is_ok());
+            assert!(external(&format!("{link}&insecure=1"), "test").is_err());
+            assert!(external(&format!("{link}&obfs=unknown"), "test").is_err());
+        }
+    }
     #[test]
     fn supported_external_protocols_parse_and_plugins_are_rejected() {
         assert_eq!(

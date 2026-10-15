@@ -21,12 +21,17 @@ curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/
 
 | 协议 | 设置 |
 | --- | --- |
-| VLESS | REALITY + Vision，或 TLS + Vision；自动生成 UUID |
+| VLESS | 默认 TCP + REALITY + Vision，IP 和域名均适用；可显式选择 TLS + Vision |
 | Shadowsocks 2022 | 自动生成密钥，使用 `2022-blake3-aes-128-gcm` |
 | Trojan | TLS，需要域名和证书，密码可自动生成 |
+| VMess AEAD | TCP，alterId 为 0；域名默认使用 TLS，自动生成 UUID |
+| Hysteria 2 | QUIC + TLS，需要证书，自动生成认证密码；放行 UDP 监听端口 |
+| TUIC v5 | QUIC + TLS，需要证书，自动生成 UUID 和密码；放行 UDP 监听端口 |
 | HTTP / SOCKS5 | 用户名密码；普通入口不加密 |
 
 TLS 模式可自动申请证书，也可填写自己的 PEM 证书链与私钥。REALITY 使用服务器的伪装站点设置，无需自己的证书。
+
+TUIC v5 及包含 TUIC 的外部代理链由发行包内的 Mihomo 内核运行，随 Agent 启停；仍使用面板的流量统计、限速和出网链路。其他接入协议使用 Xray。升级时需同时更新控制台与 Agent。
 
 ## 本机与外部代理
 

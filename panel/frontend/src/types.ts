@@ -46,7 +46,7 @@ export interface Hop {
   port: number;
   uuid?: string;
 }
-export type Protocol = "vless" | "http" | "socks" | "shadowsocks" | "trojan";
+export type Protocol = "vless" | "http" | "socks" | "shadowsocks" | "trojan" | "vmess" | "hysteria2" | "tuic";
 export interface TLS {
   mode: string;
   domain: string;

@@ -25,6 +25,10 @@ pub fn import(input: &str) -> Result<(String, String)> {
     let input = input.trim();
     if [
         "vless://",
+        "vmess://",
+        "hysteria2://",
+        "hy2://",
+        "tuic://",
         "ss://",
         "trojan://",
         "http://",
@@ -36,6 +40,14 @@ pub fn import(input: &str) -> Result<(String, String)> {
     .any(|p| input.starts_with(p))
     {
         external_outbound(input, "check")?;
+        if input.starts_with("vmess://") {
+            let encoded = input.trim_start_matches("vmess://").trim_end_matches('=');
+            let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(encoded)
+                .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))?;
+            let data: Value = serde_json::from_slice(&bytes)?;
+            return Ok((input.into(), data["ps"].as_str().unwrap_or_default().into()));
+        }
         let url = Url::parse(input)?;
         let name = percent_decode_str(url.fragment().unwrap_or(""))
             .decode_utf8()?
@@ -54,8 +66,11 @@ pub fn import(input: &str) -> Result<(String, String)> {
     let fields = node.as_object().context("Mihomo 节点必须是对象")?;
     let kind = text(&node, "type", "")?;
     ensure!(
-        matches!(kind, "vless" | "trojan" | "ss" | "http" | "socks5"),
-        "支持 VLESS、Trojan、Shadowsocks、HTTP 和 SOCKS5 节点"
+        matches!(
+            kind,
+            "vless" | "trojan" | "ss" | "http" | "socks5" | "vmess" | "hysteria2" | "tuic"
+        ),
+        "不支持此代理协议"
     );
     // Reject unsupported settings instead of silently changing how the proxy connects.
     let common = ["name", "type", "server", "port", "udp", "tfo", "ip-version"];
@@ -86,6 +101,27 @@ pub fn import(input: &str) -> Result<(String, String)> {
             "alpn",
         ],
         "ss" => &["cipher", "password"],
+        "vmess" => &[
+            "uuid",
+            "alterId",
+            "cipher",
+            "network",
+            "tls",
+            "servername",
+            "client-fingerprint",
+            "skip-cert-verify",
+            "alpn",
+        ],
+        "hysteria2" => &["password", "sni", "skip-cert-verify", "alpn"],
+        "tuic" => &[
+            "uuid",
+            "password",
+            "sni",
+            "skip-cert-verify",
+            "alpn",
+            "congestion-controller",
+            "udp-relay-mode",
+        ],
         _ => &[
             "username",
             "password",
@@ -120,13 +156,46 @@ pub fn import(input: &str) -> Result<(String, String)> {
         .as_u64()
         .filter(|p| *p > 0 && *p <= 65535)
         .context("port 必须是 1–65535 的整数")? as u16;
-    let tls = flag(&node, "tls", kind == "trojan")?;
+    if kind == "vmess" {
+        flag(&node, "tls", false)?;
+        for field in [
+            "uuid",
+            "cipher",
+            "network",
+            "servername",
+            "client-fingerprint",
+        ] {
+            text(&node, field, "")?;
+        }
+        flag(&node, "tfo", false)?;
+        ensure!(flag(&node, "udp", true)?, "VMess 导入暂不支持关闭 UDP");
+        ensure!(
+            !flag(&node, "skip-cert-verify", false)?,
+            "不支持跳过证书验证"
+        );
+        if let Some(alpn) = node.get("alpn") {
+            ensure!(
+                alpn.as_array()
+                    .is_some_and(|v| v.iter().all(Value::is_string)),
+                "alpn 必须是文本数组"
+            );
+        }
+        let link = crate::access::vmess_link(&node)?;
+        external_outbound(&link, "check")?;
+        return Ok((link, text(&node, "name", "")?.into()));
+    }
+    let tls = flag(
+        &node,
+        "tls",
+        matches!(kind, "trojan" | "hysteria2" | "tuic"),
+    )?;
     ensure!(kind != "socks5" || !tls, "SOCKS5 导入暂不支持 TLS");
     let scheme = if kind == "http" && tls { "https" } else { kind };
     let mut url = Url::parse(&format!("{scheme}://{}", address(host, port)))?;
     let user = match kind {
         "vless" => text(&node, "uuid", "")?.to_owned(),
-        "trojan" => text(&node, "password", "")?.to_owned(),
+        "trojan" | "hysteria2" => text(&node, "password", "")?.to_owned(),
+        "tuic" => text(&node, "uuid", "")?.to_owned(),
         "ss" => URL_SAFE_NO_PAD.encode(format!(
             "{}:{}",
             text(&node, "cipher", "")?,
@@ -136,7 +205,7 @@ pub fn import(input: &str) -> Result<(String, String)> {
     };
     url.set_username(&user)
         .map_err(|_| anyhow::anyhow!("代理账号无效"))?;
-    if matches!(kind, "http" | "socks5") && !user.is_empty() {
+    if matches!(kind, "http" | "socks5" | "tuic") && !user.is_empty() {
         url.set_password(Some(text(&node, "password", "")?))
             .map_err(|_| anyhow::anyhow!("代理密码无效"))?;
     }
@@ -158,7 +227,6 @@ pub fn import(input: &str) -> Result<(String, String)> {
     if tls {
         url.query_pairs_mut()
             .append_pair("sni", text(&node, "servername", text(&node, "sni", host)?)?)
-            .append_pair("fp", text(&node, "client-fingerprint", "chrome")?)
             .append_pair(
                 "allowInsecure",
                 if flag(&node, "skip-cert-verify", false)? {
@@ -167,6 +235,10 @@ pub fn import(input: &str) -> Result<(String, String)> {
                     "false"
                 },
             );
+        if !matches!(kind, "hysteria2" | "tuic") {
+            url.query_pairs_mut()
+                .append_pair("fp", text(&node, "client-fingerprint", "chrome")?);
+        }
         if let Some(alpn) = node.get("alpn") {
             let values = alpn
                 .as_array()
@@ -176,6 +248,14 @@ pub fn import(input: &str) -> Result<(String, String)> {
                 .collect::<Result<Vec<_>>>()?;
             url.query_pairs_mut().append_pair("alpn", &values.join(","));
         }
+    }
+    if kind == "tuic" {
+        url.query_pairs_mut()
+            .append_pair(
+                "congestion_control",
+                text(&node, "congestion-controller", "bbr")?,
+            )
+            .append_pair("udp_relay_mode", text(&node, "udp-relay-mode", "native")?);
     }
     if let Some(reality) = reality {
         for key in reality
@@ -216,6 +296,13 @@ pub fn import(input: &str) -> Result<(String, String)> {
     }
     for key in ["tfo", "udp"] {
         if node.get(key).is_some() {
+            if matches!(kind, "hysteria2" | "tuic") {
+                ensure!(
+                    key == "udp" && flag(&node, key, true)?,
+                    "QUIC 节点不支持此参数：{key}"
+                );
+                continue;
+            }
             url.query_pairs_mut().append_pair(
                 key,
                 if flag(&node, key, false)? {
@@ -234,20 +321,45 @@ pub fn import(input: &str) -> Result<(String, String)> {
 
 pub fn mihomo(link: &str, name: &str) -> Result<Value> {
     let out = external_outbound(link, "export")?;
-    let url = Url::parse(link)?;
-    let q: std::collections::BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    let q: std::collections::BTreeMap<String, String> = if link.starts_with("vmess://") {
+        Default::default()
+    } else {
+        Url::parse(link)?.query_pairs().into_owned().collect()
+    };
     let protocol = out["protocol"].as_str().context("代理协议无效")?;
-    let server = if protocol == "vless" {
+    if protocol == "tuic" {
+        let mut node = out["settings"].clone();
+        node["name"] = json!(name);
+        return Ok(node);
+    }
+    let server = if matches!(protocol, "vless" | "vmess") {
         &out["settings"]["vnext"][0]
+    } else if protocol == "hysteria" {
+        &out["settings"]
     } else {
         &out["settings"]["servers"][0]
     };
-    let mut node = json!({"name":name,"type":match protocol {"shadowsocks"=>"ss","socks"=>"socks5",other=>other},"server":server["address"],"port":server["port"]});
+    let mut node = json!({"name":name,"type":match protocol {"shadowsocks"=>"ss","socks"=>"socks5","hysteria"=>"hysteria2",other=>other},"server":server["address"],"port":server["port"]});
     match protocol {
         "vless" => {
             node["uuid"] = server["users"][0]["id"].clone();
             node["flow"] = server["users"][0]["flow"].clone();
             node["network"] = out["streamSettings"]["network"].clone();
+        }
+        "vmess" => {
+            node["uuid"] = server["users"][0]["id"].clone();
+            node["alterId"] = json!(0);
+            node["cipher"] = server["users"][0]["security"].clone();
+            node["network"] = json!("tcp");
+            node["tls"] = json!(out["streamSettings"]["security"] == "tls");
+            node["udp"] = json!(true);
+            if let Some(tfo) = out["streamSettings"]["sockopt"].get("tcpFastOpen") {
+                node["tfo"] = tfo.clone();
+            }
+        }
+        "hysteria" => {
+            node["password"] = out["streamSettings"]["hysteriaSettings"]["auth"].clone();
+            node["udp"] = json!(true);
         }
         "shadowsocks" => {
             node["cipher"] = server["method"].clone();
@@ -265,13 +377,15 @@ pub fn mihomo(link: &str, name: &str) -> Result<Value> {
     }
     let stream = &out["streamSettings"];
     if matches!(stream["security"].as_str(), Some("tls" | "reality")) {
-        node["tls"] = json!(true);
+        if protocol != "hysteria" {
+            node["tls"] = json!(true);
+        }
         let settings = if stream["security"] == "reality" {
             &stream["realitySettings"]
         } else {
             &stream["tlsSettings"]
         };
-        node[if protocol == "vless" {
+        node[if matches!(protocol, "vless" | "vmess") {
             "servername"
         } else {
             "sni"
@@ -323,7 +437,9 @@ mod tests {
         assert!(import(&input.replace("network: tcp", "network: ws")).is_err());
         assert!(import(&input.replace("tls: true", "tls: true, dialer-proxy: hidden")).is_err());
         assert!(import(&input.replace("port: 8443", "port: 0")).is_err());
-        assert!(import(&input.replace("skip-cert-verify: false", "skip-cert-verify: true")).is_err());
+        assert!(
+            import(&input.replace("skip-cert-verify: false", "skip-cert-verify: true")).is_err()
+        );
     }
     #[test]
     fn other_protocols_and_security_flags_round_trip() {
@@ -332,6 +448,9 @@ mod tests {
             "{name: socks, type: socks5, server: proxy.example, port: 1080, username: user, password: secret}",
             "{name: http, type: http, server: proxy.example, port: 8080, username: user, password: secret}",
             "{name: trojan, type: trojan, server: proxy.example, port: 443, password: secret, skip-cert-verify: false, alpn: [h2]}",
+            "{name: vmess, type: vmess, server: proxy.example, port: 443, uuid: 00000000-0000-4000-8000-000000000001, alterId: 0, cipher: auto, tls: true, servername: origin.example, alpn: [h2], tfo: false}",
+            "{name: hy2, type: hysteria2, server: proxy.example, port: 443, password: 'secret:@?#', sni: origin.example, alpn: [h3]}",
+            "{name: tuic, type: tuic, server: proxy.example, port: 443, uuid: 00000000-0000-4000-8000-000000000001, password: 'secret:@?#', sni: origin.example, alpn: [h3]}",
         ] {
             let (link, name) = import(input).unwrap();
             let node = mihomo(&link, &name).unwrap();
