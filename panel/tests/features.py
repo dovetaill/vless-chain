@@ -155,11 +155,11 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
         udp.settimeout(.4)
         packet = b"\x00\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", echo_port) + b"udp-auth"
-        udp.sendto(packet, ("127.0.0.1", socks_port))
         try:
+            udp.sendto(packet, ("127.0.0.1", socks_port))
             udp.recv(1024)
             raise AssertionError("Unauthenticated SOCKS UDP was accepted")
-        except socket.timeout:
+        except (socket.timeout, ConnectionRefusedError):
             pass
         with socket.create_connection(("127.0.0.1", socks_port), timeout=8) as sock:
             sock.sendall(b"\x05\x01\x02")
@@ -169,17 +169,25 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
             assert receive(sock, 2) == b"\x01\x00"
             sock.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
             reply = receive(sock, 10)
-            assert struct.unpack("!H", reply[-2:])[0] == socks_port, reply
+            assert len(reply) == 10 and reply[:2] == b"\x05\x00" and reply[3] == 1, reply
+            address = socket.inet_ntoa(reply[4:8])
+            relay_port = struct.unpack("!H", reply[-2:])[0]
+            assert relay_port > 0, reply
+            relay = (sock.getpeername()[0] if address == "0.0.0.0" else address, relay_port)
+            h.ports.add(relay_port)
+            h.record()
             udp.settimeout(5)
-            udp.sendto(packet, ("127.0.0.1", socks_port))
+            udp.sendto(packet, relay)
             assert udp.recv(1024).endswith(b"udp-auth")
-        time.sleep(.2)
+        h.wait(lambda: all(int(entry.split()[1].split(':')[1], 16) != relay_port
+            for table in ('udp', 'udp6') for entry in Path('/proc/net', table).read_text().splitlines()[1:]),
+            "SOCKS UDP relay closure", timeout=5)
         udp.settimeout(.4)
-        udp.sendto(packet, ("127.0.0.1", socks_port))
         try:
+            udp.sendto(packet, relay)
             udp.recv(1024)
             raise AssertionError("SOCKS UDP association remained authorized after close")
-        except socket.timeout:
+        except (socket.timeout, ConnectionRefusedError):
             pass
     print("PASS SOCKS UDP public endpoint, authentication and association lifetime", flush=True)
 

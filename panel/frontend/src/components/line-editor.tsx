@@ -82,7 +82,7 @@ export function LineEditor({
           id: line?.id,
           kind,
           name: field(data, "name").trim() || `${protocolNames[protocol]} ${host.trim()}`.slice(0, 80),
-          enabled: data.has("enabled"),
+          enabled: line ? line.enabled : data.has("enabled"),
           hops: line ? line.hops.map((h, i) => ({ node_id: h.node_id, port: i === 0 ? shared ? 443 : number(data, "port") : h.port })) : [{ node_id: node.id, port: shared ? 443 : batch ? null : number(data, "port") }],
           external_id: null, chain, target: "", network: "tcp",
           access: {
@@ -106,7 +106,7 @@ export function LineEditor({
               key: tls === "manual" ? field(data, "key") : "",
             },
           },
-          limits: {
+          limits: line ? line.limits : {
             upload_mbps: number(data, "upload"),
             download_mbps: number(data, "download"),
             monthly_gib: number(data, "quota"),
@@ -267,15 +267,8 @@ export function LineEditor({
         <p className="muted" aria-label="代理路径">客户端 → 本机{chain.map(id => ` → ${choices.find(c => c.id === id)?.name || "待选择落地"}`).join("")} → 互联网</p>
         {chain.length > 0 && <p className="muted">HTTP/HTTPS 出口仅支持 TCP；经它连接 Shadowsocks 或 SOCKS5 时也不支持 UDP。Hysteria 2、TUIC 的前置路径必须支持 UDP。</p>}
       </section>
-      <details
+      {!line && <details
         className="details"
-        open={
-          Boolean(
-            line?.limits.monthly_gib ||
-              line?.limits.upload_mbps ||
-              line?.limits.download_mbps,
-          ) || undefined
-        }
       >
         <summary>流量额度与带宽上限</summary>
         <div className="grid gap-4 pt-4 sm:grid-cols-3">
@@ -285,7 +278,6 @@ export function LineEditor({
               type="number"
               min="0.001"
               step="any"
-              defaultValue={line?.limits.upload_mbps ?? ""}
               placeholder="不限速"
             />
           </Field>
@@ -295,7 +287,6 @@ export function LineEditor({
               type="number"
               min="0.001"
               step="any"
-              defaultValue={line?.limits.download_mbps ?? ""}
               placeholder="不限速"
             />
           </Field>
@@ -305,26 +296,26 @@ export function LineEditor({
               type="number"
               min="0.001"
               step="any"
-              defaultValue={line?.limits.monthly_gib ?? ""}
               placeholder="不限量"
             />
           </Field>
         </div>
         <p className="muted mt-3">
-          按入口上传＋下载统计，每月 1 日 UTC 重置；用尽停用。
+          按入口上传＋下载统计；出租后按开通日逐月重置（北京时间），用尽暂停。
         </p>
-      </details>
-      <div className="flex flex-wrap gap-5 text-sm">
+      </details>}
+      {line && <p className="muted">额度、限速及手动启停请在代理列表的运营操作中调整。</p>}
+      {!line && <div className="flex flex-wrap gap-5 text-sm">
         <label className="flex items-center gap-2">
           <input
             type="checkbox"
             name="enabled"
-            defaultChecked={line?.enabled !== false}
+            defaultChecked
           />
           启用
         </label>
 
-      </div>
+      </div>}
     </Modal>
   );
 }

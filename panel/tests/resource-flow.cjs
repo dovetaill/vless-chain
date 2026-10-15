@@ -17,20 +17,22 @@ const assets = path.resolve(process.argv[2]);
     const state = { nodes: [node], local_node_id: 'local', externals: [
       { id: 'a', name: '落地 A', url: 'vless://00000000-0000-4000-8000-000000000001@a.example:443?security=tls' },
       { id: 'b', name: '落地 B', url: 'socks5://user:password@b.example:1080' },
-    ], lines: [], checks: {}, jobs: [], busy: false, time: 0, subscriptions: [], security: { totp_enabled: false, recovery_remaining: 0, origin: '', passkeys: [] }, alerts: [] };
+    ], lines: [], checks: {}, jobs: [], busy: false, time: 0, subscriptions: [], security: { totp_enabled: false, recovery_remaining: 0, origin: '', passkeys: [] }, alerts: [], customers: [], payments: [], renewal_contact: '' };
     await page.route('http://chain.test/**', async route => {
+      try {
       const request = route.request(), url = new URL(request.url());
       if (url.pathname.startsWith('/api/')) {
         let body = state;
+        if (url.pathname === '/api/auth/options') body = { totp: false, passkey: false };
         if (url.pathname.endsWith('/export')) body = { node: '- ' + JSON.stringify({ name: '落地', type: 'vless', server: 'a.example', port: 443 }), share: state.externals[0].url };
         if (request.method() !== 'GET') {
           const data = request.postDataJSON(); writes.push({ path: url.pathname, body: data });
           if (url.pathname === '/api/local-node') { state.local_node_id = 'local'; state.nodes = [{ ...node, host: data.host }]; body = { id: 'local' }; }
-          else if (url.pathname === '/api/lines') { body = { ...data, id: data.id || String(state.lines.length + 1), published: false, traffic: null }; state.lines = [...state.lines.filter(l => l.id !== body.id), body]; }
-          else if (url.pathname === '/api/lines/batch') { body = data.map((line, index) => ({ ...line, id: String(state.lines.length + index + 1), published: false, traffic: null })); state.lines.push(...body); }
+          else if (url.pathname === '/api/lines') { body = { ...data, id: data.id || String(state.lines.length + 1), published: false, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' }; state.lines = [...state.lines.filter(l => l.id !== body.id), body]; }
+          else if (url.pathname === '/api/lines/batch') { body = data.map((line, index) => ({ ...line, id: String(state.lines.length + index + 1), published: false, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' })); state.lines.push(...body); }
           else if (url.pathname === '/api/reality/check') body = { ok: true, detail: 'TLS 1.3、证书/SNI 与 H2 检查通过', latency_ms: 12 };
           else if (url.pathname === '/api/preview') body = { affected_line_ids: [], affected_lines: [], message: '', nodes: [] };
-          else if (url.pathname === '/api/publish') { state.lines.forEach(l => l.published = true); state.jobs = [{ id: 'job', state: 'applied', events: [] }]; body = { job_id: 'job' }; }
+          else if (url.pathname === '/api/publish') { state.lines.forEach(l => { l.published = true; l.rental_status = 'active'; l.sync_status = 'synced'; }); state.jobs = [{ id: 'job', state: 'applied', events: [] }]; body = { job_id: 'job' }; }
           else if (url.pathname === '/api/externals') { body = { id: 'imported', name: data.name || 'Mihomo 落地', url: state.externals[0].url }; state.externals.push(body); }
           else throw new Error('Unexpected mutation: ' + url.pathname);
         }
@@ -38,20 +40,24 @@ const assets = path.resolve(process.argv[2]);
       }
       const file = path.join(assets, url.pathname === '/' ? 'index.html' : url.pathname);
       return fs.existsSync(file) ? route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' }) : route.fulfill({ status: 404 });
+      } catch (error) {
+        errors.push(error.message);
+        await route.fulfill({ status: 500, json: { error: error.message } }).catch(() => {});
+      }
     });
     const button = name => page.getByRole('button', { name, exact: true });
     const close = () => page.getByRole('dialog').last().getByRole('button', { name: '关闭', exact: true }).first().click();
     const create = async name => { await button('新建代理').first().click(); await page.getByLabel('名称', { exact: true }).fill(name); };
     const save = async () => { await page.getByRole('dialog').getByRole('button', { name: '创建代理', exact: true }).click(); await page.getByRole('heading', { name: '分享代理', exact: true }).waitFor(); await close(); };
     await page.goto('http://chain.test/#lines');
-    assert.equal(await page.locator('aside nav button').count(), 3);
-    for (const name of ['代理', '外部代理', '设置']) assert.equal(await page.locator('aside nav').getByRole('button', { name, exact: true }).count(), 1);
+    assert.equal(await page.locator('aside nav button').count(), 5);
+    for (const name of ['总览', '代理', '客户与收款', '外部代理', '设置']) assert.equal(await page.locator('aside nav').getByRole('button', { name, exact: true }).count(), 1);
     await create('VLESS A');
     assert.equal(await page.getByLabel('入口服务器', { exact: true }).count(), 0);
     assert.equal(await button('添加远程服务器').count(), 0);
     assert.equal(await page.getByText('使用购买的中转入口').count(), 0);
     assert.equal(await page.getByLabel('本机 IP 或域名').inputValue(), '192.0.2.20');
-    assert.equal(await page.getByLabel('协议').inputValue(), 'vless');
+    assert.equal(await page.getByLabel('协议', { exact: true }).inputValue(), 'vless');
     assert.equal(await page.getByLabel('出网方式').inputValue(), 'direct');
     if (root) await page.screenshot({ path: path.join(root, 'local-create.png') });
     await save();
@@ -69,9 +75,9 @@ const assets = path.resolve(process.argv[2]);
     assert.match(await page.getByRole('dialog').innerText(), /使用 REALITY/);
     await page.getByText('传输安全 · REALITY', { exact: true }).click();
     assert.equal(await page.getByLabel('HTTPS / 证书').inputValue(), 'off');
-    await page.getByLabel('协议').selectOption('trojan');
+    await page.getByLabel('协议', { exact: true }).selectOption('trojan');
     assert.equal(await page.getByLabel('HTTPS / 证书').inputValue(), 'auto');
-    await page.getByLabel('协议').selectOption('vless');
+    await page.getByLabel('协议', { exact: true }).selectOption('vless');
     assert.equal(await page.getByLabel('HTTPS / 证书').inputValue(), 'off');
     await page.getByLabel('HTTPS / 证书').selectOption('manual');
     await page.getByLabel('本机 IP 或域名').fill('changed.example.com');
@@ -87,7 +93,7 @@ const assets = path.resolve(process.argv[2]);
     assert.equal(state.lines.length, 2);
     for (const protocol of ['vmess', 'hysteria2', 'tuic']) {
       await create(protocol);
-      await page.getByLabel('协议').selectOption(protocol);
+      await page.getByLabel('协议', { exact: true }).selectOption(protocol);
       await page.getByLabel('本机 IP 或域名').fill('proxy.example.com');
       await save();
       const body = writes.filter(w => w.path === '/api/lines').at(-1).body;

@@ -4,6 +4,8 @@ pub mod external;
 pub mod gateway;
 pub mod local_agent;
 pub mod model;
+pub mod rental;
+pub mod meter;
 pub mod runtime;
 pub mod security;
 pub mod website;

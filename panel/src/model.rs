@@ -216,6 +216,10 @@ pub struct Limits {
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Traffic {
+    #[serde(default)]
+    pub cycle_start: u64,
+    #[serde(default)]
+    pub cycle_end: u64,
     pub epoch: String,
     pub month: String,
     pub upload: u64,
@@ -324,6 +328,14 @@ pub struct Job {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Document {
+    #[serde(default)]
+    pub customers: Vec<Customer>,
+    #[serde(default)]
+    pub rentals: BTreeMap<String, Rental>,
+    #[serde(default)]
+    pub payments: Vec<Payment>,
+    #[serde(default)]
+    pub renewal_contact: String,
     pub nodes: Vec<Node>,
     pub externals: Vec<External>,
     pub lines: Vec<Line>,
@@ -336,6 +348,63 @@ pub struct Document {
     pub security: Security,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Customer {
+    pub id: String,
+    pub name: String,
+    pub contact: String,
+    pub notes: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq)]
+pub struct Prices {
+    pub monthly: Option<u64>,
+    pub quarterly: Option<u64>,
+    pub yearly: Option<u64>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+pub struct Rental {
+    pub customer_id: String,
+    pub prices: Prices,
+    pub started_at: u64,
+    pub expires_at: u64,
+    pub paid_months: u32,
+    pub query_token_hash: String,
+}
+impl Rental {
+    pub fn policy(&self) -> LeasePolicy {
+        LeasePolicy {
+            cycle_anchor: self.started_at,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct LeasePolicy {
+    pub cycle_anchor: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Payment {
+    pub id: String,
+    pub request_id: String,
+    pub request_hash: String,
+    pub line_id: String,
+    pub customer_id: String,
+    pub line_name: String,
+    pub customer_name: String,
+    pub term: String,
+    pub months: u32,
+    pub amount_fen: u64,
+    pub created: u64,
+    pub previous_expires_at: u64,
+    pub expires_at: u64,
+    pub note: String,
 }
 impl Document {
     pub fn busy(&self) -> bool {

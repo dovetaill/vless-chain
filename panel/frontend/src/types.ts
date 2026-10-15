@@ -11,6 +11,8 @@ export interface Traffic {
   sampled_at: number;
   blocked: boolean;
   days: Record<string, [number, number]>;
+  cycle_start: number;
+  cycle_end: number;
 }
 export interface NodeInfo {
   id: string;
@@ -33,6 +35,11 @@ export interface NodeInfo {
       network_rx?: number;
       network_tx?: number;
       sampled_at?: number;
+      cpu_percent?: number | null;
+      disk_total?: number;
+      disk_used?: number;
+      network_rx_bps?: number | null;
+      network_tx_bps?: number | null;
     };
   };
 }
@@ -72,6 +79,41 @@ export interface Limits {
   download_mbps: number | null;
   monthly_gib: number | null;
 }
+export type Term = "monthly" | "quarterly" | "yearly";
+export type Prices = Record<Term, number | null>;
+export type RentalStatus = "draft" | "not_started" | "disabled" | "expired" | "quota_exhausted" | "offline" | "active";
+export type SyncStatus = "unpublished" | "pending" | "error" | "synced";
+export interface Customer {
+  id: string;
+  name: string;
+  contact: string;
+  notes: string;
+}
+export interface Rental {
+  customer_id: string;
+  prices: Prices;
+  started_at: number;
+  expires_at: number;
+  paid_months: number;
+  next_reset_at: number;
+  query_link_exists: boolean;
+  permanent: boolean;
+}
+export interface Payment {
+  id: string;
+  request_id: string;
+  line_id: string;
+  customer_id: string;
+  line_name: string;
+  customer_name: string;
+  term: Term;
+  months: number;
+  amount_fen: number;
+  created: number;
+  previous_expires_at: number;
+  expires_at: number;
+  note: string;
+}
 export interface Line {
   id: string;
   name: string;
@@ -87,6 +129,9 @@ export interface Line {
   access: Access;
   limits: Limits;
   traffic: Traffic | null;
+  rental: Rental | null;
+  rental_status: RentalStatus;
+  sync_status: SyncStatus;
 }
 export interface Check {
   ok: boolean;
@@ -123,6 +168,24 @@ export interface PanelState {
   }[];
   security: Security;
   alerts: { id: string; level: string; message: string }[];
+  customers: Customer[];
+  payments: Payment[];
+  renewal_contact: string;
+}
+export interface PublicLine {
+  id: string;
+  name: string;
+  status: RentalStatus;
+  sync_status: SyncStatus;
+  traffic: Traffic | null;
+  limits: Limits;
+  rental: Pick<Rental, "prices" | "started_at" | "expires_at" | "next_reset_at" | "permanent">;
+}
+export interface PublicLookup {
+  lines: PublicLine[];
+  unmatched: string[];
+  renewal_contact: string;
+  time: number;
 }
 export interface Preview {
   message: string;

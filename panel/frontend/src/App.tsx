@@ -14,18 +14,16 @@ import {
   Fingerprint,
   LogOut,
   Menu,
-  MoreHorizontal,
   Network,
   Plus,
-  Search,
   Server,
   Settings,
   Trash2,
   X,
-  Zap,
   KeyRound,
+  LayoutDashboard,
+  Users,
 } from "lucide-react";
-import { DropdownMenu } from "radix-ui";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -33,20 +31,21 @@ import { api, ApiError } from "./api";
 import { LineEditor } from "./components/line-editor";
 import { AccessDialog } from "./components/access-dialog";
 import { SecuritySettings } from "./components/security-settings";
+import { Dashboard } from "./components/dashboard";
+import { Customers } from "./components/customers";
+import { ProxyList } from "./components/proxy-list";
+import { RentalEditor } from "./components/rental-editor";
 import {
   Modal,
   Field,
   Status,
-  Empty,
   PathView,
   CopyButton,
-  bytes,
   stamp,
   field,
   endpoint,
   splitAddress,
   errorText,
-  protocolNames,
 } from "./components/shared";
 import { loginPasskey } from "./passkey";
 import type {
@@ -59,13 +58,15 @@ import type {
 } from "./types";
 
 const pages = [
+  { id: "dashboard", label: "总览", icon: LayoutDashboard },
   { id: "lines", label: "代理", icon: Network },
+  { id: "customers", label: "客户与收款", icon: Users },
   { id: "nodes", label: "外部代理", icon: Server },
   { id: "settings", label: "设置", icon: Settings },
 ] as const;
 type Page = (typeof pages)[number]["id"];
 const pageFromHash = (): Page =>
-  pages.find((p) => p.id === location.hash.slice(1))?.id || "lines";
+  pages.find((p) => p.id === location.hash.slice(1))?.id || "dashboard";
 const jobNames: Record<string, string> = {
   publishing: "正在应用",
   rolling_back: "正在恢复",
@@ -73,21 +74,6 @@ const jobNames: Record<string, string> = {
   rolled_back: "已恢复旧配置",
   degraded: "部分服务器尚未确认恢复",
 };
-function LineStatus({ line, state }: { line: Line; state: PanelState }) {
-  if (!line.published) return <Status tone="warn">有待应用的修改</Status>;
-  if (!line.enabled) return <Status>已停用</Status>;
-  if (line.traffic?.blocked) return <Status tone="bad">额度用尽</Status>;
-  if (
-    line.hops.some((h) => !state.nodes.find((n) => n.id === h.node_id)?.online)
-  )
-    return <Status tone="warn">服务器离线</Status>;
-  const check = state.checks[line.id];
-  return (
-    <Status tone={check?.ok === false ? "warn" : "good"}>
-      {check?.ok === false ? "最近检查未通过" : "运行中"}
-    </Status>
-  );
-}
 function ProbeEditor({
   line,
   state,
@@ -170,7 +156,6 @@ export function App() {
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem("chain-sidebar") === "collapsed",
   );
-  const [search, setSearch] = useState("");
   const [modal, setModal] = useState<ReactNode>(null);
   const [editor, setEditor] = useState<{ kind: Line["kind"]; line?: Line; initialChain?: string[] } | null>(null);
   const [toast, setToast] = useState("");
@@ -207,7 +192,6 @@ export function App() {
     }, 3000);
     const change = () => {
       setPage(pageFromHash());
-      setSearch("");
     };
     window.addEventListener("hashchange", change);
     return () => {
@@ -240,7 +224,6 @@ export function App() {
   const navigate = (next: string) => {
     location.hash = next;
     setMobile(false);
-    setSearch("");
   };
   const run = async (action: () => Promise<void>) => {
     try {
@@ -457,10 +440,6 @@ export function App() {
     );
   const current = pages.find((p) => p.id === page)!;
   const kind: Line["kind"] = "vless";
-  const lines = state.lines.filter(
-    (l) =>
-      l.kind === kind && l.name.toLowerCase().includes(search.toLowerCase()),
-  );
   const latest = state.jobs[0];
   return (
     <div className={collapsed ? "app-shell is-collapsed" : "app-shell"}>
@@ -611,218 +590,14 @@ export function App() {
               </p>
             </div>
           )}
-          {page === "lines" && (
-            <Card>
-              <CardHeader>
-                <CardTitle>
-                  我的代理{" "}
-                  <span className="ms-2 text-sm font-normal text-slate-400">
-                    {lines.length}
-                  </span>
-                </CardTitle>
-                <div className="relative w-48 max-w-[50%]">
-                  <Search className="absolute left-3 top-2.5 size-4 text-slate-400" />
-                  <Input
-                    className="pl-9"
-                    aria-label="搜索规则"
-                    placeholder="搜索名称…"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                  />
-                </div>
-              </CardHeader>
-              {lines.length ? (
-                <div className="overflow-x-auto">
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th>名称 / 路径</th>
-                        <th>类型 / 入口</th>
-                        <th>状态</th>
-                        <th>本月流量</th>
-                        <th className="text-right">操作</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {lines.map((l) => (
-                        <tr key={l.id}>
-                          <td>
-                            <p className="mb-2 text-sm font-semibold">
-                              {l.name}
-                            </p>
-                            <PathView line={l} state={state} />
-                          </td>
-                          <td>
-                            <p className="text-xs font-medium">
-                              {l.kind === "vless"
-                                ? protocolNames[l.access.protocol]
-                                : l.network.toUpperCase()}
-                            </p>
-                            <p className="mono mt-2 text-xs text-slate-400">
-                              端口 {l.hops[0].port}
-                            </p>
-                          </td>
-                          <td>
-                            <LineStatus line={l} state={state} />
-                          </td>
-                          <td>
-                            <p className="text-xs">
-                              {l.traffic
-                                ? bytes(l.traffic.upload + l.traffic.download)
-                                : "尚未采集"}
-                            </p>
-                            <p className="mt-2 text-[11px] text-slate-400">
-                              {l.limits.monthly_gib
-                                ? `额度 ${l.limits.monthly_gib} GiB`
-                                : "不限量"}
-                            </p>
-                          </td>
-                          <td>
-                            <div className="flex items-center justify-end gap-1">
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                role="switch"
-                                aria-checked={l.enabled}
-                                aria-label={`${l.enabled ? "停用" : "启用"} ${l.name}`}
-                                disabled={state.busy}
-                                onClick={() => void run(async () => {
-                                  await api("/lines", "POST", { ...l, enabled: !l.enabled });
-                                  await refresh();
-                                  await apply(l.id);
-                                })}
-                              >{l.enabled ? "停用" : "启用"}</Button>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={
-                                  !l.published || !l.enabled || state.busy
-                                }
-                                onClick={() =>
-                                  setModal(
-                                    <AccessDialog
-                                      line={l}
-                                      state={state}
-                                      close={close}
-                                    />,
-                                  )
-                                }
-                              >
-                                分享
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                disabled={state.busy}
-                                onClick={() => editLine(l.kind, l)}
-                              >
-                                编辑
-                              </Button>
-                              <DropdownMenu.Root>
-                                <DropdownMenu.Trigger
-                                  className="row-menu-trigger"
-                                  aria-label={`${l.name} 更多操作`}
-                                >
-                                  <MoreHorizontal className="size-4" />
-                                </DropdownMenu.Trigger>
-                                <DropdownMenu.Portal>
-                                  <DropdownMenu.Content
-                                    className="row-menu-content"
-                                    align="end"
-                                    sideOffset={4}
-                                    collisionPadding={8}
-                                  >
-                                    <DropdownMenu.Item
-                                      disabled={
-                                        !l.published || !l.enabled || state.busy
-                                      }
-                                      onSelect={() =>
-                                        setModal(
-                                          <ProbeEditor
-                                            line={l}
-                                            state={state}
-                                            close={close}
-                                            saved={refresh}
-                                          />,
-                                        )
-                                      }
-                                    >
-                                      检查连接
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      disabled={state.busy}
-                                      onSelect={() => void run(() => apply(l.id))}
-                                    >
-                                      应用修改
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      disabled={state.busy}
-                                      className="text-red-600"
-                                      onSelect={() =>
-                                        setModal(
-                                          <Modal
-                                            title="删除代理"
-                                            description={`删除「${l.name}」并应用配置后，该入口停止服务。`}
-                                            submit="删除并应用"
-                                            close={close}
-                                            action={async () => {
-                                              await api(
-                                                `/lines/${l.id}`,
-                                                "DELETE",
-                                              );
-                                              await refresh();
-                                              await apply(l.id);
-                                            }}
-                                          />,
-                                        )
-                                      }
-                                    >
-                                      删除
-                                    </DropdownMenu.Item>
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Portal>
-                              </DropdownMenu.Root>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <Empty
-                  title={
-                    search
-                      ? "没有匹配结果"
-                      : "暂无代理"
-                  }
-                  action={
-                    !search && (
-                      <Button onClick={() => editLine(kind)}>
-                        <Plus />
-                        新建代理
-                      </Button>
-                    )
-                  }
-                >
-                </Empty>
-              )}
-              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-4 text-xs text-slate-400">
-                <span>{lines.length} 条</span>
-                {state.lines.some((l) => !l.published) && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={state.busy}
-                    onClick={() => void run(() => apply())}
-                  >
-                    <Zap />
-                    应用待处理修改
-                  </Button>
-                )}
-              </div>
-            </Card>
-          )}
+          {page === "dashboard" && <Dashboard state={state} manage={line => setModal(<RentalEditor line={line} state={state} close={close} saved={refresh} />)} />}
+          {page === "customers" && <Customers state={state} saved={refresh} />}
+          {page === "lines" && <ProxyList state={state} saved={refresh}
+            create={() => editLine(kind)} edit={line => editLine(line.kind, line)}
+            share={line => setModal(<AccessDialog line={line} state={state} close={close} />)}
+            probe={line => setModal(<ProbeEditor line={line} state={state} close={close} saved={refresh} />)}
+            apply={line => void run(() => apply(line?.id))}
+          />}
           {page === "nodes" && (
             <div className="space-y-6">
               <Button onClick={() => importExternal()}><Plus />导入外部代理</Button>
@@ -888,7 +663,7 @@ export function App() {
             />
           )}
           <footer className="mt-10 flex items-center justify-between border-t border-border pt-5 text-[11px] text-slate-400">
-            <span>Chain Panel · 个人网络控制台</span>
+            <span>Chain Panel · 节点租赁运营控制台</span>
           </footer>
         </main>
       </div>

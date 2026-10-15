@@ -265,16 +265,43 @@ impl ManagedXray {
         Ok(x)
     }
     pub fn running(&mut self) -> bool {
-        self.gateway.as_ref().is_none_or(|g| g.running())
-            && self
-                .mihomo
-                .as_mut()
-                .is_none_or(|c| matches!(c.try_wait(), Ok(None)))
-            && self
-                .child
-                .as_mut()
-                .map(|c| matches!(c.try_wait(), Ok(None)))
-                .unwrap_or(false)
+        if self.gateway.as_ref().is_some_and(|g| !g.running()) {
+            eprintln!("Runtime stopped: Gateway listener or policy task finished");
+            return false;
+        }
+        if let Some(child) = &mut self.mihomo {
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    eprintln!("Runtime stopped: Mihomo exited with {status}");
+                    return false;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Runtime stopped: Mihomo status error={error} errno={:?}",
+                        error.raw_os_error()
+                    );
+                    return false;
+                }
+            }
+        }
+        let Some(child) = &mut self.child else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                eprintln!("Runtime stopped: Xray exited with {status}");
+                false
+            }
+            Err(error) => {
+                eprintln!(
+                    "Runtime stopped: Xray status error={error} errno={:?}",
+                    error.raw_os_error()
+                );
+                false
+            }
+        }
     }
     fn xray_config(&self, config: &Value) -> Result<Value> {
         let mut value = crate::gateway::xray_config(config);
@@ -716,7 +743,7 @@ mod tests {
         };
         let mut config = json!({
             "inbounds":[{"tag":"line-test-in","protocol":"hysteria","streamSettings":{"security":"tls"}}],
-            "_chain":[{"id":"test","port":20000,"backend":50000,"kind":"vless","protocol":"hysteria2","network":"udp","target":"","limits":{},"tls":{"mode":"auto","domain":"cert.example.com"}}],
+            "_chain":[{"id":"test","port":20000,"backend":50000,"meter":{"port":20001,"backend":50001,"password":"test-secret"},"kind":"vless","protocol":"hysteria2","network":"udp","target":"","limits":{},"tls":{"mode":"auto","domain":"cert.example.com"}}],
             "_mihomo":{"listeners":[],"proxies":[]}
         });
         let cert = dir

@@ -21,6 +21,10 @@ use std::{
 use subtle::ConstantTimeEq;
 #[path = "../delivery_api.rs"]
 mod delivery_api;
+#[path = "../rental_api.rs"]
+mod rental_api;
+#[path = "../rental_public.rs"]
+mod rental_public;
 #[path = "../security_api.rs"]
 mod security_api;
 
@@ -113,6 +117,7 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
                 | "/api/auth/options"
                 | "/api/auth/passkey/start"
                 | "/api/auth/passkey/finish"
+                | "/api/public/lookup"
         ) {
             let token = cookie(request.headers());
             let hash = digest(&token);
@@ -235,12 +240,10 @@ fn snapshot(doc: &Document) -> Value {
         .map(|l| {
             let mut v = serde_json::to_value(l).unwrap();
             v["share"] = json!(share(l, doc).ok());
-            let traffic = l
-                .hops
-                .first()
-                .and_then(|h| doc.nodes.iter().find(|n| n.id == h.node_id))
-                .and_then(|n| n.report.traffic.get(&l.id));
-            v["traffic"] = json!(traffic);
+            let rental = chain_panel::rental::view(doc, l, now());
+            for (key, value) in rental.as_object().unwrap() {
+                v[key] = value.clone();
+            }
             let resources_match = configs
                 .as_ref()
                 .map(|configs| {
@@ -272,7 +275,7 @@ fn snapshot(doc: &Document) -> Value {
         .iter()
         .map(|s| json!({"id":s.id,"name":s.name,"line_ids":s.line_ids,"created":s.created}))
         .collect();
-    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc)})
+    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact})
 }
 async fn state(State(app): State<App>) -> Json<Value> {
     let mut value = snapshot(&app.store.lock().unwrap().doc);
@@ -716,6 +719,17 @@ async fn check_reality(
     Ok(Json(chain_panel::runtime::check_reality(&input).await?))
 }
 async fn remove_line(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let proxy = app
+        .store
+        .lock()
+        .unwrap()
+        .doc
+        .lines
+        .iter()
+        .any(|l| l.id == id && l.kind == Kind::Vless);
+    if proxy {
+        return rental_api::delete_one(State(app), Path(id)).await;
+    }
     edit(&app, |d| {
         ensure!(d.lines.iter().any(|l| l.id == id), "线路不存在");
         ensure!(
@@ -803,7 +817,7 @@ async fn publish(State(app): State<App>) -> ApiResult<Json<Value>> {
                 .is_some_and(|s| !s.is_empty())
             {
                 ensure!(
-                    node.report.system["gateway_version"] == 1,
+                    node.report.system["gateway_version"] == 2,
                     "{} 的 Agent 尚未就绪或版本过旧，请先更新 Agent 并等待心跳后再应用",
                     node.name
                 );
@@ -1115,7 +1129,11 @@ async fn web_asset(uri: Uri) -> Response {
     if path.starts_with("api/") {
         return error(StatusCode::NOT_FOUND, "接口不存在").into_response();
     }
-    let path = if path.is_empty() { "index.html" } else { path };
+    let path = if path.is_empty() || matches!(path, "query" | "query/") {
+        "index.html"
+    } else {
+        path
+    };
     let Some(file) = WEB.get_file(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1232,6 +1250,16 @@ async fn main() -> Result<()> {
         )
         .route("/api/logout", post(logout))
         .route("/api/state", get(state))
+        .route("/api/customers", post(rental_api::save_customer))
+        .route("/api/customers/{id}", delete(rental_api::delete_customer))
+        .route("/api/rentals/renew", post(rental_api::renew))
+        .route("/api/rentals/contact", post(rental_api::save_contact))
+        .route("/api/rentals/{id}", post(rental_api::save_rental))
+        .route(
+            "/api/rentals/{id}/query-link",
+            post(rental_public::query_link),
+        )
+        .route("/api/public/lookup", post(rental_public::lookup))
         .route("/api/local-node", post(local_node))
         .route("/api/nodes", post(add_node))
         .route("/api/nodes/{id}", post(update_node).delete(remove_node))
@@ -1244,6 +1272,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/lines", post(save_line))
         .route("/api/lines/batch", post(save_lines))
+        .route("/api/lines/operate", post(rental_api::operate))
         .route("/api/reality/check", post(check_reality))
         .route("/api/lines/{id}", delete(remove_line))
         .route("/api/lines/{id}/probe", post(diagnose))
@@ -1281,13 +1310,16 @@ async fn main() -> Result<()> {
         "Chain Panel: http://{listen}；首次登录令牌位于 {}",
         token_file.display()
     );
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let mut sig =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-            tokio::select! {_=tokio::signal::ctrl_c()=>{},_=sig.recv()=>{}}
-        })
-        .await;
+    let result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let mut sig =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=sig.recv()=>{}}
+    })
+    .await;
     local_task.abort();
     let _ = local_task.await;
     app.local_agent.lock().await.stop().await;

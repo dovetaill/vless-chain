@@ -262,7 +262,7 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
     if spec.kind == Kind::Vless && spec.target == "builtin" {
         return axum::response::Html("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>欢迎访问</title><style>body{max-width:46rem;margin:12vh auto;padding:24px;font:18px/1.8 system-ui;color:#334155;background:#f8fafc}h1{color:#0f172a}</style><h1>欢迎访问</h1><p>网站已上线，更多内容正在准备中。</p></html>").into_response();
     }
-    // A fallback is already accounted for by its outer VLESS listener.
+    // Public website fallbacks are not authenticated proxy traffic.
     let account = spec.kind == Kind::Website;
     let result = async {
         let mut upstream = url::Url::parse(&spec.target)?;

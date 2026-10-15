@@ -311,10 +311,6 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     .iter()
                     .find(|l| l.id == id && l.kind == Kind::Vless)
                     .context("引用的代理不存在")?;
-                ensure!(
-                    !line.enabled || next.enabled,
-                    "请先移除对已停用代理的链式引用"
-                );
                 check_chain(next, doc, visited)?;
             } else {
                 ensure!(reference.starts_with("external:"), "链式代理引用无效");
@@ -446,13 +442,14 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         udp_supported(line, doc)?;
         let sidecar_chain = external.iter().any(needs_mihomo);
         crate::access::validate_line(line)?;
-        if !line.enabled {
+        if !line.enabled && line.kind != Kind::Vless {
             continue;
         }
         for (i, hop) in line.hops.iter().enumerate() {
             let node = doc.nodes.iter().find(|n| n.id == hop.node_id).unwrap();
             let in_tag = format!("line-{}-in", line.id);
             let out_tag = format!("line-{}-out", line.id);
+            let mut meter = None;
             let mut inbound = if i == 0 && line.kind == Kind::Forward {
                 let (host, port) = forward.as_ref().unwrap();
                 json!({"tag":in_tag,"listen":"0.0.0.0","port":hop.port,"protocol":"dokodemo-door",
@@ -567,6 +564,13 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 if config.get("_chain").is_none() {
                     config["_chain"] = json!([]);
                 }
+                if line.kind == Kind::Vless {
+                    meter = Some(crate::meter::Spec {
+                        port: backend_port(&mut reserved, node)?,
+                        backend: backend_port(&mut reserved, node)?,
+                        password: hop.uuid.clone(),
+                    });
+                }
                 config["_chain"].as_array_mut().unwrap().push(json!({
                     "id":line.id,"port":port,"backend":backend,"kind":line.kind,
                     "listen":if line.access.shared_port {"127.0.0.1"} else {"0.0.0.0"},
@@ -574,6 +578,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     "fallback_port":fallback_port,"fallback_target":line.access.fallback,
                     "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
                     "limits":line.limits,"tls":line.access.tls,"target":line.target,
+                    "enabled":line.enabled,"lease":doc.rentals.get(&line.id).map(Rental::policy),"meter":meter,
                 }));
                 if line.kind == Kind::Website {
                     continue;
@@ -587,10 +592,26 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     .unwrap()
                     .extend_from_slice(&external[..external.len() - 1]);
             }
-            config["routing"]["rules"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"type":"field","inboundTag":[in_tag],"outboundTag":out_tag}));
+            if let Some(meter) = meter {
+                let bridge_in = format!("line-{}-meter-in", line.id);
+                let bridge_out = format!("line-{}-meter-out", line.id);
+                config["inbounds"].as_array_mut().unwrap().push(json!({
+                    "tag":bridge_in,"listen":"127.0.0.1","port":meter.backend,"protocol":"socks",
+                    "settings":{"auth":"password","accounts":[{"user":line.id,"pass":meter.password}],"udp":true,"ip":"127.0.0.1"}
+                }));
+                config["outbounds"].as_array_mut().unwrap().push(json!({
+                    "tag":bridge_out,"protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":meter.port,"users":[{"user":line.id,"pass":meter.password}]}]}
+                }));
+                config["routing"]["rules"].as_array_mut().unwrap().extend([
+                    json!({"type":"field","inboundTag":[in_tag],"outboundTag":bridge_out}),
+                    json!({"type":"field","inboundTag":[bridge_in],"outboundTag":out_tag}),
+                ]);
+            } else {
+                config["routing"]["rules"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type":"field","inboundTag":[in_tag],"outboundTag":out_tag}));
+            }
         }
     }
     Ok(configs)
@@ -650,6 +671,44 @@ mod tests {
                 .to_string()
                 .contains("系统临时端口")
         );
+    }
+
+    #[test]
+    fn authenticated_payload_crosses_meter_and_operational_updates_keep_core_config() {
+        let mut d = fixture();
+        d.lines[0].hops.truncate(1);
+        let active = compile(&d).unwrap();
+        let config = &active["a"];
+        let spec = crate::gateway::specs(config).unwrap().remove(0);
+        let meter = spec.meter.as_ref().unwrap();
+        let id = &d.lines[0].id;
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["inboundTag"][0] == format!("line-{id}-in")
+                    && r["outboundTag"] == format!("line-{id}-meter-out"))
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["inboundTag"][0] == format!("line-{id}-meter-in")
+                    && r["outboundTag"] == format!("line-{id}-out"))
+        );
+        assert_ne!(meter.port, meter.backend);
+        assert_ne!(meter.port, spec.port);
+        assert_eq!(meter.password, d.lines[0].hops[0].uuid);
+        d.lines[0].enabled = false;
+        d.lines[0].limits.monthly_gib = Some(100.0);
+        let stopped = compile(&d).unwrap();
+        assert_eq!(
+            crate::gateway::xray_config(config),
+            crate::gateway::xray_config(&stopped["a"])
+        );
+        assert!(crate::gateway::same_listeners(
+            &[spec],
+            &crate::gateway::specs(&stopped["a"]).unwrap()
+        ));
     }
     #[test]
     fn udp_capability_follows_local_references_and_exports() {

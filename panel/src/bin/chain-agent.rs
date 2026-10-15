@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chain_panel::{model::*, runtime::*};
 use std::os::unix::fs::PermissionsExt;
 use std::{path::PathBuf, time::Duration};
@@ -73,6 +73,26 @@ async fn main() -> Result<()> {
     };
     tokio::pin!(shutdown);
     loop {
+        if runtime.active.is_some() && !runtime.running() {
+            report.running = false;
+            report.applied = false;
+            report.error =
+                "代理内核或网关异常退出；Agent 将退出，由服务管理器恢复最后已应用配置".into();
+            runtime.close().await;
+            report.traffic = runtime.traffic.snapshot();
+            // Keep this failure outside `step`: its errors are logged and retried in place.
+            // The installed service restarts failures after 5s; active.json remains authoritative.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                client
+                    .post(&url)
+                    .bearer_auth(token.trim())
+                    .json(&report)
+                    .send(),
+            )
+            .await;
+            bail!("{}", report.error);
+        }
         let step = async {
             report.running = runtime.running();
             report.traffic = runtime.traffic.snapshot();
@@ -90,10 +110,6 @@ async fn main() -> Result<()> {
                 if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     report.system["certificate"] = status;
                 }
-            }
-            if !report.running && report.applied && runtime.active.is_some() {
-                report.applied = false;
-                report.error = "Xray 已退出；请检查节点日志后重新发布".into();
             }
             let response = client
                 .post(&url)

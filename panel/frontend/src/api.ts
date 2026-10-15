@@ -1,9 +1,9 @@
 export class ApiError extends Error {
   constructor(message: string, public status: number) { super(message); }
 }
-export async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+export async function api<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch('/api' + path, {
-    method, credentials: 'same-origin',
+    method, credentials: 'same-origin', signal,
     headers: { 'Content-Type': 'application/json', 'X-Chain-Request': '1' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });

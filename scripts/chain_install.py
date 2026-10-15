@@ -234,7 +234,8 @@ class Manager:
                 f'[Service]\nType=simple\nUser=chain-{role}\nGroup=chain-{role}\nStateDirectory=chain-{role}\n'
                 f'StateDirectoryMode=0700\nUMask=0077\nEnvironmentFile={env_file}\n'
                 f'ExecStart={quote(self.base / ("current-" + role) / "bin" / ("chain-" + role))}\n'
-                'Restart=on-failure\nRestartSec=5\nKillMode=control-group\nTimeoutStopSec=50\n'
+                'Restart=on-failure\nRestartSec=5\nKillMode=control-group\nTimeoutStopSec=50\n' +
+                ('LimitNOFILE=65536\n' if role == 'agent' else '') +
                 'NoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\n' + capability +
                 f'ReadWritePaths={quote(self.path("/var/lib/chain-acme") / role)}\n' +
                 '\n[Install]\nWantedBy=multi-user.target\n')

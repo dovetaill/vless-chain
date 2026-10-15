@@ -398,7 +398,9 @@ class Delivery(unittest.TestCase):
         args = self.args(component='agent', panel_url='https://panel.example.com', node_id='a94a6794-c60a-4c51-a094-b9164ddaaabc', token_file=token)
         self.manager.install(source, manifest, args)
         self.assertEqual(self.manager.state()['roles']['panel'], panel)
-        etc, _, _ = self.manager.role_paths('agent')
+        etc, _, unit = self.manager.role_paths('agent')
+        self.assertIn('LimitNOFILE=65536', unit.read_text().splitlines())
+        self.assertNotIn('LimitNOFILE=', self.manager.role_paths('panel')[2].read_text())
         self.assertEqual((etc / 'token').read_text().strip(), 'a' * 64)
         self.assertEqual((etc / 'token').stat().st_mode & 0o777, 0o600)
         with self.assertRaisesRegex(ValueError, '需要 HTTPS'):
