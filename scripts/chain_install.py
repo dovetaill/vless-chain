@@ -307,7 +307,7 @@ class Manager:
                                         and not path.readlink().is_absolute()
                                         and path.resolve().is_relative_to(source / 'acme/config/archive') and path.is_file(),
                                         '备份路径包含非 Certbot 内部证书链接，拒绝继续。')
-                            if path.is_file() and path.name not in ('xray.log', 'process.lock', 'candidate.json'):
+                            if path.is_file() and path.name not in ('xray.log', 'service.log', 'process.lock', 'candidate.json'):
                                 bundle.add(path, arcname=prefix + '/' + str(path.relative_to(source)), recursive=False)
         print(f'私有备份：{destination}（权限 600，含连接凭据，请私下保存）')
         return destination
@@ -536,6 +536,8 @@ class Manager:
             require(not p.is_symlink() and (not p.exists() or p.is_file() and owner in p.read_text()),
                     f'{p} 不归本安装器管理，拒绝删除。')
         logs = [self.path('/var/log/chain-' + role + '.log') for role in roles] + [self.path('/var/log/chain-panel-https.log')]
+        if service_kind() == 'openrc':
+            logs += [self.role_paths(role)[1] / 'service.log' for role in roles]
         for p in logs:
             require(not p.is_symlink(), f'日志路径为链接，拒绝删除：{p}')
         if purge and backups.exists():
@@ -610,8 +612,10 @@ class Manager:
             self.system.call('status', 'chain-' + role + '.service', '--no-pager', check=False)
         elif action == 'logs':
             require(self.live, '--root 离线安装树没有服务日志。')
+            log = (str(self.role_paths(role)[1] / 'service.log') if service_kind() == 'openrc'
+                   else '/var/log/chain-' + role + '.log')
             run(['journalctl', '-u', 'chain-' + role + '.service', '--no-pager', '-n', '100']
-                if service_kind() == 'systemd' else ['tail', '-n', '100', '/var/log/chain-' + role + '.log'])
+                if service_kind() == 'systemd' else ['tail', '-n', '100', log])
         elif action == 'token':
             require(role == 'panel', 'Agent 令牌只在 Web 创建或重置时显示。')
             print((self.role_paths(role)[1] / 'admin-token').read_text().strip())

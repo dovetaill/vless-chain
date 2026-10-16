@@ -421,7 +421,7 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
                     id.clone(),
                     title.clone(),
                     request.shared_443,
-                    source.id.starts_with("systemd:"),
+                    source.id.starts_with("systemd:") || source.id.starts_with("openrc:"),
                 )?;
                 doc.lines.push(line.clone());
                 compile(doc)?;
@@ -543,6 +543,30 @@ mod tests {
         assert_eq!(settings["shortIds"], json!([reality.short_id]));
         assert_eq!(settings["limitFallbackUpload"], upload);
         assert_eq!(settings["limitFallbackDownload"], download);
+    }
+
+    #[test]
+    fn local_reality_target_requires_a_host_service() {
+        for kind in ["systemd", "openrc", "docker", "unmanaged"] {
+            let reality = Reality::new("127.0.0.1:18443".into(), "cover.example.com".into());
+            let (mut doc, mut request) = fixture(json!({"port":443,"protocol":"vless",
+                "settings":{"clients":[{"id":id(),"flow":"xtls-rprx-vision"}]},
+                "streamSettings":{"security":"reality","realitySettings":{"target":reality.target,
+                    "serverNames":[reality.server_name],"shortIds":[reality.short_id],
+                    "privateKey":reality.private_key}}}));
+            request.sources[0].id = format!("{kind}:xray:/config.json");
+            let result = import(&mut doc, &request).unwrap();
+            if matches!(kind, "systemd" | "openrc") {
+                assert_eq!(result["pending"], json!([]));
+                assert_eq!(
+                    doc.lines[0].access.reality.as_ref().unwrap().target,
+                    reality.target
+                );
+            } else {
+                assert!(doc.lines.is_empty());
+                assert_eq!(doc.pending_imports.len(), 1);
+            }
+        }
     }
 
     #[test]

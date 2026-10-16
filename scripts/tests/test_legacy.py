@@ -113,6 +113,102 @@ class Legacy(unittest.TestCase):
             self.assertEqual(len(owners), 1)
             self.assertEqual(owners[0]['kind'], 'unmanaged')
 
+    def test_openrc_discovery_requires_matching_host_supervisor(self):
+        for variant in ['managed', 'wrong-parent', 'wrong-service', 'missing-unit', 'container', 'platform-service']:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                proc, system = root / 'proc', root / 'system'
+                name = 'chain-agent' if variant == 'platform-service' else 'xray-chain-example'
+                unit = system / 'etc/init.d' / name
+                unit.parent.mkdir(parents=True)
+                if variant != 'missing-unit':
+                    unit.write_text('#!/sbin/openrc-run\ncommand=/usr/local/bin/xray\n')
+                config = system / 'etc/conf.d' / name
+                config.parent.mkdir(parents=True)
+                config.write_text('respawn_delay=3\n')
+                for pid, executable in [('1', '/sbin/init'), ('10', '/sbin/supervise-daemon'), ('20', '/usr/local/bin/xray')]:
+                    process = proc / pid
+                    (process / 'ns').mkdir(parents=True)
+                    namespace = 'pid:[2]' if pid == '20' and variant == 'container' else 'pid:[1]'
+                    (process / 'ns/pid').symlink_to(namespace)
+                    (process / 'exe').symlink_to(Path('/usr/sbin/sshd' if pid == '10' and variant == 'wrong-parent' else executable).resolve())
+                    (process / 'cwd').symlink_to('/')
+                    (process / 'root').symlink_to(system)
+                    (process / 'cmdline').write_bytes(executable.encode() + b'\0')
+                    (process / 'cgroup').write_text('0::/\n')
+                    (process / 'status').write_text('PPid:\t10\n')
+                service = 'sshd' if variant == 'wrong-service' else name
+                (proc / '10/cmdline').write_bytes(f'supervise-daemon\0{name}\0--start\0/usr/local/bin/xray\0'.encode())
+                (proc / '10/environ').write_bytes(f'RC_SVCNAME={name}\0RC_SERVICE=/etc/init.d/{service}\0'.encode())
+                with patch.object(legacy.shutil, 'which', side_effect=lambda name: '/sbin/supervise-daemon' if name == 'supervise-daemon' else None), \
+                        patch.object(legacy, 'run') as run:
+                    owners = legacy.discover(proc)
+                run.assert_not_called()
+                self.assertEqual(len(owners), 1)
+                owner = owners[0]
+                self.assertEqual(owner['kind'], 'openrc' if variant == 'managed' else 'unmanaged')
+                self.assertEqual(owner['pids'], [20])
+                if variant == 'managed':
+                    self.assertEqual(owner['id'], name)
+                    self.assertEqual(owner['files']['/etc/init.d/' + name]['body'], unit.read_bytes())
+                    self.assertEqual(owner['files']['/etc/conf.d/' + name]['body'], config.read_bytes())
+
+    def test_openrc_handover_restores_original_runlevels_on_failure(self):
+        for variant in ['success', 'stop-fails', 'status-fails', 'inactive', 'unit-changed']:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                name = 'xray-chain-example'
+                unit = root / name
+                body = b'#!/sbin/openrc-run\ncommand=/usr/local/bin/xray\n'
+                unit.write_bytes(body)
+                levels = root / 'runlevels'
+                for level in ['default', 'custom']:
+                    (levels / level).mkdir(parents=True)
+                    (levels / level / name).symlink_to(unit)
+                owner = {'id': name, 'name': name, 'kind': 'openrc', 'sources': [], 'files': {
+                    '/etc/init.d/' + name: {'path': str(unit), 'body': body}}}
+                handover = legacy.Handover([owner], root / 'backups')
+                calls = []
+                def run(command, **_):
+                    calls.append(command)
+                    if command == ['rc-service', name, 'stop'] and variant == 'stop-fails':
+                        raise subprocess.CalledProcessError(1, command)
+                    code = 0
+                    if command == ['rc-service', name, 'status']:
+                        code = 3 if variant == 'inactive' or ['rc-service', name, 'stop'] in calls else 0
+                        if variant == 'status-fails' and ['rc-service', name, 'stop'] in calls:
+                            code = 1
+                    return Mock(returncode=code)
+                with patch.object(legacy, 'Path', side_effect=lambda p: levels if p == '/etc/runlevels' else Path(p)), \
+                        patch.object(legacy, 'run', side_effect=run):
+                    handover.prepare()
+                    metadata = json.loads((handover.backup / '0/source.json').read_text())
+                    self.assertEqual(metadata['runlevels'], ['custom', 'default'])
+                    self.assertEqual(metadata['active'], variant != 'inactive')
+                    self.assertEqual((handover.backup / '0/file-0').read_bytes(), body)
+                    if variant == 'unit-changed':
+                        unit.write_bytes(body + b'# concurrent change\n')
+                        with self.assertRaisesRegex(ValueError, '旧配置在安装期间已变化'):
+                            handover.stop()
+                        self.assertEqual(handover.changed, [])
+                        self.assertEqual(calls, [['rc-service', name, 'status']])
+                        continue
+                    if variant == 'stop-fails':
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            handover.stop()
+                    elif variant == 'status-fails':
+                        with self.assertRaisesRegex(ValueError, '未确认停止'):
+                            handover.stop()
+                    else:
+                        handover.stop()
+                    handover.restore()
+                for level in ['custom', 'default']:
+                    self.assertIn(['rc-update', 'del', name, level], calls)
+                    self.assertIn(['rc-update', 'add', name, level], calls)
+                self.assertEqual(['rc-service', name, 'start'] in calls, variant != 'inactive')
+                self.assertTrue(all(c[0] in ['rc-service', 'rc-update'] and name in c for c in calls))
+                self.assertEqual(unit.read_bytes(), body)
+
     def test_backup_is_private_and_never_rewrites_source_config(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

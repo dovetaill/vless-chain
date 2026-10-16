@@ -112,6 +112,9 @@ def service_definition(name, command, owner, user=None, env=None, interval=None)
         else:
             value['KeepAlive'] = {'SuccessfulExit': False}
         return plistlib.dumps(value).decode()
+    if user:
+        # supervise-daemon opens logs after dropping to command_user.
+        log = '/var/lib/' + name + '/service.log'
     if interval:
         command = ['/bin/sh', '-c', 'while :; do ' + shlex.join(list(map(str, command))) +
                    '; sleep ' + str(interval) + '; done']
@@ -124,6 +127,8 @@ def service_definition(name, command, owner, user=None, env=None, interval=None)
         text += f'command_user={shlex.quote(user + ":" + user)}\nno_new_privs=yes\n'
         if name == 'chain-agent':
             text += 'capabilities="^cap_net_bind_service"\nrc_ulimit="-n 65536"\n'
+    # OpenRC adds its own helper directories before sourcing the service script.
+    text += f'export PATH={shlex.quote(env.pop("PATH"))}:"$PATH"\n'
     text += ''.join(f'export {key}={shlex.quote(value)}\n' for key, value in env.items())
     return text + 'depend() { need net; }\n'
 

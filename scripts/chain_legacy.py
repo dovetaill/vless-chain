@@ -41,6 +41,27 @@ def configs(command, cwd):
     return result
 
 
+def openrc_owner(process):
+    proc = process.parent
+    with contextlib.suppress(OSError, ValueError, UnicodeError):
+        if (process / 'ns/pid').readlink() != (proc / '1/ns/pid').readlink():
+            return None
+        status = dict(line.split(':', 1) for line in (process / 'status').read_text().splitlines())
+        parent = proc / status.get('PPid', '0').strip()
+        binary = shutil.which('supervise-daemon')
+        if not binary or (parent / 'exe').readlink() != Path(binary).resolve():
+            return None
+        command = (parent / 'cmdline').read_bytes().decode().rstrip('\0').split('\0')
+        env = dict(line.split('=', 1) for line in (parent / 'environ').read_bytes().decode().split('\0') if '=' in line)
+        name = env.get('RC_SVCNAME', '')
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name) or name.startswith('chain-')
+                or command[1:3] != [name, '--start'] or env.get('RC_SERVICE') != '/etc/init.d/' + name):
+            return None
+        if (process / 'root/etc/init.d' / name).is_file():
+            return name
+    return None
+
+
 def discover(proc=Path('/proc')):
     if not proc.is_dir():
         return []
@@ -85,12 +106,18 @@ def discover(proc=Path('/proc')):
             elif unit and not unit.startswith(('chain-', 'docker.', 'containerd.')):
                 identity, kind, title = unit, 'systemd', unit
             else:
-                identity, kind, title = process.name, 'unmanaged', executable.name
+                name = openrc_owner(process) if not unit else None
+                identity, kind, title = (name, 'openrc', name) if name else (process.name, 'unmanaged', executable.name)
             key = kind + ':' + identity
             owner = owners.setdefault(key, {'id': identity, 'kind': kind, 'name': title, 'pids': [],
                                             'files': {}, 'sources': [], 'container': container})
             owner['pids'].append(int(process.name))
             root = process / 'root'
+            if kind == 'openrc':
+                for logical in ['/etc/init.d/' + identity, '/etc/conf.d/' + identity]:
+                    path = root / logical.lstrip('/')
+                    if path.is_file():
+                        owner['files'][logical] = {'path': str(path), 'body': read_config(path)}
             cwd = process.joinpath('cwd').readlink()
             paths = configs(command, cwd)
             if not paths and 'x-ui' in executable.name:
@@ -205,6 +232,11 @@ class Handover:
                 owner['enabled'] = output(['systemctl', 'is-enabled', owner['id']], check=False) == 'enabled'
                 owner['active'] = run(['systemctl', 'is-active', '--quiet', owner['id']], check=False).returncode == 0
                 metadata.update(enabled=owner['enabled'], active=owner['active'])
+            elif owner['kind'] == 'openrc':
+                owner['runlevels'] = sorted(p.parent.name for p in Path('/etc/runlevels').glob('*/' + owner['id'])
+                                            if p.is_symlink())
+                owner['active'] = run(['rc-service', owner['id'], 'status'], check=False, capture_output=True).returncode == 0
+                metadata.update(runlevels=owner['runlevels'], active=owner['active'])
             for number, (logical, file) in enumerate(owner['files'].items()):
                 require(read_config(Path(file['path'])) == file['body'], '旧配置在预检期间已变化，请重新运行安装。')
                 atomic_write(directory / f'file-{number}', file['body'])
@@ -229,6 +261,12 @@ class Handover:
                 run(['docker', 'update', '--restart=no', owner['id']], capture_output=True)
                 run(['docker', 'stop', '--time', '30', owner['id']], capture_output=True)
                 require(output(['docker', 'inspect', '--format', '{{.State.Running}}', owner['id']]) == 'false', '旧容器未停止。')
+            elif owner['kind'] == 'openrc':
+                for level in owner['runlevels']:
+                    run(['rc-update', 'del', owner['id'], level])
+                run(['rc-service', owner['id'], 'stop'])
+                require(run(['rc-service', owner['id'], 'status'], check=False, capture_output=True).returncode == 3,
+                        '旧 OpenRC 服务未确认停止。')
             else:
                 if owner['enabled']:
                     run(['systemctl', 'disable', owner['id']])
@@ -246,6 +284,11 @@ class Handover:
                         restart += ':' + str(policy['MaximumRetryCount'])
                     run(['docker', 'update', '--restart=' + restart, owner['id']], capture_output=True)
                     run(['docker', 'start', owner['id']], capture_output=True)
+                elif owner['kind'] == 'openrc':
+                    for level in owner['runlevels']:
+                        run(['rc-update', 'add', owner['id'], level])
+                    if owner['active']:
+                        run(['rc-service', owner['id'], 'start'])
                 else:
                     if owner['enabled']:
                         run(['systemctl', 'enable', owner['id']])

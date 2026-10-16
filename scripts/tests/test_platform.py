@@ -5,6 +5,7 @@ from pathlib import Path
 import plistlib
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -99,6 +100,35 @@ class Platforms(unittest.TestCase):
         result = subprocess.run(['/bin/sh', '-c', exports + '\nprintf %s "$CHAIN_VALUE"'], check=True, capture_output=True, text=True)
         self.assertEqual(result.stdout, '$(exit 77)"\'中文')
 
+    def test_openrc_definition_preserves_runtime_command_path(self):
+        inherited = '/custom/openrc/sbin:/custom/openrc/bin:/bin'
+        for configured in [platform.SERVICE_PATH, '/custom service/bin:$(exit 77)']:
+            with self.subTest(path=configured), patch.object(platform, 'service_kind', return_value='openrc'):
+                value = platform.service_definition('chain-panel', ['/bin/true'], installer.OWNER,
+                                                    env={'PATH': configured})
+                result = subprocess.run(['/bin/sh', '-c', value + '\nprintf %s "$PATH"'],
+                                        env={'PATH': inherited}, check=True, capture_output=True, text=True)
+                self.assertEqual(result.stdout, configured + ':' + inherited)
+
+    def test_openrc_logs_use_the_service_data_directory(self):
+        for role in ['panel', 'agent']:
+            with self.subTest(role=role), patch.object(platform, 'service_kind', return_value='openrc'), \
+                    patch.object(installer, 'service_kind', return_value='openrc'):
+                name = 'chain-' + role
+                log = '/var/lib/' + name + '/service.log'
+                value = platform.service_definition(name, ['/bin/true'], installer.OWNER, name)
+                self.assertIn('output_log=' + log + '\nerror_log=' + log, value)
+                with tempfile.TemporaryDirectory() as temporary:
+                    subprocess.run(['/bin/sh', '-c', value.replace('/var/lib/' + name, temporary)
+                                    + '\nprintf log-check >> "$output_log"'], check=True)
+                    self.assertEqual((Path(temporary) / 'service.log').read_text(), 'log-check')
+                manager = installer.Manager.__new__(installer.Manager)
+                manager.live, manager.root = True, Path('/')
+                args = SimpleNamespace(action='logs', component=role)
+                with patch.object(manager, 'require_role'), patch.object(installer, 'run') as run:
+                    manager.operate(args)
+                run.assert_called_once_with(['tail', '-n', '100', log])
+
     def test_launchd_restart_unloads_old_definition_before_bootstrap(self):
         with patch.object(platform, 'service_kind', return_value='launchd'), \
                 patch.object(platform.subprocess, 'run') as run:
@@ -157,9 +187,15 @@ class Platforms(unittest.TestCase):
                     etc, data, unit = manager.role_paths('panel')
                     env = (etc / 'panel.env').read_bytes()
                     (data / 'keep').write_text('business data')
+                    if kind == 'openrc':
+                        (data / 'service.log').write_text('service output')
                     previous = manager.state()['roles']['panel']['current']
                     source, manifest = fixture.package('0.2.0')
                     manager.install(source, manifest, fixture.args(action='update'))
+                    if kind == 'openrc':
+                        backup = next(manager.path('/var/backups/chain-panel').glob('*.tar.gz'))
+                        with tarfile.open(backup) as archive:
+                            self.assertNotIn('data/service.log', archive.getnames())
                     self.assertEqual((etc / 'panel.env').read_bytes(), env)
                     if kind == 'launchd':
                         service = plistlib.loads(unit.read_bytes())
@@ -173,6 +209,7 @@ class Platforms(unittest.TestCase):
                     self.assertEqual((data / 'keep').read_text(), 'business data')
                     args = installer.make_parser().parse_args(['uninstall', '--non-interactive'])
                     manager.operate(args)
+                    self.assertFalse((data / 'service.log').exists())
                     self.assertFalse(unit.exists())
                     self.assertEqual((data / 'keep').read_text(), 'business data')
                     args.purge = True
