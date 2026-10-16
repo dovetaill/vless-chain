@@ -173,6 +173,19 @@ export function LineEditor({
         <Field label="XHTTP 模式"><select name="xhttp_mode" className="select" defaultValue={line?.access.transport?.mode || "auto"}>{["auto", "packet-up", "stream-up", "stream-one"].map(mode => <option key={mode}>{mode}</option>)}</select></Field>
       </section>}
       {usesReality && <section className="space-y-4 rounded-xl border border-border p-4">
+        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="REALITY 目标快捷选择">
+          <span className="muted">快捷选择</span>
+          {[
+            ["微软", "www.microsoft.com"],
+            ["苹果", "www.apple.com"],
+            ["AWS", "aws.amazon.com"],
+            ["三星", "www.samsung.com"],
+            ["索尼", "www.sony.com"],
+            ["戴尔", "www.dell.com"],
+            ["惠普", "www.hp.com"],
+            ["Cloudflare", "www.cloudflare.com"],
+          ].map(([name, host]) => <Button key={host} type="button" variant="outline" size="sm" disabled={checking} onClick={() => { setRealityTarget(`${host}:443`); setSni(host); setCheck(""); }}>{name}</Button>)}
+        </div>
         <Field label="REALITY 目标地址" hint="目标网站的域名或 IP 加端口，需支持 TLS 1.3 与 H2；无需解析到本机。"><Input value={realityTarget} readOnly={checking} onChange={e => { setRealityTarget(e.target.value); setCheck(""); }} required /></Field>
         <Field label="REALITY SNI" hint="必须是目标网站证书覆盖的域名。无需申请自己的证书。"><Input value={sni} readOnly={checking} onChange={e => { setSni(e.target.value); setCheck(""); }} required /></Field>
         <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await api<{ ok: boolean; detail: string; latency_ms: number }>("/reality/check", "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测目标与 SNI"}</Button>

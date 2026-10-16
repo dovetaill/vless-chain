@@ -13,7 +13,7 @@ const assets = path.resolve(process.argv[2]);
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     const errors = [], writes = [];
     page.on('pageerror', e => errors.push(e.message));
-    const node = { id: 'local', name: '本机', host: '192.0.2.20', online: true, target: 'www.microsoft.com:443', server_name: 'www.microsoft.com', seen: 0, report: { running: true, applied: true, error: '', revision: '', traffic: {}, system: {} } };
+    const node = { id: 'local', name: '本机', host: '192.0.2.20', online: true, target: 'www.cloudflare.com:443', server_name: 'www.cloudflare.com', seen: 0, report: { running: true, applied: true, error: '', revision: '', traffic: {}, system: {} } };
     const state = { nodes: [node], local_node_id: 'local', externals: [
       { id: 'a', name: '落地 A', url: 'vless://00000000-0000-4000-8000-000000000001@a.example:443?security=tls' },
       { id: 'b', name: '落地 B', url: 'socks5://user:password@b.example:1080' },
@@ -59,11 +59,32 @@ const assets = path.resolve(process.argv[2]);
     assert.equal(await page.getByLabel('本机 IP 或域名').inputValue(), '192.0.2.20');
     assert.equal(await page.getByLabel('协议', { exact: true }).inputValue(), 'vless');
     assert.equal(await page.getByLabel('出网方式').inputValue(), 'direct');
+    const target = page.getByLabel('REALITY 目标地址', { exact: true });
+    const sni = page.getByLabel('REALITY SNI', { exact: true });
+    assert.equal(await target.inputValue(), 'www.cloudflare.com:443');
+    assert.equal(await sni.inputValue(), 'www.cloudflare.com');
+    for (const [name, host] of [
+      ['微软', 'www.microsoft.com'], ['苹果', 'www.apple.com'], ['AWS', 'aws.amazon.com'],
+      ['三星', 'www.samsung.com'], ['索尼', 'www.sony.com'], ['戴尔', 'www.dell.com'],
+      ['惠普', 'www.hp.com'], ['Cloudflare', 'www.cloudflare.com'],
+    ]) {
+      await button(name).click();
+      assert.equal(await target.inputValue(), `${host}:443`);
+      assert.equal(await sni.inputValue(), host);
+    }
+    assert.equal(writes.filter(w => w.path === '/api/lines').length, 0);
+    await button('检测目标与 SNI').click();
+    const checked = page.getByText('通过：TLS 1.3、证书/SNI 与 H2 检查通过（12 ms）');
+    await checked.waitFor();
+    assert.deepEqual(writes.find(w => w.path === '/api/reality/check').body, { target: 'www.cloudflare.com:443', server_name: 'www.cloudflare.com' });
+    await button('苹果').click();
+    await checked.waitFor({ state: 'hidden' });
     if (root) await page.screenshot({ path: path.join(root, 'local-create.png') });
     await save();
     const first = writes.find(w => w.path === '/api/lines').body;
     assert.deepEqual(first.hops, [{ node_id: 'local', port: null }]);
     assert.equal(first.access.tls.mode, 'off');
+    assert.deepEqual(first.access.reality, { target: 'www.apple.com:443', server_name: 'www.apple.com' });
     assert.equal(writes.filter(w => w.path === '/api/local-node').length, 0);
     await create('VLESS B');
     await page.getByLabel('出网方式').selectOption('chain');
@@ -106,6 +127,7 @@ const assets = path.resolve(process.argv[2]);
     await page.getByLabel('本机 IP 或域名').fill('batch.example.com');
     await page.getByLabel('REALITY + XHTTP', { exact: true }).check();
     await page.getByLabel('TLS + XHTTP', { exact: true }).check();
+    await button('微软').click();
     await page.getByLabel('REALITY 目标地址', { exact: true }).fill('cover.example.com:443');
     await page.getByLabel('REALITY SNI', { exact: true }).fill('cover.example.com');
     await button('检测目标与 SNI').click();
@@ -124,7 +146,7 @@ const assets = path.resolve(process.argv[2]);
     const batch = writes.find(w => w.path === '/api/lines/batch').body;
     assert.equal(batch.length, 4);
     assert.deepEqual(batch.map(l => [l.access.transport.network, l.access.tls.mode]), [['tcp', 'off'], ['tcp', 'auto'], ['xhttp', 'off'], ['xhttp', 'auto']]);
-    assert.equal(batch[2].access.reality.server_name, 'cover.example.com');
+    for (const line of [batch[0], batch[2]]) assert.deepEqual(line.access.reality, { target: 'cover.example.com:443', server_name: 'cover.example.com' });
     assert.equal(batch[2].access.transport.path, '/batch-path');
     assert.equal(batch[1].access.fallback, '');
     await page.locator('aside nav').getByRole('button', { name: '外部代理', exact: true }).click();
@@ -151,6 +173,12 @@ const assets = path.resolve(process.argv[2]);
     assert.equal(writes.filter(w => w.path === '/api/lines').at(-1).body.hops[0].node_id, 'local');
     await create('手机布局');
     await page.setViewportSize({ width: 390, height: 844 });
+    const presets = page.getByRole('group', { name: 'REALITY 目标快捷选择' });
+    assert.equal(await presets.getByRole('button').count(), 8);
+    assert.ok(await presets.evaluate(el => el.scrollWidth <= el.clientWidth));
+    await presets.getByRole('button', { name: 'Cloudflare', exact: true }).click();
+    assert.equal(await target.inputValue(), 'www.cloudflare.com:443');
+    assert.equal(await sni.inputValue(), 'www.cloudflare.com');
     await page.getByLabel('本机 IP 或域名').fill('mobile.example.com');
     await page.getByText('传输安全 · REALITY', { exact: true }).click();
     await page.getByLabel('HTTPS / 证书').selectOption('auto');
@@ -160,7 +188,7 @@ const assets = path.resolve(process.argv[2]);
     assert.ok(hint.x > box.x + 10 && hint.x + hint.width < box.x + box.width - 10);
     await close();
     assert.deepEqual(errors, []);
-    console.log('PASS local defaults, domain REALITY, explicit TLS preserved, ordered chain, Mihomo import/export, orphan local identity and mobile form');
+    console.log('PASS local defaults, REALITY presets and custom targets, domain REALITY, explicit TLS preserved, ordered chain, Mihomo import/export, orphan local identity and mobile form');
   } finally {
     await browser.close(); await server.close();
     console.log('CLEANUP browser pid=' + server.process().pid);
