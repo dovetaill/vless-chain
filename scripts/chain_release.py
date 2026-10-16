@@ -230,7 +230,7 @@ def build(args):
         project.mkdir()
         for name in ['Cargo.toml', 'Cargo.lock', 'build.rs']:
             shutil.copy2(ROOT / 'panel' / name, project / name)
-        for name in ['src', 'empty-web', 'frontend']:
+        for name in ['src', 'empty-web', 'frontend', 'tests/fixtures']:
             shutil.copytree(ROOT / 'panel' / name, project / name,
                             ignore=shutil.ignore_patterns('node_modules', 'dist', '.env', '.env.*', '__pycache__'))
         work.env['CHAIN_WEB_ASSETS'] = str(project / 'frontend/dist')

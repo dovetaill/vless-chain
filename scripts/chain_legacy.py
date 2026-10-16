@@ -420,7 +420,8 @@ def guided_install(manager, source, manifest, args):
             request = {'node_id': node_id, 'sources': sources, 'preview': True}
             preview = api.call('legacy-import', request)
             for item in preview['imported']:
-                print(f'可导入：{item["name"]}（{item["protocol"]}，端口 {item["port"]}）')
+                exit_label = ' → 外部 VLESS 代理' if item.get('chain') else ''
+                print(f'可导入：{item["name"]}（{item["protocol"]}，端口 {item["port"]}）{exit_label}')
             for item in preview['pending']:
                 print(f'仅导入名称：{item["name"]}；{item["reason"]}')
             require(not preview['pending'], '旧配置尚不能完整导入，取消切换；旧服务保持运行。')

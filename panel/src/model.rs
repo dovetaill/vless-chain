@@ -191,9 +191,18 @@ pub struct RealityTarget {
     pub target: String,
     pub server_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<RealityCredentials>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_fallback_upload: Option<RealityFallbackLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_fallback_download: Option<RealityFallbackLimit>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+pub struct RealityCredentials {
+    pub private_key: String,
+    pub public_key: String,
+    pub short_id: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
@@ -204,6 +213,17 @@ pub struct RealityFallbackLimit {
     pub burst_bytes_per_sec: u64,
 }
 impl Access {
+    pub fn reality_credentials<'a>(&'a self, node: &'a Node) -> (&'a str, &'a str, &'a str) {
+        match self.reality.as_ref().and_then(|r| r.credentials.as_ref()) {
+            Some(keys) => (&keys.private_key, &keys.public_key, &keys.short_id),
+            None => (
+                &node.reality.private_key,
+                &node.reality.public_key,
+                &node.reality.short_id,
+            ),
+        }
+    }
+
     pub fn server_name<'a>(&'a self, node: &'a Node) -> &'a str {
         if matches!(self.tls.mode.as_str(), "auto" | "manual") {
             &self.tls.domain

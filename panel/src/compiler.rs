@@ -188,10 +188,9 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
         ]);
     }
     if !tls {
-        u.query_pairs_mut().extend_pairs([
-            ("pbk", &node.reality.public_key),
-            ("sid", &node.reality.short_id),
-        ]);
+        let (_, public_key, short_id) = line.access.reality_credentials(node);
+        u.query_pairs_mut()
+            .extend_pairs([("pbk", public_key), ("sid", short_id)]);
     }
     if !udp_supported(line, doc)? {
         u.query_pairs_mut().append_pair("udp", "false");
@@ -509,6 +508,11 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 if line.kind == Kind::Vless && line.access.protocol == Protocol::Vless {
                     if let Some(reality) = &line.access.reality {
                         if inbound["streamSettings"]["security"] == "reality" {
+                            let (private_key, _, short_id) = line.access.reality_credentials(node);
+                            inbound["streamSettings"]["realitySettings"]["privateKey"] =
+                                json!(private_key);
+                            inbound["streamSettings"]["realitySettings"]["shortIds"] =
+                                json!([short_id]);
                             inbound["streamSettings"]["realitySettings"]["target"] =
                                 json!(reality.target);
                             inbound["streamSettings"]["realitySettings"]["serverNames"] =
@@ -839,6 +843,7 @@ mod tests {
         d.lines[0].access.reality = Some(RealityTarget {
             target: "cover.example.com:8443".into(),
             server_name: "cover.example.com".into(),
+            credentials: None,
             limit_fallback_upload: None,
             limit_fallback_download: None,
         });

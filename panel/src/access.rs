@@ -324,6 +324,24 @@ pub fn validate_line(line: &Line) -> Result<()> {
         if let Some(r) = &a.reality {
             crate::compiler::target(&r.target)?;
             ensure!(host_valid(&r.server_name), "REALITY SNI 无效");
+            if let Some(keys) = &r.credentials {
+                let private: [u8; 32] = URL_SAFE_NO_PAD
+                    .decode(&keys.private_key)?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("REALITY 私钥长度无效"))?;
+                let public =
+                    x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private));
+                ensure!(
+                    URL_SAFE_NO_PAD.encode(public.as_bytes()) == keys.public_key,
+                    "REALITY 公私钥不匹配"
+                );
+                ensure!(
+                    keys.short_id.len() <= 16
+                        && keys.short_id.len() % 2 == 0
+                        && keys.short_id.bytes().all(|c| c.is_ascii_hexdigit()),
+                    "REALITY short ID 无效"
+                );
+            }
         }
         if a.shared_port {
             ensure!(
@@ -586,8 +604,8 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
                 v["servername"] = json!(a.tls.domain);
             } else {
                 v["servername"] = json!(a.server_name(node));
-                v["reality-opts"] =
-                    json!({"public-key":node.reality.public_key,"short-id":node.reality.short_id});
+                let (_, public_key, short_id) = a.reality_credentials(node);
+                v["reality-opts"] = json!({"public-key":public_key,"short-id":short_id});
             }
         }
         Protocol::Http | Protocol::Socks => {

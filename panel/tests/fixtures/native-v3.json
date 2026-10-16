@@ -1,0 +1,345 @@
+[
+  {
+    "id": "openrc:xray-chain-native-direct:/etc/xray-chain/native-direct/config.json",
+    "name": "native-direct",
+    "config": {
+      "log": {
+        "loglevel": "info"
+      },
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+          {
+            "type": "field",
+            "inboundTag": [
+              "vless-reality-in"
+            ],
+            "outboundTag": "direct"
+          }
+        ]
+      },
+      "inbounds": [
+        {
+          "tag": "vless-reality-in",
+          "listen": "0.0.0.0",
+          "port": 443,
+          "protocol": "vless",
+          "settings": {
+            "clients": [
+              {
+                "id": "d5f6099d-aaaf-562c-8e3c-ae8cf4fdd0f8",
+                "flow": "xtls-rprx-vision"
+              }
+            ],
+            "decryption": "none"
+          },
+          "streamSettings": {
+            "method": "raw",
+            "security": "reality",
+            "realitySettings": {
+              "show": false,
+              "target": "127.0.0.1:18443",
+              "xver": 0,
+              "serverNames": [
+                "legacy-1.example.com"
+              ],
+              "privateKey": "K_ZQ_IFvVIlLqxAlxoQE9RuZ-6wO7rjWNssjNrnhcO0",
+              "shortIds": [
+                "07645b96c0b3ae7f"
+              ],
+              "limitFallbackUpload": {
+                "afterBytes": 0,
+                "bytesPerSec": 1048576,
+                "burstBytesPerSec": 2097152
+              },
+              "limitFallbackDownload": {
+                "afterBytes": 0,
+                "bytesPerSec": 4194304,
+                "burstBytesPerSec": 8388608
+              }
+            }
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "tag": "direct",
+          "protocol": "freedom"
+        }
+      ]
+    }
+  },
+  {
+    "id": "openrc:xray-chain-native-relay-1:/etc/xray-chain/native-relay-1/config.json",
+    "name": "native-relay-1",
+    "config": {
+      "log": {
+        "loglevel": "info"
+      },
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+          {
+            "type": "field",
+            "inboundTag": [
+              "vless-reality-in"
+            ],
+            "outboundTag": "upstream-vless"
+          }
+        ]
+      },
+      "inbounds": [
+        {
+          "tag": "vless-reality-in",
+          "listen": "0.0.0.0",
+          "port": 8443,
+          "protocol": "vless",
+          "settings": {
+            "clients": [
+              {
+                "id": "a4798ace-6ac8-5809-93b1-6c6e7d30601b",
+                "flow": "xtls-rprx-vision"
+              }
+            ],
+            "decryption": "none"
+          },
+          "streamSettings": {
+            "method": "raw",
+            "security": "reality",
+            "realitySettings": {
+              "show": false,
+              "target": "127.0.0.1:18444",
+              "xver": 0,
+              "serverNames": [
+                "legacy-2.example.com"
+              ],
+              "privateKey": "dMx72MolIF2C3IECwrbU3sAu8fEv8OflkWZOBwtDaHs",
+              "shortIds": [
+                "104f90d3ac821b4f"
+              ],
+              "limitFallbackUpload": {
+                "afterBytes": 0,
+                "bytesPerSec": 1048576,
+                "burstBytesPerSec": 2097152
+              },
+              "limitFallbackDownload": {
+                "afterBytes": 0,
+                "bytesPerSec": 4194304,
+                "burstBytesPerSec": 8388608
+              }
+            }
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "tag": "upstream-vless",
+          "protocol": "vless",
+          "settings": {
+            "address": "legacy-3.example.com",
+            "port": 23677,
+            "id": "45dcef1b-caa8-521e-bab8-c7e046b09048",
+            "encryption": "none",
+            "flow": "xtls-rprx-vision"
+          },
+          "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+              "serverName": "legacy-4.example.com",
+              "fingerprint": "firefox",
+              "publicKey": "rpndrJD4NIlCwdNkDrd6PAn5zEDFgU4d-ZUBNrN6gZc",
+              "shortId": "fff499eb84"
+            }
+          }
+        },
+        {
+          "tag": "direct",
+          "protocol": "freedom"
+        }
+      ]
+    }
+  },
+  {
+    "id": "openrc:xray-chain-native-relay-2:/etc/xray-chain/native-relay-2/config.json",
+    "name": "native-relay-2",
+    "config": {
+      "log": {
+        "loglevel": "info"
+      },
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+          {
+            "type": "field",
+            "inboundTag": [
+              "vless-reality-in"
+            ],
+            "outboundTag": "upstream-vless"
+          }
+        ]
+      },
+      "inbounds": [
+        {
+          "tag": "vless-reality-in",
+          "listen": "0.0.0.0",
+          "port": 8444,
+          "protocol": "vless",
+          "settings": {
+            "clients": [
+              {
+                "id": "e7f49c8e-4d1a-51ab-867f-400eceaf5897",
+                "flow": "xtls-rprx-vision"
+              }
+            ],
+            "decryption": "none"
+          },
+          "streamSettings": {
+            "method": "raw",
+            "security": "reality",
+            "realitySettings": {
+              "show": false,
+              "target": "127.0.0.1:18445",
+              "xver": 0,
+              "serverNames": [
+                "legacy-5.example.com"
+              ],
+              "privateKey": "CDaMVxBrECcQecSTmnk9FRT1JAo0bid8RVH9lFH2r_Q",
+              "shortIds": [
+                "684782bdd60aa1ad"
+              ],
+              "limitFallbackUpload": {
+                "afterBytes": 0,
+                "bytesPerSec": 1048576,
+                "burstBytesPerSec": 2097152
+              },
+              "limitFallbackDownload": {
+                "afterBytes": 0,
+                "bytesPerSec": 4194304,
+                "burstBytesPerSec": 8388608
+              }
+            }
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "tag": "upstream-vless",
+          "protocol": "vless",
+          "settings": {
+            "address": "legacy-6.example.com",
+            "port": 443,
+            "id": "6e8a256a-1d53-52ce-aa5e-d9cf640cc386",
+            "encryption": "none",
+            "flow": "xtls-rprx-vision"
+          },
+          "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+              "serverName": "legacy-6.example.com",
+              "fingerprint": "chrome",
+              "publicKey": "Bnxvq2RI6iziv8q3Bjz_6ZcJoBDLnVB2niNYwcoK5Do",
+              "shortId": "ded49a5e75200508"
+            }
+          }
+        },
+        {
+          "tag": "direct",
+          "protocol": "freedom"
+        }
+      ]
+    }
+  },
+  {
+    "id": "openrc:xray-chain-native-relay-3:/etc/xray-chain/native-relay-3/config.json",
+    "name": "native-relay-3",
+    "config": {
+      "log": {
+        "loglevel": "info"
+      },
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+          {
+            "type": "field",
+            "inboundTag": [
+              "vless-reality-in"
+            ],
+            "outboundTag": "upstream-vless"
+          }
+        ]
+      },
+      "inbounds": [
+        {
+          "tag": "vless-reality-in",
+          "listen": "0.0.0.0",
+          "port": 8445,
+          "protocol": "vless",
+          "settings": {
+            "clients": [
+              {
+                "id": "83148855-0314-535b-add7-9a860efdc9e8",
+                "flow": "xtls-rprx-vision"
+              }
+            ],
+            "decryption": "none"
+          },
+          "streamSettings": {
+            "method": "raw",
+            "security": "reality",
+            "realitySettings": {
+              "show": false,
+              "target": "127.0.0.1:18446",
+              "xver": 0,
+              "serverNames": [
+                "legacy-7.example.com"
+              ],
+              "privateKey": "FzEYGh2-3ZzqrYcsOjcHLSJ62K-byNeGVwUk9gR1wis",
+              "shortIds": [
+                "03c643fe9bd6524d"
+              ],
+              "limitFallbackUpload": {
+                "afterBytes": 0,
+                "bytesPerSec": 1048576,
+                "burstBytesPerSec": 2097152
+              },
+              "limitFallbackDownload": {
+                "afterBytes": 0,
+                "bytesPerSec": 4194304,
+                "burstBytesPerSec": 8388608
+              }
+            }
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "tag": "upstream-vless",
+          "protocol": "vless",
+          "settings": {
+            "address": "legacy-8.example.com",
+            "port": 8443,
+            "id": "023cdd70-b25c-547d-b32b-10e9ccfee177",
+            "encryption": "none",
+            "flow": "xtls-rprx-vision"
+          },
+          "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+              "serverName": "legacy-8.example.com",
+              "fingerprint": "chrome",
+              "publicKey": "lsUvbtNFIvRKqiHJ2Igxlv-r9t96aC7z0HCNiF3X204",
+              "shortId": "190cf907c54bd4eb"
+            }
+          }
+        },
+        {
+          "tag": "direct",
+          "protocol": "freedom"
+        }
+      ]
+    }
+  }
+]
