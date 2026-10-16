@@ -157,8 +157,10 @@ class Network(unittest.TestCase):
             site.site.write_text(network.SITE_OWNER + '\n# previous config\n')
             original = site.site.read_bytes()
             with patch.object(site, 'prepare'), patch.object(site, 'reload'), \
+                    patch.object(site, 'service_state', return_value=(False, False)), \
                     patch.object(site, 'renewal_paths', return_value=tuple(root / name for name in ('hook', 'service', 'timer'))), \
                     patch.object(site, 'challenge_check'), \
+                    patch.object(network.subprocess, 'run', side_effect=AssertionError('must not query host services')), \
                     patch.object(network, 'run', side_effect=subprocess.CalledProcessError(1, ['certbot'])):
                 with self.assertRaises(subprocess.CalledProcessError):
                     with site.activate():
