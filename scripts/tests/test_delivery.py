@@ -27,6 +27,150 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def uninstall_fixture(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args(listen='127.0.0.1:22305'))
+        self.manager.install(source, manifest, self.args(component='agent', panel_url='http://127.0.0.1:22305',
+                            node_id='a94a6794-c60a-4c51-a094-b9164ddaaabc', node_token='s' * 64, allow_http=True))
+        for role in installer.ROLES:
+            data = self.manager.role_paths(role)[1]
+            (data / '.chain-owner').write_text('chain-' + role)
+            (data / 'fixture.db').write_bytes(b'private-data-' + role.encode())
+        config = self.manager.role_paths('panel')[0] / 'panel.env'
+        env = installer.parse_env(config)
+        env['CHAIN_PUBLIC_URL'] = 'https://panel.example.com'
+        installer.write_env(config, env)
+        sites = self.manager.path('/etc/nginx/conf.d')
+        sites.mkdir(parents=True)
+        for name in ['chain-panel.conf', 'chain-proxy-acme.conf']:
+            (sites / name).write_text(installer.SITE_OWNER + '\nserver {}\n')
+        (sites / 'other.conf').write_text('keep other website')
+        cert = self.manager.path('/etc/letsencrypt/live/chain-panel-panel.example.com/fullchain.pem')
+        cert.parent.mkdir(parents=True)
+        cert.write_text('keep certificate')
+        self.manager.backup_files('panel')
+        args = installer.make_parser().parse_args(['uninstall', '--root', str(self.manager.root), '--non-interactive'])
+        return source, manifest, args
+
+    def test_uninstall_retains_data_and_reinstall_restores_both_identities(self):
+        source, manifest, args = self.uninstall_fixture()
+        retained = {p: p.read_bytes() for role in installer.ROLES
+                    for directory in self.manager.role_paths(role)[:2] for p in directory.rglob('*') if p.is_file()}
+        self.manager.operate(args)
+        state = self.manager.state()
+        self.assertFalse(state['roles'])
+        self.assertEqual(state['retained_roles']['panel']['domain'], 'panel.example.com')
+        for p, body in retained.items():
+            self.assertEqual(p.read_bytes(), body)
+        for role in installer.ROLES:
+            self.assertFalse(self.manager.role_paths(role)[2].exists())
+        for name in ['manager', 'releases', 'current-panel', 'current-agent']:
+            self.assertFalse((self.manager.base / name).exists())
+        self.assertFalse(self.manager.path('/usr/local/bin/chainctl').exists())
+        self.assertTrue(self.manager.path('/etc/nginx/conf.d/other.conf').exists())
+        self.assertFalse(self.manager.path('/etc/nginx/conf.d/chain-panel.conf').exists())
+        self.manager.install(source, manifest, self.args())
+        with patch.object(installer.urllib.request, 'build_opener', side_effect=AssertionError('must reuse saved Agent identity')):
+            installer.provision_local_agent(self.manager, source, manifest, self.args())
+        self.assertEqual(set(self.manager.state()['roles']), {'panel', 'agent'})
+        self.assertFalse(self.manager.state()['retained_roles'])
+        for p, body in retained.items():
+            self.assertEqual(p.read_bytes(), body)
+
+    def test_purge_can_remove_retained_installation_without_deleting_certificate_or_other_sites(self):
+        _, _, args = self.uninstall_fixture()
+        self.manager.operate(args)
+        args.purge = True
+        self.manager.operate(args)
+        for role in installer.ROLES:
+            for p in self.manager.role_paths(role):
+                self.assertFalse(p.exists())
+        for path in ['/opt/chain', '/var/lib/chain-acme', '/var/backups/chain-panel', '/usr/local/bin/chainctl']:
+            self.assertFalse(self.manager.path(path).exists())
+        self.assertEqual(self.manager.path('/etc/nginx/conf.d/other.conf').read_text(), 'keep other website')
+        self.assertEqual(self.manager.path('/etc/letsencrypt/live/chain-panel-panel.example.com/fullchain.pem').read_text(),
+                         'keep certificate')
+
+    def test_uninstall_rejects_foreign_service_and_live_process_before_deleting_data(self):
+        _, _, args = self.uninstall_fixture()
+        unit = self.manager.role_paths('panel')[2]
+        original = unit.read_bytes()
+        unit.write_text('foreign service')
+        with patch.object(self.manager.system, 'call') as call:
+            with self.assertRaisesRegex(ValueError, '不归本安装器'):
+                self.manager.operate(args)
+            call.assert_not_called()
+        unit.write_bytes(original)
+        with patch.object(self.manager.system, 'active', return_value=True):
+            with self.assertRaisesRegex(ValueError, '尚未停止'):
+                self.manager.operate(args)
+        self.assertEqual(set(self.manager.state()['roles']), {'panel', 'agent'})
+        self.assertTrue(self.manager.path('/usr/local/bin/chainctl').exists())
+        self.assertTrue((self.manager.role_paths('panel')[1] / 'fixture.db').exists())
+
+    def test_uninstall_menu_requires_confirmation_and_exits_after_removing_manager(self):
+        self.uninstall_fixture()
+        with patch.object(installer, 'choose', side_effect=['16', '1']), patch('builtins.input', return_value='UNINSTALL'):
+            installer.menu(self.manager.root)
+        self.assertFalse(self.manager.path('/usr/local/bin/chainctl').exists())
+        args = installer.make_parser().parse_args(['uninstall', '--root', str(self.manager.root), '--purge'])
+        with patch('builtins.input', return_value='UNINSTALL'):
+            with self.assertRaisesRegex(ValueError, '取消'):
+                self.manager.operate(args)
+        self.assertTrue(self.manager.role_paths('panel')[1].exists())
+
+    def test_uninstall_restores_nginx_files_when_validation_fails(self):
+        _, _, args = self.uninstall_fixture()
+        self.manager.live = True
+        site = self.manager.path('/etc/nginx/conf.d/chain-panel.conf')
+        before = site.read_bytes()
+        with patch.object(installer, 'nginx_conf', return_value=self.manager.path('/etc/nginx/nginx.conf')), \
+                patch.object(installer.shutil, 'which', return_value='/usr/sbin/nginx'), \
+                patch.object(installer, 'run', side_effect=subprocess.CalledProcessError(1, ['nginx', '-t'])):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.manager.operate(args)
+        self.assertEqual(site.read_bytes(), before)
+        self.assertEqual(set(self.manager.state()['roles']), {'panel', 'agent'})
+        self.assertTrue(self.manager.path('/usr/local/bin/chainctl').exists())
+
+    def test_reinstall_restores_saved_https_before_installing_panel(self):
+        source, _, args = self.uninstall_fixture()
+        archive = self.archive(source)
+        self.manager.operate(args)
+        args = installer.make_parser().parse_args(['install', '--package', str(archive), '--panel-only'])
+        self.manager.live = True
+        def questions(manager, values):
+            self.assertEqual(values.domain, 'panel.example.com')
+            values.listen = '127.0.0.1:22305'
+        with patch.object(installer, 'panel_questions', side_effect=questions), \
+                patch.object(installer, 'HttpsSite') as https, \
+                patch.object(self.manager, 'install') as install, patch.object(self.manager, 'show_access'):
+            https.return_value.activate.return_value = contextlib.nullcontext()
+            installer.install_package(self.manager, args)
+        https.assert_called_once_with('panel.example.com', 22305, False)
+        install.assert_called_once()
+
+    def test_uninstall_restores_other_sites_before_removing_unified_ingress(self):
+        from chain_ingress import Ingress
+        self.uninstall_fixture()
+        ingress = Ingress(self.manager.root)
+        site = self.manager.path('/etc/nginx/conf.d/other.conf')
+        before, after = 'server { listen 443 ssl; }', 'server { listen 127.0.0.1:14443 ssl proxy_protocol; }'
+        site.write_text(after)
+        ingress.config.mkdir(parents=True)
+        for name in ['stream.conf', 'routes.conf']:
+            (ingress.config / name).write_text('fixture')
+        common.json_write(ingress.state_path, {'files': {str(site): {'before': before, 'after': after, 'mode': 0o644}}})
+        self.manager.live = True
+        args = installer.make_parser().parse_args(['uninstall', '--non-interactive'])
+        with patch.object(installer, 'nginx_conf', return_value=self.manager.path('/etc/nginx/nginx.conf')), \
+                patch.object(Ingress, 'command', return_value=''), patch.object(installer, 'run'), \
+                patch.object(installer, 'service_state', return_value=(False, False)):
+            self.manager.operate(args)
+        self.assertEqual(site.read_text(), before)
+        self.assertFalse(ingress.config.exists())
+        self.assertFalse(ingress.directory.exists())
+
     def test_backup_preserves_certbot_links_but_rejects_escape(self):
         source, manifest = self.package()
         self.manager.install(source, manifest, self.args())

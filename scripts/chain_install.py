@@ -31,8 +31,8 @@ import uuid
 from chain_common import (architecture, operating_system, compatible_release, atomic_write, json_write, output, require, restore_modes,
                           run, safe_extract, sha256, verify_archive_checksum, verify_tree, download_release)
 from chain_platform import (service_kind, service_path, service, service_state, service_definition,
-                            create_account, init_path)
-from chain_network import (HttpsSite, available_port, domain_name, public_ipv4, server_addresses, validate_dns)
+                            create_account, remove_account, nginx_conf, init_path)
+from chain_network import (HttpsSite, SITE_OWNER, available_port, domain_name, public_ipv4, server_addresses, validate_dns)
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER = 'chain-panel-installer-v1'
@@ -316,6 +316,7 @@ class Manager:
         role = args.component
         state = self.state()
         old = state['roles'].get(role)
+        retained = state.get('retained_roles', {}).get(role)
         require(args.action != 'update' or old, f'尚未安装 {role}；首次请用 install。')
         compatible_release(manifest)
         etc, data, unit = self.role_paths(role)
@@ -325,7 +326,9 @@ class Manager:
         if old is None:
             require(not unit.exists(), f'{unit} 已存在，拒绝覆盖其他安装方式创建的服务。')
             for directory in (etc, data):
-                require(not directory.exists() or not any(directory.iterdir()), f'{directory} 非空，拒绝接管。')
+                require(not directory.is_symlink(), f'{directory} 不能是符号链接。')
+                require(retained is not None or not directory.exists() or not any(directory.iterdir()),
+                        f'{directory} 非空，拒绝接管。')
         else:
             require(unit.is_file() and OWNER in unit.read_text(), '服务文件归属不匹配。')
         env, token = self.config(role, args)
@@ -363,8 +366,9 @@ class Manager:
             previous = {p: p.read_bytes() if p.exists() else None for p in configs}
             was_active, was_enabled = self.system.active(role), self.system.autostart(role)
             try:
-                if old:
-                    self.system.call('stop', 'chain-' + role + '.service')
+                if old or retained is not None:
+                    if old:
+                        self.system.call('stop', 'chain-' + role + '.service')
                     self.backup_files(role)
                 if check_after_stop:
                     self.check_panel_port(env)
@@ -389,6 +393,7 @@ class Manager:
                 if role == 'panel':
                     state['roles'][role]['panel_only'] = (getattr(args, 'panel_only', False) if args.action == 'install'
                                                           else (old or {}).get('panel_only', False))
+                state.get('retained_roles', {}).pop(role, None)
                 json_write(self.state_file, state)
                 manager = self.base / 'manager'
                 manager.mkdir(exist_ok=True)
@@ -412,6 +417,8 @@ class Manager:
                 else:
                     (self.base / ('current-' + role)).unlink(missing_ok=True)
                     state['roles'].pop(role, None)
+                if retained is not None:
+                    state.setdefault('retained_roles', {})[role] = retained
                 json_write(self.state_file, state)
                 self.system.call('daemon-reload', check=False)
                 if not was_enabled:
@@ -476,7 +483,109 @@ class Manager:
                 raise
         print('程序版本已回滚，业务数据与配置保留；没有将数据库恢复到旧备份。')
 
+    def uninstall(self, args):
+        state = self.state()
+        roles = {**state.get('retained_roles', {}), **state['roles']}
+        require(roles, '没有本安装器管理的组件可卸载。')
+        require(set(roles) <= set(ROLES), '安装状态中的组件无效。')
+        purge = args.purge
+        print('将卸载本机全部 Chain Panel / Agent、服务和 chainctl；' +
+              ('删除配置、数据库、备份和服务账户。' if purge else '保留配置、数据库、备份和服务账户，供重装恢复。'))
+        print('保留系统 Nginx、其他网站和 /etc/letsencrypt 中的面板证书。')
+        if not args.non_interactive:
+            word = 'PURGE' if purge else 'UNINSTALL'
+            require(input(f'输入 {word} 确认: ').strip() == word, '已取消卸载。')
+        from chain_ingress import Ingress, OWNER as INGRESS_OWNER
+        ingress = Ingress(self.root)
+        wrapper = self.path('/usr/local/bin/chainctl')
+        hook, renew_service, renew_timer = [self.path(str(p)) for p in HttpsSite('uninstall.invalid', 0).renewal_paths()]
+        units = [(self.role_paths(role)[2], 'chain-' + role + '.service', OWNER) for role in roles]
+        if service_kind() == 'systemd':
+            units += [(renew_service, 'chain-panel-cert-renew.service', SITE_OWNER),
+                      (renew_timer, 'chain-panel-cert-renew.timer', SITE_OWNER)]
+        else:
+            units.append((renew_timer, 'chain-panel-cert-renew', SITE_OWNER))
+        units += [(p, p.name if service_kind() == 'systemd' else 'chain-ingress', INGRESS_OWNER)
+                  for p in ingress.unit_paths()]
+        config_root = nginx_conf().parent if self.live else self.path('/etc/nginx')
+        sites = [p for name in ('chain-panel.conf', 'chain-proxy-acme.conf') for p in config_root.rglob(name)]
+        files = [(wrapper, OWNER), (hook, SITE_OWNER), (renew_service, SITE_OWNER),
+                 *[(p, owner) for p, _, owner in units], *[(p, SITE_OWNER) for p in sites]]
+        directories = [self.base, ingress.directory, ingress.config, self.path('/var/lib/chain-acme')]
+        directories += [p for role in roles for p in self.role_paths(role)[:2]]
+        backups = self.path('/var/backups/chain-panel')
+        directories.append(backups)
+        for p in directories:
+            require(not p.is_symlink() and not os.path.ismount(p), f'拒绝删除链接或挂载目录：{p}')
+        for p, owner in files:
+            require(not p.is_symlink() and (not p.exists() or p.is_file() and owner in p.read_text()),
+                    f'{p} 不归本安装器管理，拒绝删除。')
+        logs = [self.path('/var/log/chain-' + role + '.log') for role in roles]
+        for p in logs:
+            require(not p.is_symlink(), f'日志路径为链接，拒绝删除：{p}')
+        if purge and backups.exists():
+            require(all(p.is_file() and not p.is_symlink() and
+                        re.fullmatch(r'(panel|agent)-\d{8}T\d{6}Z-[a-f0-9]{8}\.tar\.gz', p.name)
+                        for p in backups.iterdir()), '备份目录包含其他文件，拒绝清除。')
+        if 'panel' in roles:
+            env = parse_env(self.role_paths('panel')[0] / 'panel.env')
+            url = urllib.parse.urlsplit(env.get('CHAIN_PUBLIC_URL', ''))
+            if url.scheme == 'https' and url.hostname:
+                domain = domain_name(url.hostname)
+                if any(p.name == 'chain-panel.conf' for p in sites) or self.path(
+                        '/etc/letsencrypt/live/chain-panel-' + domain + '/fullchain.pem').is_file():
+                    roles['panel'] = {**roles['panel'], 'domain': domain}
+        with self.lock():
+            require(self.state() == state, '安装状态已变化，请重试。')
+            for p, name, _ in units:
+                if p.exists():
+                    self.system.call('stop', name)
+                    self.system.call('disable', name)
+            for role in roles:
+                require(not self.system.active(role), f'chain-{role} 尚未停止，未删除数据。')
+            if ingress.state_path.exists():
+                require(self.live, '离线安装树含统一入口状态，请在原系统关闭统一入口后卸载。')
+                ingress.operate('disable')
+            previous = {p: (p.read_bytes(), p.stat().st_mode & 0o777) for p in sites}
+            try:
+                for p in sites:
+                    p.unlink()
+                if sites and self.live and shutil.which('nginx'):
+                    run(['nginx', '-t'])
+                    if service_state('nginx')[0]:
+                        service('reload', 'nginx')
+            except BaseException:
+                for p, (body, mode) in previous.items():
+                    atomic_write(p, body, mode)
+                raise
+            json_write(self.state_file, {'owner': OWNER, 'roles': {}, 'retained_roles': roles})
+            for p, _ in files:
+                p.unlink(missing_ok=True)
+            self.system.call('daemon-reload')
+            if purge and self.live:
+                for role in roles:
+                    remove_account('chain-' + role)
+            remove = [ingress.directory, ingress.config, self.path('/var/lib/chain-acme')]
+            if purge:
+                remove += [p for role in roles for p in self.role_paths(role)[:2]] + [backups]
+            for p in remove:
+                if p.exists():
+                    shutil.rmtree(p)
+            for p in logs:
+                p.unlink(missing_ok=True)
+            for p in self.base.iterdir():
+                if p.name not in ('.chain-install.json', '.install.lock'):
+                    if p.is_dir() and not p.is_symlink():
+                        shutil.rmtree(p)
+                    else:
+                        p.unlink()
+        if purge:
+            shutil.rmtree(self.base)
+        print('已卸载；' + ('应用数据已清除。' if purge else '数据已保留，重新运行安装脚本可恢复使用。') + '面板证书保留。')
+
     def operate(self, args):
+        if args.action == 'uninstall':
+            return self.uninstall(args)
         role, action = args.component, args.action
         state = self.require_role(role)
         if action == 'status':
@@ -538,7 +647,8 @@ def local_packages():
 
 
 def provision_local_agent(manager, source, manifest, args):
-    if 'agent' in manager.state()['roles']:
+    state = manager.state()
+    if 'agent' in state['roles'] or 'agent' in state.get('retained_roles', {}):
         agent_env = parse_env(manager.role_paths('agent')[0] / 'agent.env')
         panel_env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
         if 'CHAIN_LISTEN' not in panel_env:
@@ -549,7 +659,8 @@ def provision_local_agent(manager, source, manifest, args):
         same_host = agent_url.hostname == local_host or (
             agent_url.hostname == 'localhost' and ipaddress.ip_address(local_host).is_loopback)
         if agent_url.scheme == 'http' and same_host and agent_url.port == panel_port:
-            agent = make_parser().parse_args(['update', '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
+            action = 'update' if 'agent' in state['roles'] else 'install'
+            agent = make_parser().parse_args([action, '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
             agent.allow_http = True  # The existing endpoint was verified as this local panel.
             manager.install(source, manifest, agent)
             mark_local_node(manager, agent_env['CHAIN_NODE_ID'])
@@ -621,6 +732,11 @@ def install_package(manager, args):
     def install_source(source, manifest):
         # Validate the downloaded package before asking for deployment details.
         compatible_release(manifest)
+        if args.action == 'install' and args.component == 'panel':
+            retained = manager.state().get('retained_roles', {}).get('panel', {})
+            if args.domain is None:
+                args.domain = retained.get('domain')
+            args.panel_only = args.panel_only or retained.get('panel_only', False)
         if args.action == 'install' and args.component == 'panel' and (
                 getattr(args, 'guided', False) or getattr(args, 'domain', None) is not None):
             panel_questions(manager, args)
@@ -729,7 +845,8 @@ def panel_questions(manager, args):
 def agent_questions(manager, args):
     if args.panel_url and args.node_id and args.token_file:
         return
-    installed = 'agent' in manager.state()['roles']
+    state = manager.state()
+    installed = 'agent' in state['roles'] or 'agent' in state.get('retained_roles', {})
     print('在 Web「服务器」中添加节点或重置接入码，然后复制完整接入码。')
     while True:
         value = getpass.getpass('粘贴接入码（不回显）' + ('，直接回车保留当前身份' if installed else '') + ': ').strip()
@@ -782,13 +899,22 @@ def menu(root):
             '1': '安装 / 配置控制台与本机节点', '2': '接入 / 重新接入节点', '3': '更新到最新版本',
             '4': '查看状态', '5': '查看日志', '6': '重启服务', '7': '备份数据',
             '8': '回滚上一版本', '9': '查看登录信息', '10': '启动服务', '11': '停止服务',
-            '12': '查看命令帮助', '13': '重置登录安全（TOTP / Passkey）', '14': '启用统一 443（保留已有网站）', '15': '关闭统一 443', '0': '退出'}, '4' if installed else '1')
+            '12': '查看命令帮助', '13': '重置登录安全（TOTP / Passkey）', '14': '启用统一 443（保留已有网站）', '15': '关闭统一 443',
+            '16': '卸载本机全部组件', '0': '退出'}, '4' if installed else '1')
         if choice == '0':
             return
         try:
             if choice == '12':
                 make_parser().print_help()
                 continue
+            if choice == '16':
+                mode = choose('卸载方式（两种均保留面板 HTTPS 证书）',
+                              {'1': '卸载程序，保留配置、数据和备份', '2': '清除程序、配置、数据和备份', '0': '取消'})
+                if mode == '0':
+                    continue
+                args = make_parser().parse_args(['uninstall', '--root', str(root)] + (['--purge'] if mode == '2' else []))
+                manager.uninstall(args)
+                return
             if choice in ('14', '15'):
                 from chain_ingress import Ingress
                 require(manager.live, '统一 443 仅用于实际系统安装。')
@@ -822,13 +948,16 @@ def make_parser():
   backup / rollback         私有备份 / 回滚程序版本
   access / token            查看登录信息 / 仅输出管理令牌
   reset-auth                本机恢复登录，清除 TOTP / Passkey（保留管理员密钥）
+  uninstall                 卸载本机全部组件和 chainctl，保留数据与面板证书
+  uninstall --purge         同时清除应用配置、数据库和备份；面板证书仍保留
   ingress-enable / ingress-disable   启用 / 关闭统一 443，保留已有 HTTPS 网站
   --component agent         操作节点 Agent，默认操作控制台
   --package 文件.tar.gz      使用本地发行包，旁边需有 SHA256SUMS
   --non-interactive         自动化调用，不打开安装向导
 
 安装脚本同样支持 help 和以上子命令。""")
-    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token', 'reset-auth', 'ingress-enable', 'ingress-disable'])
+    parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token', 'reset-auth', 'ingress-enable', 'ingress-disable', 'uninstall'])
+    parser.add_argument('--purge', action='store_true', help='卸载时同时删除应用配置、数据、备份和服务账户；保留面板证书')
     parser.add_argument('--component', choices=ROLES, default='panel', help='默认 panel；节点机器选择 agent')
     parser.add_argument('--package', type=Path, help='本地发行包，同目录需有 SHA256SUMS')
     parser.add_argument('--latest', action='store_true', help='下载最新正式版本')

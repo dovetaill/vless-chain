@@ -149,6 +149,30 @@ def create_account(name, home):
         run(['adduser', '-S', '-D', '-H', '-h', home, '-s', '/sbin/nologin', '-G', name, name])
 
 
+def remove_account(name):
+    try:
+        user = pwd.getpwnam(name)
+    except KeyError:
+        return
+    require(name in ('chain-panel', 'chain-agent') and user.pw_uid != 0
+            and user.pw_dir == '/var/lib/' + name and user.pw_shell.endswith(('nologin', 'false')),
+            f'用户 {name} 的归属不匹配，拒绝删除。')
+    group = grp.getgrgid(user.pw_gid)
+    require(group.gr_name == name and not group.gr_mem
+            and not any(p.pw_gid == user.pw_gid and p.pw_name != name for p in pwd.getpwall()),
+            f'组 {name} 被其他账户使用，拒绝删除。')
+    if operating_system() == 'darwin':
+        run(['dscl', '.', '-delete', '/Users/' + name])
+        run(['dscl', '.', '-delete', '/Groups/' + name])
+    else:
+        run(['userdel' if shutil.which('userdel') else 'deluser', name])
+        try:
+            grp.getgrnam(name)
+        except KeyError:
+            return
+        run(['groupdel' if shutil.which('groupdel') else 'delgroup', name])
+
+
 def brew_command(*args):
     brew = shutil.which('brew')
     require(brew, 'macOS 请先通过 https://brew.sh 安装 Homebrew。')

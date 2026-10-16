@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,6 +19,30 @@ import chain_release as release
 
 
 class Platforms(unittest.TestCase):
+    def test_remove_service_accounts_checks_ownership_and_platform_commands(self):
+        user = SimpleNamespace(pw_name='chain-agent', pw_uid=987, pw_gid=987,
+                               pw_dir='/var/lib/chain-agent', pw_shell='/usr/sbin/nologin')
+        group = SimpleNamespace(gr_name='chain-agent', gr_mem=[])
+        for os_name, binary, expected in [
+                ('linux', True, [['userdel', 'chain-agent'], ['groupdel', 'chain-agent']]),
+                ('linux', False, [['deluser', 'chain-agent'], ['delgroup', 'chain-agent']]),
+                ('darwin', True, [['dscl', '.', '-delete', '/Users/chain-agent'], ['dscl', '.', '-delete', '/Groups/chain-agent']])]:
+            with self.subTest(os=os_name, binary=binary), \
+                    patch.object(platform.pwd, 'getpwnam', return_value=user), \
+                    patch.object(platform.pwd, 'getpwall', return_value=[user]), \
+                    patch.object(platform.grp, 'getgrgid', return_value=group), \
+                    patch.object(platform.grp, 'getgrnam', return_value=group), \
+                    patch.object(platform, 'operating_system', return_value=os_name), \
+                    patch.object(platform.shutil, 'which', return_value='/bin/tool' if binary else None), \
+                    patch.object(platform, 'run') as run:
+                platform.remove_account('chain-agent')
+                self.assertEqual([c.args[0] for c in run.call_args_list], expected)
+                run.reset_mock()
+                with patch.object(user, 'pw_uid', 0):
+                    with self.assertRaisesRegex(ValueError, '归属不匹配'):
+                        platform.remove_account('chain-agent')
+                run.assert_not_called()
+
     def test_os_architecture_and_pinned_assets(self):
         for os_name, system in [('Linux', 'linux'), ('Darwin', 'darwin')]:
             for machine, arch in [('x86_64', 'x86_64'), ('arm64', 'aarch64'), ('aarch64', 'aarch64')]:
@@ -113,7 +138,7 @@ class Platforms(unittest.TestCase):
         dump = '# configuration file /opt/homebrew/etc/nginx/nginx.conf:\nhttp { include servers/*; }\n'
         self.assertEqual(network.nginx_site_directory(dump), Path('/opt/homebrew/etc/nginx/servers'))
 
-    def test_non_systemd_install_upgrade_and_rollback(self):
+    def test_non_systemd_install_upgrade_rollback_and_uninstall(self):
         from test_delivery import Delivery
         for kind, system in [('openrc', 'Linux'), ('launchd', 'Darwin')]:
             fixture = Delivery()
@@ -122,6 +147,8 @@ class Platforms(unittest.TestCase):
                 with patch.object(common.platform, 'system', return_value=system), \
                         patch.object(common.platform, 'mac_ver', return_value=('14.0', (), '')), \
                         patch.object(platform, 'service_kind', return_value=kind), \
+                        patch.object(network, 'service_kind', return_value=kind), \
+                        patch('chain_ingress.service_kind', return_value=kind), \
                         patch.object(installer, 'service_kind', return_value=kind), \
                         patch.object(installer, 'service_path', side_effect=lambda name: platform.service_path(name, kind)):
                     manager = fixture.manager
@@ -144,6 +171,14 @@ class Platforms(unittest.TestCase):
                     manager.rollback('panel')
                     self.assertEqual(manager.state()['roles']['panel']['current'], previous)
                     self.assertEqual((data / 'keep').read_text(), 'business data')
+                    args = installer.make_parser().parse_args(['uninstall', '--non-interactive'])
+                    manager.operate(args)
+                    self.assertFalse(unit.exists())
+                    self.assertEqual((data / 'keep').read_text(), 'business data')
+                    args.purge = True
+                    manager.operate(args)
+                    self.assertFalse(data.exists())
+                    self.assertFalse(manager.base.exists())
             finally:
                 fixture.tearDown()
                 fixture.doCleanups()
