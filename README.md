@@ -15,7 +15,7 @@
 
 ## 安装
 
-支持 Linux（systemd / OpenRC）和 macOS 14+，CPU 为 x86_64 或 ARM64：
+正式发行包支持 Linux（systemd / OpenRC）的 x86_64 / ARM64，以及 macOS 14+ 的 Apple Silicon（ARM64）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo sh

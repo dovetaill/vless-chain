@@ -574,11 +574,11 @@ class Delivery(unittest.TestCase):
             self.assertEqual(git('rev-parse', 'HEAD'), commit)
             self.assertIn(commit + '\trefs/tags/v98.2.0^{}', git('ls-remote', '--tags', 'origin'))
 
-    def test_dual_arch_release_aggregation_rejects_dirty_builds(self):
+    def test_supported_release_aggregation_and_publish_reject_dirty_builds(self):
         source, manifest = self.package()
         incoming = self.root / 'incoming'
         commit = 'a' * 40
-        for system, arch in ((s, a) for s in ci.PLATFORMS for a in ci.ARCHES):
+        for system, arch in [('linux', 'x86_64'), ('linux', 'aarch64'), ('darwin', 'aarch64')]:
             manifest.update(os=system, arch=arch, target=f'{arch}-unknown-linux-musl' if system == 'linux' else f'{arch}-apple-darwin', commit=commit, dirty=False)
             common.json_write(source / 'release.json', manifest)
             archive = self.archive(source)
@@ -591,9 +591,13 @@ class Delivery(unittest.TestCase):
         outgoing = self.root / 'published'
         with patch.object(ci, 'version', return_value='0.1.0'):
             ci.assemble(incoming, outgoing, 'v0.1.0', commit)
-        self.assertEqual(len(list(outgoing.iterdir())), 9)
+        self.assertEqual(len(list(outgoing.iterdir())), 7)
         for archive in outgoing.glob('*.tar.gz'):
             common.verify_archive_checksum(archive)
+        with patch.object(ci, 'version', return_value='0.1.0'), \
+                patch.object(ci, 'output', side_effect=RuntimeError('release lookup')):
+            with self.assertRaisesRegex(RuntimeError, 'release lookup'):
+                ci.publish(outgoing, 'v0.1.0', 'owner/repo', commit)
         manifest['dirty'] = True
         common.json_write(source / 'release.json', manifest)
         archive = self.archive(source)

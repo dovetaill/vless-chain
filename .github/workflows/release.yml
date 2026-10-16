@@ -30,9 +30,6 @@ jobs:
           - runner: ubuntu-22.04-arm
             arch: aarch64
             system: linux
-          - runner: macos-15-intel
-            arch: x86_64
-            system: darwin
           - runner: macos-14
             arch: aarch64
             system: darwin

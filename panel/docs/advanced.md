@@ -126,7 +126,7 @@ sudo chainctl rollback --component panel
 
 升级保留监听地址、令牌、线路数据库及节点配置；修改参数时显式传入对应选项。升级和备份会短暂停止所选组件，以获得一致的私有备份；Agent 停止会使其转发连接重连。备份位于 `/var/backups/chain-panel/`，权限 600。启动检查失败会恢复升级前的程序链接与配置；运行数据和备份保留。`rollback` 回滚程序版本，不将数据库回退到旧备份。Agent 的进程启动检查通过后，还应在 Web 确认心跳。
 
-推荐通过 `.github/workflows/release.yml` 发布：提交版本改动后推送 `vX.Y.Z` 标签，Actions 分别在 Linux x86_64/ARM64、macOS Intel/Apple Silicon runner 构建，校验标签与四个版本清单一致。四个平台组合均成功后合并 `SHA256SUMS`，创建草稿、上传并重新下载校验全部附件，最后公开正式 Release。安装器不读取 Actions 中间产物。任一平台组合失败都不会公开半套包；中间 artifact 在工作流结束时删除，Cargo/npm 临时缓存由构建器清理。
+推荐通过 `.github/workflows/release.yml` 发布：提交版本改动后推送 `vX.Y.Z` 标签，Actions 分别在 Linux x86_64/ARM64、macOS Apple Silicon runner 构建，校验标签与 Cargo/npm 四份版本文件一致。三个平台组合均成功后合并 `SHA256SUMS`，创建草稿、上传并重新下载校验全部附件，最后公开正式 Release；不再构建或要求 macOS Intel 包。安装器不读取 Actions 中间产物。任一平台组合失败都不会公开半套包；中间 artifact 在工作流结束时删除，Cargo/npm 临时缓存由构建器清理。
 
 日常发布先自行完成业务代码的 Git 提交，再运行 `./scripts/version-release.sh`。菜单直接回车进入默认的 **9「发布已提交的代码」**；版本号再次回车默认递增补丁版本，例如 `0.2.1 → 0.2.2`，也可以输入指定版本，例如 `0.3.0`。查看版本文件、已有未推送提交和自动生成的中文提交正文，再输入 `y` 确认，无需重新填写业务更新说明。
 
