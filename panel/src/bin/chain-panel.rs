@@ -275,7 +275,7 @@ fn snapshot(doc: &Document) -> Value {
         .iter()
         .map(|s| json!({"id":s.id,"name":s.name,"line_ids":s.line_ids,"created":s.created}))
         .collect();
-    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact})
+    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"pending_imports":doc.pending_imports,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact})
 }
 async fn state(State(app): State<App>) -> Json<Value> {
     let mut value = snapshot(&app.store.lock().unwrap().doc);
@@ -575,6 +575,8 @@ struct HopInput {
 #[derive(Deserialize)]
 struct LineInput {
     #[serde(default)]
+    pending_import_id: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     name: String,
     kind: Kind,
@@ -629,6 +631,10 @@ async fn save_lines(
     Ok(Json(json!(lines)))
 }
 fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
+    if let Some(id) = &input.pending_import_id {
+        ensure!(d.pending_imports.iter().any(|p| &p.id == id), "待配置项目不存在");
+        d.pending_imports.retain(|p| &p.id != id);
+    }
     ensure!(
         input.kind != Kind::Forward,
         "仅支持创建代理，端口转发已移除"
@@ -708,6 +714,33 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
     d.checks.remove(&line_id);
     Ok(line)
 }
+async fn import_legacy(
+    State(app): State<App>,
+    Json(input): Json<chain_panel::legacy::Import>,
+) -> ApiResult<Json<Value>> {
+    if input.preview {
+        let mut doc = app.store.lock().unwrap().doc.clone();
+        if doc.busy() {
+            return Err(error(StatusCode::CONFLICT, "请等待发布完成"));
+        }
+        return Ok(Json(chain_panel::legacy::import(&mut doc, &input)?));
+    }
+    Ok(Json(edit(&app, |doc| {
+        chain_panel::legacy::import(doc, &input)
+    })?))
+}
+
+async fn remove_pending_import(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    edit(&app, |doc| {
+        doc.pending_imports.retain(|p| p.id != id);
+        Ok(())
+    })?;
+    Ok(Json(json!({"ok":true})))
+}
+
 async fn check_reality(
     State(app): State<App>,
     Json(input): Json<RealityTarget>,
@@ -1300,6 +1333,8 @@ async fn run() -> Result<()> {
             get(delivery_api::external_export),
         )
         .route("/api/lines", post(save_line))
+        .route("/api/legacy-import", post(import_legacy))
+        .route("/api/legacy-import/{id}", delete(remove_pending_import))
         .route("/api/lines/batch", post(save_lines))
         .route("/api/lines/operate", post(rental_api::operate))
         .route("/api/reality/check", post(check_reality))

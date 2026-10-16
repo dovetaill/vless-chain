@@ -237,7 +237,7 @@ class Delivery(unittest.TestCase):
         (root / 'scripts').mkdir()
         for name in ['chain-panel', 'chain-agent', 'xray']:
             (root / 'bin' / name).write_text('fixture-' + version)
-        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'install-server.sh']:
+        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'install-server.sh']:
             shutil.copy2(Path(__file__).resolve().parents[1] / name, root / 'scripts' / name)
         files = {str(p.relative_to(root)): {'sha256': common.sha256(p), 'mode': 0o755 if p.parent.name == 'bin' or p.suffix == '.sh' else 0o644}
                  for p in root.rglob('*') if p.is_file()}
@@ -367,6 +367,19 @@ class Delivery(unittest.TestCase):
             self.manager.install(source, manifest, self.args(listen='127.0.0.1:45123', secure_cookie='1'))
         self.assertLess(events.index('stop'), events.index('bind'))
         self.assertLess(events.index('bind'), events.index('restart'))
+
+    def test_migration_staging_defers_acme_without_creating_root_owned_webroot(self):
+        source, manifest = self.package()
+        self.manager.live = True
+        with patch.object(self.manager, 'account', return_value=(os.geteuid(), os.getegid())), \
+                patch('chain_network.install_proxy_acme') as acme, \
+                patch.object(self.manager.system, 'active', return_value=False), \
+                patch.object(self.manager.system, 'autostart', return_value=False), \
+                patch.object(self.manager.system, 'call'), patch.object(self.manager, 'healthy'), \
+                patch.object(self.manager, 'show_access'), patch.object(self.manager, 'check_panel_port'):
+            self.manager.install(source, manifest, self.args(defer_proxy_acme=True))
+        acme.assert_not_called()
+        self.assertFalse(self.manager.path('/var/lib/chain-acme/panel').exists())
 
     def test_common_run_allows_best_effort_cleanup(self):
         self.assertEqual(common.run([sys.executable, '-c', 'raise SystemExit(3)'], check=False).returncode, 3)

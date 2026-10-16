@@ -157,7 +157,7 @@ export function App() {
     () => localStorage.getItem("chain-sidebar") === "collapsed",
   );
   const [modal, setModal] = useState<ReactNode>(null);
-  const [editor, setEditor] = useState<{ kind: Line["kind"]; line?: Line; initialChain?: string[] } | null>(null);
+  const [editor, setEditor] = useState<{ kind: Line["kind"]; line?: Line; initialChain?: string[]; pendingImport?: { id: string; name: string } } | null>(null);
   const [toast, setToast] = useState("");
   const [pendingShare, setPendingShare] = useState<string | null>(null);
   const [loginError, setLoginError] = useState("");
@@ -593,6 +593,7 @@ export function App() {
           {page === "dashboard" && <Dashboard state={state} manage={line => setModal(<RentalEditor line={line} state={state} close={close} saved={refresh} />)} />}
           {page === "customers" && <Customers state={state} saved={refresh} />}
           {page === "lines" && <ProxyList state={state} saved={refresh}
+            configureImport={pendingImport => setEditor({ kind: "vless", pendingImport })}
             create={() => editLine(kind)} edit={line => editLine(line.kind, line)}
             share={line => setModal(<AccessDialog line={line} state={state} close={close} />)}
             probe={line => setModal(<ProbeEditor line={line} state={state} close={close} saved={refresh} />)}

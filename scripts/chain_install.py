@@ -340,10 +340,11 @@ class Manager:
             if not check_after_stop:
                 self.check_panel_port(env)  # Never stop a foreign port owner.
         uid, gid = self.account(role)
-        if self.live:
+        if self.live and not getattr(args, 'defer_proxy_acme', False):
             from chain_network import install_proxy_acme
-            install_proxy_acme(role, uid, gid)
-        else:
+            if install_proxy_acme(role, uid, gid) is False:
+                env.pop('CHAIN_ACME_WEBROOT', None)
+        elif not self.live:
             (self.path('/var/lib/chain-acme') / role).mkdir(parents=True, exist_ok=True)
         release_id = f'{manifest["version"]}-{manifest.get("os", "linux")}-{manifest["arch"]}-{sha256(source / "release.json")[:12]}'
         release = self.base / 'releases' / release_id
@@ -391,13 +392,17 @@ class Manager:
                 state['roles'][role] = {'current': release_id, 'previous': old['current'] if old and old['current'] != release_id else (old or {}).get('previous'),
                                         'version': manifest['version']}
                 if role == 'panel':
+                    state['roles'][role]['manual_https'] = (old or retained or {}).get('manual_https')
+                    state['roles'][role]['https_port'] = (old or retained or {}).get('https_port')
                     state['roles'][role]['panel_only'] = (getattr(args, 'panel_only', False) if args.action == 'install'
                                                           else (old or {}).get('panel_only', False))
                 state.get('retained_roles', {}).pop(role, None)
                 json_write(self.state_file, state)
                 manager = self.base / 'manager'
                 manager.mkdir(exist_ok=True)
-                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py']:
+                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py']:
+                    if name == 'chain_legacy.py' and not (release / 'scripts' / name).exists():
+                        continue
                     if name == 'chain_platform.py' and 'os' not in manifest and not (release / 'scripts' / name).exists():
                         continue
                     atomic_write(manager / name, (release / 'scripts' / name).read_bytes(), 0o644)
@@ -500,6 +505,7 @@ class Manager:
         wrapper = self.path('/usr/local/bin/chainctl')
         hook, renew_service, renew_timer = [self.path(str(p)) for p in HttpsSite('uninstall.invalid', 0).renewal_paths()]
         units = [(self.role_paths(role)[2], 'chain-' + role + '.service', OWNER) for role in roles]
+        units.append((self.path(str(service_path('chain-panel-https'))), 'chain-panel-https.service', SITE_OWNER))
         if service_kind() == 'systemd':
             units += [(renew_service, 'chain-panel-cert-renew.service', SITE_OWNER),
                       (renew_timer, 'chain-panel-cert-renew.timer', SITE_OWNER)]
@@ -510,6 +516,7 @@ class Manager:
         config_root = nginx_conf().parent if self.live else self.path('/etc/nginx')
         sites = [p for name in ('chain-panel.conf', 'chain-proxy-acme.conf') for p in config_root.rglob(name)]
         files = [(wrapper, OWNER), (hook, SITE_OWNER), (renew_service, SITE_OWNER),
+                 (self.path('/etc/chain-panel-https/nginx.conf'), SITE_OWNER),
                  *[(p, owner) for p, _, owner in units], *[(p, SITE_OWNER) for p in sites]]
         directories = [self.base, ingress.directory, ingress.config, self.path('/var/lib/chain-acme')]
         directories += [p for role in roles for p in self.role_paths(role)[:2]]
@@ -520,7 +527,7 @@ class Manager:
         for p, owner in files:
             require(not p.is_symlink() and (not p.exists() or p.is_file() and owner in p.read_text()),
                     f'{p} 不归本安装器管理，拒绝删除。')
-        logs = [self.path('/var/log/chain-' + role + '.log') for role in roles]
+        logs = [self.path('/var/log/chain-' + role + '.log') for role in roles] + [self.path('/var/log/chain-panel-https.log')]
         for p in logs:
             require(not p.is_symlink(), f'日志路径为链接，拒绝删除：{p}')
         if purge and backups.exists():
@@ -532,7 +539,7 @@ class Manager:
             url = urllib.parse.urlsplit(env.get('CHAIN_PUBLIC_URL', ''))
             if url.scheme == 'https' and url.hostname:
                 domain = domain_name(url.hostname)
-                if any(p.name == 'chain-panel.conf' for p in sites) or self.path(
+                if roles['panel'].get('manual_https') or any(p.name == 'chain-panel.conf' for p in sites) or self.path(
                         '/etc/letsencrypt/live/chain-panel-' + domain + '/fullchain.pem').is_file():
                     roles['panel'] = {**roles['panel'], 'domain': domain}
         with self.lock():
@@ -561,6 +568,8 @@ class Manager:
             json_write(self.state_file, {'owner': OWNER, 'roles': {}, 'retained_roles': roles})
             for p, _ in files:
                 p.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError, OSError):
+                self.path('/etc/chain-panel-https').rmdir()
             self.system.call('daemon-reload')
             if purge and self.live:
                 for role in roles:
@@ -662,6 +671,7 @@ def provision_local_agent(manager, source, manifest, args):
             action = 'update' if 'agent' in state['roles'] else 'install'
             agent = make_parser().parse_args([action, '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
             agent.allow_http = True  # The existing endpoint was verified as this local panel.
+            agent.defer_proxy_acme = getattr(args, 'defer_proxy_acme', False)
             manager.install(source, manifest, agent)
             mark_local_node(manager, agent_env['CHAIN_NODE_ID'])
         return
@@ -689,6 +699,7 @@ def provision_local_agent(manager, source, manifest, args):
         node = api('nodes', {'name': '本机节点', 'host': public_host, 'target': target, 'server_name': name})
         agent = make_parser().parse_args(['install', '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
         agent.panel_url, agent.node_id, agent.node_token = base, node['id'], node['token']
+        agent.defer_proxy_acme = getattr(args, 'defer_proxy_acme', False)
         manager.install(source, manifest, agent)
         mark_local_node(manager, node['id'])
         print('本机 Agent 已安装并自动接入；在 Web「代理」中直接新建代理即可。')
@@ -742,10 +753,24 @@ def install_package(manager, args):
             panel_questions(manager, args)
         elif args.action == 'install' and args.component == 'agent' and getattr(args, 'guided', False):
             agent_questions(manager, args)
+        if manager.live and args.action == 'install' and args.component == 'panel' and getattr(args, 'guided', False):
+            from chain_legacy import guided_install
+            if guided_install(manager, source, manifest, args):
+                manager.show_access()
+                return
         site = None
         if getattr(args, 'domain', None):
             require(manager.live, '自动 HTTPS 仅用于实际系统安装，不支持 --root 离线模式。')
             site = HttpsSite(args.domain, listen_address(args.listen)[1], getattr(args, 'domain_ipv6', False))
+            saved = manager.state()
+            previous_panel = saved['roles'].get('panel') or saved.get('retained_roles', {}).get('panel', {})
+            site.https_port = previous_panel.get('https_port') or 443
+            if site.https_port != 443:
+                args.public_url = f'https://{args.domain}:{site.https_port}'
+            manual = previous_panel.get('manual_https')
+            if manual:
+                site.https_port, site.certificate, site.key = manual['port'], Path(manual['cert']), Path(manual['key'])
+                args.public_url = f'https://{args.domain}:{site.https_port}'
         args.defer_access = True
         with site.activate() if site else contextlib.nullcontext():
             manager.install(source, manifest, args)
@@ -758,7 +783,7 @@ def install_package(manager, args):
         if manager.live and args.component == 'panel':
             manager.show_access()
             if site:
-                print('HTTPS 与证书自动续期已配置。')
+                print('HTTPS 已配置，证书由原工具续期。' if site.certificate else 'HTTPS 与证书自动续期已配置。')
             else:
                 env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
                 if env.get('CHAIN_PUBLIC_URL', '').startswith('http://'):

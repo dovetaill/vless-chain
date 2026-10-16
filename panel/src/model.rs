@@ -326,8 +326,17 @@ pub struct Job {
     pub externals: Vec<External>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingImport {
+    pub id: String,
+    pub name: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Document {
+    #[serde(default)]
+    pub pending_imports: Vec<PendingImport>,
     #[serde(default)]
     pub customers: Vec<Customer>,
     #[serde(default)]

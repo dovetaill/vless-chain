@@ -20,6 +20,7 @@ export function LineEditor({
   kind,
   state,
   initialChain,
+  pendingImport,
   close,
   saved,
   ensureLocalServer,
@@ -29,6 +30,7 @@ export function LineEditor({
   kind: Line["kind"];
   state: PanelState;
   initialChain?: string[];
+  pendingImport?: { id: string; name: string };
   close: () => void;
   ensureLocalServer: (host: string) => Promise<NodeInfo>;
   importExternal?: (done: (external?: External) => void) => void;
@@ -79,6 +81,7 @@ export function LineEditor({
         if (batch && (!combinations.length || usesTls && !domain)) throw new Error("请选择组合；TLS 组合需要解析到本机的域名。");
         if (batch && shared && (combinations.filter(c => c.endsWith("tls")).length > 1 || combinations.filter(c => c.endsWith("reality")).length > 1)) throw new Error("相同 SNI 无法同时分流 TCP 和 XHTTP；请选择一种传输，或使用独立端口。");
         const payload = {
+          pending_import_id: pendingImport?.id,
           id: line?.id,
           kind,
           name: field(data, "name").trim() || `${protocolNames[protocol]} ${host.trim()}`.slice(0, 80),
@@ -130,7 +133,7 @@ export function LineEditor({
       <Field label="名称">
         <Input
           name="name"
-          defaultValue={line?.name}
+          defaultValue={line?.name || pendingImport?.name}
           placeholder="自动命名"
           maxLength={80}
         />
@@ -155,7 +158,7 @@ export function LineEditor({
         </Field>
       )}
       {protocol === "vless" && !line && <section className="space-y-3">
-        <label className="flex items-center gap-2"><input type="checkbox" checked={batch} onChange={e => { setBatch(e.target.checked); if (e.target.checked) setCertificate("auto"); }} />一次创建多种组合</label>
+        {!pendingImport && <label className="flex items-center gap-2"><input type="checkbox" checked={batch} onChange={e => { setBatch(e.target.checked); if (e.target.checked) setCertificate("auto"); }} />一次创建多种组合</label>}
         {batch && <div className="grid gap-3 sm:grid-cols-2">{Object.entries(names).map(([value, name]) => <label key={value} className="flex items-center gap-2"><input type="checkbox" checked={combinations.includes(value)} onChange={e => setCombinations(old => e.target.checked ? [...old, value] : old.filter(v => v !== value))} />{name}</label>)}</div>}
       </section>}
       <Field label="本机 IP 或域名" hint={usesReality && !usesTls ? "使用 REALITY，无需证书；填写域名时需解析到本机。" : showTls ? "TLS 使用有效证书；自动申请需域名解析到本机并开放 TCP 80。" : ["trojan", "hysteria2", "tuic"].includes(protocol) ? "填写域名后自动申请 SSL 证书。" : "客户端通过此地址连接本机。"}>

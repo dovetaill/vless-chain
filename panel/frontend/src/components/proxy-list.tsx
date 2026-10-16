@@ -30,9 +30,10 @@ function ExportDialog({ lines, close }: { lines: Line[]; close: () => void }) {
   </Modal>;
 }
 
-export function ProxyList({ state, saved, edit, create, share, probe, apply }: {
+export function ProxyList({ state, saved, edit, create, share, probe, apply, configureImport }: {
   state: PanelState; saved: () => Promise<void>; edit: (line: Line) => void; create: () => void;
   share: (line: Line) => void; probe: (line: Line) => void; apply: (line?: Line) => void;
+  configureImport: (item: { id: string; name: string }) => void;
 }) {
   const [search, setSearch] = useState("");
   const [protocol, setProtocol] = useState("");
@@ -75,6 +76,15 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply }: {
   return <Card>
     <CardHeader><CardTitle>我的代理 <span className="ml-2 text-sm font-normal text-slate-400">{lines.length} / {all.length}</span></CardTitle>
     </CardHeader>
+    {(state.pending_imports || []).map(item => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
+      <div><p className="text-sm font-medium">{item.name} · 待手动配置</p><p className="mt-1 text-xs text-amber-700">{item.reason}；当前未运行。</p></div>
+      <div className="flex gap-2"><Button variant="outline" size="sm" disabled={disabled} onClick={() => configureImport(item)}>配置代理</Button>
+        <Button variant="ghost" size="sm" disabled={disabled} onClick={async () => {
+          setPending(true); setError("");
+          try { await api(`/legacy-import/${item.id}`, "DELETE"); await saved(); }
+          catch (error) { setError(errorText(error)); } finally { setPending(false); }
+        }}>移除名称</Button></div>
+    </div>)}
     <div className="flex flex-wrap items-center gap-2.5 border-b border-border px-5 py-4" role="group" aria-label="代理搜索与筛选">
       <div className="relative w-full min-w-0 sm:w-72"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" /><Input className="pl-9" aria-label="搜索代理名称、客户、服务器、地址或端口" placeholder="名称 / 客户 / 服务器 / 地址 / 端口" value={search} onChange={event => filtersChanged(setSearch, event.target.value)} /></div>
       <select className="select h-8.5 w-auto min-w-0 max-w-full py-0" aria-label="筛选协议" value={protocol} onChange={event => filtersChanged(setProtocol, event.target.value)}><option value="">所有协议</option>{Object.entries(protocolNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>

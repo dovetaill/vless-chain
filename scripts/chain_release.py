@@ -194,6 +194,7 @@ def check(args):
     run(['bash', '-n', ROOT / 'scripts/version-release.sh', ROOT / 'scripts/install-server.sh'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_delivery.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_network.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_legacy.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_platform.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_ingress.py'])
     if args.full:
@@ -253,7 +254,7 @@ def build(args):
         work.run([stage / 'bin/xray', 'version'])
         fetch_mihomo(work, stage / 'bin/mihomo')
         work.run([stage / 'bin/mihomo', '-v'])
-        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py']:
+        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py']:
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')

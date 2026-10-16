@@ -152,6 +152,7 @@ export interface Security {
   passkeys: { id: string; name: string; created: number }[];
 }
 export interface PanelState {
+  pending_imports?: { id: string; name: string; reason: string }[];
   local_node_id: string | null;
   nodes: NodeInfo[];
   externals: External[];

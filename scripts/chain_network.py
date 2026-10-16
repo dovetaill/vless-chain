@@ -233,10 +233,29 @@ def proxy_acme_config(ipv6=False):
             '    }\n    location / { return 404; }\n}\n')
 
 
-def install_proxy_acme(role, uid, gid):
+def listeners(ports=(80, 443)):
+    if operating_system() == 'darwin':
+        probe = run(['lsof', '-nP', '-iTCP:' + ','.join(map(str, ports)), '-sTCP:LISTEN', '-Fpc'],
+                    check=False, capture_output=True, text=True)
+        require(probe.returncode in (0, 1), '无法检测端口归属。')
+        return '\n'.join(line for line in probe.stdout.splitlines() if line.startswith('c'))
+    if not shutil.which('ss'):
+        install_packages(['iproute2' if shutil.which('apt-get') else 'iproute'])
+    return output(['ss', '-H', '-ltnp', '( ' + ' or '.join(f'sport = :{p}' for p in ports) + ' )'])
+
+
+def foreign_listeners(ports=(80, 443)):
+    return '\n'.join(line for line in listeners(ports).splitlines()
+                     if (line != 'cnginx' if operating_system() == 'darwin' else '"nginx"' not in line))
+
+
+def install_proxy_acme(role, uid, gid, undo=None):
     """Provision HTTP-01 once at installation; the panel never controls Nginx."""
     site = HttpsSite('chain-proxy-acme.invalid', 0)
-    site.prepare()
+    if foreign_listeners((80,)):
+        print('TCP 80 由旧服务占用，保留该服务；代理请使用 REALITY 或手动证书，HTTP-01 自动签发暂不可用。')
+        return False
+    site.prepare(ports=(80,))
     panel_site = site.site
     panel_previous = panel_site.read_bytes() if panel_site.exists() else None
     site.site = site.site.with_name('chain-proxy-acme.conf')
@@ -252,6 +271,9 @@ def install_proxy_acme(role, uid, gid):
         path.chmod(0o755)
         os.chown(path, uid, gid)
     previous = site.site.read_bytes() if site.site.exists() else None
+    if undo is not None:
+        undo.setdefault(site.site, previous)
+        undo.setdefault(panel_site, panel_previous)
     try:
         if panel_previous is not None:
             migrated = panel_previous.replace(b'try_files $uri =404;', b'try_files $uri /agent$uri /panel$uri =404;')
@@ -260,6 +282,7 @@ def install_proxy_acme(role, uid, gid):
         atomic_write(site.site, proxy_acme_config(any(':' in address for address in server_addresses())), 0o644)
         site.reload()
         service('enable', 'nginx')
+        return True
     except BaseException:
         if panel_previous is not None:
             atomic_write(panel_site, panel_previous, 0o644)
@@ -278,20 +301,13 @@ class HttpsSite:
         self.certname = 'chain-panel-' + domain
         self.cert = Path('/etc/letsencrypt/live') / self.certname
         self.site = None
+        self.https_port = 443
+        self.certificate = self.key = None
 
-    def prepare(self):
+    def prepare(self, ports=(80, 443)):
         # Refuse foreign port owners before package installation can start Nginx.
-        if operating_system() == 'darwin':
-            probe = run(['lsof', '-nP', '-iTCP:80,443', '-sTCP:LISTEN', '-Fpc'], check=False, capture_output=True, text=True)
-            require(probe.returncode in (0, 1), '无法检测 80/443 端口归属。')
-            listeners = '\n'.join(line for line in probe.stdout.splitlines() if line.startswith('c'))
-        else:
-            if not shutil.which('ss'):
-                install_packages(['iproute2' if shutil.which('apt-get') else 'iproute'])
-            listeners = output(['ss', '-H', '-ltnp', '( sport = :80 or sport = :443 )'])
-        for line in listeners.splitlines():
-            require(line == 'cnginx' if operating_system() == 'darwin' else '"nginx"' in line,
-                    f'80/443 已被其他服务占用：{line}；请先调整该服务。')
+        conflicts = foreign_listeners(ports)
+        require(not conflicts, f'{"/".join(map(str, ports))} 已被其他服务占用：{conflicts}；请运行交互安装向导选择接管或换端口。')
         install_packages([name for name in ('nginx', 'certbot', 'openssl') if not shutil.which(name)])
         if operating_system() == 'darwin' and not any(Path(p).is_file() for p in
                 ('/opt/homebrew/opt/openssl@3/bin/openssl', '/usr/local/opt/openssl@3/bin/openssl')):
@@ -341,16 +357,17 @@ class HttpsSite:
         require(not conflict, f'域名 {self.domain} 已在 {conflict} 配置，请使用独立面板域名。')
 
     def config(self, tls=False):
+        public = f'https://{self.domain}' + (f':{self.https_port}' if self.https_port != 443 else '')
         ipv6_http = '    listen [::]:80;\n' if self.ipv6 else ''
         text = (f'{SITE_OWNER}\nserver {{\n    listen 80;\n{ipv6_http}    server_name {self.domain};\n'
                 f'    location ^~ /.well-known/acme-challenge/ {{\n        root {self.webroot};\n'
                 '        default_type text/plain;\n        try_files $uri /agent$uri /panel$uri =404;\n    }\n')
-        text += (f'    location / {{ return 301 https://{self.domain}$request_uri; }}\n' if tls else
+        text += (f'    location / {{ return 301 {public}$request_uri; }}\n' if tls else
                  '    location / { return 404; }\n')
         text += '}\n'
         if tls:
-            ipv6_tls = '    listen [::]:443 ssl;\n' if self.ipv6 else ''
-            text += (f'server {{\n    listen 443 ssl;\n{ipv6_tls}    server_name {self.domain};\n'
+            ipv6_tls = f'    listen [::]:{self.https_port} ssl;\n' if self.ipv6 else ''
+            text += (f'server {{\n    listen {self.https_port} ssl;\n{ipv6_tls}    server_name {self.domain};\n'
                      f'    ssl_certificate {self.cert}/fullchain.pem;\n'
                      f'    ssl_certificate_key {self.cert}/privkey.pem;\n'
                      '    ssl_protocols TLSv1.2 TLSv1.3;\n    client_max_body_size 2m;\n'
@@ -469,7 +486,7 @@ class HttpsSite:
         run(['systemctl', 'is-active', '--quiet', timer.name])
 
     def certificate_valid(self):
-        certificate, key = self.cert / 'fullchain.pem', self.cert / 'privkey.pem'
+        certificate, key = self.certificate or self.cert / 'fullchain.pem', self.key or self.cert / 'privkey.pem'
         if not certificate.exists() and not key.exists():
             return False
         require(certificate.is_file() and key.is_file(), '已有证书或私钥缺失，请恢复文件；不会重新申请证书。')
@@ -482,14 +499,75 @@ class HttpsSite:
         return True
 
     @contextlib.contextmanager
+    def manual_activate(self):
+        """An isolated listener leaves existing Nginx sites and ports untouched."""
+        require(self.certificate and self.key and self.certificate_valid(), '手动 HTTPS 证书无效或已过期。')
+        directory = Path('/etc/chain-panel-https')
+        config = directory / 'nginx.conf'
+        unit = service_path('chain-panel-https')
+        for path in (config, unit):
+            require(not path.is_symlink() and (not path.exists() or SITE_OWNER in path.read_text()), f'{path} 不归本安装器管理。')
+        require(not directory.is_symlink(), f'{directory} 不能为链接。')
+        previous = {p: p.read_bytes() if p.exists() else None for p in (config, unit)}
+        state = self.service_state('chain-panel-https')
+        if not state[0]:
+            require(not listeners((self.https_port,)), f'端口 {self.https_port} 仍被占用。')
+        install_packages(['nginx'] if not shutil.which('nginx') else [])
+        nginx = shutil.which('nginx')
+        # Nginx quoted strings do not use shell escaping.
+        quote = lambda p: '"' + str(p).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$') + '"'
+        require(not any(c in str(p) for p in (self.certificate, self.key) for c in '\n\r\0'), '证书路径无效。')
+        ipv6 = f'listen [::]:{self.https_port} ssl;' if self.ipv6 else ''
+        body = (f'{SITE_OWNER}\npid /var/run/chain-panel-https.pid;\nerror_log /var/log/chain-panel-https.log;\n'
+                'events {}\nhttp { access_log off; server {\n'
+                f'listen {self.https_port} ssl; {ipv6}\nserver_name {self.domain};\n'
+                f'ssl_certificate {quote(self.certificate)};\nssl_certificate_key {quote(self.key)};\n'
+                'ssl_protocols TLSv1.2 TLSv1.3;\nclient_max_body_size 2m;\n'
+                f'location / {{ proxy_pass http://127.0.0.1:{self.port};\n'
+                'proxy_http_version 1.1; proxy_set_header Host $http_host;\n'
+                'proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+                'proxy_set_header X-Forwarded-Proto https; proxy_read_timeout 120s;\n} } }\n')
+        try:
+            atomic_write(config, body, 0o600)
+            run([nginx, '-t', '-c', config])
+            command = [nginx, '-c', str(config), '-g', 'daemon off;']
+            definition = (f'{SITE_OWNER}\n[Unit]\nDescription=Chain Panel HTTPS\nAfter=network.target\n'
+                          f'[Service]\nExecStart={shlex.join(command)}\nExecReload={nginx} -c {config} -s reload\n'
+                          'Restart=on-failure\n[Install]\nWantedBy=multi-user.target\n') if service_kind() == 'systemd' else service_definition('chain-panel-https', command, SITE_OWNER)
+            atomic_write(unit, definition, 0o755 if service_kind() == 'openrc' else 0o644)
+            if service_kind() == 'systemd':
+                run(['systemctl', 'daemon-reload'])
+            service('enable', 'chain-panel-https')
+            service('restart', 'chain-panel-https')
+            require(self.service_state('chain-panel-https')[0], '独立 HTTPS 入口启动失败。')
+            print('HTTPS 复用指定证书；请保留原续期工具，并在续期部署钩子中重载 chain-panel-https 服务。')
+            yield
+        except BaseException:
+            service('stop', 'chain-panel-https', check=False)
+            service('disable', 'chain-panel-https', check=False)
+            for path, old in previous.items():
+                if old is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, old, 0o600 if path == config else 0o755 if service_kind() == 'openrc' else 0o644)
+            if service_kind() == 'systemd':
+                run(['systemctl', 'daemon-reload'], check=False)
+            self.restore_service('chain-panel-https', state)
+            raise
+
+    @contextlib.contextmanager
     def activate(self):
+        if self.certificate:
+            with self.manual_activate():
+                yield
+            return
         nginx_state = self.service_state('nginx')
         timer_state = self.service_state('chain-panel-cert-renew.timer')
         previous, renewal = None, {}
         site_written = False
         renewal_started = False
         try:
-            self.prepare()
+            self.prepare(ports=(80, self.https_port))
             self.check_renewal_paths()
             reuse_certificate = self.certificate_valid()
             previous = self.site.read_bytes() if self.site.exists() else None
