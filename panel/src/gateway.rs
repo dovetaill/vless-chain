@@ -1184,6 +1184,9 @@ pub fn system_metrics() -> serde_json::Value {
 
 #[cfg(target_os = "macos")]
 pub fn system_metrics() -> serde_json::Value {
+    unsafe extern "C" {
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
+    }
     fn sysctl<T: Default>(name: &std::ffi::CStr) -> Option<T> {
         let mut value = T::default();
         let mut size = std::mem::size_of::<T>();
@@ -1229,7 +1232,7 @@ pub fn system_metrics() -> serde_json::Value {
                 (u64::from(vm.free_count) + u64::from(vm.inactive_count))
                     * libc::sysconf(libc::_SC_PAGESIZE) as u64
             });
-        libc::mach_port_deallocate(libc::mach_task_self(), host);
+        mach_port_deallocate(libc::mach_task_self(), host);
         (cpu, available)
     };
     let (mut rx, mut tx) = (0u64, 0u64);
@@ -1287,9 +1290,8 @@ pub fn system_metrics() -> serde_json::Value {
         let mut stat: libc::statvfs = std::mem::zeroed();
         let disk = (libc::statvfs(c"/".as_ptr(), &mut stat) == 0).then(|| {
             (
-                stat.f_blocks.saturating_mul(stat.f_frsize as u64),
-                stat.f_blocks
-                    .saturating_sub(stat.f_bfree)
+                u64::from(stat.f_blocks).saturating_mul(stat.f_frsize as u64),
+                u64::from(stat.f_blocks.saturating_sub(stat.f_bfree))
                     .saturating_mul(stat.f_frsize as u64),
             )
         });
