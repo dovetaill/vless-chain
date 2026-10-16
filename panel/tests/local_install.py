@@ -59,6 +59,10 @@ time.sleep(60)
                 harness.wait(lambda: all(subprocess.run(['ps', '-p', str(pid)], stdout=subprocess.DEVNULL).returncode != 0
                                          for pid in watched), 'macOS cores and watchdog exit after owner SIGKILL')
             print('PASS installed service configuration, real local auto-enrollment, node heartbeat, and repeated installation preserving identity.', flush=True)
+        except BaseException:
+            for name, process, _ in harness.processes:
+                print(f'{name} exit={process.poll()}:\n{(root / (name + ".log")).read_text(errors="replace")[-4000:]}', file=sys.stderr)
+            raise
         finally:
             harness.close()
     assert not root.exists()

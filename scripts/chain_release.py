@@ -219,6 +219,7 @@ def build(args):
     require(target in output(['rustup', 'target', 'list', '--installed']).splitlines(), f'请先安装 Rust 构建目标：rustup target add {target}')
     if operating_system() == 'linux':
         require(shutil.which('musl-gcc'), 'Linux 静态发行包需要 musl-gcc（musl-tools）和 Perl。')
+        require(shutil.which('readelf'), 'Linux 静态发行包需要 readelf（binutils）验证链接结果。')
     destination = Path(args.output or default_output()).resolve()
     require(not destination.exists(), f'输出目录已存在：{destination}；请使用新的 --output 目录，避免覆盖已发行文件。')
     dirty = bool(source_status())
@@ -233,7 +234,7 @@ def build(args):
                             ignore=shutil.ignore_patterns('node_modules', 'dist', '.env', '.env.*', '__pycache__'))
         work.env['CHAIN_WEB_ASSETS'] = str(project / 'frontend/dist')
         if operating_system() == 'linux':
-            work.env['CARGO_TARGET_' + target.upper().replace('-', '_') + '_LINKER'] = 'musl-gcc'
+            # Older musl-gcc linker specs break static PIE; Rust supplies its own musl runtime.
             work.env['CC_' + target.replace('-', '_')] = 'musl-gcc'
         else:
             work.env['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
@@ -245,6 +246,9 @@ def build(args):
         (stage / 'bin').mkdir(parents=True)
         for binary in ['chain-panel', 'chain-agent']:
             shutil.copy2(work.root / 'target' / target / 'release' / binary, stage / 'bin' / binary)
+            if operating_system() == 'linux':
+                headers = output(['readelf', '-l', '-d', stage / 'bin' / binary])
+                require('INTERP' not in headers and '(NEEDED)' not in headers, f'{binary} 不是完全静态发行程序。')
         fetch_xray(work, stage / 'bin/xray')
         work.run([stage / 'bin/xray', 'version'])
         fetch_mihomo(work, stage / 'bin/mihomo')
