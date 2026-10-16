@@ -129,9 +129,17 @@ class Legacy(unittest.TestCase):
             def command(argv, **kwargs):
                 if '-t' in argv:
                     text = config.read_text().replace('/var/run/chain-panel-https.pid', str(root / 'nginx.pid')).replace('/var/log/chain-panel-https.log', str(root / 'nginx.log'))
+                    text = text.replace('http {', 'http {\n' + ''.join(
+                        f'{name}_temp_path {root}/{name};\n'
+                        for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')))
                     validation = root / 'validate.conf'
                     validation.write_text(text)
-                    return subprocess.run(['nginx', '-t', '-p', root, '-e', root / 'validation.log', '-c', validation], check=True, capture_output=True)
+                    command = ['nginx', '-t', '-p', root, '-c', validation]
+                    if '-e filename' in subprocess.run(['nginx', '-h'], capture_output=True, text=True).stderr:
+                        command += ['-e', root / 'validation.log']
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    return result
                 return Mock(returncode=0)
             with patch.object(network, 'Path', side_effect=lambda p: root / 'https' if p == '/etc/chain-panel-https' else Path(p)), \
                     patch.object(network, 'service_path', return_value=unit), patch.object(network, 'service_kind', return_value='systemd'), \
