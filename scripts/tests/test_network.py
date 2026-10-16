@@ -38,6 +38,7 @@ class Network(unittest.TestCase):
             panel.write_text(original)
             with patch.object(network, 'HttpsSite') as site_type, \
                     patch.object(network, 'Path', side_effect=lambda p: root / 'web' if p == '/var/lib/chain-acme' else Path(p)), \
+                    patch.object(network, 'foreign_listeners', return_value=''), \
                     patch.object(network, 'server_addresses', return_value={'192.0.2.1'}), \
                     patch.object(network, 'run'):
                 site_type.return_value.site = panel
