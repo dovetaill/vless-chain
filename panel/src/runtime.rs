@@ -707,11 +707,23 @@ pub struct ProbeRequest {
     pub url: String,
 }
 
+fn probe_share(line: &Line, doc: &Document, local: bool) -> Result<String> {
+    if !local {
+        return compiler::share(line, doc);
+    }
+    // A NAT host may not be able to reach its own public address.
+    let mut line = line.clone();
+    line.access.host = "127.0.0.1".into();
+    line.access.public_port = Some(line.hops.first().context("无入口")?.port);
+    compiler::share(&line, doc)
+}
+
 pub async fn probe(
     binary: &Path,
     line: &Line,
     doc: &Document,
     request: &ProbeRequest,
+    local_node: Option<&str>,
 ) -> Result<Value> {
     let start = std::time::Instant::now();
     ensure!(line.enabled, "线路已停用");
@@ -721,7 +733,8 @@ pub async fn probe(
         .iter()
         .find(|n| n.id == entry.node_id)
         .context("入口节点不存在")?;
-    let endpoint = compiler::address(&node.host, entry.port);
+    let local = local_node == Some(node.id.as_str());
+    let endpoint = compiler::address(if local { "127.0.0.1" } else { &node.host }, entry.port);
     let marker = format!("chain-probe-{}", id()).into_bytes();
     let detail = match request.mode.as_str() {
         "udp_echo" => {
@@ -809,14 +822,19 @@ pub async fn probe(
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let port = listener.local_addr()?.port();
             drop(listener);
+            let share = if line.kind == Kind::Vless {
+                probe_share(line, doc, local)?
+            } else {
+                String::new()
+            };
             let outbound = if line.kind == Kind::Vless {
-                compiler::external_outbound(&compiler::share(line, doc)?, "probe")?
+                compiler::external_outbound(&share, "probe")?
             } else {
                 json!({"tag":"probe","protocol":"freedom","settings":{"redirect":endpoint}})
             };
             let sidecar = compiler::needs_mihomo(&outbound);
             let config = if sidecar {
-                let proxy = crate::external::mihomo(&compiler::share(line, doc)?, "probe")?;
+                let proxy = crate::external::mihomo(&share, "probe")?;
                 json!({"listeners":[{"name":"probe-in","type":"socks","listen":"127.0.0.1","port":port,"proxy":"probe"}],"proxies":[proxy],"mode":"rule","rules":["MATCH,REJECT"],"log-level":"warning"})
             } else {
                 json!({"log":{"loglevel":log_level()},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[outbound]})
@@ -856,7 +874,12 @@ pub async fn probe(
                     response.status()
                 );
                 Ok::<_, anyhow::Error>(format!(
-                    "实际入口 → 完整线路 → 探测目标，HTTP {}（不代表 UDP 已验证）",
+                    "{} → 完整线路 → 探测目标，HTTP {}（不代表 UDP 已验证）",
+                    if local {
+                        "本机入口"
+                    } else {
+                        "实际入口"
+                    },
                     response.status().as_u16()
                 ))
             }
@@ -887,6 +910,41 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_probe_preserves_credentials_and_sni_without_changing_public_links() {
+        let node: Node = serde_json::from_value(json!({
+            "id":"local", "name":"local", "host":"198.51.100.1", "token_hash":"",
+            "reality":Reality::new("example.com:443".into(), "example.com".into())
+        }))
+        .unwrap();
+        let doc = Document {
+            nodes: vec![node],
+            ..Default::default()
+        };
+        let mut line: Line = serde_json::from_value(json!({
+            "id":"line", "name":"line", "kind":"vless",
+            "hops":[{"node_id":"local", "port":443, "uuid":id()}],
+            "access":{"host":"public.example.com", "public_host":"nat.example.com",
+                      "public_port":24443, "password":"test-password"}
+        }))
+        .unwrap();
+        for protocol in [Protocol::Vless, Protocol::Vmess, Protocol::Hysteria2] {
+            line.access.protocol = protocol.clone();
+            if protocol != Protocol::Vless {
+                line.access.tls.mode = "manual".into();
+                line.access.tls.domain = "example.com".into();
+            }
+            let public = compiler::share(&line, &doc).unwrap();
+            assert_eq!(probe_share(&line, &doc, false).unwrap(), public);
+            let mut expected = crate::external::mihomo(&public, "probe").unwrap();
+            expected["server"] = json!("127.0.0.1");
+            expected["port"] = json!(443);
+            let local = probe_share(&line, &doc, true).unwrap();
+            assert_eq!(crate::external::mihomo(&local, "probe").unwrap(), expected);
+            assert_eq!(compiler::share(&line, &doc).unwrap(), public);
+        }
+    }
 
     #[test]
     fn macos_listener_requires_matching_socket_and_state() {

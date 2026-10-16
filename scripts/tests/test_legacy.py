@@ -2,6 +2,7 @@
 import contextlib
 import grp
 import json
+import os
 from pathlib import Path
 import pwd
 import shutil
@@ -19,6 +20,21 @@ import chain_network as network
 
 
 class Legacy(unittest.TestCase):
+    def test_acme_directory_preserves_existing_metadata_and_rejects_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'acme/panel'
+            network.prepare_proxy_acme_directory(root, os.geteuid(), os.getegid())
+            before = {p: p.stat() for p in [root.parent, root, *root.rglob('*')]}
+            network.prepare_proxy_acme_directory(root, os.geteuid(), os.getegid())
+            for path, old in before.items():
+                current = path.stat()
+                self.assertEqual((old.st_uid, old.st_gid, old.st_mode, old.st_ctime_ns),
+                                 (current.st_uid, current.st_gid, current.st_mode, current.st_ctime_ns))
+            link = root.parent / 'agent'
+            link.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, '归属不匹配'):
+                network.prepare_proxy_acme_directory(link, os.geteuid(), os.getegid())
+
     def test_json_comments_preserve_urls_and_strings(self):
         value = legacy.json_config('/* comment */ {"url":"https://example.com//x", // comment\n"key":"a\\\"//b"}')
         self.assertEqual(value, {'url': 'https://example.com//x', 'key': 'a"//b'})
@@ -199,7 +215,7 @@ class Legacy(unittest.TestCase):
             api.publish()
         self.assertEqual(api.call.call_count, 4)
 
-    def migration(self, temporary, failure=False):
+    def migration(self, temporary, failure=False, pending=False, target_pid=None):
         manager = installer.Manager(Path(temporary))
         etc, data, _ = manager.role_paths('panel')
         etc.mkdir(parents=True)
@@ -217,7 +233,9 @@ class Legacy(unittest.TestCase):
         owner = {'import': True, 'name': 'x-ui', 'pids': [123], 'sources': [{'id': 'old'}]}
         events = []
         result = {'imported': [{'name': 'ok', 'port': 8443, 'protocol': 'vmess'}],
-                  'pending': [{'name': 'old ws', 'reason': 'WS needs configuration'}]}
+                  'pending': [{'name': 'old ws', 'reason': 'WS needs configuration'}] if pending else []}
+        if target_pid is not None:
+            result['imported'][0]['reality_target'] = '127.0.0.1:18443'
         api = Mock()
         def call(path, payload=None):
             if path == 'state':
@@ -240,7 +258,8 @@ class Legacy(unittest.TestCase):
         acme = Path(temporary) / 'chain-proxy-acme.conf'
         def restore():
             self.assertFalse(acme.exists(), 'new port 80 site must be removed before restoring old service')
-            events.append('restore old')
+            if handover.changed:
+                events.append('restore old')
         handover.restore.side_effect = restore
         def provision(*args, undo):
             undo.setdefault(acme, None)
@@ -251,25 +270,43 @@ class Legacy(unittest.TestCase):
                 (legacy, 'discover', {'return_value': [owner]}), (legacy, 'select', {'return_value': [owner]}),
                 (legacy, 'Handover', {'return_value': handover}), (legacy, 'PanelAPI', {'return_value': api}),
                 (installer, 'install_components', {'side_effect': lambda *a: events.append('install')}),
-                (network, 'foreign_listeners', {'return_value': ''}), (network, 'install_proxy_acme', {'side_effect': provision}),
+                (network, 'foreign_listeners', {'return_value': ''}), (network, 'listeners', {'return_value': f'pid={target_pid}'}),
+                (network, 'install_proxy_acme', {'side_effect': provision}),
                 (network.HttpsSite, 'service_state', {'return_value': (False, False)}),
                 (network.HttpsSite, 'restore_service', {'side_effect': lambda *a: events.append('restore nginx')}),
                 (manager.system, 'call', {'side_effect': lambda *a: events.append(a[0] + ' ' + a[1])})]:
                 stack.enter_context(patch.object(target, name, **options))
-            if failure:
+            if target_pid == 123:
+                with self.assertRaisesRegex(ValueError, '会随旧代理停止'):
+                    legacy.guided_install(manager, None, None, args)
+            elif pending:
+                with self.assertRaisesRegex(ValueError, '不能完整导入'):
+                    legacy.guided_install(manager, None, None, args)
+            elif failure:
                 with self.assertRaisesRegex(ValueError, 'publish failed'):
                     legacy.guided_install(manager, None, None, args)
             else:
                 self.assertTrue(legacy.guided_install(manager, None, None, args))
         return events
 
-    def test_names_only_do_not_delay_stopping_old_service(self):
+    def test_complete_import_precedes_stopping_old_service(self):
         with tempfile.TemporaryDirectory() as temporary:
             events = self.migration(temporary)
         self.assertLess(events.index('install'), events.index('import'))
         self.assertLess(events.index('import'), events.index('stop old'))
         self.assertLess(events.index('stop old'), events.index('publish'))
         self.assertNotIn('restore old', events)
+
+    def test_pending_import_never_stops_old_service(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            events = self.migration(temporary, pending=True)
+        self.assertEqual(events, ['install', 'preview'])
+
+    def test_local_reality_target_must_survive_handover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(self.migration(temporary, target_pid=123), ['install', 'preview'])
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertIn('publish', self.migration(temporary, target_pid=456))
 
     def test_failed_publish_stops_new_agent_before_restoring_old_service(self):
         with tempfile.TemporaryDirectory() as temporary:

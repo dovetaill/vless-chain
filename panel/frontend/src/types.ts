@@ -60,9 +60,11 @@ export interface TLS {
   cert: string;
   key: string;
 }
+export type RealityFallbackLimit = { afterBytes: number; bytesPerSec: number; burstBytesPerSec: number };
+
 export interface Access {
   transport: { network: "tcp" | "xhttp"; path: string; host: string; mode: string };
-  reality: { target: string; server_name: string } | null;
+  reality: { target: string; server_name: string; limit_fallback_upload?: RealityFallbackLimit; limit_fallback_download?: RealityFallbackLimit } | null;
   shared_port: boolean;
   fallback: string;
   host: string;

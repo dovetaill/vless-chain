@@ -86,8 +86,11 @@ fn global(config: &Value) -> Result<()> {
     );
     only(&config["routing"], &["rules", "domainStrategy"])?;
     for rule in config["routing"]["rules"].as_array().into_iter().flatten() {
+        only(rule, &["type", "inboundTag", "outboundTag"]).context("自定义路由需要手动配置")?;
         ensure!(
-            rule["inboundTag"] == json!(["api"]) && rule["outboundTag"] == "api",
+            matches!(text(&rule["type"]), "" | "field")
+                && ((rule["inboundTag"] == json!(["api"]) && rule["outboundTag"] == "api")
+                    || (!text(&out[0]["tag"]).is_empty() && rule["outboundTag"] == out[0]["tag"])),
             "自定义路由需要手动配置"
         );
     }
@@ -101,6 +104,7 @@ fn convert(
     id: String,
     title: String,
     shared: bool,
+    local_source: bool,
 ) -> Result<Line> {
     only(
         inbound,
@@ -140,6 +144,7 @@ fn convert(
         stream,
         &[
             "network",
+            "method",
             "security",
             "tcpSettings",
             "rawSettings",
@@ -148,7 +153,11 @@ fn convert(
             "tlsSettings",
         ],
     )?;
-    access.transport.network = match text(&stream["network"]) {
+    let network = stream
+        .get("method")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&stream["network"]);
+    access.transport.network = match text(network) {
         "" | "tcp" | "raw" => "tcp".into(),
         "xhttp" if access.protocol == Protocol::Vless => "xhttp".into(),
         _ => anyhow::bail!("此传输方式需要手动配置"),
@@ -234,6 +243,8 @@ fn convert(
                     "serverNames",
                     "privateKey",
                     "shortIds",
+                    "limitFallbackUpload",
+                    "limitFallbackDownload",
                 ],
             )?;
             ensure!(
@@ -253,8 +264,9 @@ fn convert(
             };
             let (host, _) = crate::compiler::target(target)?;
             ensure!(
-                host.contains('.') && !host.starts_with("127.") && host != "localhost",
-                "REALITY 本地或容器目标需要手动配置"
+                local_source
+                    || (host.contains('.') && !host.starts_with("127.") && host != "localhost"),
+                "REALITY 容器目标需要手动配置"
             );
             let key: [u8; 32] = URL_SAFE_NO_PAD
                 .decode(text(&r["privateKey"]))?
@@ -289,6 +301,10 @@ fn convert(
             access.reality = Some(RealityTarget {
                 target: reality.target.clone(),
                 server_name: reality.server_name.clone(),
+                limit_fallback_upload: serde_json::from_value(r["limitFallbackUpload"].clone())?,
+                limit_fallback_download: serde_json::from_value(
+                    r["limitFallbackDownload"].clone(),
+                )?,
             });
             doc.nodes[node_index].reality = reality;
         }
@@ -405,6 +421,7 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
                     id.clone(),
                     title.clone(),
                     request.shared_443,
+                    source.id.starts_with("systemd:"),
                 )?;
                 doc.lines.push(line.clone());
                 compile(doc)?;
@@ -413,7 +430,8 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
             match result {
                 Ok(line) => imported.push(json!({"id":id,"name":title,"port":line.hops[0].port,"protocol":line.access.protocol,
                     "can_share": line.access.protocol == Protocol::Vless && line.access.tls.mode != "manual",
-                    "sni":line.access.server_name(doc.nodes.iter().find(|n| n.id == request.node_id).unwrap())})),
+                    "sni":line.access.server_name(doc.nodes.iter().find(|n| n.id == request.node_id).unwrap()),
+                    "reality_target":line.access.reality.as_ref().map(|r| &r.target)})),
                 Err(error) => {
                     *doc = before;
                     let item = PendingImport { id, name: title, reason: format!("{error:#}") };
@@ -495,6 +513,55 @@ mod tests {
         assert_eq!(doc.nodes[0].reality.public_key, reality.public_key);
         assert_eq!(doc.nodes[0].reality.short_id, reality.short_id);
         assert!(doc.lines[0].access.shared_port);
+    }
+
+    #[test]
+    fn preserves_local_reality_target_method_and_fallback_limits() {
+        let reality = Reality::new("127.0.0.1:18443".into(), "cover.example.com".into());
+        let uuid = id();
+        let upload = json!({"afterBytes":0,"bytesPerSec":1048576,"burstBytesPerSec":2097152});
+        let download = json!({"afterBytes":0,"bytesPerSec":4194304,"burstBytesPerSec":8388608});
+        let input = json!({"tag":"old reality","listen":"0.0.0.0","port":443,"protocol":"vless",
+            "settings":{"decryption":"none","clients":[{"id":uuid,"flow":"xtls-rprx-vision"}]},
+            "streamSettings":{"method":"raw","network":"ws","security":"reality","realitySettings":{
+                "target":reality.target,"serverNames":[reality.server_name],"shortIds":[reality.short_id],
+                "privateKey":reality.private_key,"limitFallbackUpload":upload,"limitFallbackDownload":download}}});
+        let (mut doc, mut request) = fixture(input);
+        request.sources[0].config["outbounds"][0]["tag"] = json!("direct");
+        request.sources[0].config["routing"] = json!({"domainStrategy":"AsIs","rules":[
+            {"type":"field","inboundTag":["old reality"],"outboundTag":"direct"}]});
+        let result = import(&mut doc, &request).unwrap();
+        assert_eq!(result["pending"], json!([]));
+        let restored: Document =
+            serde_json::from_value(serde_json::to_value(&doc).unwrap()).unwrap();
+        let configs = compile(&restored).unwrap();
+        let inbound = &configs[&doc.nodes[0].id]["inbounds"][0];
+        assert_eq!(inbound["settings"]["clients"][0]["id"], uuid);
+        let settings = &inbound["streamSettings"]["realitySettings"];
+        assert_eq!(settings["target"], reality.target);
+        assert_eq!(settings["privateKey"], reality.private_key);
+        assert_eq!(settings["shortIds"], json!([reality.short_id]));
+        assert_eq!(settings["limitFallbackUpload"], upload);
+        assert_eq!(settings["limitFallbackDownload"], download);
+    }
+
+    #[test]
+    fn invalid_fallback_limits_remain_pending() {
+        for limit in [
+            json!({"bytesPerSec":-1}),
+            json!({"unknown":1}),
+            json!({"afterBytes":"1"}),
+        ] {
+            let reality = Reality::new("cover.example.com:443".into(), "cover.example.com".into());
+            let (mut doc, request) = fixture(json!({"port":443,"protocol":"vless",
+                "settings":{"clients":[{"id":id(),"flow":"xtls-rprx-vision"}]},
+                "streamSettings":{"security":"reality","realitySettings":{"target":reality.target,
+                    "serverNames":[reality.server_name],"shortIds":[reality.short_id],
+                    "privateKey":reality.private_key,"limitFallbackUpload":limit}}}));
+            let result = import(&mut doc, &request).unwrap();
+            assert_eq!(result["imported"], json!([]));
+            assert_eq!(doc.pending_imports.len(), 1);
+        }
     }
 
     #[test]

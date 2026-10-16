@@ -380,18 +380,29 @@ class Delivery(unittest.TestCase):
         self.assertLess(events.index('stop'), events.index('bind'))
         self.assertLess(events.index('bind'), events.index('restart'))
 
-    def test_migration_staging_defers_acme_without_creating_root_owned_webroot(self):
+    def test_migration_staging_prepares_writable_paths_before_start_without_acme(self):
         source, manifest = self.package()
         self.manager.live = True
+        def check_start(action, unit=None, **kwargs):
+            if action == 'restart':
+                role = unit.removeprefix('chain-').removesuffix('.service')
+                root = self.manager.path('/var/lib/chain-acme') / role
+                self.assertTrue(root.is_dir())
+                self.assertEqual(root.stat().st_uid, os.geteuid())
+                self.assertEqual(root.stat().st_gid, os.getegid())
+                self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+                self.assertIn(f'ReadWritePaths="{root}"', self.manager.role_paths(role)[2].read_text())
         with patch.object(self.manager, 'account', return_value=(os.geteuid(), os.getegid())), \
                 patch('chain_network.install_proxy_acme') as acme, \
                 patch.object(self.manager.system, 'active', return_value=False), \
                 patch.object(self.manager.system, 'autostart', return_value=False), \
-                patch.object(self.manager.system, 'call'), patch.object(self.manager, 'healthy'), \
+                patch.object(self.manager.system, 'call', side_effect=check_start), patch.object(self.manager, 'healthy'), \
                 patch.object(self.manager, 'show_access'), patch.object(self.manager, 'check_panel_port'):
             self.manager.install(source, manifest, self.args(defer_proxy_acme=True))
+            self.manager.install(source, manifest, self.args(component='agent', defer_proxy_acme=True,
+                                 panel_url='http://127.0.0.1:23456', node_id='a94a6794-c60a-4c51-a094-b9164ddaaabc',
+                                 node_token='s' * 64))
         acme.assert_not_called()
-        self.assertFalse(self.manager.path('/var/lib/chain-acme/panel').exists())
 
     def test_common_run_allows_best_effort_cleanup(self):
         self.assertEqual(common.run([sys.executable, '-c', 'raise SystemExit(3)'], check=False).returncode, 3)

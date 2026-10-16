@@ -340,12 +340,13 @@ class Manager:
             if not check_after_stop:
                 self.check_panel_port(env)  # Never stop a foreign port owner.
         uid, gid = self.account(role)
+        from chain_network import prepare_proxy_acme_directory
+        # systemd needs this writable path even while certificate setup is deferred.
+        prepare_proxy_acme_directory(self.path('/var/lib/chain-acme') / role, uid, gid)
         if self.live and not getattr(args, 'defer_proxy_acme', False):
             from chain_network import install_proxy_acme
             if install_proxy_acme(role, uid, gid) is False:
                 env.pop('CHAIN_ACME_WEBROOT', None)
-        elif not self.live:
-            (self.path('/var/lib/chain-acme') / role).mkdir(parents=True, exist_ok=True)
         release_id = f'{manifest["version"]}-{manifest.get("os", "linux")}-{manifest["arch"]}-{sha256(source / "release.json")[:12]}'
         release = self.base / 'releases' / release_id
         with self.lock():

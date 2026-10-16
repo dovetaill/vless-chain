@@ -251,6 +251,18 @@ def foreign_listeners(ports=(80, 443)):
                      if (line != 'cnginx' if operating_system() == 'darwin' else '"nginx"' not in line))
 
 
+def prepare_proxy_acme_directory(root, uid, gid):
+    for path in [root.parent, root, root / '.well-known', root / '.well-known/acme-challenge']:
+        owner = os.geteuid() if path == root.parent else uid
+        require(not path.is_symlink() and (not path.exists() or path.is_dir() and path.stat().st_uid == owner),
+                f'{path} 归属不匹配。')
+        if not path.exists():
+            path.mkdir(mode=0o755, parents=True)
+            path.chmod(0o755)
+            if path != root.parent:
+                os.chown(path, uid, gid)
+
+
 def install_proxy_acme(role, uid, gid, undo=None):
     """Provision HTTP-01 once at installation; the panel never controls Nginx."""
     site = HttpsSite('chain-proxy-acme.invalid', 0)
@@ -263,15 +275,7 @@ def install_proxy_acme(role, uid, gid, undo=None):
     site.site = site.site.with_name('chain-proxy-acme.conf')
     require(not site.site.is_symlink() and (not site.site.exists() or site.site.read_text().startswith(SITE_OWNER + '\n')),
             f'{site.site} 不归本安装器管理，拒绝覆盖。')
-    root = Path('/var/lib/chain-acme')
-    require(not root.is_symlink(), f'{root} 不能是符号链接。')
-    root.mkdir(mode=0o755, parents=True, exist_ok=True)
-    root.chmod(0o755)
-    for path in [root / role, root / role / '.well-known', root / role / '.well-known/acme-challenge']:
-        require(not path.is_symlink() and (not path.exists() or path.stat().st_uid == uid), f'{path} 归属不匹配。')
-        path.mkdir(mode=0o755, exist_ok=True)
-        path.chmod(0o755)
-        os.chown(path, uid, gid)
+    prepare_proxy_acme_directory(Path('/var/lib/chain-acme') / role, uid, gid)
     previous = site.site.read_bytes() if site.site.exists() else None
     if undo is not None:
         undo.setdefault(site.site, previous)

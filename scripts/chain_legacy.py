@@ -1,5 +1,6 @@
 """Discover and hand over explicitly selected proxy services; never kill by name."""
 import contextlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -179,7 +180,7 @@ def select(owners, choose):
         if any(k.startswith(('com.docker.swarm.', 'io.kubernetes.')) for k in labels):
             print('此容器由集群调度器管理，保留运行。')
             continue
-        choice = choose('如何处理该服务？接管成功后将停止旧服务；不兼容的代理仅导入名称，需手动配置。',
+        choice = choose('如何处理该服务？配置完整导入并通过预检后才会停止旧服务；不兼容时保留旧服务。',
                         {'1': '备份并导入，安装成功后停止旧服务', '2': '备份并停用旧服务，重新配置代理', '3': '保留旧服务'}, '3')
         if choice != '3':
             owner['import'] = choice == '1'
@@ -331,7 +332,7 @@ def manual_certificate(site):
 
 def guided_install(manager, source, manifest, args):
     from chain_install import choose, install_components, listen_address, parse_env, write_env
-    from chain_network import HttpsSite, foreign_listeners, install_proxy_acme, conflicting_site, nginx_site_directory
+    from chain_network import HttpsSite, foreign_listeners, listeners, install_proxy_acme, conflicting_site, nginx_site_directory
     from chain_ingress import Ingress
 
     owners = discover()
@@ -379,8 +380,20 @@ def guided_install(manager, source, manifest, args):
                 print(f'可导入：{item["name"]}（{item["protocol"]}，端口 {item["port"]}）')
             for item in preview['pending']:
                 print(f'仅导入名称：{item["name"]}；{item["reason"]}')
+            require(not preview['pending'], '旧配置尚不能完整导入，取消切换；旧服务保持运行。')
         ports = {item['port'] for item in preview['imported']}
         selected_pids = {pid for owner in selected for pid in owner['pids']}
+        for item in preview['imported']:
+            if not item.get('reality_target'):
+                continue
+            target = urllib.parse.urlsplit('tcp://' + item['reality_target'])
+            local = target.hostname == 'localhost'
+            with contextlib.suppress(ValueError):
+                local = local or ipaddress.ip_address(target.hostname).is_loopback
+            if local:
+                pids = {int(p) for p in re.findall(r'pid=(\d+)', listeners((target.port,)))}
+                require(pids and not pids.intersection(selected_pids),
+                        'REALITY 本机目标未监听或会随旧代理停止，取消切换；旧服务保持运行。')
         def retained(port):
             for line in foreign_listeners((port,)).splitlines():
                 pids = {int(p) for p in re.findall(r'pid=(\d+)', line)}

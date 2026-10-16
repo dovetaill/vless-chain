@@ -513,6 +513,15 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                                 json!(reality.target);
                             inbound["streamSettings"]["realitySettings"]["serverNames"] =
                                 json!([reality.server_name]);
+                            for (key, value) in [
+                                ("limitFallbackUpload", &reality.limit_fallback_upload),
+                                ("limitFallbackDownload", &reality.limit_fallback_download),
+                            ] {
+                                if let Some(value) = value {
+                                    inbound["streamSettings"]["realitySettings"][key] =
+                                        json!(value);
+                                }
+                            }
                         }
                     }
                     if line.access.transport.network == "xhttp" {
@@ -830,6 +839,8 @@ mod tests {
         d.lines[0].access.reality = Some(RealityTarget {
             target: "cover.example.com:8443".into(),
             server_name: "cover.example.com".into(),
+            limit_fallback_upload: None,
+            limit_fallback_download: None,
         });
         let c = compile(&d).unwrap();
         let inbound = &c["a"]["inbounds"][0];

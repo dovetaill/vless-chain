@@ -1135,9 +1135,10 @@ async fn diagnose(
         .iter()
         .find(|l| l.id == id)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "请先发布该线路"))?;
+    let local_node = chain_panel::local_agent::node_id(app.token_file.parent().unwrap());
     let result = match tokio::time::timeout(
         Duration::from_secs(40),
-        probe(&app.xray, line, &doc, &request),
+        probe(&app.xray, line, &doc, &request, local_node.as_deref()),
     )
     .await
     {

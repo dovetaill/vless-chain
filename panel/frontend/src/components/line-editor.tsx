@@ -90,7 +90,7 @@ export function LineEditor({
           external_id: null, chain, target: "", network: "tcp",
           access: {
             transport: { network: protocol === "vless" ? transport : "tcp", path: field(data, "xhttp_path") || "/", host: field(data, "xhttp_host"), mode: field(data, "xhttp_mode") || "auto" },
-            reality: usesReality ? { target: realityTarget.trim(), server_name: sni.trim() } : null,
+            reality: usesReality ? { ...line?.access.reality, target: realityTarget.trim(), server_name: sni.trim() } : null,
             shared_port: protocol === "vless" && shared,
             fallback: usesTls && transport === "tcp" ? field(data, "fallback") : "",
             host: host.trim(),

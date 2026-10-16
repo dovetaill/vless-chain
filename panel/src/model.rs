@@ -190,6 +190,18 @@ fn default_mode() -> String {
 pub struct RealityTarget {
     pub target: String,
     pub server_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_fallback_upload: Option<RealityFallbackLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_fallback_download: Option<RealityFallbackLimit>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct RealityFallbackLimit {
+    pub after_bytes: u64,
+    pub bytes_per_sec: u64,
+    pub burst_bytes_per_sec: u64,
 }
 impl Access {
     pub fn server_name<'a>(&'a self, node: &'a Node) -> &'a str {
