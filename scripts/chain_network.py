@@ -2,10 +2,12 @@
 import contextlib
 import errno
 import fnmatch
+import grp
 import ipaddress
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import secrets
 import shlex
@@ -505,6 +507,23 @@ class HttpsSite:
         directory = Path('/etc/chain-panel-https')
         config = directory / 'nginx.conf'
         unit = service_path('chain-panel-https')
+        temporary = Path('/var/lib/chain-panel-https')
+        marker = temporary / '.chain-owner'
+        try:
+            worker = pwd.getpwnam('nobody')
+            group = grp.getgrgid(worker.pw_gid)
+        except KeyError:
+            raise ValueError('无法确认 nobody 工作用户及其主组，未配置独立 HTTPS 入口。') from None
+        require(worker.pw_uid != 0 and worker.pw_gid != 0, '独立 HTTPS 入口需要非特权工作用户和组。')
+        require(not temporary.is_symlink() and not os.path.ismount(temporary), f'临时目录不能是链接或挂载点：{temporary}')
+        require(not temporary.exists() or (temporary.is_dir() and not marker.is_symlink()
+                and marker.is_file() and marker.read_text().strip() == SITE_OWNER), f'{temporary} 不归本安装器管理。')
+        for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi', 'nginx.lock', 'nginx.lock.accept'):
+            path = temporary / name
+            require(not path.is_symlink() and not os.path.ismount(path), f'拒绝使用链接或挂载路径：{path}')
+            if path.exists() and not name.startswith('nginx.lock'):
+                require(path.is_dir() and path.stat().st_uid == worker.pw_uid and path.stat().st_mode & 0o700 == 0o700,
+                        f'临时目录的属主或权限不匹配，请核对后处理：{path}')
         for path in (config, unit):
             require(not path.is_symlink() and (not path.exists() or SITE_OWNER in path.read_text()), f'{path} 不归本安装器管理。')
         require(not directory.is_symlink(), f'{directory} 不能为链接。')
@@ -518,8 +537,12 @@ class HttpsSite:
         quote = lambda p: '"' + str(p).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$') + '"'
         require(not any(c in str(p) for p in (self.certificate, self.key) for c in '\n\r\0'), '证书路径无效。')
         ipv6 = f'listen [::]:{self.https_port} ssl;' if self.ipv6 else ''
-        body = (f'{SITE_OWNER}\npid /var/run/chain-panel-https.pid;\nerror_log /var/log/chain-panel-https.log;\n'
-                'events {}\nhttp { access_log off; server {\n'
+        # Even nginx -t creates/chowns temp paths; never inherit the host defaults.
+        body = (f'{SITE_OWNER}\nuser {quote(worker.pw_name)} {quote(group.gr_name)};\n'
+                f'pid /var/run/chain-panel-https.pid;\nerror_log /var/log/chain-panel-https.log;\n'
+                f'lock_file {quote(temporary / "nginx.lock")};\nevents {{}}\nhttp {{ access_log off;\n' +
+                ''.join(f'{name}_temp_path {quote(temporary / name)};\n'
+                        for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')) + 'server {\n'
                 f'listen {self.https_port} ssl; {ipv6}\nserver_name {self.domain};\n'
                 f'ssl_certificate {quote(self.certificate)};\nssl_certificate_key {quote(self.key)};\n'
                 'ssl_protocols TLSv1.2 TLSv1.3;\nclient_max_body_size 2m;\n'
@@ -527,7 +550,13 @@ class HttpsSite:
                 'proxy_http_version 1.1; proxy_set_header Host $http_host;\n'
                 'proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
                 'proxy_set_header X-Forwarded-Proto https; proxy_read_timeout 120s;\n} } }\n')
+        created_temporary = False
         try:
+            if not temporary.exists():
+                temporary.mkdir(mode=0o755)
+                created_temporary = True
+                temporary.chmod(0o755)
+                atomic_write(marker, SITE_OWNER + '\n')
             atomic_write(config, body, 0o600)
             run([nginx, '-t', '-c', config])
             command = [nginx, '-c', str(config), '-g', 'daemon off;']
@@ -553,6 +582,8 @@ class HttpsSite:
             if service_kind() == 'systemd':
                 run(['systemctl', 'daemon-reload'], check=False)
             self.restore_service('chain-panel-https', state)
+            if created_temporary and not self.service_state('chain-panel-https')[0]:
+                shutil.rmtree(temporary)
             raise
 
     @contextlib.contextmanager

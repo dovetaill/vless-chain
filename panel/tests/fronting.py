@@ -25,6 +25,8 @@ from chain_ingress import Ingress, OWNER
 
 
 def main():
+    if os.geteuid() == 0 or os.getegid() == 0:
+        raise SystemExit('fronting 验证必须以非特权用户和组运行，并使用该用户拥有的独立 CHAIN_TEST_ROOT。')
     with tempfile.TemporaryDirectory(prefix='fronting-', dir=os.environ['CHAIN_TEST_ROOT']) as temporary:
         h=Harness(Path(temporary))
         watcher_stop=threading.Event()
@@ -48,11 +50,17 @@ def main():
             config=h.root/'nginx.conf'
             config.write_text(f"""load_module {os.environ['CHAIN_TEST_STREAM_MODULE']};
 pid {h.root}/nginx.pid;
+lock_file {h.root}/nginx.lock;
 worker_processes 1;
 error_log {h.root}/nginx-error.log info;
 events {{ worker_connections 1024; }}
 http {{
  access_log off;
+ client_body_temp_path {h.root}/client_body;
+ proxy_temp_path {h.root}/proxy;
+ fastcgi_temp_path {h.root}/fastcgi;
+ uwsgi_temp_path {h.root}/uwsgi;
+ scgi_temp_path {h.root}/scgi;
  ssl_certificate {cert}; ssl_certificate_key {key}; ssl_protocols TLSv1.2 TLSv1.3;
  server {{ listen 127.0.0.1:{tls_port} ssl; http2 on; server_name reality.test; location / {{ return 200 'target-ok'; }} }}
  server {{ listen 127.0.0.1:{existing_port} ssl proxy_protocol; server_name existing.test;

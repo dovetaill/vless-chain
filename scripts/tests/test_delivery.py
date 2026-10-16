@@ -77,6 +77,18 @@ class Delivery(unittest.TestCase):
         for p, body in retained.items():
             self.assertEqual(p.read_bytes(), body)
 
+    def test_uninstall_removes_only_owned_https_temporary_directory(self):
+        _, _, args = self.uninstall_fixture()
+        temporary = self.manager.path('/var/lib/chain-panel-https')
+        temporary.mkdir()
+        (temporary / 'buffer').write_bytes(b'preserve foreign data')
+        with self.assertRaisesRegex(ValueError, '不归本安装器管理'):
+            self.manager.operate(args)
+        self.assertEqual((temporary / 'buffer').read_bytes(), b'preserve foreign data')
+        (temporary / '.chain-owner').write_text(installer.SITE_OWNER + '\n')
+        self.manager.operate(args)
+        self.assertFalse(temporary.exists())
+
     def test_purge_can_remove_retained_installation_without_deleting_certificate_or_other_sites(self):
         _, _, args = self.uninstall_fixture()
         self.manager.operate(args)

@@ -1,7 +1,9 @@
 """Migration checks use fixtures and mocked service managers only."""
 import contextlib
+import grp
 import json
 from pathlib import Path
+import pwd
 import shutil
 import sqlite3
 import subprocess
@@ -129,9 +131,12 @@ class Legacy(unittest.TestCase):
             def command(argv, **kwargs):
                 if '-t' in argv:
                     text = config.read_text().replace('/var/run/chain-panel-https.pid', str(root / 'nginx.pid')).replace('/var/log/chain-panel-https.log', str(root / 'nginx.log'))
-                    text = text.replace('http {', 'http {\n' + ''.join(
-                        f'{name}_temp_path {root}/{name};\n'
-                        for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')))
+                    for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi'):
+                        self.assertIn(f'{name}_temp_path "{root}/temporary/{name}";', text)
+                    worker = pwd.getpwnam('nobody')
+                    self.assertIn(f'user "{worker.pw_name}" "{grp.getgrgid(worker.pw_gid).gr_name}";', text)
+                    self.assertIn(f'lock_file "{root}/temporary/nginx.lock";', text)
+                    self.assertNotIn('/var/lib/nginx', text)
                     validation = root / 'validate.conf'
                     validation.write_text(text)
                     command = ['nginx', '-t', '-p', root, '-c', validation]
@@ -141,11 +146,12 @@ class Legacy(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     return result
                 return Mock(returncode=0)
-            with patch.object(network, 'Path', side_effect=lambda p: root / 'https' if p == '/etc/chain-panel-https' else Path(p)), \
+            paths = {'/etc/chain-panel-https': root / 'https', '/var/lib/chain-panel-https': root / 'temporary'}
+            with patch.object(network, 'Path', side_effect=lambda p: paths.get(p, Path(p))), \
                     patch.object(network, 'service_path', return_value=unit), patch.object(network, 'service_kind', return_value='systemd'), \
                     patch.object(network, 'listeners', return_value=''), patch.object(network, 'install_packages'), \
                     patch.object(network, 'run', side_effect=command), patch.object(network, 'service') as service, \
-                    patch.object(site, 'service_state', side_effect=[(False, False), (True, True)]), \
+                    patch.object(site, 'service_state', side_effect=[(False, False), (True, True), (False, False)]), \
                     patch.object(site, 'restore_service'), patch.object(site, 'certificate_valid', return_value=True):
                 with self.assertRaisesRegex(ValueError, 'installation failed'):
                     with site.manual_activate():
@@ -154,8 +160,35 @@ class Legacy(unittest.TestCase):
                         raise ValueError('installation failed')
             self.assertFalse(config.exists())
             self.assertFalse(unit.exists())
+            self.assertFalse((root / 'temporary').exists())
             self.assertEqual(foreign.read_text(), 'preserve this site')
             self.assertTrue(all(call.args[1] == 'chain-panel-https' for call in service.call_args_list))
+
+    def test_manual_https_rejects_foreign_and_linked_temporary_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            site = network.HttpsSite('panel.example.com', 12345)
+            site.certificate, site.key = root / 'cert', root / 'key'
+            state = root / 'state'
+            state.mkdir()
+            foreign = root / 'foreign'
+            foreign.mkdir()
+            before = foreign.stat()
+            paths = {'/etc/chain-panel-https': root / 'https', '/var/lib/chain-panel-https': state}
+            with patch.object(network, 'Path', side_effect=lambda p: paths.get(p, Path(p))), \
+                    patch.object(site, 'certificate_valid', return_value=True), patch.object(network, 'run') as run:
+                with self.assertRaisesRegex(ValueError, '不归本安装器管理'):
+                    with site.manual_activate():
+                        self.fail('foreign directory accepted')
+                (state / '.chain-owner').write_text(network.SITE_OWNER + '\n')
+                (state / 'proxy').symlink_to(foreign, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, '链接或挂载'):
+                    with site.manual_activate():
+                        self.fail('linked proxy directory accepted')
+                run.assert_not_called()
+            after = foreign.stat()
+            self.assertEqual((before.st_uid, before.st_gid, before.st_mode, before.st_ctime_ns),
+                             (after.st_uid, after.st_gid, after.st_mode, after.st_ctime_ns))
 
     def test_publish_waits_for_actual_applied_job(self):
         api = legacy.PanelAPI.__new__(legacy.PanelAPI)

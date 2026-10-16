@@ -518,6 +518,13 @@ class Manager:
         files = [(wrapper, OWNER), (hook, SITE_OWNER), (renew_service, SITE_OWNER),
                  (self.path('/etc/chain-panel-https/nginx.conf'), SITE_OWNER),
                  *[(p, owner) for p, _, owner in units], *[(p, SITE_OWNER) for p in sites]]
+        https_temporary = self.path('/var/lib/chain-panel-https')
+        https_marker = https_temporary / '.chain-owner'
+        require(not https_temporary.is_symlink() and not os.path.ismount(https_temporary),
+                f'拒绝删除链接或挂载目录：{https_temporary}')
+        require(not https_temporary.exists() or (https_temporary.is_dir() and not https_marker.is_symlink()
+                and https_marker.is_file() and https_marker.read_text().strip() == SITE_OWNER),
+                f'{https_temporary} 不归本安装器管理，拒绝删除。')
         directories = [self.base, ingress.directory, ingress.config, self.path('/var/lib/chain-acme')]
         directories += [p for role in roles for p in self.role_paths(role)[:2]]
         backups = self.path('/var/backups/chain-panel')
@@ -574,7 +581,7 @@ class Manager:
             if purge and self.live:
                 for role in roles:
                     remove_account('chain-' + role)
-            remove = [ingress.directory, ingress.config, self.path('/var/lib/chain-acme')]
+            remove = [ingress.directory, ingress.config, self.path('/var/lib/chain-acme'), https_temporary]
             if purge:
                 remove += [p for role in roles for p in self.role_paths(role)[:2]] + [backups]
             for p in remove:
