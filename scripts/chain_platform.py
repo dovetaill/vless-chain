@@ -33,12 +33,49 @@ def service_path(name, kind=None):
     return Path('/etc/systemd/system') / (name + '.service')
 
 
+def stop_openrc_residue(name):
+    """OpenRC can mark a failed start stopped while its supervisor keeps respawning."""
+    pidfile = Path('/run') / f'supervise-{name}.pid'
+    if not pidfile.exists():
+        return
+    require(not pidfile.is_symlink() and pidfile.is_file()
+            and pidfile.stat().st_uid == 0 and not pidfile.stat().st_mode & 0o022,
+            f'{pidfile} 归属不可信，拒绝清理。')
+    pid = pidfile.read_text().strip()
+    require(pid.isdecimal() and int(pid) > 1, f'{pidfile} 内容无效，拒绝清理。')
+    process = Path('/proc') / pid
+    if process.exists():
+        binary = shutil.which('supervise-daemon')
+        command = (process / 'cmdline').read_bytes().decode().rstrip('\0').split('\0')
+        env = dict(item.split('=', 1) for item in (process / 'environ').read_bytes().decode().split('\0') if '=' in item)
+        role = name.removeprefix('chain-')
+        require(binary and process.stat().st_uid == 0
+                and (process / 'exe').resolve() == Path(binary).resolve()
+                and command[1:3] == [name, '--start']
+                and command[-2:] == [f'/opt/chain/current-{role}/bin/{name}', '--']
+                and env.get('RC_SVCNAME') == name
+                and env.get('RC_SERVICE') == '/etc/init.d/' + name,
+                f'{name} 的 PID {pid} 不属于本安装器的 supervisor，拒绝清理。')
+        print(f'正在清理上次未退出的 {name} supervisor（PID {pid}）…', flush=True)
+        run([binary, name, '--stop'], env={**os.environ, 'RC_SVCNAME': name}, timeout=65)
+    else:
+        pidfile.unlink()
+
+
 def service(action, name, check=True):
     kind = service_kind()
     if kind == 'systemd':
         return run(['systemctl', action, name], check=check).returncode
     name = name.removesuffix('.service').removesuffix('.timer')
     if kind == 'openrc':
+        if name in ('chain-panel', 'chain-agent') and action in ('stop', 'restart'):
+            code = run(['rc-service', name, 'stop'], check=check).returncode
+            if code:
+                return code
+            stop_openrc_residue(name)
+            if action == 'stop':
+                return 0
+            action = 'start'
         if action in ('enable', 'disable'):
             argv = ['rc-update', 'add' if action == 'enable' else 'del', name, 'default']
         else:

@@ -20,6 +20,36 @@ import chain_release as release
 
 
 class Platforms(unittest.TestCase):
+    def test_openrc_restart_and_rollback_recover_only_panel_and_agent(self):
+        for name in ['chain-panel', 'chain-agent']:
+            for action in ['stop', 'restart']:
+                events = []
+                with self.subTest(name=name, action=action), \
+                        patch.object(platform, 'service_kind', return_value='openrc'), \
+                        patch.object(platform, 'run', side_effect=lambda argv, **kw:
+                                     (events.append(argv) or subprocess.CompletedProcess(argv, 0))), \
+                        patch.object(platform, 'stop_openrc_residue', side_effect=lambda name: events.append(['recover', name])):
+                    self.assertEqual(platform.service(action, name + '.service'), 0)
+                expected = [['rc-service', name, 'stop'], ['recover', name]]
+                if action == 'restart':
+                    expected.append(['rc-service', name, 'start'])
+                self.assertEqual(events, expected)
+        for name in ['nginx', 'xray-chain-example', 'chain-panel-https']:
+            with self.subTest(name=name), patch.object(platform, 'service_kind', return_value='openrc'), \
+                    patch.object(platform, 'run', return_value=subprocess.CompletedProcess([], 0)) as run, \
+                    patch.object(platform, 'stop_openrc_residue') as recover:
+                platform.service('restart', name)
+                run.assert_called_once_with(['rc-service', name, 'restart'], check=True)
+                recover.assert_not_called()
+
+    def test_openrc_restart_does_not_start_after_stop_failure(self):
+        with patch.object(platform, 'service_kind', return_value='openrc'), \
+                patch.object(platform, 'run', return_value=subprocess.CompletedProcess([], 1)) as run, \
+                patch.object(platform, 'stop_openrc_residue') as recover:
+            self.assertEqual(platform.service('restart', 'chain-panel', check=False), 1)
+            run.assert_called_once_with(['rc-service', 'chain-panel', 'stop'], check=False)
+            recover.assert_not_called()
+
     def test_remove_service_accounts_checks_ownership_and_platform_commands(self):
         user = SimpleNamespace(pw_name='chain-agent', pw_uid=987, pw_gid=987,
                                pw_dir='/var/lib/chain-agent', pw_shell='/usr/sbin/nologin')
