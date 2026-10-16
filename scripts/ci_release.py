@@ -107,6 +107,7 @@ def smoke(directory):
 def check():
     root = Path(__file__).resolve().parents[1]
     with Workspace(Path(os.environ.get('RUNNER_TEMP', str(root.parent)))) as work:
+        work.env['PYTHONUNBUFFERED'] = '1'
         log = work.root / 'checks.log'
         try:
             with log.open('w') as stream:
@@ -115,7 +116,7 @@ def check():
         except subprocess.CalledProcessError:
             # Make the actionable failure visible in the check annotation even
             # when an unauthenticated maintainer cannot download Actions logs.
-            tail = log.read_text()[-12000:]
+            tail = log.read_bytes()[-3000:].decode('utf-8', errors='replace')
             escaped = tail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
             print('::error title=Installer verification failed::' + escaped, flush=True)
             raise
