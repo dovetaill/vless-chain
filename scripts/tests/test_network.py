@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -153,7 +154,7 @@ class Network(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='chain-https-test-') as temp:
             root = Path(temp)
             site = network.HttpsSite('panel.example.com', 45000)
-            site.site, site.webroot = root / 'site.conf', root / 'webroot'
+            site.site, site.webroot, site.cert = root / 'site.conf', root / 'webroot', root / 'cert'
             site.site.write_text(network.SITE_OWNER + '\n# previous config\n')
             original = site.site.read_bytes()
             with patch.object(site, 'prepare'), patch.object(site, 'reload'), \
@@ -171,6 +172,92 @@ class Network(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, '验证路径不可达'):
                     site.challenge_check(timeout=0)
             self.assertEqual(list((site.webroot / '.well-known/acme-challenge').iterdir()), [])
+
+    def make_certificate(self, site):
+        site.cert.mkdir(exist_ok=True)
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+                        '-nodes', '-days', '1', '-subj', '/CN=' + site.domain,
+                        '-keyout', str(site.cert / 'privkey.pem'), '-out', str(site.cert / 'fullchain.pem')],
+                       check=True, capture_output=True)
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL unavailable')
+    def test_existing_certificate_checks_expiry_domain_and_key(self):
+        with tempfile.TemporaryDirectory(prefix='chain-cert-reuse-') as temporary:
+            site = network.HttpsSite('panel.example.com', 45000)
+            site.cert = Path(temporary) / 'cert'
+            self.assertFalse(site.certificate_valid())
+            self.make_certificate(site)
+            self.assertTrue(site.certificate_valid())  # Even a certificate expiring tomorrow is reused.
+            site.domain = 'other.example.com'
+            with self.assertRaises(subprocess.CalledProcessError):
+                site.certificate_valid()
+            site.domain = 'panel.example.com'
+            key = site.cert / 'privkey.pem'
+            original = key.read_bytes()
+            key.unlink()
+            with self.assertRaisesRegex(ValueError, '不会重新申请'):
+                site.certificate_valid()
+            subprocess.run(['openssl', 'genpkey', '-algorithm', 'EC', '-pkeyopt',
+                            'ec_paramgen_curve:prime256v1', '-out', str(key)], check=True, capture_output=True)
+            with self.assertRaises(ssl.SSLError):
+                site.certificate_valid()
+            key.write_bytes(original)
+            (site.cert / 'fullchain.pem').write_text('broken certificate')
+            with self.assertRaises(ssl.SSLError):
+                site.certificate_valid()
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL unavailable')
+    def test_interrupted_https_install_reuses_certificate_until_expired(self):
+        with tempfile.TemporaryDirectory(prefix='chain-https-retry-') as temporary:
+            root = Path(temporary)
+            site = network.HttpsSite('panel.example.com', 45000)
+            site.site, site.cert = root / 'site.conf', root / 'cert'
+            requests = []
+            real_run = network.run
+
+            def command(argv, **kwargs):
+                if argv[0] == 'certbot':
+                    requests.append(argv)
+                    self.make_certificate(site)
+                elif argv[0] == 'openssl':
+                    return real_run(argv, **kwargs)
+                return subprocess.CompletedProcess(argv, 0)
+
+            with patch.object(site, 'prepare'), patch.object(site, 'reload'), \
+                    patch.object(site, 'challenge_check') as challenge, patch.object(site, 'renewal') as renewal, \
+                    patch.object(site, 'service_state', return_value=(False, False)), \
+                    patch.object(site, 'renewal_paths', return_value=tuple(root / name for name in ('hook', 'service', 'timer'))), \
+                    patch('chain_ingress.refresh_panel_site') as refresh, patch.object(network, 'run', side_effect=command):
+                with self.assertRaises(KeyboardInterrupt):
+                    with site.activate():
+                        raise KeyboardInterrupt()
+                self.assertFalse(site.site.exists())
+                saved = {path: path.read_bytes() for path in site.cert.iterdir()}
+                with site.activate():
+                    pass
+                self.assertEqual(len(requests), 1)
+                challenge.assert_called_once()
+                self.assertEqual(renewal.call_count, 2)
+                refresh.assert_called_once_with(site.site)
+                self.assertEqual({path: path.read_bytes() for path in saved}, saved)
+                self.assertIn('ssl_certificate ', site.site.read_text())
+                certificate = site.cert / 'fullchain.pem'
+                (root / 'index').touch()
+                (root / 'serial').write_text('01\n')
+                (root / 'ca.conf').write_text('[ca]\ndefault_ca=issuer\n[issuer]\n'
+                    f'database={root}/index\nserial={root}/serial\nnew_certs_dir={root}\n'
+                    'default_md=sha256\npolicy=subject\n[subject]\ncommonName=supplied\n')
+                real_run(['openssl', 'x509', '-x509toreq', '-in', certificate, '-signkey', site.cert / 'privkey.pem',
+                          '-out', root / 'request.pem'], capture_output=True)
+                real_run(['openssl', 'ca', '-batch', '-selfsign', '-notext', '-config', root / 'ca.conf',
+                          '-keyfile', site.cert / 'privkey.pem', '-in', root / 'request.pem',
+                          '-startdate', '20200101000000Z', '-enddate', '20200102000000Z',
+                          '-out', certificate], capture_output=True)
+                self.assertFalse(site.certificate_valid())
+                with site.activate():
+                    pass
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(challenge.call_count, 2)
 
     def test_challenge_retries_transient_response_and_keeps_same_probe(self):
         for failure in (urllib.error.HTTPError('http://panel.example.com', 404, 'Not Found', {}, io.BytesIO()),
@@ -352,6 +439,7 @@ class Network(unittest.TestCase):
                 if argv[:3] == ['systemctl', 'enable', '--now']:
                     raise subprocess.CalledProcessError(1, argv)
             with patch.object(site, 'prepare'), patch.object(site, 'reload'), patch.object(site, 'challenge_check'), \
+                    patch.object(site, 'certificate_valid', return_value=True), \
                     patch.object(site, 'renewal_paths', return_value=paths), patch.object(network, 'run', side_effect=command), \
                     patch.object(site, 'service_state', return_value=(True, True)), \
                     patch.object(network.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name):
@@ -390,6 +478,7 @@ class Network(unittest.TestCase):
             site.site.write_text(network.SITE_OWNER + '\n# original port\n')
             previous = site.site.read_bytes()
             with patch.object(site, 'prepare'), patch.object(site, 'reload'), patch.object(site, 'challenge_check'), \
+                    patch.object(site, 'certificate_valid', return_value=True), \
                     patch.object(site, 'renewal'), patch.object(site, 'service_state', return_value=(True, True)), \
                     patch.object(site, 'renewal_paths', return_value=tuple(root / name for name in ('hook', 'service', 'timer'))), \
                     patch.object(network, 'run'):

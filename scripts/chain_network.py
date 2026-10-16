@@ -11,6 +11,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -467,6 +468,19 @@ class HttpsSite:
         run(['systemctl', 'enable', '--now', timer.name])
         run(['systemctl', 'is-active', '--quiet', timer.name])
 
+    def certificate_valid(self):
+        certificate, key = self.cert / 'fullchain.pem', self.cert / 'privkey.pem'
+        if not certificate.exists() and not key.exists():
+            return False
+        require(certificate.is_file() and key.is_file(), '已有证书或私钥缺失，请恢复文件；不会重新申请证书。')
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(certificate, key, password='')
+        if run(['openssl', 'x509', '-in', certificate, '-noout', '-checkend', '0'],
+               check=False, capture_output=True).returncode != 0:
+            return False
+        run(['openssl', 'verify', '-trusted', certificate, '-partial_chain',
+             '-verify_hostname', self.domain, certificate], capture_output=True)
+        return True
+
     @contextlib.contextmanager
     def activate(self):
         nginx_state = self.service_state('nginx')
@@ -477,18 +491,22 @@ class HttpsSite:
         try:
             self.prepare()
             self.check_renewal_paths()
+            reuse_certificate = self.certificate_valid()
             previous = self.site.read_bytes() if self.site.exists() else None
             renewal = {path: (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None
                        for path in self.renewal_paths()}
             site_written = True
-            atomic_write(self.site, self.config(), 0o644)
-            self.reload()
-            self.challenge_check()
-            print('正在申请 HTTPS 证书（Let’s Encrypt），并设置自动续期…', flush=True)
-            run(['certbot', 'certonly', '--non-interactive', '--agree-tos', '--register-unsafely-without-email',
-                 '--config-dir', '/etc/letsencrypt', '--work-dir', '/var/lib/letsencrypt', '--logs-dir', '/var/log/letsencrypt',
-                 '--webroot', '--webroot-path', self.webroot, '--cert-name', self.certname,
-                 '--domain', self.domain, '--keep-until-expiring'])
+            if reuse_certificate:
+                print(f'复用已有且未过期的 HTTPS 证书：{self.certname}；不重复申请。', flush=True)
+            else:
+                atomic_write(self.site, self.config(), 0o644)
+                self.reload()
+                self.challenge_check()
+                print('正在申请 HTTPS 证书（Let’s Encrypt），并设置自动续期…', flush=True)
+                run(['certbot', 'certonly', '--non-interactive', '--agree-tos', '--register-unsafely-without-email',
+                     '--config-dir', '/etc/letsencrypt', '--work-dir', '/var/lib/letsencrypt', '--logs-dir', '/var/log/letsencrypt',
+                     '--webroot', '--webroot-path', self.webroot, '--cert-name', self.certname,
+                     '--domain', self.domain, '--keep-until-expiring'])
             require((self.cert / 'fullchain.pem').is_file() and (self.cert / 'privkey.pem').is_file(), '证书文件缺失。')
             atomic_write(self.site, self.config(tls=True), 0o644)
             self.reload()

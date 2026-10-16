@@ -66,7 +66,7 @@ cleanup() { if [ -n "$bootstrap_dir" ]; then rm -rf -- "$bootstrap_dir"; fi; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [ ! -f "$script_dir/chain_install.py" ] || [ ! -f "$script_dir/chain_common.py" ] || [ ! -f "$script_dir/chain_network.py" ] || [ ! -f "$script_dir/chain_platform.py" ]; then
+if [ ! -f "$script_dir/chain_install.py" ] || [ ! -f "$script_dir/chain_common.py" ] || [ ! -f "$script_dir/chain_network.py" ] || [ ! -f "$script_dir/chain_ingress.py" ] || [ ! -f "$script_dir/chain_platform.py" ]; then
   bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/chain-bootstrap-XXXXXXXX")
   "$python" -B - "$bootstrap_dir" <<'PY'
 import json, pathlib, re, sys, urllib.request
@@ -77,7 +77,7 @@ with urllib.request.urlopen(request, timeout=30) as response:
     commit = json.load(response)['sha']
 if not re.fullmatch('[0-9a-f]{40}', commit):
     raise SystemExit('安装器版本信息无效。')
-for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_platform.py']:
+for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py']:
     with urllib.request.urlopen(f'https://raw.githubusercontent.com/{repo}/{commit}/scripts/{name}', timeout=30) as response:
         value = response.read(1024 * 1024 + 1)
     if len(value) > 1024 * 1024:

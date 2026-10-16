@@ -1,4 +1,5 @@
 """Platform decisions and service files, without changing host accounts or services."""
+import io
 import os
 from pathlib import Path
 import plistlib
@@ -175,6 +176,27 @@ class Platforms(unittest.TestCase):
             self.assertIn('Linux', result.stdout)
             self.assertIn('macOS', result.stdout)
             self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_bootstrap_downloads_https_runtime_dependencies(self):
+        script = Path(__file__).resolve().parents[1] / 'install-server.sh'
+        bootstrap = script.read_text().split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+
+        def download(request, timeout):
+            if isinstance(request, str):
+                return io.BytesIO((script.parent / request.rsplit('/', 1)[-1]).read_bytes())
+            return io.BytesIO(b'{"sha": "' + b'a' * 40 + b'"}')
+
+        with tempfile.TemporaryDirectory(prefix='chain-bootstrap-test-') as temporary:
+            with patch('urllib.request.urlopen', side_effect=download), \
+                    patch.object(sys, 'argv', ['-', temporary]):
+                exec(compile(bootstrap, str(script), 'exec'), {'__name__': '__main__'})
+            result = subprocess.run(
+                [sys.executable, '-B', '-S', '-c',
+                 'import chain_install; from chain_ingress import refresh_panel_site'],
+                cwd=temporary, env={**os.environ, 'PYTHONPATH': ''},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(Path(temporary).exists())
 
 
 if __name__ == '__main__':
