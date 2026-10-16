@@ -1,4 +1,4 @@
-"""Native Linux release builder; invoked through version-release.sh."""
+"""Linux/macOS release builder; invoked through version-release.sh."""
 import argparse
 import contextlib
 import datetime
@@ -16,20 +16,24 @@ import tarfile
 import urllib.request
 import zipfile
 
-from chain_common import (Workspace, architecture, atomic_write, json_write, output, require,
+from chain_common import (Workspace, architecture, operating_system, atomic_write, json_write, output, require,
                           run, sha256, verify_archive_checksum, VERSION_RE)
 
 ROOT = Path(__file__).resolve().parents[1]
 XRAY_VERSION = '26.3.27'
 # Pinned official release ZIP checksums (GitHub asset digest); no unauthenticated latest download.
 XRAY_ASSETS = {
-    'x86_64': ('Xray-linux-64.zip', '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae'),
-    'aarch64': ('Xray-linux-arm64-v8a.zip', '4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c'),
+    ('linux', 'x86_64'): ('Xray-linux-64.zip', '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae'),
+    ('linux', 'aarch64'): ('Xray-linux-arm64-v8a.zip', '4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c'),
+    ('darwin', 'x86_64'): ('Xray-macos-64.zip', 'f5b0471d3459eff1b82e48af0aeac186abcc3298210070afbbbd8437a4e8b203'),
+    ('darwin', 'aarch64'): ('Xray-macos-arm64-v8a.zip', '2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf'),
 }
 MIHOMO_VERSION = '1.19.32'
 MIHOMO_ASSETS = {
-    'x86_64': ('amd64-compatible', 'ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20'),
-    'aarch64': ('arm64', '9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0'),
+    ('linux', 'x86_64'): ('amd64-compatible', 'ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20'),
+    ('linux', 'aarch64'): ('arm64', '9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0'),
+    ('darwin', 'x86_64'): ('amd64-compatible', '18b382df77bded2ad0fb3db27db5636cb15b20729d5ba995a357eeb9b46bf507'),
+    ('darwin', 'aarch64'): ('arm64', '3312a6780652c622890fd4357c6a853bbf865464fd047ac7b7f52dab8de18652'),
 }
 SHIPPED = ['panel', 'scripts', 'README.md', '.gitignore']
 
@@ -148,8 +152,8 @@ def release_wizard(push_only=False):
 
 
 def fetch_mihomo(work, destination):
-    arch, digest = MIHOMO_ASSETS[architecture()]
-    name = f'mihomo-linux-{arch}-v{MIHOMO_VERSION}.gz'
+    arch, digest = MIHOMO_ASSETS[operating_system(), architecture()]
+    name = f'mihomo-{operating_system()}-{arch}-v{MIHOMO_VERSION}.gz'
     archive = work.root / name
     url = f'https://github.com/MetaCubeX/mihomo/releases/download/v{MIHOMO_VERSION}/{name}'
     with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as stream:
@@ -166,7 +170,7 @@ def fetch_mihomo(work, destination):
 
 
 def fetch_xray(work, destination):
-    name, digest = XRAY_ASSETS[architecture()]
+    name, digest = XRAY_ASSETS[operating_system(), architecture()]
     archive = work.root / name
     url = f'https://github.com/XTLS/Xray-core/releases/download/v{XRAY_VERSION}/{name}'
     print(f'下载固定版本 Xray v{XRAY_VERSION} 并校验 SHA256。', flush=True)
@@ -183,13 +187,15 @@ def fetch_xray(work, destination):
 
 
 def default_output():
-    return ROOT / 'release-output' / f'v{version()}-linux-{architecture()}'
+    return ROOT / 'release-output' / f'v{version()}-{operating_system()}-{architecture()}'
 
 
 def check(args):
     run(['bash', '-n', ROOT / 'scripts/version-release.sh', ROOT / 'scripts/install-server.sh'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_delivery.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_network.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_platform.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_ingress.py'])
     if args.full:
         with Workspace(args.work_parent or ROOT.parent) as work:
             xray = work.root / 'bin/xray'
@@ -209,8 +215,10 @@ def build(args):
     node = tuple(int(v) for v in output(['node', '--version']).lstrip('v').split('.')[:3])
     require((node[0] == 20 and node >= (20, 19, 0)) or node >= (22, 12, 0), 'Vite 需要 Node.js 20.19+ 或 22.12+。')
     arch, ver = architecture(), version()
-    target = re.search(r'^host: (.+)$', output(['rustc', '-vV']), re.M).group(1)
-    require(target == f'{arch}-unknown-linux-gnu', '首版只构建本机 GNU/Linux 目标，不执行交叉编译。')
+    target = f'{arch}-unknown-linux-musl' if operating_system() == 'linux' else f'{arch}-apple-darwin'
+    require(target in output(['rustup', 'target', 'list', '--installed']).splitlines(), f'请先安装 Rust 构建目标：rustup target add {target}')
+    if operating_system() == 'linux':
+        require(shutil.which('musl-gcc'), 'Linux 静态发行包需要 musl-gcc（musl-tools）和 Perl。')
     destination = Path(args.output or default_output()).resolve()
     require(not destination.exists(), f'输出目录已存在：{destination}；请使用新的 --output 目录，避免覆盖已发行文件。')
     dirty = bool(source_status())
@@ -224,6 +232,11 @@ def build(args):
             shutil.copytree(ROOT / 'panel' / name, project / name,
                             ignore=shutil.ignore_patterns('node_modules', 'dist', '.env', '.env.*', '__pycache__'))
         work.env['CHAIN_WEB_ASSETS'] = str(project / 'frontend/dist')
+        if operating_system() == 'linux':
+            work.env['CARGO_TARGET_' + target.upper().replace('-', '_') + '_LINKER'] = 'musl-gcc'
+            work.env['CC_' + target.replace('-', '_')] = 'musl-gcc'
+        else:
+            work.env['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
         work.run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=project / 'frontend')
         work.run(['npm', 'run', 'build'], cwd=project / 'frontend')
         work.run(['cargo', 'test', '--locked', '--lib', '--quiet'], cwd=project)
@@ -236,7 +249,7 @@ def build(args):
         work.run([stage / 'bin/xray', 'version'])
         fetch_mihomo(work, stage / 'bin/mihomo')
         work.run([stage / 'bin/mihomo', '-v'])
-        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py']:
+        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py']:
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')
@@ -251,12 +264,12 @@ def build(args):
                 mode = 0o755 if name.startswith('bin/') or name.endswith('.sh') else 0o644
                 file.chmod(mode)
                 files[name] = {'sha256': sha256(file), 'mode': mode}
-        glibc = output(['getconf', 'GNU_LIBC_VERSION']).split()[-1]
-        manifest = {'format': 1, 'version': ver, 'arch': arch, 'target': target, 'glibc_min': glibc,
+        manifest = {'format': 1, 'version': ver, 'arch': arch, 'os': operating_system(), 'target': target,
                     'commit': commit, 'dirty': dirty, 'xray': XRAY_VERSION, 'mihomo': MIHOMO_VERSION, 'files': files,
                     'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        manifest.update({'libc': 'musl'} if operating_system() == 'linux' else {'macos_min': '14.0'})
         json_write(stage / 'release.json', manifest, 0o644)
-        name = f'chain-panel-{ver}-linux-{arch}.tar.gz'
+        name = f'chain-panel-{ver}-{operating_system()}-{arch}.tar.gz'
         package = work.root / name
         with tarfile.open(package, 'w:gz') as bundle:
             for file in sorted(stage.rglob('*')):
@@ -273,7 +286,7 @@ def build(args):
         atomic_write(destination / 'SHA256SUMS', f'{sha256(package)}  {name}\n', 0o644)
         verify_archive_checksum(destination / name)
     print(f'发行包：{destination / name}\n校验文件：{destination / "SHA256SUMS"}\n'
-          f'运行要求：Linux {arch}，glibc ≥ {glibc}；包含固定版本 Xray，无需 Node.js/Rust。')
+          f'运行要求：{operating_system()} {arch}；包含固定版本代理内核，无需 Node.js/Rust。')
     if dirty:
         print('这是包含未提交修改的本地构建；可本地安装，GitHub 发布前需提交并重新构建。')
 
@@ -288,7 +301,7 @@ def github(args):
             and manifest['commit'] == output(['git', 'rev-parse', 'HEAD'], cwd=ROOT),
             '发行包必须来自当前版本对应的干净提交。')
     tag = 'v' + manifest['version']
-    name = f'chain-panel-{manifest["version"]}-linux-{manifest["arch"]}.tar.gz'
+    name = f'chain-panel-{manifest["version"]}-{manifest.get("os", "linux")}-{manifest["arch"]}.tar.gz'
     verify_archive_checksum(directory / name)
     run(['gh', 'api', f'repos/{args.repo}/commits/{manifest["commit"]}', '--silent'])
     if args.action == 'draft':

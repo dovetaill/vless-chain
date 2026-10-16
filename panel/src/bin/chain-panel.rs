@@ -1172,8 +1172,16 @@ mod web_tests {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    chain_panel::runtime::watch_parent()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let listen = std::env::var("CHAIN_LISTEN").unwrap_or_else(|_| "127.0.0.1:8088".into());
     let listener = tokio::net::TcpListener::bind(&listen)
         .await

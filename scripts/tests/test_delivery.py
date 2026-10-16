@@ -66,6 +66,11 @@ class Delivery(unittest.TestCase):
         self.assertEqual((data / 'admin-token').read_text(), 'keep-this-token')
 
     def setUp(self):
+        for mock in [patch.object(installer, 'service_kind', return_value='systemd'),
+                     patch.object(installer, 'service_path', side_effect=lambda name:
+                         Path('/etc/systemd/system') / (name + '.service'))]:
+            mock.start()
+            self.addCleanup(mock.stop)
         self.temp = tempfile.TemporaryDirectory(prefix='chain-delivery-test-')
         self.root = Path(self.temp.name)
         self.manager = installer.Manager(self.root / 'system')
@@ -87,11 +92,11 @@ class Delivery(unittest.TestCase):
         (root / 'scripts').mkdir()
         for name in ['chain-panel', 'chain-agent', 'xray']:
             (root / 'bin' / name).write_text('fixture-' + version)
-        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'install-server.sh']:
+        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'install-server.sh']:
             shutil.copy2(Path(__file__).resolve().parents[1] / name, root / 'scripts' / name)
         files = {str(p.relative_to(root)): {'sha256': common.sha256(p), 'mode': 0o755 if p.parent.name == 'bin' or p.suffix == '.sh' else 0o644}
                  for p in root.rglob('*') if p.is_file()}
-        manifest = {'format': 1, 'version': version, 'arch': common.architecture(), 'glibc_min': '2.17', 'files': files}
+        manifest = {'format': 1, 'version': version, 'arch': common.architecture(), 'os': common.operating_system(), 'libc': 'musl', 'macos_min': '14.0', 'files': files}
         common.json_write(root / 'release.json', manifest)
         return root, manifest
 
@@ -226,7 +231,7 @@ class Delivery(unittest.TestCase):
         with patch('urllib.request.urlopen', side_effect=request_error):
             with self.assertRaisesRegex(ValueError, '尚无已发布'):
                 common.download_release(self.root)
-        name = f'chain-panel-0.1.0-linux-{common.architecture()}.tar.gz'
+        name = f'chain-panel-0.1.0-{common.operating_system()}-{common.architecture()}.tar.gz'
         release_info = {'tag_name': 'v0.1.0', 'assets': [{'name': n, 'browser_download_url': f'https://github.com/{common.RELEASE_REPO}/releases/download/v0.1.0/{n}'} for n in [name, 'SHA256SUMS']]}
         class Response(io.BytesIO):
             def geturl(self):
@@ -408,7 +413,7 @@ class Delivery(unittest.TestCase):
 
     def test_bad_arch_and_glibc_fail_before_changes(self):
         source, manifest = self.package()
-        for wrong in [{'arch': 'unsupported'}, {'glibc_min': '999.0'}]:
+        for wrong in [{'arch': 'unsupported'}, {'os': 'linux', 'libc': 'glibc', 'glibc_min': '999.0'}]:
             with self.assertRaises(ValueError):
                 self.manager.install(source, {**manifest, **wrong}, self.args())
             self.assertFalse(self.manager.base.exists())
@@ -573,27 +578,27 @@ class Delivery(unittest.TestCase):
         source, manifest = self.package()
         incoming = self.root / 'incoming'
         commit = 'a' * 40
-        for arch in ci.ARCHES:
-            manifest.update(arch=arch, target=f'{arch}-unknown-linux-gnu', commit=commit, dirty=False)
+        for system, arch in ((s, a) for s in ci.PLATFORMS for a in ci.ARCHES):
+            manifest.update(os=system, arch=arch, target=f'{arch}-unknown-linux-musl' if system == 'linux' else f'{arch}-apple-darwin', commit=commit, dirty=False)
             common.json_write(source / 'release.json', manifest)
             archive = self.archive(source)
-            destination = incoming / ('release-' + arch)
+            destination = incoming / f'release-{system}-{arch}'
             destination.mkdir(parents=True)
-            name = f'chain-panel-0.1.0-linux-{arch}.tar.gz'
+            name = f'chain-panel-0.1.0-{system}-{arch}.tar.gz'
             shutil.copy2(archive, destination / name)
             shutil.copy2(source / 'release.json', destination / 'release.json')
             (destination / 'SHA256SUMS').write_text(f'{common.sha256(archive)}  {name}\n')
         outgoing = self.root / 'published'
         with patch.object(ci, 'version', return_value='0.1.0'):
             ci.assemble(incoming, outgoing, 'v0.1.0', commit)
-        self.assertEqual(len(list(outgoing.iterdir())), 5)
+        self.assertEqual(len(list(outgoing.iterdir())), 9)
         for archive in outgoing.glob('*.tar.gz'):
             common.verify_archive_checksum(archive)
         manifest['dirty'] = True
         common.json_write(source / 'release.json', manifest)
         archive = self.archive(source)
-        destination = incoming / 'release-aarch64'
-        name = 'chain-panel-0.1.0-linux-aarch64.tar.gz'
+        destination = incoming / 'release-darwin-aarch64'
+        name = 'chain-panel-0.1.0-darwin-aarch64.tar.gz'
         shutil.copy2(archive, destination / name)
         shutil.copy2(source / 'release.json', destination / 'release.json')
         (destination / 'SHA256SUMS').write_text(f'{common.sha256(archive)}  {name}\n')

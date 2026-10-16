@@ -12,9 +12,14 @@ import socket
 import subprocess
 import sys
 import uuid
+import time
+import signal
+import shlex
+import shutil
 
 from chain_common import atomic_write, json_write, require
 from chain_network import domain_name, install_packages
+from chain_platform import service_kind, service_path, service, service_definition, init_path
 
 OWNER = '# chain-ingress managed v1'
 LISTEN = re.compile(r'(?m)^([ \t]*listen[ \t]+)([^;\n]+);')
@@ -44,7 +49,7 @@ def route_config(routes, blocked):
         require(isinstance(route, dict) and set(route) == {'sni', 'port'}, '路由只允许 SNI 和本机端口。')
         name = domain_name(route['sni'])
         port = route['port']
-        require(type(port) is int and 50000 <= port <= 65535, '路由只允许 Agent 内部端口 50000–65535。')
+        require(type(port) is int and 30000 <= port <= 65535, '路由只允许 Agent 内部端口 30000–65535。')
         require(name not in seen, 'SNI 重复：' + name)
         for pattern in blocked:
             matches = (fnmatch.fnmatchcase(name, pattern) or
@@ -106,7 +111,10 @@ class Ingress:
 
     def reload(self):
         self.command('nginx', '-t')
-        self.command('systemctl', 'reload', 'nginx')
+        if service_kind() == 'systemd':
+            self.command('systemctl', 'reload', 'nginx')
+        else:
+            service('reload', 'nginx')
 
     def status(self, **value):
         atomic_write(self.status_path, json.dumps(value, ensure_ascii=False), 0o644)
@@ -115,10 +123,10 @@ class Ingress:
         if self.state_path.exists():
             require(json.loads(self.status_path.read_text()).get('ready'), '统一入口状态异常，请先检查或关闭后重试。')
             return
-        require(self.path('/etc/systemd/system/chain-agent.service').exists(), '请先安装本机 Agent。')
-        for name in ['chain-ingress.service', 'chain-ingress.path']:
-            unit = self.path('/etc/systemd/system') / name
-            require(not unit.exists() or unit.read_text().startswith(OWNER), '系统服务不归本项目管理：' + name)
+        require(self.path(str(service_path('chain-agent'))).exists(), '请先安装本机 Agent。')
+        for unit in self.unit_paths():
+            name = unit.name
+            require(not unit.exists() or OWNER in unit.read_text(), '系统服务不归本项目管理：' + name)
         dump = self.command('nginx', '-T')
         sections = re.split(r'^# configuration file ', dump, flags=re.M)[1:]
         require(sections, '无法读取 Nginx 配置。')
@@ -155,11 +163,15 @@ class Ingress:
         text = files.get(str(main), {}).get('after', main.read_text())
         text, count = re.subn(r'(?m)^(\s*http\s*\{)', r'\1\n    real_ip_header proxy_protocol;\n    set_real_ip_from 127.0.0.1;\n    set_real_ip_from ::1;', text)
         require(count == 1, '无法定位 Nginx HTTP 主配置。')
-        if 'ngx_stream_module.so' not in dump:
+        build = subprocess.run(['nginx', '-V'], check=True, capture_output=True, text=True).stderr if self.root == Path('/') else ''
+        if 'ngx_stream_module.so' not in dump and '--with-stream' not in shlex.split(build):
             module = Path('/usr/lib/nginx/modules/ngx_stream_module.so')
             if not module.is_file() and self.root == Path('/'):
-                install_packages(['libnginx-mod-stream'])
+                install_packages(['nginx-mod-stream' if shutil.which('dnf') or shutil.which('yum') else 'libnginx-mod-stream'])
                 dump = self.command('nginx', '-T')
+                modules = re.search(r'--modules-path=(\S+)', build)
+                if modules:
+                    module = Path(modules[1]) / 'ngx_stream_module.so'
             require(module.is_file(), '缺少 Nginx stream 模块，请先安装系统的 libnginx-mod-stream。')
             if 'ngx_stream_module.so' not in dump:
                 text = f'load_module {module};\n' + text
@@ -197,11 +209,25 @@ class Ingress:
             self.status(ready=False, error='启用失败，已恢复原配置')
             raise
 
+    def unit_paths(self):
+        if service_kind() != 'systemd':
+            return [self.path(str(service_path('chain-ingress')))]
+        return [self.path('/etc/systemd/system') / name for name in ('chain-ingress.service', 'chain-ingress.path')]
+
     def install_units(self):
+        if service_kind() != 'systemd':
+            path = self.unit_paths()[0]
+            require(not path.exists() or OWNER in path.read_text(), '系统服务不归本项目管理：' + str(path))
+            script = self.path('/opt/chain/current-agent/scripts/chain_ingress.py')
+            atomic_write(path, service_definition('chain-ingress', [sys.executable, '-B', script, 'watch'], OWNER),
+                         0o755 if service_kind() == 'openrc' else 0o644)
+            service('enable', 'chain-ingress')
+            service('restart', 'chain-ingress')
+            return
         units = self.path('/etc/systemd/system')
         script = self.path('/opt/chain/current-agent/scripts/chain_ingress.py')
         service = (f'{OWNER}\n[Unit]\nDescription=Chain Nginx SNI routes\nStartLimitIntervalSec=0\n'
-                   f'[Service]\nType=oneshot\nExecStart=/usr/bin/python3 -B {script} apply\n')
+                   f'[Service]\nType=oneshot\nExecStart={sys.executable} -B {script} apply\n')
         watch = (f'{OWNER}\n[Unit]\nDescription=Watch Chain SNI route requests\n'
                  f'[Path]\nPathChanged={self.request_path}\nUnit=chain-ingress.service\n'
                  '[Install]\nWantedBy=multi-user.target\n')
@@ -213,6 +239,13 @@ class Ingress:
         self.command('systemctl', 'enable', '--now', 'chain-ingress.path')
 
     def remove_units(self):
+        if service_kind() != 'systemd':
+            path = self.unit_paths()[0]
+            if path.exists() and OWNER in path.read_text():
+                service('stop', 'chain-ingress')
+                service('disable', 'chain-ingress')
+                path.unlink()
+            return
         watch = self.path('/etc/systemd/system/chain-ingress.path')
         if watch.exists() and watch.read_text().startswith(OWNER):
             with contextlib.suppress(Exception):
@@ -276,11 +309,26 @@ class Ingress:
 
 
 def main():
+    init_path()
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['enable', 'disable', 'apply'])
+    parser.add_argument('action', choices=['enable', 'disable', 'apply', 'watch'])
     args = parser.parse_args()
     require(os.geteuid() == 0, '需要 root 权限。')
     ingress = Ingress()
+    if args.action == 'watch':
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        previous = None
+        while True:
+            try:
+                stamp = ingress.request_path.stat().st_mtime_ns
+                if stamp != previous:
+                    ingress.operate('apply')
+                    previous = stamp
+            except FileNotFoundError:
+                pass
+            except (ValueError, OSError, subprocess.CalledProcessError) as error:
+                print(error, file=sys.stderr, flush=True)
+            time.sleep(1)
     ingress.operate(args.action)
 
 

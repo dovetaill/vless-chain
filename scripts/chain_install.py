@@ -28,8 +28,10 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from chain_common import (architecture, atomic_write, json_write, output, require, restore_modes,
+from chain_common import (architecture, operating_system, compatible_release, atomic_write, json_write, output, require, restore_modes,
                           run, safe_extract, sha256, verify_archive_checksum, verify_tree, download_release)
+from chain_platform import (service_kind, service_path, service, service_state, service_definition,
+                            create_account, init_path)
 from chain_network import (HttpsSite, available_port, domain_name, public_ipv4, server_addresses, validate_dns)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,13 +96,19 @@ class System:
     def call(self, *args, check=True):
         if not self.enabled:
             return 0
+        if service_kind() != 'systemd':
+            return 0 if args[0] == 'daemon-reload' else service(args[0], args[1], check=check)
         return subprocess.run(['systemctl', *args], check=check).returncode
 
     def active(self, role):
+        if service_kind() != 'systemd':
+            return self.enabled and service_state('chain-' + role)[0]
         return self.enabled and subprocess.run(['systemctl', 'is-active', '--quiet', f'chain-{role}.service'],
                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
     def autostart(self, role):
+        if service_kind() != 'systemd':
+            return self.enabled and service_state('chain-' + role)[1]
         return self.enabled and subprocess.run(['systemctl', 'is-enabled', '--quiet', f'chain-{role}.service'],
                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
@@ -111,7 +119,8 @@ class Manager:
         self.live = self.root == Path('/')
         if self.live:
             require(os.geteuid() == 0, '安装与运维需要 root 或 sudo。')
-            require(Path('/run/systemd/system').is_dir(), '当前安装脚本需要正在运行的 systemd。')
+            require(service_kind() != 'systemd' or Path('/run/systemd/system').is_dir(),
+                    'Linux 安装需要正在运行的 systemd 或 OpenRC。')
         self.base = self.path('/opt/chain')
         self.state_file = self.base / '.chain-install.json'
         self.system = System(self.live)
@@ -143,7 +152,7 @@ class Manager:
     def role_paths(self, role):
         require(role in ROLES, '组件只能是 panel 或 agent。')
         return (self.path('/etc/chain-' + role), self.path('/var/lib/chain-' + role),
-                self.path('/etc/systemd/system/chain-' + role + '.service'))
+                self.path(str(service_path('chain-' + role))))
 
     def require_role(self, role):
         state = self.state()
@@ -165,8 +174,7 @@ class Manager:
                 pass
             else:
                 raise ValueError(f'已有组 {name}，无法确认归属。')
-            run(['useradd', '--system', '--user-group', '--no-create-home', '--home-dir', home,
-                 '--shell', '/usr/sbin/nologin', name])
+            create_account(name, home)
             user = pwd.getpwnam(name)
         return user.pw_uid, user.pw_gid
 
@@ -225,6 +233,9 @@ class Manager:
 
     def unit(self, role):
         etc, _, _ = self.role_paths(role)
+        if service_kind() != 'systemd':
+            return service_definition('chain-' + role, [self.base / ('current-' + role) / 'bin' / ('chain-' + role)],
+                                      OWNER, 'chain-' + role, parse_env(etc / (role + '.env')))
         env_file = str(etc / (role + '.env')).replace('%', '%%')
         require(not any(c in env_file for c in '\n\r\0'), '服务路径包含无效字符。')
         def quote(value):
@@ -272,7 +283,7 @@ class Manager:
                     except OSError:
                         pass
             time.sleep(.5)
-        raise ValueError(f'chain-{role} 启动检查未通过；请查看 journalctl -u chain-{role}。')
+        raise ValueError(f'chain-{role} 启动检查未通过；请运行 chainctl logs --component {role}。')
 
     def check_panel_port(self, env):
         host, port = listen_address(env['CHAIN_LISTEN'])
@@ -306,10 +317,7 @@ class Manager:
         state = self.state()
         old = state['roles'].get(role)
         require(args.action != 'update' or old, f'尚未安装 {role}；首次请用 install。')
-        require(manifest.get('arch') == architecture(), '发行包与本机 CPU 架构不匹配。')
-        current_glibc = tuple(map(int, output(['getconf', 'GNU_LIBC_VERSION']).split()[-1].split('.')))
-        require(current_glibc >= tuple(map(int, manifest['glibc_min'].split('.'))),
-                f'发行包要求 glibc ≥ {manifest["glibc_min"]}；请在更旧系统构建兼容包或在目标机原生构建。')
+        compatible_release(manifest)
         etc, data, unit = self.role_paths(role)
         wrapper = self.path('/usr/local/bin/chainctl')
         if not state['roles']:
@@ -334,7 +342,7 @@ class Manager:
             install_proxy_acme(role, uid, gid)
         else:
             (self.path('/var/lib/chain-acme') / role).mkdir(parents=True, exist_ok=True)
-        release_id = f'{manifest["version"]}-linux-{manifest["arch"]}-{sha256(source / "release.json")[:12]}'
+        release_id = f'{manifest["version"]}-{manifest.get("os", "linux")}-{manifest["arch"]}-{sha256(source / "release.json")[:12]}'
         release = self.base / 'releases' / release_id
         with self.lock():
             state = self.state()
@@ -370,7 +378,7 @@ class Manager:
                 for path in configs[:2]:
                     if path.exists():
                         os.chown(path, uid, gid)
-                atomic_write(unit, self.unit(role), 0o644)
+                atomic_write(unit, self.unit(role), 0o755 if service_kind() == 'openrc' else 0o644)
                 self.link(role, release_id)
                 self.system.call('daemon-reload')
                 self.system.call('enable', 'chain-' + role + '.service')
@@ -384,16 +392,18 @@ class Manager:
                 json_write(self.state_file, state)
                 manager = self.base / 'manager'
                 manager.mkdir(exist_ok=True)
-                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py']:
+                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py']:
+                    if name == 'chain_platform.py' and 'os' not in manifest and not (release / 'scripts' / name).exists():
+                        continue
                     atomic_write(manager / name, (release / 'scripts' / name).read_bytes(), 0o644)
-                atomic_write(wrapper, f'#!/usr/bin/env bash\n# {OWNER}\nset -Eeuo pipefail\nexec python3 -B {shlex.quote(str(manager / "chain_install.py"))} "$@"\n', 0o755)
+                atomic_write(wrapper, f'#!/bin/sh\n# {OWNER}\nset -eu\nexec {shlex.quote(sys.executable)} -B {shlex.quote(str(manager / "chain_install.py"))} "$@"\n', 0o755)
             except BaseException:
                 self.system.call('stop', 'chain-' + role + '.service', check=False)
                 for path, value in previous.items():
                     if value is None:
                         path.unlink(missing_ok=True)
                     else:
-                        atomic_write(path, value, 0o644 if path == unit else 0o600)
+                        atomic_write(path, value, (0o755 if service_kind() == 'openrc' else 0o644) if path == unit else 0o600)
                         if path != unit:
                             os.chown(path, uid, gid)
                 if old:
@@ -418,7 +428,7 @@ class Manager:
             else:
                 print('Agent 已启动，可在 Web「代理」中新建本机代理。排障时输入 chainctl，选择「查看日志」。')
         else:
-            print(f'离线安装树已准备：{self.root}；未创建系统账户、未操作 systemd、未启动监听服务。')
+            print(f'离线安装树已准备：{self.root}；未创建系统账户、未操作服务管理器、未启动监听服务。')
 
     def show_access(self):
         self.require_role('panel')
@@ -473,8 +483,9 @@ class Manager:
             print(f'{ROLE_NAMES[role]} · 版本 {state["roles"][role]["version"]}')
             self.system.call('status', 'chain-' + role + '.service', '--no-pager', check=False)
         elif action == 'logs':
-            require(self.live, '--root 离线安装树没有 systemd 日志。')
-            run(['journalctl', '-u', 'chain-' + role + '.service', '--no-pager', '-n', '100'])
+            require(self.live, '--root 离线安装树没有服务日志。')
+            run(['journalctl', '-u', 'chain-' + role + '.service', '--no-pager', '-n', '100']
+                if service_kind() == 'systemd' else ['tail', '-n', '100', '/var/log/chain-' + role + '.log'])
         elif action == 'token':
             require(role == 'panel', 'Agent 令牌只在 Web 创建或重置时显示。')
             print((self.role_paths(role)[1] / 'admin-token').read_text().strip())
@@ -522,7 +533,7 @@ class Manager:
 
 
 def local_packages():
-    return sorted((ROOT / 'release-output').glob(f'*/chain-panel-*-linux-{architecture()}.tar.gz'),
+    return sorted((ROOT / 'release-output').glob(f'*/chain-panel-*-{operating_system()}-{architecture()}.tar.gz'),
                   key=lambda p: p.stat().st_mtime)
 
 
@@ -609,10 +620,7 @@ def install_components(manager, source, manifest, args):
 def install_package(manager, args):
     def install_source(source, manifest):
         # Validate the downloaded package before asking for deployment details.
-        require(manifest['arch'] == architecture(), '发行包与本机 CPU 架构不匹配。')
-        glibc = tuple(map(int, output(['getconf', 'GNU_LIBC_VERSION']).split()[-1].split('.')))
-        require(glibc >= tuple(map(int, manifest['glibc_min'].split('.'))),
-                f'发行包需要 glibc ≥ {manifest["glibc_min"]}；请使用 Ubuntu 22.04+ 或 Debian 12+。')
+        compatible_release(manifest)
         if args.action == 'install' and args.component == 'panel' and (
                 getattr(args, 'guided', False) or getattr(args, 'domain', None) is not None):
             panel_questions(manager, args)
@@ -620,7 +628,7 @@ def install_package(manager, args):
             agent_questions(manager, args)
         site = None
         if getattr(args, 'domain', None):
-            require(manager.live, '自动 HTTPS 仅用于实际 systemd 安装，不支持 --root 离线模式。')
+            require(manager.live, '自动 HTTPS 仅用于实际系统安装，不支持 --root 离线模式。')
             site = HttpsSite(args.domain, listen_address(args.listen)[1], getattr(args, 'domain_ipv6', False))
         args.defer_access = True
         with site.activate() if site else contextlib.nullcontext():
@@ -842,6 +850,7 @@ def make_parser():
 
 
 def main(argv=None):
+    init_path()
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = make_parser()
     args = parser.parse_args(argv)

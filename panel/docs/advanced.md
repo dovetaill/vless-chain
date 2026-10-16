@@ -24,7 +24,7 @@
 
 `npm ci` 报缺少锁文件时，先检查所在目录：前端清单与锁文件位于 `panel/frontend/`，仓库根目录没有 npm 项目。不要为了消除报错在根目录生成新锁文件。
 
-需要 Linux、Rust 2024 edition 工具链、Node.js 20.19+ 或 22.12+、npm、C 编译器、pkg-config 与 OpenSSL 开发库（Ubuntu/Debian 为 libssl-dev）。WebAuthn 使用 OpenSSL，正式 Ubuntu 22.04 构建运行时需要 libssl3。运行时包括两个 Rust 二进制和 Xray；Agent 自动证书还需要 Certbot，安装器会补齐。前端静态文件编译进 `chain-panel`，不需要 Node.js 服务。
+需要 Linux 或 macOS 14+、Rust 2024 edition 工具链、Node.js 20.19+ 或 22.12+、npm、C 编译器、Perl 和 make。WebAuthn 的 OpenSSL 随程序静态编译，不要求目标系统安装匹配版本的 libssl。Linux 发行构建还需要 musl-tools 和对应 Rust 目标（`rustup target add x86_64-unknown-linux-musl` 或 `aarch64-unknown-linux-musl`）；macOS 使用本机 apple-darwin 目标。运行时包括两个 Rust 二进制和 Xray；Agent 自动证书还需要 Certbot，安装器会补齐。前端静态文件编译进 `chain-panel`，不需要 Node.js 服务。
 
 ```bash
 cd /home/wwwroot/vless-chain/panel/frontend
@@ -74,13 +74,13 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 
 按 `Ctrl+C` 关闭隧道。高级自动化可用 `install --domain panel.example.com --non-interactive` 自动配置 HTTPS，或 `--domain '' --non-interactive` 自动选择 IP 和随机端口。NAT 环境通过 `--local-host` 明确公网入站地址。需要固定监听地址时增加 `--listen 0.0.0.0:8088`，并按需要配置防火墙访问范围。
 
-域名安装查询公共 DNS 的 A/AAAA 记录并核对网卡公网地址，使用 Nginx webroot 完成 HTTP-01 验证。自动安装仅调用 apt/dnf；不下载第三方 Nginx/ACME 安装脚本。受管站点为主配置 `http` 块实际包含目录中的 `chain-panel.conf`，证书名为 `chain-panel-域名`，验证目录为 `/var/lib/chain-acme`。签证书前检查真实 HTTP 验证路径，重载后最多等待 15 秒让新站点生效；失败时显示验证 URL、HTTP 状态码或连接错误，HTTP 404/403 不再统一误报为防火墙问题。本机自检通过后仍由证书机构从公网验证 TCP 80；HTTPS 访问使用 TCP 443。同域名已有站点或 80/443 被其他程序占用时拒绝覆盖。只支持系统 Nginx 主配置及其 systemd 服务。TLS 配置失败恢复原站点与此前服务状态，已签发证书保留供重试。
+域名安装查询公共 DNS 的 A/AAAA 记录并核对网卡公网地址，使用 Nginx webroot 完成 HTTP-01 验证。自动安装调用系统包管理器 apt、dnf、yum、apk、pacman、zypper 或 Homebrew；不下载第三方 Nginx/ACME 安装脚本。受管站点为主配置 `http` 块实际包含目录中的 `chain-panel.conf`，证书名为 `chain-panel-域名`，验证目录为 `/var/lib/chain-acme`。签证书前检查真实 HTTP 验证路径，重载后最多等待 15 秒让新站点生效；失败时显示验证 URL、HTTP 状态码或连接错误，HTTP 404/403 不再统一误报为防火墙问题。本机自检通过后仍由证书机构从公网验证 TCP 80；HTTPS 访问使用 TCP 443。同域名已有站点或 80/443 被其他程序占用时拒绝覆盖。支持系统包安装的 Nginx 配置；Linux 由 systemd/OpenRC 管理，macOS 使用独立的系统 LaunchDaemon。macOS 已有其他方式启动的 Nginx 时须先停止原服务，安装器保留已有站点配置。TLS 配置失败恢复原站点与此前服务状态，已签发证书保留供重试。
 
-`chain-panel-cert-renew.timer` 每天检查两次，Certbot 只续期该面板证书；deploy hook 也核对证书路径后才检查并重载 Nginx。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
+证书续期在 systemd 使用 `chain-panel-cert-renew.timer`，OpenRC 使用受监控的定时任务，macOS 使用 launchd 的 StartInterval；每 12 小时检查一次，Certbot 只续期该面板证书；deploy hook 也核对证书路径后才检查并重载 Nginx。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
 
-构建使用本机 Linux x86_64 或 aarch64 GNU 工具链，执行 TypeScript/Vite 构建与 Rust 单元测试后生成 release 二进制。自动下载固定的 Xray v26.3.27 并检查官方 ZIP 的 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
+构建支持 Linux/macOS 的 x86_64 与 aarch64；Linux 使用静态 musl 目标，macOS 使用原生 apple-darwin 目标（最低 macOS 14），执行 TypeScript/Vite 构建与 Rust 单元测试后生成 release 二进制。自动下载固定的 Xray v26.3.27 并检查官方 ZIP 的 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
 
-产物默认放在 `release-output/v0.1.0-linux-x86_64/`（依当前版本、架构变化）。包含 `chain-panel-0.1.0-linux-x86_64.tar.gz`、`release.json`、`SHA256SUMS`。这是有意保留的最终交付目录；临时源码副本、npm 缓存和 Cargo target 在成功、失败或中断后自动清理，下一次构建会重新编译。输出目录已存在时不会覆盖，请传入新的 `--output` 或更新版本。
+产物默认放在 `release-output/v0.1.0-linux-x86_64/`（依当前版本、系统、架构变化，macOS 的系统名为 `darwin`）。包含 `chain-panel-0.1.0-linux-x86_64.tar.gz`、`release.json`、`SHA256SUMS`。这是有意保留的最终交付目录；临时源码副本、npm 缓存和 Cargo target 在成功、失败或中断后自动清理，下一次构建会重新编译。输出目录已存在时不会覆盖，请传入新的 `--output` 或更新版本。
 
 ```bash
 ./scripts/version-release.sh build --work-parent /大容量磁盘 --output /新的发行目录
@@ -91,9 +91,9 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 ./scripts/version-release.sh status
 ```
 
-目标服务器需要 Linux、glibc、Python 3.10+、systemd、基础用户管理命令；无需 npm、Rust 或额外安装 Xray。发行包记录构建机的 glibc 版本，安装前会检查架构及 glibc 下限。需要兼容较旧发行版时，请在对应旧环境构建；目前不执行跨架构或 musl 构建。
+目标机器需要 Linux（systemd 或 OpenRC）或 macOS 14+（launchd）、Python 3.10+；无需 npm、Rust 或额外安装代理内核。macOS 需先安装 Homebrew，再通过普通管理员账户运行 `sudo sh`。新版 Linux 静态包不依赖系统 glibc；旧 GNU 包仍检查 glibc 下限。安装前检查操作系统与 CPU 架构，拒绝混用包。旧版 CentOS 软件源可能缺少兼容 Python 或 Certbot，需要先配置相应依赖，不保证已经停止维护的系统和失效软件源。
 
-安装器只管理 `/opt/chain` 下有归属标识的安装、`chain-panel.service`、`chain-agent.service`、各自的 `/etc/chain-*` 与 `/var/lib/chain-*`。遇到同名的非本安装器目录或服务会拒绝覆盖。默认安装控制台并自动接入本机 Agent；只需控制台时使用 `--panel-only`。其他机器请自行通过 SSH 登录，运行默认安装命令，在该机器面板创建代理后将链接导入本面板；网页不执行 SSH 安装。
+安装器只管理 `/opt/chain` 下有归属标识的安装、`chain-panel`、`chain-agent` 服务、各自的 `/etc/chain-*` 与 `/var/lib/chain-*`。遇到同名的非本安装器目录或服务会拒绝覆盖。默认安装控制台并自动接入本机 Agent；只需控制台时使用 `--panel-only`。其他机器请自行通过 SSH 登录，运行默认安装命令，在该机器面板创建代理后将链接导入本面板；网页不执行 SSH 安装。
 
 安装会优先选择本地发行包，没有本地包时自动下载最新正式版本。`chainctl update` 默认下载最新正式包；本地包可显式指定：
 
@@ -126,7 +126,7 @@ sudo chainctl rollback --component panel
 
 升级保留监听地址、令牌、线路数据库及节点配置；修改参数时显式传入对应选项。升级和备份会短暂停止所选组件，以获得一致的私有备份；Agent 停止会使其转发连接重连。备份位于 `/var/backups/chain-panel/`，权限 600。启动检查失败会恢复升级前的程序链接与配置；运行数据和备份保留。`rollback` 回滚程序版本，不将数据库回退到旧备份。Agent 的进程启动检查通过后，还应在 Web 确认心跳。
 
-推荐通过 `.github/workflows/release.yml` 发布：提交版本改动后推送 `vX.Y.Z` 标签，Actions 在 Ubuntu 22.04 的 x86_64、aarch64 runner 分别原生构建（glibc 下限 2.35），校验标签与四个版本清单一致。两个架构均成功后合并 `SHA256SUMS`，创建草稿、上传并重新下载校验全部附件，最后公开正式 Release。安装器不读取 Actions 中间产物。单架构失败不会公开半套包；中间 artifact 在工作流结束时删除，Cargo/npm 临时缓存由构建器清理。
+推荐通过 `.github/workflows/release.yml` 发布：提交版本改动后推送 `vX.Y.Z` 标签，Actions 分别在 Linux x86_64/ARM64、macOS Intel/Apple Silicon runner 构建，校验标签与四个版本清单一致。四个平台组合均成功后合并 `SHA256SUMS`，创建草稿、上传并重新下载校验全部附件，最后公开正式 Release。安装器不读取 Actions 中间产物。任一平台组合失败都不会公开半套包；中间 artifact 在工作流结束时删除，Cargo/npm 临时缓存由构建器清理。
 
 日常发布先自行完成业务代码的 Git 提交，再运行 `./scripts/version-release.sh`。菜单直接回车进入默认的 **9「发布已提交的代码」**；版本号再次回车默认递增补丁版本，例如 `0.2.1 → 0.2.2`，也可以输入指定版本，例如 `0.3.0`。查看版本文件、已有未推送提交和自动生成的中文提交正文，再输入 `y` 确认，无需重新填写业务更新说明。
 
@@ -141,7 +141,7 @@ git tag v0.1.0
 git push origin main v0.1.0
 ```
 
-手工上传发行包需要安装并登录 `gh`。本地构建与安装不会自动推送 Git、上传附件或发布版本；上述一键向导通过推送标签触发 Actions，以下命令则直接操作指定远端的 Release（手工脚本一次发布一个架构，双架构应使用 Actions）：
+手工上传发行包需要安装并登录 `gh`。本地构建与安装不会自动推送 Git、上传附件或发布版本；上述一键向导通过推送标签触发 Actions，以下命令则直接操作指定远端的 Release（手工脚本一次发布一个架构，多平台完整发布应使用 Actions）：
 
 ```bash
 # 先提交并推送对应源码，然后从干净的发行输入重新构建。
@@ -151,7 +151,7 @@ git push origin main v0.1.0
 
 草稿命令将发行包绑定到清单中的已推送提交；发布命令再次下载并校验草稿附件，与本地产物一致后才正式发布。未提交的本地构建可安装，不能上传为正式草稿。无 GitHub Actions 隐式触发流程。
 
-审核安装文件而不操作系统时，可执行 `install --root /临时审核目录 --package ...`。此模式只生成离线安装树，不创建系统用户、操作 systemd 或启动服务；测试使用该模式验证升级、回滚与数据保留。
+审核安装文件而不操作系统时，可执行 `install --root /临时审核目录 --package ...`。此模式只生成离线安装树，不创建系统用户、操作服务管理器或启动服务；测试使用该模式验证升级、回滚与数据保留。
 
 ## 启动控制台
 
@@ -211,7 +211,7 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 编译配置的 `_chain` 元数据记录公共入口、限速、额度、网站与证书；Agent 在传给 Xray 前移除此字段。代理/转发的内核入口绑定 127.0.0.1 的内部端口，公共端口由 Agent 网关监听。原生节点间中转使用 Xray 的 VLESS/REALITY；Hysteria 2、TUIC 接入和包含 Hysteria 2、TUIC、Shadowsocks、HTTPS 的出网链由 Agent 管理的 Mihomo 执行。
 
-`traffic.json` 持久化线路计量，约每 2 秒写入并在正常退出前保存；`active.json` 保存已应用版本。Agent 上报网关能力、已占用 TCP/UDP 端口及系统临时连接端口范围；内部端口分配避开临时范围，防止与出站连接或 TIME_WAIT 冲突。旧 Agent 未上报范围时按 Linux 默认 32768–60999 处理。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
+`traffic.json` 持久化线路计量，约每 2 秒写入并在正常退出前保存；`active.json` 保存已应用版本。Agent 上报网关能力、已占用 TCP/UDP 端口及系统临时连接端口范围；内部端口优先使用 50000–65534，必要时回退到 30000–49999，避开 macOS 默认的 49152–65535 临时范围及已有监听；防止与出站连接或 TIME_WAIT 冲突。旧 Agent 未上报范围时按 Linux 默认 32768–60999 处理。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
 
 自动证书在 Agent 数据目录的 `acme/` 下，Certbot 使用独立 config/work/logs/web 路径，以 Agent 用户执行；可用 `CHAIN_CERTBOT_BIN` 指定程序位置。安装器安装 Nginx，由独立 ACME 站点将验证请求路由至 `/var/lib/chain-acme/{agent,panel}`；`CHAIN_ACME_WEBROOT` 指定对应目录，Agent 无需监听 TCP 80。手工部署未设置此变量时仍使用独立挑战监听。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
 
@@ -227,7 +227,7 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 安装器可单独下载运行；在 curl 管道中会从 `/dev/tty` 读取交互输入。无参数脚本执行 `setup`：首次直接安装，已安装时显示登录信息，缺失默认本机 Agent 时重试接入。`chainctl` 无参数仍打开运维菜单。缺少 Python 时使用 apt/dnf 安装并校验 Python 3.10+。在线引导从项目 main 的固定提交下载三个辅助模块，再从 GitHub Releases 下载本机架构的正式包，检查 SHA256、清单和兼容性后才询问可选域名。下载和解压目录在退出时删除。没有正式包、架构缺失或校验失败时终止，不会静默改为源码编译。
 
-维护者需要先推送安装器和前端改动，再按本页发布流程上传对应版本的正式包；此前本机已有包可用安装向导选择。发布兼容较旧系统的包时，应在对应旧版 glibc 环境构建。单次正式发行需要同时提供包、release.json 和 SHA256SUMS。
+维护者需要先推送安装器和前端改动，再按本页发布流程上传对应版本的正式包；此前本机已有包可用安装向导选择。Linux 新包使用静态 musl，不再要求与构建机匹配的 glibc；系统内核、Python 与软件源仍需满足运行要求。单次正式发行需要同时提供包、release.json 和 SHA256SUMS。
 
 接入码只是将控制台地址、节点 UUID 和节点令牌合并成一份可复制凭据，不是临时兑换码；它没有单独有效期，节点重置令牌后失效。接入码不进入 shell 参数或历史，只通过隐藏输入交给向导。重新接入会保存新身份并重启 Agent，受其管理的流量可能短暂重连。HTTP 接入需要在向导中明确确认可信私网。
 

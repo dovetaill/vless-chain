@@ -126,8 +126,14 @@ fn spawn_core(mut cmd: Command, log: &Path) -> Result<Child> {
         .stdout(output.try_clone()?)
         .stderr(output)
         .kill_on_drop(true);
+    spawn_owned(cmd)
+}
+
+pub fn spawn_owned(mut cmd: Command) -> Result<Child> {
+    #[cfg(target_os = "linux")]
     let parent = unsafe { libc::getpid() };
     // Managed cores must exit even when their owning Agent is killed.
+    #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
@@ -139,8 +145,139 @@ fn spawn_core(mut cmd: Command, log: &Path) -> Result<Child> {
             Ok(())
         });
     }
-    Ok(cmd.spawn().context("无法启动代理内核")?)
+    let child = cmd.spawn().context("无法启动代理组件")?;
+    #[cfg(target_os = "macos")]
+    let mut child = child;
+    #[cfg(target_os = "macos")]
+    {
+        let watcher = Command::new(std::env::current_exe()?)
+            .args([
+                "--chain-watch",
+                &std::process::id().to_string(),
+                &child.id().unwrap().to_string(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match watcher {
+            Ok(mut watcher) => {
+                use std::os::fd::AsRawFd;
+                let pipe = watcher.stdout.take().unwrap();
+                let mut poll = libc::pollfd {
+                    fd: pipe.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let mut ready = 0u8;
+                let registered = unsafe {
+                    libc::poll(&mut poll, 1, 5000) > 0
+                        && libc::read(pipe.as_raw_fd(), (&mut ready as *mut u8).cast(), 1) == 1
+                        && ready == b'R'
+                };
+                if !registered {
+                    let _ = watcher.start_kill();
+                    let _ = child.start_kill();
+                    tokio::spawn(async move {
+                        let _ = watcher.wait().await;
+                    });
+                    bail!("无法注册代理组件的退出监控");
+                }
+                tokio::spawn(async move {
+                    let _ = watcher.wait().await;
+                });
+            }
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(child)
 }
+
+#[cfg(target_os = "macos")]
+pub fn watch_parent() -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) != Some("--chain-watch") {
+        return Ok(());
+    }
+    ensure!(args.len() == 4, "无效的进程监控参数");
+    let parent: i32 = args[2].parse()?;
+    let child: i32 = args[3].parse()?;
+    ensure!(parent > 1 && child > 1, "无效的进程 ID");
+    // kqueue retains process identity, so PID reuse cannot turn an exit into a new owner.
+    unsafe {
+        let fd = libc::kqueue();
+        ensure!(fd >= 0, "无法创建进程监控队列");
+        let queue = OwnedFd::from_raw_fd(fd);
+        for pid in [child, parent] {
+            let event = libc::kevent {
+                ident: pid as _,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if libc::kevent(
+                queue.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            ) < 0
+            {
+                if pid == child {
+                    std::process::exit(0);
+                }
+                libc::kill(child, libc::SIGTERM);
+                break;
+            }
+        }
+        let mut stopping = libc::getppid() != parent;
+        if stopping {
+            libc::kill(child, libc::SIGTERM);
+        }
+        std::io::stdout().write_all(b"R")?;
+        std::io::stdout().flush()?;
+        loop {
+            let mut event: libc::kevent = std::mem::zeroed();
+            let timeout = libc::timespec {
+                tv_sec: 3,
+                tv_nsec: 0,
+            };
+            let count = libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                if stopping { &timeout } else { std::ptr::null() },
+            );
+            if count == 0 {
+                libc::kill(child, libc::SIGKILL);
+                break;
+            }
+            if count < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                libc::kill(child, libc::SIGTERM);
+                break;
+            }
+            if event.ident == child as usize {
+                break;
+            }
+            libc::kill(child, libc::SIGTERM);
+            stopping = true;
+        }
+    }
+    std::process::exit(0);
+}
+
 fn mihomo_command(xray: &Path, config: &Path, dir: &Path) -> Command {
     let binary = std::env::var_os("CHAIN_MIHOMO_BIN")
         .map(PathBuf::from)
@@ -407,6 +544,7 @@ impl ManagedXray {
         }
         if let Some(child) = &self.mihomo {
             let pid = child.id().context("Mihomo 已退出")?;
+            #[cfg(target_os = "linux")]
             let sockets: std::collections::BTreeSet<_> =
                 std::fs::read_dir(format!("/proc/{pid}/fd"))?
                     .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
@@ -419,7 +557,9 @@ impl ManagedXray {
                 } else {
                     "tcp"
                 };
+                #[cfg(target_os = "linux")]
                 let address = format!("0100007F:{:04X}", listener["port"].as_u64().unwrap());
+                #[cfg(target_os = "linux")]
                 let bound = std::fs::read_to_string(format!("/proc/{pid}/net/{table}"))?
                     .lines()
                     .skip(1)
@@ -431,6 +571,14 @@ impl ManagedXray {
                             })
                             && (table == "udp" || fields.get(3) == Some(&"0A"))
                     });
+                #[cfg(target_os = "macos")]
+                let bound = {
+                    let mut command = Command::new("/usr/sbin/lsof");
+                    command.args(["-nP", "-a", "-p", &pid.to_string(), "-i", "-FfpnPT"]).kill_on_drop(true);
+                    let result = tokio::time::timeout(Duration::from_secs(5), command.output()).await??;
+                    ensure!(result.status.success(), "无法检测 Mihomo 监听端口归属");
+                    lsof_listener(&String::from_utf8_lossy(&result.stdout), table, listener["port"].as_u64().unwrap() as u16)
+                };
                 ensure!(
                     bound,
                     "Mihomo 监听未就绪：{} {}",
@@ -542,12 +690,23 @@ impl ManagedXray {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn lsof_listener(text: &str, protocol: &str, port: u16) -> bool {
+    text.split("\nf").skip(1).any(|record| {
+        let lines: Vec<_> = record.lines().collect();
+        lines.contains(&format!("P{}", protocol.to_uppercase()).as_str())
+            && lines.contains(&format!("n127.0.0.1:{port}").as_str())
+            && (protocol == "udp" || lines.contains(&"TST=LISTEN"))
+    })
+}
+
 #[derive(serde::Deserialize)]
 pub struct ProbeRequest {
     pub mode: String,
     #[serde(default)]
     pub url: String,
 }
+
 pub async fn probe(
     binary: &Path,
     line: &Line,
@@ -728,6 +887,16 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_listener_requires_matching_socket_and_state() {
+        let sockets = "p42\nf5\nPTCP\nn127.0.0.1:54321\nTST=LISTEN\nf6\nPUDP\nn127.0.0.1:54322\n";
+        assert!(lsof_listener(sockets, "tcp", 54321));
+        assert!(lsof_listener(sockets, "udp", 54322));
+        assert!(!lsof_listener(sockets, "tcp", 54322));
+        assert!(!lsof_listener(&sockets.replace("LISTEN", "ESTABLISHED"), "tcp", 54321));
+        assert!(!lsof_listener(&sockets.replace("127.0.0.1", "*"), "tcp", 54321));
+    }
 
     #[test]
     fn automatic_hysteria_certificates_follow_saved_or_new_core_config() {

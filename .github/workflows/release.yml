@@ -17,7 +17,7 @@ env:
 
 jobs:
   build:
-    name: Linux ${{ matrix.arch }}
+    name: ${{ matrix.system }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -26,8 +26,16 @@ jobs:
         include:
           - runner: ubuntu-22.04
             arch: x86_64
+            system: linux
           - runner: ubuntu-22.04-arm
             arch: aarch64
+            system: linux
+          - runner: macos-15-intel
+            arch: x86_64
+            system: darwin
+          - runner: macos-14
+            arch: aarch64
+            system: darwin
     env:
       RUSTUP_TOOLCHAIN: 1.96.0
       CARGO_INCREMENTAL: '0'
@@ -48,31 +56,36 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
       - name: Install WebAuthn build dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        run: |
+          if [ "${{ matrix.system }}" = linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y pkg-config libssl-dev musl-tools perl
+            rustup target add "${{ matrix.arch }}-unknown-linux-musl"
+          fi
       - name: Check installer
         run: python3 -B scripts/ci_release.py check
       - name: Build native release
         env:
-          RELEASE_ARCH: ${{ matrix.arch }}
+          RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
         run: |
-          ./scripts/version-release.sh build --work-parent "$RUNNER_TEMP" --output "$RUNNER_TEMP/release-$RELEASE_ARCH"
+          ./scripts/version-release.sh build --work-parent "$RUNNER_TEMP" --output "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
       - name: Verify installed panel and local Agent
         env:
-          RELEASE_ARCH: ${{ matrix.arch }}
+          RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
         run: |
-          python3 -B scripts/ci_release.py smoke --input "$RUNNER_TEMP/release-$RELEASE_ARCH"
+          python3 -B scripts/ci_release.py smoke --input "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-${{ matrix.arch }}
-          path: ${{ runner.temp }}/release-${{ matrix.arch }}/
+          name: release-${{ matrix.system }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release-${{ matrix.system }}-${{ matrix.arch }}/
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
       - name: Remove task artifacts
         if: always()
         env:
-          RELEASE_ARCH: ${{ matrix.arch }}
-        run: rm -rf -- "$RUNNER_TEMP/release-$RELEASE_ARCH"
+          RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
+        run: rm -rf -- "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
 
   publish:
     name: Verify and publish complete release
@@ -89,7 +102,7 @@ jobs:
         with:
           pattern: release-*
           path: ${{ runner.temp }}/chain-artifacts
-      - name: Validate both architectures and publish
+      - name: Validate all platform builds and publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -1085,6 +1085,7 @@ fn metric_rates(
         current.tx.checked_sub(old.tx).map(|n| n as f64 / seconds),
     )
 }
+#[cfg(target_os = "linux")]
 pub fn system_metrics() -> serde_json::Value {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let value = |key: &str| {
@@ -1179,6 +1180,152 @@ pub fn system_metrics() -> serde_json::Value {
         .filter_map(|s| s.parse().ok())
         .collect();
     serde_json::json!({"gateway_version":2,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+}
+
+#[cfg(target_os = "macos")]
+pub fn system_metrics() -> serde_json::Value {
+    fn sysctl<T: Default>(name: &std::ffi::CStr) -> Option<T> {
+        let mut value = T::default();
+        let mut size = std::mem::size_of::<T>();
+        (unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut value as *mut T).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+            && size == std::mem::size_of::<T>())
+        .then_some(value)
+    }
+    let total = sysctl::<u64>(c"hw.memsize");
+    let (cpu, available) = unsafe {
+        let host = libc::mach_host_self();
+        let mut cpu: libc::host_cpu_load_info = std::mem::zeroed();
+        let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+        let cpu = (libc::host_statistics(
+            host,
+            libc::HOST_CPU_LOAD_INFO,
+            (&mut cpu as *mut libc::host_cpu_load_info).cast(),
+            &mut count,
+        ) == 0)
+            .then(|| {
+                (
+                    cpu.cpu_ticks.iter().map(|n| u64::from(*n)).sum(),
+                    u64::from(cpu.cpu_ticks[libc::CPU_STATE_IDLE as usize]),
+                )
+            });
+        let mut vm: libc::vm_statistics64 = std::mem::zeroed();
+        let mut count =
+            (std::mem::size_of_val(&vm) / std::mem::size_of::<libc::integer_t>()) as u32;
+        let available = (libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut vm as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        ) == 0)
+            .then(|| {
+                (u64::from(vm.free_count) + u64::from(vm.inactive_count))
+                    * libc::sysconf(libc::_SC_PAGESIZE) as u64
+            });
+        libc::mach_port_deallocate(libc::mach_task_self(), host);
+        (cpu, available)
+    };
+    let (mut rx, mut tx) = (0u64, 0u64);
+    unsafe {
+        let mut interfaces = std::ptr::null_mut();
+        if libc::getifaddrs(&mut interfaces) == 0 {
+            let mut current = interfaces;
+            while !current.is_null() {
+                let interface = &*current;
+                if !interface.ifa_addr.is_null()
+                    && (*interface.ifa_addr).sa_family as i32 == libc::AF_LINK
+                    && interface.ifa_flags & libc::IFF_LOOPBACK as u32 == 0
+                    && !interface.ifa_data.is_null()
+                {
+                    let mut mib = [
+                        libc::CTL_NET,
+                        libc::PF_LINK,
+                        libc::NETLINK_GENERIC,
+                        libc::IFMIB_IFDATA,
+                        libc::if_nametoindex(interface.ifa_name) as i32,
+                        libc::IFDATA_GENERAL,
+                    ];
+                    let mut data: libc::ifmibdata = std::mem::zeroed();
+                    let mut size = std::mem::size_of_val(&data);
+                    if libc::sysctl(
+                        mib.as_mut_ptr(),
+                        mib.len() as u32,
+                        (&mut data as *mut libc::ifmibdata).cast(),
+                        &mut size,
+                        std::ptr::null_mut(),
+                        0,
+                    ) == 0
+                    {
+                        rx = rx.saturating_add(data.ifmd_data.ifi_ibytes);
+                        tx = tx.saturating_add(data.ifmd_data.ifi_obytes);
+                    }
+                }
+                current = interface.ifa_next;
+            }
+            libc::freeifaddrs(interfaces);
+        }
+    }
+    let current = SystemSample {
+        at: Instant::now(),
+        cpu,
+        rx,
+        tx,
+    };
+    static PREVIOUS: std::sync::OnceLock<Mutex<Option<SystemSample>>> = std::sync::OnceLock::new();
+    let mut previous = PREVIOUS.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    let (cpu_percent, network_rx_bps, network_tx_bps) = metric_rates(previous.as_ref(), &current);
+    *previous = Some(current);
+    drop(previous);
+    let (disk, load) = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        let disk = (libc::statvfs(c"/".as_ptr(), &mut stat) == 0).then(|| {
+            (
+                stat.f_blocks.saturating_mul(stat.f_frsize as u64),
+                stat.f_blocks
+                    .saturating_sub(stat.f_bfree)
+                    .saturating_mul(stat.f_frsize as u64),
+            )
+        });
+        let mut load = 0.0;
+        (disk, (libc::getloadavg(&mut load, 1) == 1).then_some(load))
+    };
+    let mut listening_ports = std::collections::BTreeSet::new();
+    for protocol in ["tcp", "udp"] {
+        if let Ok(result) = std::process::Command::new("/usr/sbin/netstat")
+            .args(["-an", "-p", protocol])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&result.stdout).lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields
+                    .first()
+                    .is_some_and(|name| name.starts_with(protocol))
+                    && (protocol == "udp" || fields.contains(&"LISTEN"))
+                {
+                    if let Some(port) = fields
+                        .get(3)
+                        .and_then(|s| s.rsplit('.').next())
+                        .and_then(|s| s.parse::<u16>().ok())
+                    {
+                        if port > 0 {
+                            listening_ports.insert(port);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ephemeral = sysctl::<u32>(c"net.inet.ip.portrange.first")
+        .zip(sysctl::<u32>(c"net.inet.ip.portrange.last"))
+        .map(|(first, last)| [first, last]);
+    serde_json::json!({"gateway_version":2,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(test)]

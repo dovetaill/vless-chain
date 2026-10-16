@@ -220,12 +220,13 @@ fn backend_port(reserved: &mut BTreeSet<(String, u16)>, node: &Node) -> Result<u
         .zip(range[1].as_u64())
         .filter(|(low, high)| *low > 0 && low <= high && *high <= 65535)
         .unwrap_or((32768, 60999));
-    let port = (50000..65535)
+    // macOS reserves 49152–65535 for outgoing connections; keep Linux's existing choices first.
+    let port = (50000..65535).chain(30000..50000)
         .find(|p| {
             !(ephemeral.0..=ephemeral.1).contains(&u64::from(*p))
                 && !reserved.iter().any(|(_, used)| used == p)
         })
-        .context("没有可供内部接入使用的端口：50000–65534 必须避开已用端口及系统临时端口范围")?;
+        .context("没有可供内部接入使用的端口：30000–65534 必须避开已用端口及系统临时端口范围")?;
     reserved.insert((node.id.clone(), port));
     Ok(port)
 }
@@ -664,7 +665,9 @@ mod tests {
         assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 61001);
         d.nodes[0].report.system = json!({"ephemeral_port_range":[60000,65535]});
         assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 50000);
-        d.nodes[0].report.system["ephemeral_port_range"] = json!([40000, 65535]);
+        d.nodes[0].report.system["ephemeral_port_range"] = json!([49152, 65535]);
+        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 30000);
+        d.nodes[0].report.system["ephemeral_port_range"] = json!([30000, 65535]);
         assert!(
             backend_port(&mut reserved, &d.nodes[0])
                 .unwrap_err()

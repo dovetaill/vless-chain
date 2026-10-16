@@ -21,6 +21,14 @@ from chain_common import Workspace
 
 
 class Network(unittest.TestCase):
+    def setUp(self):
+        for mock in [patch.object(network, 'service_kind', return_value='systemd'),
+                     patch.object(network, 'operating_system', return_value='linux'),
+                     patch.object(network, 'service', side_effect=lambda action, name, check=True:
+                         network.run(['systemctl', action, name], check=check).returncode)]:
+            mock.start()
+            self.addCleanup(mock.stop)
+
     def test_proxy_acme_upgrades_only_owned_panel_challenge_route(self):
         with tempfile.TemporaryDirectory(prefix='chain-proxy-acme-') as temporary:
             root = Path(temporary)
@@ -170,9 +178,11 @@ class Network(unittest.TestCase):
                 site.webroot = Path(temp) / 'webroot'
                 calls = []
 
-                def request(url, **kwargs):
-                    calls.append(url)
-                    probe = site.webroot / '.well-known/acme-challenge' / url.rsplit('/', 1)[1]
+                def request(probe_request, **kwargs):
+                    self.assertTrue(probe_request.full_url.startswith('http://127.0.0.1/.well-known/acme-challenge/'))
+                    self.assertEqual(probe_request.get_header('Host'), site.domain)
+                    calls.append(probe_request.full_url)
+                    probe = site.webroot / '.well-known/acme-challenge' / probe_request.full_url.rsplit('/', 1)[1]
                     self.assertTrue(probe.is_file())
                     if len(calls) == 1:
                         if isinstance(failure, Exception):
@@ -193,7 +203,7 @@ class Network(unittest.TestCase):
     def test_challenge_reports_actual_failure_and_cleans_probe(self):
         cases = [(urllib.error.HTTPError('http://panel.example.com', code, reason, {}, io.BytesIO()), f'HTTP {code}')
                  for code, reason in ((404, 'Not Found'), (403, 'Forbidden'))]
-        cases += [(urllib.error.URLError(socket.gaierror('DNS unavailable')), 'DNS unavailable'),
+        cases += [(urllib.error.URLError(ConnectionRefusedError('connection refused')), 'connection refused'),
                   (TimeoutError('timed out'), 'timed out'), (io.BytesIO(b'wrong site'), '内容与验证文件不匹配')]
         for failure, detail in cases:
             with self.subTest(detail=detail), tempfile.TemporaryDirectory(prefix='chain-probe-') as temp:
@@ -207,7 +217,8 @@ class Network(unittest.TestCase):
                     with self.assertRaises(ValueError) as error:
                         site.challenge_check(timeout=0)
                 self.assertIn(detail, str(error.exception))
-                self.assertIn('http://panel.example.com/.well-known/acme-challenge/chain-check-', str(error.exception))
+                self.assertIn('http://127.0.0.1/.well-known/acme-challenge/chain-check-', str(error.exception))
+                self.assertIn('Host: panel.example.com', str(error.exception))
                 self.assertNotIn('TCP 80、443', str(error.exception))
                 if detail.startswith('HTTP'):
                     self.assertNotIn('防火墙', str(error.exception))
@@ -233,7 +244,7 @@ class Network(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='chain-nginx-reload-') as parent:
             with Workspace(Path(parent)) as work, contextlib.ExitStack() as cleanup:
                 port = network.available_port()
-                site = network.HttpsSite('localhost', 45000)
+                site = network.HttpsSite('panel.example.invalid', 45000)
                 site.webroot = work.root / 'webroot'
                 conf = work.root / 'nginx.conf'
                 prefix = (('user root;\n' if os.geteuid() == 0 else '') +
@@ -284,9 +295,13 @@ class Network(unittest.TestCase):
                 conf.write_text(prefix + old_site + site.config().replace('listen 80;', f'listen 127.0.0.1:{port};') + '}\n')
                 # Force the first probe to hit the old worker before HUP. The
                 # next attempt must wait for the real new worker and its file.
-                site.domain = f'localhost:{port}'
+                connect = socket.create_connection
                 sleep = time.sleep
                 reloaded = []
+
+                def connect_local(address, *args, **kwargs):
+                    self.assertEqual(address, ('127.0.0.1', 80))
+                    return connect(('127.0.0.1', port), *args, **kwargs)
 
                 def reload_after_first_probe(seconds):
                     if not reloaded:
@@ -294,7 +309,8 @@ class Network(unittest.TestCase):
                         reloaded.append(True)
                     sleep(seconds)
 
-                with patch.object(network.time, 'sleep', side_effect=reload_after_first_probe):
+                with patch.object(network.time, 'sleep', side_effect=reload_after_first_probe), \
+                        patch.object(socket, 'create_connection', side_effect=connect_local):
                     site.challenge_check(timeout=5)
                 self.assertTrue(reloaded)
                 self.assertEqual(list((site.webroot / '.well-known/acme-challenge').iterdir()), [])

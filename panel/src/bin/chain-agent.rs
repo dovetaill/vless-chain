@@ -3,8 +3,16 @@ use chain_panel::{model::*, runtime::*};
 use std::os::unix::fs::PermissionsExt;
 use std::{path::PathBuf, time::Duration};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    watch_parent()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let dir =
         PathBuf::from(std::env::var("CHAIN_AGENT_DIR").unwrap_or_else(|_| "agent-data".into()));
     private_dir(&dir, "chain-agent")?;

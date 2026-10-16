@@ -131,12 +131,19 @@ class Harness:
             except ProcessLookupError:
                 continue
             raise AssertionError(f"Owned process group still alive: {name} {p.pid}")
-        for filename in ["tcp", "tcp6", "udp", "udp6"]:
+        for filename in ["tcp", "tcp6", "udp", "udp6"] if Path('/proc/net').exists() else []:
             for entry in Path('/proc/net', filename).read_text().splitlines()[1:]:
                 columns = entry.split()
                 port = int(columns[1].split(':')[1], 16)
                 if port in self.ports and (filename.startswith('udp') or columns[3] == '0A'):
                     raise AssertionError(f"Listener remains after cleanup: {filename} port {port}")
+        if not Path('/proc/net').exists():
+            for port in self.ports:
+                for family, address in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):
+                    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+                        with socket.socket(family, kind) as check:
+                            check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                            check.bind((address, port))
         print("CLEANUP groups=" + json.dumps([p.pid for _, p, _ in self.processes]) +
               " ports=" + json.dumps(sorted(self.ports)), flush=True)
 

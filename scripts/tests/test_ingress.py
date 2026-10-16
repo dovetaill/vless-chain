@@ -12,8 +12,16 @@ from chain_ingress import Ingress, OWNER, migrate, route_config
 
 
 class IngressTest(unittest.TestCase):
+    def setUp(self):
+        for mock in [patch('chain_ingress.service_kind', return_value='systemd'),
+                     patch('chain_ingress.service_path', side_effect=lambda name:
+                         Path('/etc/systemd/system') / (name + '.service'))]:
+            mock.start()
+            self.addCleanup(mock.stop)
+
     def test_routes_cannot_override_sites_or_inject_configuration(self):
         self.assertIn('example.com 127.0.0.1:50001;', route_config([{'sni':'example.com','port':50001}], []))
+        self.assertIn('example.com 127.0.0.1:30000;', route_config([{'sni':'example.com','port':30000}], []))
         for routes, blocked in [
             ([{'sni':'panel.example.com','port':50001}], ['*.example.com']),
             ([{'sni':'example.com; include /etc/passwd','port':50001}], []),

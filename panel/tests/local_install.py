@@ -5,6 +5,8 @@ from pathlib import Path
 import signal
 import sys
 import tempfile
+import json
+import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from chain_common import verify_tree
@@ -40,6 +42,22 @@ def main():
             provision_local_agent(manager, source, manifest, args)
             assert manager.state()['roles']['agent'] == previous
             assert len(harness.state()['nodes']) == 1
+            if sys.platform == 'darwin':
+                marker = root / 'watcher.json'
+                owner_code = '''import json, os, pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+watcher = subprocess.Popen([sys.argv[1], '--chain-watch', str(os.getpid()), str(child.pid)], stdout=subprocess.PIPE)
+assert watcher.stdout.read(1) == b'R'
+pathlib.Path(sys.argv[2]).write_text(json.dumps([child.pid, watcher.pid]))
+time.sleep(60)
+'''
+                owner = harness.launch('parent-watch', sys.executable, {}, ['-c', owner_code, str(source / 'bin/chain-agent'), str(marker)])
+                harness.wait(marker.exists, 'macOS process watcher registration')
+                watched = json.loads(marker.read_text())
+                os.kill(owner.pid, signal.SIGKILL)
+                owner.wait(timeout=5)
+                harness.wait(lambda: all(subprocess.run(['ps', '-p', str(pid)], stdout=subprocess.DEVNULL).returncode != 0
+                                         for pid in watched), 'macOS cores and watchdog exit after owner SIGKILL')
             print('PASS installed service configuration, real local auto-enrollment, node heartbeat, and repeated installation preserving identity.', flush=True)
         finally:
             harness.close()

@@ -1,4 +1,4 @@
-use crate::runtime::{atomic_write, private_dir};
+use crate::runtime::{atomic_write, private_dir, spawn_owned};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -119,20 +119,7 @@ impl LocalAgent {
             .stdin(Stdio::null())
             .kill_on_drop(true);
         command.process_group(0);
-        let parent = unsafe { libc::getpid() };
-        // An abruptly terminated controller must not leave its local Agent running.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    return Err(std::io::Error::other("控制台已退出"));
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn().context("无法启动本机代理组件")?;
+        let child = spawn_owned(command).context("无法启动本机代理组件")?;
         self.group = child.id().map(|id| id as i32);
         self.child = Some(child);
         Ok(())

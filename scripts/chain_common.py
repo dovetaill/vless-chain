@@ -36,7 +36,7 @@ def download_release(directory):
     tag = release.get('tag_name', '')
     require(re.fullmatch('v' + VERSION_RE, tag) and not release.get('draft') and not release.get('prerelease'),
             '正式版本信息无效。')
-    name = f'chain-panel-{tag[1:]}-linux-{architecture()}.tar.gz'
+    name = f'chain-panel-{tag[1:]}-{operating_system()}-{architecture()}.tar.gz'
     assets = {item['name']: item for item in release.get('assets', [])}
     require(name in assets and 'SHA256SUMS' in assets, f'正式版本 {tag} 尚未提供本机架构安装包及校验文件。')
     directory = Path(directory)
@@ -60,11 +60,33 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def architecture():
-    require(platform.system() == 'Linux', '当前发行包只支持 Linux。')
-    value = {'x86_64': 'x86_64', 'aarch64': 'aarch64', 'arm64': 'aarch64'}.get(platform.machine())
-    require(value, '仅支持 Linux x86_64 / aarch64 原生构建与安装。')
+def operating_system():
+    value = {'Linux': 'linux', 'Darwin': 'darwin'}.get(platform.system())
+    require(value, '仅支持 Linux 和 macOS。')
     return value
+
+
+def architecture():
+    operating_system()
+    value = {'x86_64': 'x86_64', 'aarch64': 'aarch64', 'arm64': 'aarch64'}.get(platform.machine())
+    require(value, '仅支持 x86_64 / ARM64 原生构建与安装。')
+    return value
+
+
+def compatible_release(manifest):
+    require(manifest.get('arch') == architecture(), '发行包与本机 CPU 架构不匹配。')
+    require(manifest.get('os', 'linux') == operating_system(), '发行包与本机操作系统不匹配。')
+    if operating_system() == 'darwin':
+        require(tuple(map(int, platform.mac_ver()[0].split('.'))) >=
+                tuple(map(int, manifest.get('macos_min', '14.0').split('.'))), '此发行包需要 macOS 14 或更新版本。')
+    elif manifest.get('libc', 'glibc') == 'glibc':
+        probe = run(['getconf', 'GNU_LIBC_VERSION'], check=False, capture_output=True, text=True)
+        require(probe.returncode == 0, '此旧版发行包需要 glibc；Alpine 请使用新版静态 musl 发行包。')
+        require(tuple(map(int, probe.stdout.split()[-1].split('.'))) >=
+                tuple(map(int, manifest['glibc_min'].split('.'))),
+                f'发行包要求 glibc ≥ {manifest["glibc_min"]}，请使用静态 musl 发行包。')
+    else:
+        require(manifest['libc'] == 'musl', '不支持的 Linux 发行包类型。')
 
 
 def sha256(path):
@@ -107,6 +129,12 @@ def output(command, **kwargs):
 def owned_processes(root):
     marker = f'CHAIN_TASK_OWNER={root}'.encode()
     result = []
+    if operating_system() == 'darwin':
+        for line in output(['ps', 'eww', '-axo', 'pid=,command=']).splitlines():
+            pid, _, command = line.strip().partition(' ')
+            if pid.isdigit() and marker.decode() + ' ' in command + ' ':
+                result.append(int(pid))
+        return result
     for path in Path('/proc').iterdir():
         if path.name.isdigit():
             with contextlib.suppress(OSError):
@@ -154,7 +182,7 @@ class Workspace:
         return self
 
     def __exit__(self, *_):
-        groups = set()
+        groups = set(self.manifest['groups'])
         for pid in owned_processes(self.root):
             with contextlib.suppress(ProcessLookupError):
                 groups.add(os.getpgid(pid))
@@ -177,7 +205,7 @@ class Workspace:
         remaining = owned_processes(self.root)
         require(not remaining, f'清理未完成：PID={remaining}；保留目录 {self.root}')
         held = []
-        for proc in Path('/proc').iterdir():
+        for proc in Path('/proc').iterdir() if operating_system() == 'linux' else []:
             if not proc.name.isdigit():
                 continue
             with contextlib.suppress(OSError):
@@ -186,6 +214,10 @@ class Workspace:
                     with contextlib.suppress(OSError):
                         if str(link.readlink()).startswith(str(self.root) + '/'):
                             held.append(f'{proc.name}:{link.name}')
+        if operating_system() == 'darwin':
+            probe = run(['lsof', '-nP', '+D', self.root], check=False, capture_output=True, text=True)
+            require(probe.returncode in (0, 1), f'无法检查临时目录打开的文件：{probe.stderr}')
+            held.extend(probe.stdout.splitlines())
         require(not held, f'仍有进程持有临时文件：{held}；保留目录 {self.root}')
         size = sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file())
         shutil.rmtree(self.root)
@@ -226,6 +258,8 @@ def verify_tree(directory):
     files = manifest.get('files', {})
     required = {'bin/chain-panel', 'bin/chain-agent', 'bin/xray', 'scripts/chain_common.py',
                 'scripts/chain_install.py', 'scripts/chain_network.py', 'scripts/install-server.sh'}
+    if 'os' in manifest:
+        required.add('scripts/chain_platform.py')
     require(required.issubset(files), '发行包缺少程序或安装脚本。')
     actual = set()
     for path in directory.rglob('*'):

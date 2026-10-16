@@ -16,13 +16,17 @@ import time
 import urllib.error
 import urllib.request
 
-from chain_common import atomic_write, output, require, run
+from chain_common import atomic_write, output, require, run, operating_system
+from chain_platform import (service_kind, service, service_state, service_path, service_definition,
+                            brew_command, nginx_conf, ensure_nginx_service)
 
 SITE_OWNER = '# chain-panel HTTPS managed site v1'
 
 
 def public_ipv4():
     """Only use assigned NIC addresses, never a proxy/NAT's outbound address."""
+    if operating_system() == 'darwin':
+        return next(iter(sorted(a for a in server_addresses() if ':' not in a)), None)
     if not shutil.which('ip'):
         install_packages(['iproute2' if shutil.which('apt-get') else 'iproute'])
     addresses = server_addresses()
@@ -43,6 +47,15 @@ def public_ipv4():
 
 def server_addresses(ipv4=None):
     addresses = {ipv4} if ipv4 else set()
+    if operating_system() == 'darwin':
+        for block in re.split(r'(?m)^(?=\S)', output(['ifconfig', '-a'])):
+            if not block or 'UP' not in block.splitlines()[0] or block.startswith('lo0:'):
+                continue
+            for value in re.findall(r'\binet6?\s+(\S+)', block):
+                address = ipaddress.ip_address(value.split('%')[0])
+                if address.is_global and not address.is_multicast:
+                    addresses.add(str(address))
+        return addresses
     if shutil.which('ip'):
         try:
             for interface in json.loads(output(['ip', '-j', 'address', 'show', 'scope', 'global'])):
@@ -130,19 +143,32 @@ def install_packages(packages):
     if not packages:
         return
     print('通过系统软件源安装：' + '、'.join(packages), flush=True)
-    if shutil.which('apt-get'):
+    if operating_system() == 'darwin':
+        run(brew_command('install', *packages))
+    elif shutil.which('apt-get'):
         run(['apt-get', 'update'])
         run(['apt-get', 'install', '-y', *packages], env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'})
     elif shutil.which('dnf'):
         run(['dnf', 'install', '-y', *packages])
+    elif shutil.which('apk'):
+        names = {'iproute': 'iproute2', 'libnginx-mod-stream': 'nginx-mod-stream'}
+        run(['apk', 'add', '--no-cache', *[names.get(p, p) for p in packages]])
+    elif shutil.which('yum'):
+        run(['yum', 'install', '-y', *packages])
+    elif shutil.which('pacman'):
+        names = {'iproute': 'iproute2', 'libnginx-mod-stream': 'nginx-mod-stream'}
+        run(['pacman', '-S', '--needed', '--noconfirm', *[names.get(p, p) for p in packages]])
+    elif shutil.which('zypper'):
+        run(['zypper', '--non-interactive', 'install', *['iproute2' if p == 'iproute' else p for p in packages]])
     else:
-        raise ValueError('自动 HTTPS 需要 apt 或 dnf 软件源中的 nginx、certbot；也可留空域名使用 IP 访问。')
+        raise ValueError('未识别系统包管理器，请先安装：' + '、'.join(packages))
 
 
 def nginx_site_directory(dump):
     """Select a wildcard include directly inside the main HTTP block."""
     main = re.split(r'^# configuration file ', dump, flags=re.M)[1:2]
     require(main, '无法读取 Nginx 主配置。')
+    config_directory = Path(main[0].split('\n', 1)[0].rstrip(':')).parent
     text = main[0].split('\n', 1)[1]
     lexer = shlex.shlex(text, posix=True, punctuation_chars='{};')
     lexer.whitespace_split = True
@@ -161,6 +187,8 @@ def nginx_site_directory(dump):
             elif part == ';':
                 if stack == ['http'] and len(statement) == 2 and statement[0] == 'include':
                     path = Path(statement[1])
+                    if not path.is_absolute():
+                        path = config_directory / path
                     if path.is_absolute() and path.name in ('*.conf', '*') and '*' not in str(path.parent):
                         return path.parent
                 statement = []
@@ -215,7 +243,7 @@ def install_proxy_acme(role, uid, gid):
             f'{site.site} 不归本安装器管理，拒绝覆盖。')
     root = Path('/var/lib/chain-acme')
     require(not root.is_symlink(), f'{root} 不能是符号链接。')
-    root.mkdir(mode=0o755, exist_ok=True)
+    root.mkdir(mode=0o755, parents=True, exist_ok=True)
     root.chmod(0o755)
     for path in [root / role, root / role / '.well-known', root / role / '.well-known/acme-challenge']:
         require(not path.is_symlink() and (not path.exists() or path.stat().st_uid == uid), f'{path} 归属不匹配。')
@@ -230,7 +258,7 @@ def install_proxy_acme(role, uid, gid):
                 atomic_write(panel_site, migrated, 0o644)
         atomic_write(site.site, proxy_acme_config(any(':' in address for address in server_addresses())), 0o644)
         site.reload()
-        run(['systemctl', 'enable', 'nginx'])
+        service('enable', 'nginx')
     except BaseException:
         if panel_previous is not None:
             atomic_write(panel_site, panel_previous, 0o644)
@@ -252,23 +280,55 @@ class HttpsSite:
 
     def prepare(self):
         # Refuse foreign port owners before package installation can start Nginx.
-        require(shutil.which('ss'), '需要系统的 ss 命令（iproute2/iproute 包）检测 80/443 端口归属。')
-        listeners = output(['ss', '-H', '-ltnp', '( sport = :80 or sport = :443 )'])
+        if operating_system() == 'darwin':
+            probe = run(['lsof', '-nP', '-iTCP:80,443', '-sTCP:LISTEN', '-Fpc'], check=False, capture_output=True, text=True)
+            require(probe.returncode in (0, 1), '无法检测 80/443 端口归属。')
+            listeners = '\n'.join(line for line in probe.stdout.splitlines() if line.startswith('c'))
+        else:
+            if not shutil.which('ss'):
+                install_packages(['iproute2' if shutil.which('apt-get') else 'iproute'])
+            listeners = output(['ss', '-H', '-ltnp', '( sport = :80 or sport = :443 )'])
         for line in listeners.splitlines():
-            require('"nginx"' in line, f'80/443 已被其他服务占用：{line}；请换用 IP 访问或先调整该服务。')
-        install_packages([name for name in ('nginx', 'certbot') if not shutil.which(name)])
+            require(line == 'cnginx' if operating_system() == 'darwin' else '"nginx"' in line,
+                    f'80/443 已被其他服务占用：{line}；请先调整该服务。')
+        install_packages([name for name in ('nginx', 'certbot', 'openssl') if not shutil.which(name)])
+        if operating_system() == 'darwin' and not any(Path(p).is_file() for p in
+                ('/opt/homebrew/opt/openssl@3/bin/openssl', '/usr/local/opt/openssl@3/bin/openssl')):
+            install_packages(['openssl@3'])
         details = subprocess.run(['nginx', '-V'], check=True, capture_output=True, text=True).stderr
-        require('--conf-path=/etc/nginx/nginx.conf' in details,
-                '检测到自定义 Nginx；自动 HTTPS 需要系统软件包的 /etc/nginx/nginx.conf，请留空域名或先调整配置。')
-        pid = output(['systemctl', 'show', 'nginx', '--property=MainPID', '--value'])
-        if pid.isdigit() and int(pid):
+        conf = nginx_conf()
+        require('--conf-path=' + str(conf) in shlex.split(details),
+                f'检测到自定义 Nginx；自动 HTTPS 需要系统软件包的 {conf}。')
+        if service_kind() == 'systemd':
+            pid = output(['systemctl', 'show', 'nginx', '--property=MainPID', '--value'])
+        else:
+            # Inspect every master before creating or using the platform service.
+            if operating_system() == 'darwin':
+                masters = [line for line in output(['ps', '-axo', 'pid=,command=']).splitlines() if 'nginx: master process' in line]
+            else:
+                masters = []
+                for path in Path('/proc').glob('[0-9]*/cmdline'):
+                    with contextlib.suppress(OSError):
+                        command = path.read_bytes().decode().replace('\0', ' ').strip()
+                        if command.startswith('nginx: master process '):
+                            masters.append(path.parent.name + ' ' + command)
+            require(len(masters) <= 1, '存在多个 Nginx master，拒绝自动修改配置。')
+            pid = masters[0].split()[0] if masters else ''
+            if masters:
+                command = shlex.split(masters[0].split('nginx: master process ', 1)[1])
+                require(command and Path(shutil.which(command[0]) or command[0]).resolve() == Path(shutil.which('nginx')).resolve(),
+                        '运行中的 Nginx 与系统命令不是同一程序。')
+                require('-c' not in command or (command.index('-c') + 1 < len(command) and command[command.index('-c') + 1] == str(conf)),
+                        '运行中的 Nginx 使用自定义配置，拒绝接管。')
+            ensure_nginx_service(SITE_OWNER)
+        if operating_system() == 'linux' and pid.isdigit() and int(pid):
             process = Path('/proc') / pid
             require((process / 'exe').resolve() == Path(shutil.which('nginx')).resolve(),
                     '运行中的 Nginx 与系统命令不是同一程序，拒绝修改其配置。')
             command = shlex.split((process / 'cmdline').read_bytes().decode().replace('\0', ' '))
             if '-c' in command:
                 index = command.index('-c') + 1
-                require(index < len(command) and command[index] == '/etc/nginx/nginx.conf',
+                require(index < len(command) and command[index] == str(conf),
                         '运行中的 Nginx 使用自定义 -c 配置，无法自动接管。')
         run(['nginx', '-t'])
         dump = output(['nginx', '-T'])
@@ -307,6 +367,9 @@ class HttpsSite:
 
     def reload(self):
         run(['nginx', '-t'])
+        if service_kind() != 'systemd':
+            service('reload' if self.service_state('nginx')[0] else 'start', 'nginx')
+            return
         active = subprocess.run(['systemctl', 'is-active', '--quiet', 'nginx'], check=False).returncode == 0
         run(['systemctl', 'reload' if active else 'start', 'nginx'])
 
@@ -318,7 +381,9 @@ class HttpsSite:
             path.chmod(0o755)  # root's umask 077 must not prevent Nginx traversal.
         challenge = directory / ('chain-check-' + secrets.token_hex(16))
         value = secrets.token_hex(32).encode()
-        url = f'http://{self.domain}/.well-known/acme-challenge/{challenge.name}'
+        url = f'http://127.0.0.1/.well-known/acme-challenge/{challenge.name}'
+        # Check the domain's local vhost without requiring public-IP hairpin routing.
+        request = urllib.request.Request(url, headers={'Host': self.domain})
         try:
             atomic_write(challenge, value, 0o644)
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -328,31 +393,36 @@ class HttpsSite:
             # while old workers may still return a default site's 404/redirect.
             while True:
                 try:
-                    with opener.open(url, timeout=max(.1, min(3, deadline - time.monotonic()))) as response:
+                    with opener.open(request, timeout=max(.1, min(3, deadline - time.monotonic()))) as response:
                         if response.read(1024) == value:
                             return
-                        detail = 'HTTP 响应内容与验证文件不匹配，请检查域名是否命中正确站点及代理/CDN 缓存。'
+                        detail = 'HTTP 响应内容与验证文件不匹配，请检查 Nginx 是否命中正确站点及验证目录配置。'
                 except urllib.error.HTTPError as error:
                     detail = (f'HTTP {error.code} {error.reason}；请求已到达 HTTP 服务。'
-                              '请检查 Nginx 站点是否生效、验证目录权限及代理/CDN 配置。')
+                              '请检查 Nginx 站点是否生效及验证目录权限。')
                     error.close()
                 except OSError as error:
                     reason = error.reason if isinstance(error, urllib.error.URLError) else error
-                    detail = (f'连接错误：{reason}；请检查域名解析、本机到域名的路由及 TCP 80 入站规则。'
+                    detail = (f'连接错误：{reason}；请检查本机 Nginx 是否监听 TCP 80 及回环访问规则。'
                               '本机自检不能证明公网可达性，证书签发还会从外部验证。')
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise ValueError(f'HTTP 验证路径不可达或内容异常（已等待 {timeout:g} 秒）：{url}\n{detail}')
+                    raise ValueError(f'本机 HTTP 验证路径不可达或内容异常（已等待 {timeout:g} 秒）：{url}（Host: {self.domain}）\n{detail}')
                 time.sleep(min(.5, remaining))
         finally:
             challenge.unlink(missing_ok=True)
 
     def renewal_paths(self):
+        if service_kind() != 'systemd':
+            return (Path('/etc/letsencrypt/renewal-hooks/deploy/chain-panel-nginx'),
+                    Path('/etc/chain-panel-cert-renew.sh'), service_path('chain-panel-cert-renew'))
         return (Path('/etc/letsencrypt/renewal-hooks/deploy/chain-panel-nginx'),
                 Path('/etc/systemd/system/chain-panel-cert-renew.service'),
                 Path('/etc/systemd/system/chain-panel-cert-renew.timer'))
 
     def service_state(self, name):
+        if service_kind() != 'systemd':
+            return service_state(name)
         return tuple(subprocess.run(['systemctl', action, '--quiet', name], stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL).returncode == 0
                      for action in ('is-active', 'is-enabled'))
@@ -360,9 +430,9 @@ class HttpsSite:
     def restore_service(self, name, previous):
         current = self.service_state(name)
         if current[0] != previous[0]:
-            run(['systemctl', 'start' if previous[0] else 'stop', name])
+            service('start' if previous[0] else 'stop', name)
         if current[1] != previous[1]:
-            run(['systemctl', 'enable' if previous[1] else 'disable', name])
+            service('enable' if previous[1] else 'disable', name)
 
     def check_renewal_paths(self):
         for path in self.renewal_paths():
@@ -371,14 +441,23 @@ class HttpsSite:
 
     def renewal(self):
         # A dedicated timer also works on distributions without a Certbot timer.
-        hook, service, timer = self.renewal_paths()
+        hook, service_file, timer = self.renewal_paths()
         self.check_renewal_paths()
         nginx = shutil.which('nginx')
         certbot = shutil.which('certbot')
         atomic_write(hook, f'#!/bin/sh\n{SITE_OWNER}\nset -eu\n'
                      f'[ "${{RENEWED_LINEAGE:-}}" = {shlex.quote(str(self.cert))} ] || exit 0\n'
-                     f'{shlex.quote(nginx)} -t\nsystemctl reload nginx\n', 0o755)
-        atomic_write(service, f'{SITE_OWNER}\n[Unit]\nDescription=Renew Chain Panel HTTPS certificate\n'
+                     f'{shlex.quote(nginx)} -t\n{shlex.quote(nginx)} -s reload\n', 0o755)
+        if service_kind() != 'systemd':
+            atomic_write(service_file, f'#!/bin/sh\n{SITE_OWNER}\nexec {shlex.quote(certbot)} renew --quiet '
+                         f'--config-dir /etc/letsencrypt --work-dir /var/lib/letsencrypt --logs-dir /var/log/letsencrypt '
+                         f'--cert-name {shlex.quote(self.certname)}\n', 0o755)
+            atomic_write(timer, service_definition('chain-panel-cert-renew', ['/bin/sh', service_file],
+                         SITE_OWNER, interval=43200), 0o755 if service_kind() == 'openrc' else 0o644)
+            service('enable', 'chain-panel-cert-renew')
+            service('restart', 'chain-panel-cert-renew')
+            return
+        atomic_write(service_file, f'{SITE_OWNER}\n[Unit]\nDescription=Renew Chain Panel HTTPS certificate\n'
                      '[Service]\nType=oneshot\n'
                      f'ExecStart={certbot} renew --quiet --cert-name {self.certname}\n', 0o644)
         atomic_write(timer, f'{SITE_OWNER}\n[Unit]\nDescription=Check Chain Panel certificate twice daily\n'
@@ -407,6 +486,7 @@ class HttpsSite:
             self.challenge_check()
             print('正在申请 HTTPS 证书（Let’s Encrypt），并设置自动续期…', flush=True)
             run(['certbot', 'certonly', '--non-interactive', '--agree-tos', '--register-unsafely-without-email',
+                 '--config-dir', '/etc/letsencrypt', '--work-dir', '/var/lib/letsencrypt', '--logs-dir', '/var/log/letsencrypt',
                  '--webroot', '--webroot-path', self.webroot, '--cert-name', self.certname,
                  '--domain', self.domain, '--keep-until-expiring'])
             require((self.cert / 'fullchain.pem').is_file() and (self.cert / 'privkey.pem').is_file(), '证书文件缺失。')
@@ -414,7 +494,7 @@ class HttpsSite:
             self.reload()
             renewal_started = True
             self.renewal()
-            run(['systemctl', 'enable', 'nginx'])
+            service('enable', 'nginx')
             yield
             from chain_ingress import refresh_panel_site
             refresh_panel_site(self.site)
@@ -425,12 +505,15 @@ class HttpsSite:
                 else:
                     atomic_write(self.site, previous, 0o644)
             if renewal_started:
+                if service_kind() != 'systemd':
+                    service('stop', 'chain-panel-cert-renew', check=False)
                 for path, value in renewal.items():
                     if value is None:
                         path.unlink(missing_ok=True)
                     else:
                         atomic_write(path, value[0], value[1])
-                run(['systemctl', 'daemon-reload'], check=False)
+                if service_kind() == 'systemd':
+                    run(['systemctl', 'daemon-reload'], check=False)
             try:
                 if site_written and nginx_state[0]:
                     self.reload()
