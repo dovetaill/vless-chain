@@ -165,6 +165,7 @@ class Delivery(unittest.TestCase):
         args = installer.make_parser().parse_args(['uninstall', '--non-interactive'])
         with patch.object(installer, 'nginx_conf', return_value=self.manager.path('/etc/nginx/nginx.conf')), \
                 patch.object(Ingress, 'command', return_value=''), patch.object(installer, 'run'), \
+                patch('chain_ingress.service'), \
                 patch.object(installer, 'service_state', return_value=(False, False)):
             self.manager.operate(args)
         self.assertEqual(site.read_text(), before)
