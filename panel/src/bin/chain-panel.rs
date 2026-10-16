@@ -1129,7 +1129,7 @@ async fn web_asset(uri: Uri) -> Response {
     if path.starts_with("api/") {
         return error(StatusCode::NOT_FOUND, "接口不存在").into_response();
     }
-    let path = if path.is_empty() || matches!(path, "query" | "query/") {
+    let path = if path.is_empty() || matches!(path, "admin" | "admin/" | "query" | "query/") {
         "index.html"
     } else {
         path
@@ -1149,6 +1149,27 @@ async fn web_asset(uri: Uri) -> Response {
         "application/octet-stream"
     };
     ([(axum::http::header::CONTENT_TYPE, mime)], file.contents()).into_response()
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn public_and_admin_entrypoints_serve_the_app() {
+        for path in ["/", "/admin", "/admin/", "/query", "/query/"] {
+            let response = web_asset(path.parse().unwrap()).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/html; charset=utf-8"
+            );
+        }
+        assert_eq!(
+            web_asset("/api/missing".parse().unwrap()).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
 }
 
 #[tokio::main]

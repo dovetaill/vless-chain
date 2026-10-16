@@ -38,7 +38,7 @@ const assets = path.resolve(process.argv[2]);
         }
         return route.fulfill({ json: body });
       }
-      const file = path.join(assets, url.pathname === '/' ? 'index.html' : url.pathname);
+      const file = path.join(assets, ['/', '/admin', '/admin/'].includes(url.pathname) ? 'index.html' : url.pathname);
       return fs.existsSync(file) ? route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' }) : route.fulfill({ status: 404 });
       } catch (error) {
         errors.push(error.message);
@@ -49,7 +49,7 @@ const assets = path.resolve(process.argv[2]);
     const close = () => page.getByRole('dialog').last().getByRole('button', { name: '关闭', exact: true }).first().click();
     const create = async name => { await button('新建代理').first().click(); await page.getByLabel('名称', { exact: true }).fill(name); };
     const save = async () => { await page.getByRole('dialog').getByRole('button', { name: '创建代理', exact: true }).click(); await page.getByRole('heading', { name: '分享代理', exact: true }).waitFor(); await close(); };
-    await page.goto('http://chain.test/#lines');
+    await page.goto('http://chain.test/admin#lines');
     assert.equal(await page.locator('aside nav button').count(), 5);
     for (const name of ['总览', '代理', '客户与收款', '外部代理', '设置']) assert.equal(await page.locator('aside nav').getByRole('button', { name, exact: true }).count(), 1);
     await create('VLESS A');
@@ -143,7 +143,7 @@ const assets = path.resolve(process.argv[2]);
     await close();
     // Reproduce the screenshot: an orphan local identity with no server row.
     state.nodes = []; state.local_node_id = 'orphan'; state.lines = [];
-    await page.goto('http://chain.test/#lines'); await page.reload();
+    await page.goto('http://chain.test/admin#lines'); await page.reload();
     await create('首次本机代理');
     await page.getByLabel('本机 IP 或域名').fill('192.0.2.20');
     await save();

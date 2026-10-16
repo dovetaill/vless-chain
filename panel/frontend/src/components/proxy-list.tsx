@@ -73,13 +73,13 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply }: {
   }
   function filtersChanged(set: (value: string) => void, value: string) { set(value); setSelected([]); }
   return <Card>
-    <CardHeader className="flex flex-wrap items-center justify-between gap-3"><CardTitle>我的代理 <span className="ml-2 text-sm font-normal text-slate-400">{lines.length} / {all.length}</span></CardTitle>
-      <div className="relative w-full sm:w-80"><Search className="absolute left-3 top-2.5 size-4 text-slate-400" /><Input className="pl-9" aria-label="搜索代理名称、客户、服务器、地址或端口" placeholder="名称 / 客户 / 服务器 / 地址 / 端口" value={search} onChange={event => filtersChanged(setSearch, event.target.value)} /></div>
+    <CardHeader><CardTitle>我的代理 <span className="ml-2 text-sm font-normal text-slate-400">{lines.length} / {all.length}</span></CardTitle>
     </CardHeader>
-    <div className="flex flex-wrap gap-2 border-b border-border px-5 pb-4">
-      <select className="select w-auto" aria-label="筛选协议" value={protocol} onChange={event => filtersChanged(setProtocol, event.target.value)}><option value="">所有协议</option>{Object.entries(protocolNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
-      <select className="select w-auto" aria-label="筛选状态" value={status} onChange={event => filtersChanged(setStatus, event.target.value)}><option value="">所有状态</option>{Object.entries(rentalStatusNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
-      <select className="select w-auto" aria-label="筛选到期与余量" value={attention} onChange={event => filtersChanged(setAttention, event.target.value)}><option value="">所有到期 / 余量</option><option value="expiring">7 天内到期</option><option value="low">剩余 ≤10%</option></select>
+    <div className="flex flex-wrap items-center gap-2.5 border-b border-border px-5 py-4" role="group" aria-label="代理搜索与筛选">
+      <div className="relative w-full min-w-0 sm:w-72"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" /><Input className="pl-9" aria-label="搜索代理名称、客户、服务器、地址或端口" placeholder="名称 / 客户 / 服务器 / 地址 / 端口" value={search} onChange={event => filtersChanged(setSearch, event.target.value)} /></div>
+      <select className="select h-8.5 w-auto min-w-0 max-w-full py-0" aria-label="筛选协议" value={protocol} onChange={event => filtersChanged(setProtocol, event.target.value)}><option value="">所有协议</option>{Object.entries(protocolNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
+      <select className="select h-8.5 w-auto min-w-0 max-w-full py-0" aria-label="筛选状态" value={status} onChange={event => filtersChanged(setStatus, event.target.value)}><option value="">所有状态</option>{Object.entries(rentalStatusNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
+      <select className="select h-8.5 w-auto min-w-0 max-w-full py-0" aria-label="筛选到期与余量" value={attention} onChange={event => filtersChanged(setAttention, event.target.value)}><option value="">所有到期 / 余量</option><option value="expiring">7 天内到期</option><option value="low">剩余 ≤10%</option></select>
       {(search || protocol || status || attention) && <Button variant="ghost" size="sm" onClick={() => { setSearch(""); setProtocol(""); setStatus(""); setAttention(""); setSelected([]); }}>清除筛选</Button>}
     </div>
     {chosen.length > 0 && <div className="flex flex-wrap items-center gap-2 border-b border-blue-100 bg-blue-50 px-5 py-3" aria-label="批量操作"><span className="mr-2 text-sm font-medium">已选 {chosen.length} 条</span>

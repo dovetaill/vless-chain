@@ -612,13 +612,13 @@ export function App() {
                         key={e.id}
                         className="flex flex-wrap items-center justify-between gap-3 border-b border-border py-4 last:border-0"
                       >
-                        <div>
-                          <p className="text-sm font-medium">{e.name}</p>
+                        <div className="min-w-0 max-w-full">
+                          <p className="break-all text-sm font-medium">{e.name}</p>
                           <p className="mt-1 text-xs text-slate-400">
                             {e.url.split(":")[0].toUpperCase()} · 已导入
                           </p>
                         </div>
-                        <div className="flex gap-2">
+                        <div className="flex flex-wrap gap-2">
                           <Button variant="outline" onClick={() => setModal(<AccessDialog external={e} state={state} close={close} />)}>链接 / Mihomo</Button>
                           <Button variant="outline" onClick={() => editLine("vless", undefined, [`external:${e.id}`])}>用于新建代理</Button>
                           <Button

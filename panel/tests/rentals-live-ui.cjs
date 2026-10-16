@@ -126,7 +126,7 @@ saveRecord();
       return fs.readFileSync(path.join(output, destination), 'utf8');
     }
 
-    await page.goto(base);
+    await page.goto(base + '/admin');
     await page.getByRole('heading', { name: '登录控制台', exact: true }).waitFor();
     await page.getByLabel('管理员密钥', { exact: true }).fill(fs.readFileSync(tokenFile, 'utf8').trim());
     await button('登录').click();

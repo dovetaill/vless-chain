@@ -155,8 +155,8 @@ export function Modal({
         className={`max-h-[92dvh] w-[calc(100%-2rem)] ${wide ? "max-w-3xl" : "max-w-2xl"} overflow-y-auto rounded-xl p-6 sm:p-7`}
       >
         <DialogHeader>
-          <DialogTitle className="pe-6">{title}</DialogTitle>
-          {description && <DialogDescription className="pt-2 leading-relaxed">
+          <DialogTitle className="break-words pe-6">{title}</DialogTitle>
+          {description && <DialogDescription className="break-words pt-2 leading-relaxed">
             {description}
           </DialogDescription>}
         </DialogHeader>

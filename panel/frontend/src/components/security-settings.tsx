@@ -293,10 +293,10 @@ export function SecuritySettings({
             {security.passkeys.map((p) => (
               <div
                 key={p.id}
-                className="flex items-center justify-between border-b border-border py-4 last:border-0"
+                className="flex items-center justify-between gap-3 border-b border-border py-4 last:border-0"
               >
-                <div>
-                  <p className="text-sm font-medium">{p.name}</p>
+                <div className="min-w-0">
+                  <p className="break-all text-sm font-medium">{p.name}</p>
                   <p className="muted mt-1">{stamp(p.created)}</p>
                 </div>
                 <Button
@@ -348,14 +348,15 @@ export function SecuritySettings({
                 key={s.id}
                 className="flex items-center justify-between gap-4 rounded-lg border border-border p-3"
               >
-                <div>
-                  <p className="text-sm font-medium">{s.name}</p>
+                <div className="min-w-0">
+                  <p className="break-all text-sm font-medium">{s.name}</p>
                   <p className="muted">
                     {s.line_ids.length} 条线路 · {stamp(s.created)}
                   </p>
                 </div>
                 <Button
                   variant="outline"
+                  className="shrink-0"
                   onClick={() =>
                     setModal(
                       <Modal

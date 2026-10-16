@@ -7,7 +7,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 
 export function PaymentTable({ payments }: { payments: Payment[] }) {
-  if (!payments.length) return <p className="muted py-3">尚无收款记录。</p>;
+  if (!payments.length) return <p className="muted p-5">尚无收款记录。</p>;
   return <div className="max-h-96 overflow-auto" tabIndex={0} role="region" aria-label="收款记录"><table className="data-table"><thead><tr><th>收款时间 / 客户</th><th>代理 / 周期</th><th>实收</th><th>续后到期</th><th>备注</th></tr></thead><tbody>{payments.map(payment => <tr key={payment.id}>
     <td><p className="text-xs">{beijingTime(payment.created)}</p><p className="muted mt-1">{payment.customer_name}</p></td><td><p className="text-sm">{payment.line_name}</p><p className="muted mt-1">{payment.previous_expires_at ? payment.previous_expires_at <= payment.created ? "重新开通" : "续费" : "首次开通"} · {terms.find(term => term.id === payment.term)?.name}</p></td><td className="text-sm tabular-nums">{money(payment.amount_fen)}</td><td className="text-xs">{beijingTime(payment.expires_at)}</td><td className="max-w-64 whitespace-pre-wrap break-words text-xs">{payment.note || "—"}</td>
   </tr>)}</tbody></table></div>;

@@ -14,7 +14,7 @@ const assets = path.resolve(process.argv[2]);
   let browser;
   try {
     browser = await chromium.connect(server.wsEndpoint());
-    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN' });
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN', reducedMotion: 'reduce' });
     const errors = [], requests = [], writes = [];
     context.on('page', page => page.on('pageerror', error => errors.push(error.message)));
     const now = Math.floor(Date.now() / 1000);
@@ -66,7 +66,7 @@ const assets = path.resolve(process.argv[2]);
         } else throw new Error('Unexpected API: ' + url.pathname);
         return route.fulfill({ json: body });
       }
-      const file = path.join(assets, ['/', '/query', '/query/'].includes(url.pathname) ? 'index.html' : url.pathname);
+      const file = path.join(assets, ['/', '/admin', '/admin/', '/query', '/query/'].includes(url.pathname) ? 'index.html' : url.pathname);
       return fs.existsSync(file) ? route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' }) : route.fulfill({ status: 404 });
       } catch (error) {
         errors.push(error.message);
@@ -77,7 +77,72 @@ const assets = path.resolve(process.argv[2]);
     const button = name => page.getByRole('button', { name, exact: true });
     const nav = name => page.locator('aside nav').getByRole('button', { name, exact: true }).click();
     const close = async () => { await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).first().click(); await page.getByRole('dialog').waitFor({ state: 'hidden' }); };
+    const layout = async label => {
+      await page.evaluate(() => document.fonts.ready);
+      if (root) await page.screenshot({ path: path.join(root, label + '.png'), fullPage: true, animations: 'disabled' });
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), label + ': page overflow');
+      for (const header of await page.locator('[data-slot="card-header"]').all()) {
+        assert.ok(await header.evaluate(el => ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft'].every(key => parseFloat(getComputedStyle(el)[key]) >= 16)), label + ': header padding');
+      }
+      for (const control of await page.locator('[data-slot="card"] button:visible').all()) {
+        assert.ok(await control.evaluate(el => {
+          if (el.closest('table')) return true;
+          const card = el.closest('[data-slot="card"]').getBoundingClientRect(), box = el.getBoundingClientRect();
+          return box.left >= card.left + 16 && box.right <= card.right - 16;
+        }), label + ': action touches card edge');
+      }
+    };
     await page.goto('http://chain.test/');
+    await page.getByRole('heading', { name: '查询我的代理', exact: true }).waitFor();
+    assert.equal(requests.filter(request => request.path === '/api/state').length, 0, 'public home must not request admin state');
+    assert.equal(await page.getByRole('link', { name: '管理登录' }).getAttribute('href'), '/admin');
+    for (const width of [1440, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      await layout('public-home-' + width);
+      assert.equal(await page.getByLabel('代理链接或 Mihomo 配置').evaluate(el => getComputedStyle(el).minHeight), '144px');
+    }
+    await page.getByRole('link', { name: '管理登录' }).click();
+    await page.getByRole('heading', { name: '总览', exact: true }).waitFor();
+    state.externals = [{ id: 'external', name: 'external'.repeat(10), url: 'socks5://example.com:1080' }];
+    state.security.passkeys = [{ id: 'passkey', name: 'authenticator'.repeat(6), created: now }];
+    state.subscriptions = [{ id: 'subscription', name: 'subscription'.repeat(6), line_ids: ['1'], created: now }];
+    for (const width of [1440, 1024, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      for (const [route, title] of [['dashboard', '总览'], ['lines', '代理'], ['customers', '客户与收款'], ['nodes', '外部代理'], ['settings', '设置']]) {
+        await page.goto('http://chain.test/admin#' + route);
+        await page.getByRole('heading', { name: title, exact: true, level: 1 }).waitFor();
+        await layout(route + '-' + width);
+        if (route === 'lines') {
+          const filters = page.getByRole('group', { name: '代理搜索与筛选' });
+          const boxes = await Promise.all((await filters.locator('input, select').all()).map(el => el.boundingBox()));
+          if (width >= 1280) assert.ok(boxes.every(box => Math.abs(box.y - boxes[0].y) < 1), 'desktop filters must share one row');
+          assert.ok(boxes.every(box => Math.abs(box.height - boxes[0].height) < 1), 'toolbar controls must align');
+          const input = filters.locator('input');
+          assert.equal(await input.evaluate(el => getComputedStyle(el).fontSize), '13px', 'template input font must not be reset');
+          const frame = await filters.boundingBox();
+          assert.ok(boxes.every(box => box.y >= frame.y + 16 && box.y + box.height <= frame.y + frame.height - 16), 'filter padding');
+        }
+        if (route === 'customers') {
+          assert.ok(await page.getByText('尚无收款记录。', { exact: true }).evaluate(el => parseFloat(getComputedStyle(el).paddingLeft) >= 20), 'empty payments need content padding');
+          await button('新建客户').click();
+          await layout('customer-dialog-' + width);
+          const dialog = page.getByRole('dialog');
+          assert.ok(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth), 'customer dialog overflow');
+          await close();
+        }
+      }
+    }
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    state.externals = [];
+    state.security.passkeys = [];
+    state.subscriptions = [];
+    const originalLines = state.lines;
+    state.lines = [];
+    await page.goto('http://chain.test/admin#lines');
+    await page.getByRole('heading', { name: '暂无代理', exact: true }).waitFor();
+    await layout('lines-empty-1440');
+    state.lines = originalLines;
+    await page.goto('http://chain.test/admin#dashboard');
     await page.getByRole('heading', { name: '总览', exact: true }).waitFor();
     await page.getByText('12.5%', { exact: true }).waitFor();
     assert.equal(await page.getByRole('heading', { name: '近 30 天代理流量' }).count(), 1);
@@ -115,7 +180,8 @@ const assets = path.resolve(process.argv[2]);
     await page.getByLabel('选择 自用 C', { exact: true }).check(); await page.getByLabel('批量操作').getByRole('button', { name: '设为无限期（自用）', exact: true }).click();
     await button('确认设为无限期并下发').click(); await page.getByRole('dialog').waitFor({ state: 'hidden' });
     await page.setViewportSize({ width: 390, height: 844 });
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'operator mobile overflow');
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.app-main')).marginLeft === '0px');
+    await layout('lines-filtered-390');
     await page.close();
     const adminRequests = requests.filter(request => request.path === '/api/state').length;
     const query = await context.newPage(); await query.clock.install();

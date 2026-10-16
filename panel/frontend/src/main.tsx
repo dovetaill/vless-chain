@@ -4,8 +4,11 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { PublicQuery } from './components/public-query';
 
+const adminPage = location.pathname.replace(/\/$/, '') === '/admin';
+document.title = adminPage ? 'Chain · 管理控制台' : 'Chain · 代理服务查询';
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    {location.pathname.replace(/\/$/, '') === '/query' ? <PublicQuery /> : <App />}
+    {adminPage ? <App /> : <PublicQuery />}
   </StrictMode>,
 );

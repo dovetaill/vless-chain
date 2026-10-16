@@ -49,7 +49,7 @@ export function Dashboard({ state, manage }: { state: PanelState; manage: (line:
     <TrafficChart days={days} now={state.time} />
     </div>
     <Card><CardHeader className="px-4 py-4"><div><CardTitle className="leading-5">代理经营总览</CardTitle><p className="muted mt-1">到期与额度重置时间均为北京时间；点击名称管理出租信息。</p></div></CardHeader>
-      {lines.length ? <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="代理经营总览表"><table className="data-table [&_td]:px-4! [&_td]:py-3! [&_th]:px-4! [&_th]:py-3!"><thead><tr><th>代理 / 客户</th><th>运行 / 同步</th><th>周期用量 / 余量</th><th>实时网速</th><th>到期 / 重置</th><th>续费报价</th></tr></thead><tbody>{lines.map(line => <tr key={line.id}>
+      {lines.length ? <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="代理经营总览表"><table className="data-table [&_td]:px-4 [&_td]:py-3 [&_th]:px-4 [&_th]:py-3"><thead><tr><th>代理 / 客户</th><th>运行 / 同步</th><th>周期用量 / 余量</th><th>实时网速</th><th>到期 / 重置</th><th>续费报价</th></tr></thead><tbody>{lines.map(line => <tr key={line.id}>
         <td><button className="text-left text-sm font-semibold text-blue-700 underline-offset-4 hover:underline" onClick={() => manage(line)}>{line.name}</button><p className="mt-2 text-xs text-slate-500">{state.customers.find(customer => customer.id === line.rental?.customer_id)?.name || "自用"}</p></td>
         <td><RentalStatusBadge status={line.rental_status} /><p className="mt-2"><SyncLabel status={line.sync_status} /></p></td>
         <td><RentalUsage line={line} /></td><td><RentalSpeed line={line} now={state.time} /></td><td><RentalDates line={line} /></td><td><RentalPrices line={line} /></td>

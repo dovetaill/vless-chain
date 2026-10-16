@@ -30,7 +30,7 @@ const base = address.replace('127.0.0.1', 'localhost');
       await page.screenshot({ path: path.join(screenshots, name + '.png'), fullPage: await page.getByRole('dialog').count() === 0, animations: 'disabled' });
     };
     const nav = async name => { await page.locator('aside nav').getByRole('button', { name: new RegExp('^' + name) }).click(); await page.getByRole('heading', { name, exact: true, level: 1 }).waitFor(); };
-    await page.goto(base);
+    await page.goto(base + '/admin');
     await heading('登录控制台').waitFor();
     await shot('login');
     await page.getByLabel('管理员密钥', { exact: true }).fill('incorrect');
