@@ -104,6 +104,19 @@ def smoke(directory):
         work.run([sys.executable, '-B', root / 'panel/tests/legacy_migration.py'], cwd=root)
         if shutil.which('nginx') and shutil.which('openssl'):
             work.run([sys.executable, '-B', root / 'panel/tests/https_install.py', stage], cwd=root)
+        if manifest['os'] == 'linux' and manifest['arch'] == 'x86_64':
+            name = 'chain-openrc-install-' + str(os.getpid())
+            for scenario in ['fresh', 'recovery']:
+                try:
+                    work.run(['docker', 'run', '--rm', '--init', '--name', name,
+                        '--mount', f'type=bind,src={root},dst=/source,readonly',
+                        '--mount', f'type=bind,src={stage},dst=/release,readonly',
+                        '--workdir', '/source', '--env', 'PYTHONDONTWRITEBYTECODE=1', '--env', 'CHAIN_TEST_OPENRC=1',
+                        'alpine:3.23.6@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0',
+                        'sh', '-ec', 'apk add --no-cache openrc python3 openssl curl iproute2 nginx certbot; '
+                        'exec python3 -B panel/tests/openrc_install.py /release "$1"', 'sh', scenario])
+                finally:
+                    run(['docker', 'rm', '-f', name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def check():

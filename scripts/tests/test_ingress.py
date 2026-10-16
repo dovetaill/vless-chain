@@ -89,5 +89,52 @@ class IngressTest(unittest.TestCase):
                 with self.assertRaises(ValueError): ingress.disable()
                 self.assertTrue(site.read_text().endswith('# manual edit\n'))
 
+    def test_alpine_empty_stream_block_is_reused_and_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ingress, main, site, dump = self.fixture(Path(temporary))
+            stream = main.parent / 'conf.d/stream.conf'
+            stream.parent.mkdir()
+            stream.write_text("# Alpine module default\nstream {\n"
+                " log_format main '$remote_addr [$time_local] ' '$protocol $status';\n"
+                " access_log /var/log/nginx/stream.log main;\n include stream.d/*.conf;\n}\n")
+            dump += '# configuration file ' + str(stream) + ':\n' + stream.read_text()
+            paths = [main, site, stream]
+            before = [p.read_bytes() for p in paths]
+            def command(*args): return dump if args == ('nginx', '-T') else ''
+            with patch.object(ingress, 'command', side_effect=command):
+                ingress.enable()
+                self.assertIn(f'include {ingress.config}/stream.conf;', stream.read_text())
+                self.assertNotIn('stream {', (ingress.config / 'stream.conf').read_text())
+                ingress.disable()
+                self.assertEqual([p.read_bytes() for p in paths], before)
+
+                with patch.object(ingress, 'reload', side_effect=ValueError('test reload failure')):
+                    with self.assertRaisesRegex(ValueError, 'test reload failure'):
+                        ingress.enable()
+                self.assertEqual([p.read_bytes() for p in paths], before)
+                self.assertFalse(ingress.config.exists())
+                included = main.parent / 'stream.d'
+                included.mkdir()
+                (included / 'custom.conf').write_text('server { listen 12345; }\n')
+                with self.assertRaisesRegex(ValueError, '已有 Nginx stream'):
+                    ingress.enable()
+                (included / 'custom.conf').unlink()
+                dump = dump.replace('include stream.d/*.conf;', 'server { listen 12345; }')
+                with self.assertRaisesRegex(ValueError, '已有 Nginx stream'):
+                    ingress.enable()
+                self.assertEqual([p.read_bytes() for p in paths], before)
+
+    def test_openrc_installs_and_starts_ingress_service(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ingress = Ingress(Path(temporary))
+            with patch('chain_ingress.service_kind', return_value='openrc'), \
+                    patch('chain_platform.service_kind', return_value='openrc'), \
+                    patch('chain_ingress.service_path', return_value=Path('/etc/init.d/chain-ingress')), \
+                    patch('chain_ingress.service') as service:
+                ingress.install_units()
+                self.assertIn('supervisor=supervise-daemon', ingress.unit_paths()[0].read_text())
+                self.assertEqual(service.call_args_list, [unittest.mock.call('enable', 'chain-ingress'),
+                                                          unittest.mock.call('restart', 'chain-ingress')])
+
 
 if __name__ == '__main__': unittest.main()

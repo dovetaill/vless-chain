@@ -283,7 +283,11 @@ class Manager:
                     except OSError:
                         pass
             time.sleep(.5)
-        raise ValueError(f'chain-{role} 启动检查未通过；请运行 chainctl logs --component {role}。')
+        kind = service_kind()
+        log = str(self.role_paths(role)[1] / 'service.log') if kind == 'openrc' else f'/var/log/chain-{role}.log'
+        command = (f'journalctl -u chain-{role} -n 100 --no-pager' if kind == 'systemd'
+                   else 'tail -n 100 ' + shlex.quote(log))
+        raise ValueError(f'chain-{role} 启动检查未通过；请查看日志：{command}')
 
     def check_panel_port(self, env):
         host, port = listen_address(env['CHAIN_LISTEN'])
@@ -312,6 +316,28 @@ class Manager:
         print(f'私有备份：{destination}（权限 600，含连接凭据，请私下保存）')
         return destination
 
+    def recoverable_openrc_data(self, role):
+        data = self.role_paths(role)[1]
+        if service_kind() != 'openrc' or not self.state_file.is_file() or not data.is_dir():
+            return False
+        try:
+            user = pwd.getpwnam('chain-' + role) if self.live else None
+        except KeyError:
+            return False
+        uid, gid = (user.pw_uid, user.pw_gid) if user else (os.geteuid(), os.getegid())
+        def owned(path, mode, owner, group):
+            if path.is_symlink() or not path.exists():
+                return False
+            info = path.stat()
+            return (info.st_uid, info.st_gid, info.st_mode & 0o777) == (owner, group, mode)
+        if not owned(self.state_file, 0o600, os.geteuid(), os.getegid()) or not owned(data, 0o700, uid, gid):
+            return False
+        marker, log = data / '.chain-owner', data / 'service.log'
+        if marker.is_file() and owned(marker, 0o600, uid, gid):
+            return marker.read_text() == 'chain-' + role
+        # v0.2.25–27 created this log before the application could claim its empty directory.
+        return list(data.iterdir()) == [log] and log.is_file() and owned(log, 0o600, uid, gid)
+
     def install(self, source, manifest, args):
         role = args.component
         state = self.state()
@@ -327,7 +353,8 @@ class Manager:
             require(not unit.exists(), f'{unit} 已存在，拒绝覆盖其他安装方式创建的服务。')
             for directory in (etc, data):
                 require(not directory.is_symlink(), f'{directory} 不能是符号链接。')
-                require(retained is not None or not directory.exists() or not any(directory.iterdir()),
+                require(retained is not None or not directory.exists() or not any(directory.iterdir())
+                        or (directory == data and self.recoverable_openrc_data(role)),
                         f'{directory} 非空，拒绝接管。')
         else:
             require(unit.is_file() and OWNER in unit.read_text(), '服务文件归属不匹配。')
@@ -378,6 +405,13 @@ class Manager:
                     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                     directory.chmod(0o700)
                     os.chown(directory, uid, gid)
+                marker = data / '.chain-owner'
+                if service_kind() == 'openrc' and not marker.exists():
+                    require(not any(data.iterdir()) or self.recoverable_openrc_data(role),
+                            f'{data} 不归本安装器管理，拒绝写入归属标记。')
+                    # Claim the directory before supervise-daemon opens service.log.
+                    atomic_write(marker, 'chain-' + role)
+                    os.chown(marker, uid, gid)
                 write_env(etc / (role + '.env'), env)
                 if token is not None:
                     atomic_write(etc / 'token', token + '\n')

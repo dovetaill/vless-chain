@@ -128,11 +128,35 @@ class Ingress:
             name = unit.name
             require(not unit.exists() or OWNER in unit.read_text(), '系统服务不归本项目管理：' + name)
         dump = self.command('nginx', '-T')
+        build = subprocess.run(['nginx', '-V'], check=True, capture_output=True, text=True).stderr if self.root == Path('/') else ''
+        load_module = ''
+        if 'ngx_stream_module.so' not in dump and '--with-stream' not in shlex.split(build):
+            module = Path('/usr/lib/nginx/modules/ngx_stream_module.so')
+            if not module.is_file() and self.root == Path('/'):
+                install_packages(['nginx-mod-stream' if shutil.which('dnf') or shutil.which('yum') else 'libnginx-mod-stream'])
+                dump = self.command('nginx', '-T')
+                modules = re.search(r'--modules-path=(\S+)', build)
+                if modules:
+                    module = Path(modules[1]) / 'ngx_stream_module.so'
+            require(module.is_file(), '缺少 Nginx stream 模块，请先安装系统的 libnginx-mod-stream。')
+            if 'ngx_stream_module.so' not in dump:
+                load_module = f'load_module {module};\n'
         sections = re.split(r'^# configuration file ', dump, flags=re.M)[1:]
         require(sections, '无法读取 Nginx 配置。')
+        main = Path(sections[0].split('\n', 1)[0].rstrip(':')).resolve(strict=True)
         require(not re.search(r'(?m)^\s*(?:real_ip_header|set_real_ip_from)\s', dump), '已有自定义真实 IP 信任配置，需先整合 PROXY protocol，不能自动覆盖。')
-        # Existing stream blocks need their own orchestration; never overwrite them.
-        require(not any(re.search(r'(?m)^\s*stream\s*\{', section) for section in sections), '已有 Nginx stream 配置，不能自动接管，请先整合现有分流。')
+        stream_sections = [s for s in sections if re.search(r'(?m)^\s*stream\s*\{', s)]
+        stream_file = None
+        if stream_sections:
+            filename, _, body = stream_sections[0].partition('\n')
+            stream_file = Path(filename.rstrip(':')).resolve(strict=True)
+            clean = re.sub(r'(?m)^\s*#.*$', '', body).strip()
+            # Alpine's module installs a logging-only stream block with an empty include directory.
+            default = re.fullmatch(r"stream\s*\{\s*log_format\s+main\s+(?:'[^']*'\s*)+;\s*"
+                r'access_log\s+/var/log/nginx/stream\.log\s+main;\s*include\s+stream\.d/\*\.conf;\s*}', clean)
+            require(len(stream_sections) == 1 and stream_file == main.parent / 'conf.d/stream.conf'
+                    and default and not any((main.parent / 'stream.d').glob('*.conf')),
+                    '已有 Nginx stream 配置，不能自动接管，请先整合现有分流。')
         require(any(match[2].split()[0] in ('443', '0.0.0.0:443', '*:443') and 'ssl' in match[2].split()
                     for match in LISTEN.finditer(dump)), '统一入口需要可保留的 IPv4 HTTPS 监听。')
         ipv6 = any(match[2].split()[0] == '[::]:443' and 'ssl' in match[2].split() for match in LISTEN.finditer(dump))
@@ -159,23 +183,17 @@ class Ingress:
                     blocked.extend(name.strip('"\'').lower() for name in names.split() if name != '_')
                 files[str(path)] = {'before': text, 'after': changed, 'mode': path.stat().st_mode & 0o777}
         require(files, '未找到可保留的 Nginx HTTPS 站点。')
-        main = Path(sections[0].split('\n', 1)[0].rstrip(':')).resolve(strict=True)
         text = files.get(str(main), {}).get('after', main.read_text())
         text, count = re.subn(r'(?m)^(\s*http\s*\{)', r'\1\n    real_ip_header proxy_protocol;\n    set_real_ip_from 127.0.0.1;\n    set_real_ip_from ::1;', text)
         require(count == 1, '无法定位 Nginx HTTP 主配置。')
-        build = subprocess.run(['nginx', '-V'], check=True, capture_output=True, text=True).stderr if self.root == Path('/') else ''
-        if 'ngx_stream_module.so' not in dump and '--with-stream' not in shlex.split(build):
-            module = Path('/usr/lib/nginx/modules/ngx_stream_module.so')
-            if not module.is_file() and self.root == Path('/'):
-                install_packages(['nginx-mod-stream' if shutil.which('dnf') or shutil.which('yum') else 'libnginx-mod-stream'])
-                dump = self.command('nginx', '-T')
-                modules = re.search(r'--modules-path=(\S+)', build)
-                if modules:
-                    module = Path(modules[1]) / 'ngx_stream_module.so'
-            require(module.is_file(), '缺少 Nginx stream 模块，请先安装系统的 libnginx-mod-stream。')
-            if 'ngx_stream_module.so' not in dump:
-                text = f'load_module {module};\n' + text
-        text += f'\n{OWNER}\ninclude {self.config}/stream.conf;\n'
+        text = load_module + text
+        if stream_file:
+            before = stream_file.read_text()
+            after = re.sub(r'(include\s+stream\.d/\*\.conf;)',
+                           lambda m: m[0] + f'\n    {OWNER}\n    include {self.config}/stream.conf;', before)
+            files[str(stream_file)] = {'before': before, 'after': after, 'mode': stream_file.stat().st_mode & 0o777}
+        else:
+            text += f'\n{OWNER}\ninclude {self.config}/stream.conf;\n'
         files[str(main)] = {'before': main.read_text(), 'after': text, 'mode': main.stat().st_mode & 0o777}
         require(not self.config.exists(), '统一入口配置目录已存在，拒绝覆盖。')
         self.config.mkdir(mode=0o755, parents=True)
@@ -184,6 +202,8 @@ class Ingress:
                   f'    hostnames;\n    default 127.0.0.1:{port};\n    include {self.config}/routes.conf;\n }}\n'
                   ' server {\n    listen 443;\n' + ('    listen [::]:443;\n' if ipv6 else '') + '    ssl_preread on;\n'
                   '    proxy_pass $chain_backend;\n    proxy_protocol on;\n    proxy_connect_timeout 10s;\n    proxy_timeout 1h;\n }\n}\n')
+        if stream_file:
+            stream = stream.replace('stream {\n', '', 1).removesuffix('}\n')
         atomic_write(self.config / 'stream.conf', stream, 0o644)
         atomic_write(self.config / 'routes.conf', OWNER + '\n', 0o644)
         state = {'files': files, 'blocked': sorted(set(blocked)), 'port': port}
@@ -226,12 +246,12 @@ class Ingress:
             return
         units = self.path('/etc/systemd/system')
         script = self.path('/opt/chain/current-agent/scripts/chain_ingress.py')
-        service = (f'{OWNER}\n[Unit]\nDescription=Chain Nginx SNI routes\nStartLimitIntervalSec=0\n'
+        unit = (f'{OWNER}\n[Unit]\nDescription=Chain Nginx SNI routes\nStartLimitIntervalSec=0\n'
                    f'[Service]\nType=oneshot\nExecStart={sys.executable} -B {script} apply\n')
         watch = (f'{OWNER}\n[Unit]\nDescription=Watch Chain SNI route requests\n'
                  f'[Path]\nPathChanged={self.request_path}\nUnit=chain-ingress.service\n'
                  '[Install]\nWantedBy=multi-user.target\n')
-        for name, body in [('chain-ingress.service', service), ('chain-ingress.path', watch)]:
+        for name, body in [('chain-ingress.service', unit), ('chain-ingress.path', watch)]:
             path = units / name
             require(not path.exists() or path.read_text().startswith(OWNER), '系统服务不归本项目管理：' + name)
             atomic_write(path, body, 0o644)

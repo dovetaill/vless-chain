@@ -20,6 +20,20 @@ import chain_release as release
 
 
 class Platforms(unittest.TestCase):
+    def test_startup_failure_points_to_logs_without_requiring_chainctl(self):
+        manager = installer.Manager.__new__(installer.Manager)
+        manager.live, manager.root = True, Path('/')
+        manager.system = SimpleNamespace(active=lambda role: False)
+        for kind, expected in [('openrc', 'tail -n 100 /var/lib/chain-panel/service.log'),
+                               ('launchd', 'tail -n 100 /var/log/chain-panel.log'),
+                               ('systemd', 'journalctl -u chain-panel -n 100 --no-pager')]:
+            with self.subTest(kind=kind), patch.object(installer, 'service_kind', return_value=kind), \
+                    patch.object(installer.time, 'sleep'):
+                with self.assertRaises(ValueError) as raised:
+                    manager.healthy('panel', {'CHAIN_LISTEN': '127.0.0.1:37243'})
+                self.assertIn(expected, str(raised.exception))
+                self.assertNotIn('chainctl', str(raised.exception))
+
     def test_openrc_restart_and_rollback_recover_only_panel_and_agent(self):
         for name in ['chain-panel', 'chain-agent']:
             for action in ['stop', 'restart']:

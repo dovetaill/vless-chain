@@ -27,6 +27,55 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def test_openrc_claims_data_before_start_and_retries_failed_first_install(self):
+        source, manifest = self.package()
+        data = self.manager.role_paths('panel')[1]
+        def fail_after_log(role, env):
+            self.assertEqual((data / '.chain-owner').read_text(), 'chain-panel')
+            self.assertEqual((data / '.chain-owner').stat().st_mode & 0o777, 0o600)
+            (data / 'service.log').write_text('failed startup log')
+            (data / 'service.log').chmod(0o600)
+            raise ValueError('fixture startup failure')
+        with patch.object(installer, 'service_kind', return_value='openrc'), \
+                patch('chain_platform.service_kind', return_value='openrc'):
+            with patch.object(self.manager, 'healthy', side_effect=fail_after_log):
+                with self.assertRaisesRegex(ValueError, 'fixture startup failure'):
+                    self.manager.install(source, manifest, self.args())
+            self.assertFalse(self.manager.state()['roles'])
+            self.assertFalse(self.manager.path('/usr/local/bin/chainctl').exists())
+            self.manager.install(source, manifest, self.args())
+            self.assertEqual((data / 'service.log').read_text(), 'failed startup log')
+            self.assertIn('panel', self.manager.state()['roles'])
+
+    def test_openrc_log_only_recovery_requires_owned_state_data_and_regular_log(self):
+        source, manifest = self.package()
+        data = self.manager.role_paths('panel')[1]
+        data.mkdir(parents=True, mode=0o700)
+        log = data / 'service.log'
+        common.atomic_write(log, 'old failed startup')
+        with patch.object(installer, 'service_kind', return_value='openrc'), \
+                patch('chain_platform.service_kind', return_value='openrc'):
+            self.assertFalse(self.manager.recoverable_openrc_data('panel'))
+            common.json_write(self.manager.state_file, {'owner': installer.OWNER, 'roles': {}})
+            self.assertTrue(self.manager.recoverable_openrc_data('panel'))
+            log.chmod(0o666)
+            self.assertFalse(self.manager.recoverable_openrc_data('panel'))
+            log.chmod(0o600)
+            foreign = data / 'foreign.db'
+            foreign.write_bytes(b'keep foreign data')
+            with self.assertRaisesRegex(ValueError, '拒绝接管'):
+                self.manager.install(source, manifest, self.args())
+            self.assertEqual(foreign.read_bytes(), b'keep foreign data')
+            foreign.unlink()
+            log.rename(data / 'saved-log')
+            log.symlink_to(data / 'saved-log')
+            self.assertFalse(self.manager.recoverable_openrc_data('panel'))
+            log.unlink()
+            (data / 'saved-log').rename(log)
+            self.manager.install(source, manifest, self.args())
+            self.assertEqual(log.read_text(), 'old failed startup')
+            self.assertEqual((data / '.chain-owner').read_text(), 'chain-panel')
+
     def uninstall_fixture(self):
         source, manifest = self.package()
         self.manager.install(source, manifest, self.args(listen='127.0.0.1:22305'))
