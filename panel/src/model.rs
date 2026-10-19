@@ -368,6 +368,10 @@ pub struct PendingImport {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Document {
     #[serde(default)]
+    pub monitoring: crate::management::Monitoring,
+    #[serde(default)]
+    pub fleet: crate::management::Fleet,
+    #[serde(default)]
     pub pending_imports: Vec<PendingImport>,
     #[serde(default)]
     pub customers: Vec<Customer>,

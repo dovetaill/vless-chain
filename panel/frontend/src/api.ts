@@ -2,6 +2,12 @@ export class ApiError extends Error {
   constructor(message: string, public status: number) { super(message); }
 }
 export async function api<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
+  const remote = new URLSearchParams(location.search).get('remote');
+  if (remote && !path.startsWith('/fleet') && !path.startsWith('/auth/') && !['/login', '/logout', '/federation/login'].includes(path)) {
+    body = { path, method, body };
+    path = `/fleet/${encodeURIComponent(remote)}/forward`;
+    method = 'POST';
+  }
   const response = await fetch('/api' + path, {
     method, credentials: 'same-origin', signal,
     headers: { 'Content-Type': 'application/json', 'X-Chain-Request': '1' },

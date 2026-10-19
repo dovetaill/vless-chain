@@ -69,6 +69,24 @@ pub fn load_tls(tls: &Tls, dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
     let (cert, key) = certificate(tls, dir)?;
     tls_config(&cert, &key)
 }
+pub fn certificate_expiry(specs: &[Spec], dir: &Path) -> serde_json::Value {
+    let mut result = BTreeMap::new();
+    for spec in specs.iter().filter(|s| matches!(s.tls.mode.as_str(), "auto" | "manual")) {
+        let expiry = (|| -> Result<u64> {
+            let pem = if spec.tls.mode == "auto" {
+                std::fs::read(dir.join("acme/config/live").join(&spec.tls.domain).join("fullchain.pem"))?
+            } else { spec.tls.cert.as_bytes().to_vec() };
+            let cert = openssl::x509::X509::from_pem(&pem)?;
+            let epoch = openssl::asn1::Asn1Time::from_unix(0)?;
+            let difference = epoch.diff(cert.not_after())?;
+            Ok((i64::from(difference.days) * 86400 + i64::from(difference.secs)).max(0) as u64)
+        })();
+        if let Ok(expires_at) = expiry {
+            result.insert(spec.tls.domain.clone(), serde_json::json!({"name":spec.tls.domain,"expires_at":expires_at}));
+        }
+    }
+    serde_json::json!(result.into_values().collect::<Vec<_>>())
+}
 fn site_tls(specs: &[Spec], dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
     let mut resolver = rustls::server::ResolvesServerCertUsingSni::new();
     for s in specs {

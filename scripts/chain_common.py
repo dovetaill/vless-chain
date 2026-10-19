@@ -20,9 +20,11 @@ VERSION_RE = r'[0-9]+\.[0-9]+\.[0-9]+'
 RELEASE_REPO = 'dovetaill/vless-chain'
 
 
-def download_release(directory):
+def download_release(directory, version=None):
     """Fetch the latest published native bundle from this project's release channel."""
-    request = urllib.request.Request(f'https://api.github.com/repos/{RELEASE_REPO}/releases/latest',
+    require(version is None or re.fullmatch(VERSION_RE, version), '发行版本无效。')
+    endpoint = 'latest' if version is None else 'tags/v' + version
+    request = urllib.request.Request(f'https://api.github.com/repos/{RELEASE_REPO}/releases/{endpoint}',
                                      headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'chainctl'})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -34,6 +36,7 @@ def download_release(directory):
             raise ValueError('仓库尚无已发布的安装包。请由维护者先发布 Release；已有本地发行包可在安装向导中选择。') from None
         raise ValueError(f'获取正式版本失败（HTTP {error.code}），请稍后重试或使用本地发行包。') from None
     tag = release.get('tag_name', '')
+    require(version is None or tag == 'v' + version, '发行版本不匹配。')
     require(re.fullmatch('v' + VERSION_RE, tag) and not release.get('draft') and not release.get('prerelease'),
             '正式版本信息无效。')
     name = f'chain-panel-{tag[1:]}-{operating_system()}-{architecture()}.tar.gz'

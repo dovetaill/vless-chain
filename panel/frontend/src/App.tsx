@@ -34,6 +34,7 @@ import { SecuritySettings } from "./components/security-settings";
 import { Dashboard } from "./components/dashboard";
 import { Customers } from "./components/customers";
 import { ProxyList } from "./components/proxy-list";
+import { Fleet, Monitoring } from "./components/management";
 import { RentalEditor } from "./components/rental-editor";
 import {
   Modal,
@@ -62,11 +63,15 @@ const pages = [
   { id: "lines", label: "代理", icon: Network },
   { id: "customers", label: "客户与收款", icon: Users },
   { id: "nodes", label: "外部代理", icon: Server },
+  { id: "fleet", label: "多机总控", icon: Network },
+  { id: "monitoring", label: "监控告警", icon: Bell },
   { id: "settings", label: "设置", icon: Settings },
 ] as const;
 type Page = (typeof pages)[number]["id"];
+const remotePanel = new URLSearchParams(location.search).get('remote');
+const visiblePages = remotePanel ? pages.filter(p => ['lines', 'nodes'].includes(p.id)) : pages;
 const pageFromHash = (): Page =>
-  pages.find((p) => p.id === location.hash.slice(1))?.id || "dashboard";
+  visiblePages.find((p) => p.id === location.hash.slice(1))?.id || (remotePanel ? 'lines' : 'dashboard');
 const jobNames: Record<string, string> = {
   publishing: "正在应用",
   rolling_back: "正在恢复",
@@ -280,6 +285,7 @@ export function App() {
   async function ensureLocalServer(host: string): Promise<NodeInfo> {
     const current = state?.nodes.find(n => n.id === state.local_node_id);
     if (current?.online) return current;
+    if (remotePanel) throw new Error('远端 Agent 尚未在线，请先在对应 VPS 修复服务。');
     const value = await api<{ id: string }>("/local-node", "POST", { host });
     for (let attempt = 0; attempt < 30; attempt++) {
       const next = await api<PanelState>("/state");
@@ -467,7 +473,7 @@ export function App() {
           </button>
         </div>
         <nav className="flex-1 space-y-1 px-3 py-2">
-          {pages.map((p) => (
+          {visiblePages.map((p) => (
             <button
               key={p.id}
                 aria-label={p.label}
@@ -481,6 +487,7 @@ export function App() {
           ))}
         </nav>
         <div className="sidebar-footer">
+          {remotePanel && <a className="nav-item" href="/admin#fleet">返回总控</a>}
           <button
             className="nav-item w-full"
             onClick={() =>
@@ -591,8 +598,11 @@ export function App() {
             </div>
           )}
           {page === "dashboard" && <Dashboard state={state} manage={line => setModal(<RentalEditor line={line} state={state} close={close} saved={refresh} />)} />}
+          {remotePanel && <p role="status" className="mb-4 rounded border p-3">正在管理远端 VPS；此页面操作作用于该 VPS。<a className="ml-2 underline" href="/admin#fleet">返回总控</a></p>}
+          {page === "fleet" && <Fleet />}
+          {page === "monitoring" && <Monitoring />}
           {page === "customers" && <Customers state={state} saved={refresh} />}
-          {page === "lines" && <ProxyList state={state} saved={refresh}
+          {page === "lines" && <ProxyList state={state} saved={refresh} remote={!!remotePanel}
             configureImport={pendingImport => setEditor({ kind: "vless", pendingImport })}
             create={() => editLine(kind)} edit={line => editLine(line.kind, line)}
             share={line => setModal(<AccessDialog line={line} state={state} close={close} />)}
@@ -621,6 +631,10 @@ export function App() {
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <Button variant="outline" onClick={() => setModal(<AccessDialog external={e} state={state} close={close} />)}>链接 / Mihomo</Button>
+                          <Button variant="outline" onClick={() => setModal(<Modal title="编辑外部代理" description="保留引用关系；保存后确认应用受影响代理。" submit="保存" close={close} action={async data => {
+                            await api(`/externals/${e.id}`, 'POST', { name: field(data, 'name'), url: field(data, 'url') });
+                            await refresh(); close(); await apply();
+                          }}><Field label="名称"><Input name="name" defaultValue={e.name} required /></Field><Field label="分享链接或单节点配置"><textarea className="input min-h-32 w-full" name="url" defaultValue={e.url} required /></Field></Modal>)}>编辑</Button>
                           <Button variant="outline" onClick={() => editLine("vless", undefined, [`external:${e.id}`])}>用于新建代理</Button>
                           <Button
                             variant="ghost"

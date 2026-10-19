@@ -76,6 +76,7 @@ def main():
             run(['node', 'node_modules/playwright/cli.js', 'install', 'chromium'], directory)
             env['CHAIN_TEST_BROWSER'] = str(directory / 'node_modules' / 'playwright')
             run(['node', 'tests/resource-flow.cjs', str(root / 'frontend' / 'dist')])
+            run(['node', 'tests/management-ui.cjs', str(root / 'frontend' / 'dist')])
         run(['python3', 'tests/smoke.py'])
         run(['python3', '-B', 'tests/local_web.py'])
         run(['python3', '-B', 'tests/proxy_flow.py'])

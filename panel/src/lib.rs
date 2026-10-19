@@ -5,6 +5,8 @@ pub mod gateway;
 pub mod legacy;
 pub mod local_agent;
 pub mod model;
+pub mod management;
+pub mod notifications;
 pub mod rental;
 pub mod meter;
 pub mod runtime;

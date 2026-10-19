@@ -261,6 +261,50 @@ class Manager:
         finally:
             temp.unlink(missing_ok=True)
 
+    def maintenance_units(self):
+        if service_kind() != 'systemd':
+            return
+        script = self.base / 'current-panel/scripts/chain_maintenance.py'
+        if not script.is_file():
+            return
+        definitions = {
+            'socket': (f'# {OWNER}\n[Unit]\nDescription=Chain maintenance socket\n'
+                       '[Socket]\nListenStream=/run/chain-maintenance/control.sock\n'
+                       'SocketUser=root\nSocketGroup=chain-panel\nSocketMode=0660\nDirectoryMode=0755\nRemoveOnStop=true\n'
+                       '[Install]\nWantedBy=sockets.target\n'),
+            'service': (f'# {OWNER}\n[Unit]\nDescription=Chain restricted maintenance executor\n'
+                        '[Service]\nUser=root\nGroup=root\nUMask=0077\nStateDirectory=chain-maintenance\n'
+                        'StateDirectoryMode=0700\nEnvironment=PYTHONDONTWRITEBYTECODE=1\n'
+                        f'ExecStart="{sys.executable}" -B "{script}"\n'
+                        'PrivateTmp=true\nProtectHome=true\nKillMode=control-group\nTimeoutStopSec=45\n'),
+        }
+        for suffix in definitions:
+            path = self.path('/etc/systemd/system/chain-maintenance.' + suffix)
+            require(not path.is_symlink() and (not path.exists() or OWNER in path.read_text()),
+                    f'{path} 不归本安装器管理，拒绝覆盖。')
+        runtime = self.path('/run/chain-maintenance')
+        if runtime.exists() or runtime.is_symlink():
+            socket_unit = self.path('/etc/systemd/system/chain-maintenance.socket')
+            require(runtime.is_dir() and not runtime.is_symlink() and socket_unit.is_file()
+                    and OWNER in socket_unit.read_text() and (not self.live or runtime.stat().st_uid == 0),
+                    '维护运行目录归属不匹配，拒绝接管。')
+        state = self.path('/var/lib/chain-maintenance')
+        marker = state / '.chain-owner'
+        require(not state.is_symlink() and not os.path.ismount(state), '维护目录不能是链接或挂载点。')
+        if state.exists():
+            require(marker.is_file() and not marker.is_symlink() and marker.read_text() == OWNER,
+                    '维护目录归属不匹配，拒绝接管。')
+            require(state.stat().st_mode & 0o777 == 0o700 and (not self.live or (state.stat().st_uid == 0 and state.stat().st_gid == 0)),
+                    '维护目录权限与安装契约不符，未调整已有权限。')
+        else:
+            state.mkdir(parents=True, mode=0o700)
+            atomic_write(marker, OWNER)
+        for suffix, body in definitions.items():
+            path = self.path('/etc/systemd/system/chain-maintenance.' + suffix)
+            atomic_write(path, body, 0o644)
+        self.system.call('daemon-reload')
+        self.system.call('enable', '--now', 'chain-maintenance.socket')
+
     def healthy(self, role, env):
         if not self.live:
             return
@@ -544,6 +588,8 @@ class Manager:
         if service_kind() == 'systemd':
             units += [(renew_service, 'chain-panel-cert-renew.service', SITE_OWNER),
                       (renew_timer, 'chain-panel-cert-renew.timer', SITE_OWNER)]
+            units += [(self.path('/etc/systemd/system/chain-maintenance.' + suffix),
+                       'chain-maintenance.' + suffix, OWNER) for suffix in ('socket', 'service')]
         else:
             units.append((renew_timer, 'chain-panel-cert-renew', SITE_OWNER))
         units += [(p, p.name if service_kind() == 'systemd' else 'chain-ingress', INGRESS_OWNER)
@@ -564,6 +610,12 @@ class Manager:
         directories += [p for role in roles for p in self.role_paths(role)[:2]]
         backups = self.path('/var/backups/chain-panel')
         directories.append(backups)
+        maintenance_state = self.path('/var/lib/chain-maintenance')
+        directories.append(maintenance_state)
+        if maintenance_state.exists():
+            marker = maintenance_state / '.chain-owner'
+            require(marker.is_file() and not marker.is_symlink() and marker.read_text() == OWNER,
+                    '维护目录归属不匹配，拒绝删除。')
         for p in directories:
             require(not p.is_symlink() and not os.path.ismount(p), f'拒绝删除链接或挂载目录：{p}')
         for p, owner in files:
@@ -620,7 +672,7 @@ class Manager:
                     remove_account('chain-' + role)
             remove = [ingress.directory, ingress.config, self.path('/var/lib/chain-acme'), https_temporary]
             if purge:
-                remove += [p for role in roles for p in self.role_paths(role)[:2]] + [backups]
+                remove += [p for role in roles for p in self.role_paths(role)[:2]] + [backups, maintenance_state]
             for p in remove:
                 if p.exists():
                     shutil.rmtree(p)
@@ -827,6 +879,7 @@ def install_package(manager, args):
                 (args.action == 'update' and 'agent' in manager.state()['roles'])):
             provision_local_agent(manager, source, manifest, args)
         if manager.live and args.component == 'panel':
+            manager.maintenance_units()
             manager.show_access()
             if site:
                 print('HTTPS 已配置，证书由原工具续期。' if site.certificate else 'HTTPS 与证书自动续期已配置。')

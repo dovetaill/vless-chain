@@ -30,10 +30,11 @@ function ExportDialog({ lines, close }: { lines: Line[]; close: () => void }) {
   </Modal>;
 }
 
-export function ProxyList({ state, saved, edit, create, share, probe, apply, configureImport }: {
+export function ProxyList({ state, saved, edit, create, share, probe, apply, configureImport, remote = false }: {
   state: PanelState; saved: () => Promise<void>; edit: (line: Line) => void; create: () => void;
   share: (line: Line) => void; probe: (line: Line) => void; apply: (line?: Line) => void;
   configureImport: (item: { id: string; name: string }) => void;
+  remote?: boolean;
 }) {
   const [search, setSearch] = useState("");
   const [protocol, setProtocol] = useState("");
@@ -94,9 +95,9 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
     </div>
     {chosen.length > 0 && <div className="flex flex-wrap items-center gap-2 border-b border-blue-100 bg-blue-50 px-5 py-3" aria-label="批量操作"><span className="mr-2 text-sm font-medium">已选 {chosen.length} 条</span>
       <Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("enable", chosen)}>启用</Button><Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("disable", chosen)}>停用</Button>
-      <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RenewalDialog lines={chosen} close={close} saved={completed} />)}>收款 / 续费</Button>
-      <Button variant="outline" size="sm" disabled={disabled} onClick={() => unlimited(chosen)}>设为无限期（自用）</Button>
-      <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<LimitsDialog lines={chosen} close={close} saved={completed} />)}>额度 / 限速</Button>
+      {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RenewalDialog lines={chosen} close={close} saved={completed} />)}>收款 / 续费</Button>}
+      {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => unlimited(chosen)}>设为无限期（自用）</Button>}
+      {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<LimitsDialog lines={chosen} close={close} saved={completed} />)}>额度 / 限速</Button>}
       <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<ExportDialog lines={chosen} close={close} />)}>导出</Button>
       <Button variant="outline" size="sm" disabled={disabled} onClick={() => remove(chosen)}>删除</Button><Button variant="ghost" size="sm" onClick={() => setSelected([])}>取消选择</Button>
     </div>}
@@ -111,14 +112,14 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
       <td><RentalStatusBadge status={line.rental_status} /><p className="mt-2"><SyncLabel status={line.sync_status} /></p>{!line.published && <p className="mt-1 text-xs text-amber-600">有待应用的配置</p>}{state.checks[line.id]?.ok === false && <p className="mt-1 text-xs text-amber-600">最近连接检查未通过</p>}</td>
       <td><RentalUsage line={line} /></td><td><RentalSpeed line={line} now={state.time} /></td><td><RentalDates line={line} /></td><td><RentalPrices line={line} /></td>
       <td><div className="flex items-center justify-end gap-1">
-        <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RentalEditor line={line} state={state} close={close} saved={saved} />)}>出租信息</Button>
-        <Button variant="ghost" size="sm" disabled={disabled || !line.rental} onClick={() => setModal(<RenewalDialog lines={[line]} close={close} saved={saved} />)}>收款 / 续费</Button>
+        {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RentalEditor line={line} state={state} close={close} saved={saved} />)}>出租信息</Button>}
+        {!remote && <Button variant="ghost" size="sm" disabled={disabled || !line.rental} onClick={() => setModal(<RenewalDialog lines={[line]} close={close} saved={saved} />)}>收款 / 续费</Button>}
         <DropdownMenu.Root><DropdownMenu.Trigger className="row-menu-trigger" aria-label={`${line.name} 更多操作`} disabled={disabled}><MoreHorizontal className="size-4" /></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="row-menu-content" align="end" sideOffset={4} collisionPadding={8}>
           <DropdownMenu.Item onSelect={() => void operate(line.enabled ? "disable" : "enable", [line])}>{line.enabled ? "手动停用" : "解除手动停用"}</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => setModal(<LimitsDialog lines={[line]} close={close} saved={saved} />)}>调整额度 / 限速</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => unlimited([line])}>设为无限期（自用）</DropdownMenu.Item>
+          {!remote && <DropdownMenu.Item onSelect={() => unlimited([line])}>设为无限期（自用）</DropdownMenu.Item>}
           <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => share(line)}>分享配置</DropdownMenu.Item>
-          <DropdownMenu.Item disabled={!line.rental || !line.published} onSelect={() => setModal(<QueryLinkDialog line={line} close={close} saved={saved} />)}>客户私密查询链接</DropdownMenu.Item>
+          {!remote && <DropdownMenu.Item disabled={!line.rental || !line.published} onSelect={() => setModal(<QueryLinkDialog line={line} close={close} saved={saved} />)}>客户私密查询链接</DropdownMenu.Item>}
           <DropdownMenu.Item onSelect={() => edit(line)}>编辑代理配置</DropdownMenu.Item>
           <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => probe(line)}>检查连接</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => apply(line)}>应用配置修改</DropdownMenu.Item>

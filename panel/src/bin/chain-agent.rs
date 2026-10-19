@@ -80,6 +80,8 @@ async fn run() -> Result<()> {
         tokio::select! {_=tokio::signal::ctrl_c()=>{},_=sig.recv()=>{}}
     };
     tokio::pin!(shutdown);
+    let mut certificate_expiry = serde_json::json!([]);
+    let mut certificate_checked = 0;
     loop {
         if runtime.active.is_some() && !runtime.running() {
             report.running = false;
@@ -106,6 +108,15 @@ async fn run() -> Result<()> {
             report.traffic = runtime.traffic.snapshot();
             runtime.traffic.save()?;
             report.system = chain_panel::gateway::system_metrics();
+            if now().saturating_sub(certificate_checked) >= 300 {
+                if let Some(active) = &runtime.active {
+                    if let Ok(specs) = chain_panel::gateway::specs(&active.config) {
+                        certificate_expiry = chain_panel::website::certificate_expiry(&specs, &dir);
+                    }
+                }
+                certificate_checked = now();
+            }
+            report.system["certificate_expiry"] = certificate_expiry.clone();
             let ingress_status = std::env::var_os("CHAIN_INGRESS_STATUS")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/chain-ingress/status.json"));

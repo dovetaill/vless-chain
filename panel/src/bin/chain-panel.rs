@@ -27,6 +27,10 @@ mod rental_api;
 mod rental_public;
 #[path = "../security_api.rs"]
 mod security_api;
+#[path = "../fleet_api.rs"]
+mod fleet_api;
+#[path = "../monitor_api.rs"]
+mod monitor_api;
 
 struct Store {
     conn: Connection,
@@ -42,6 +46,8 @@ impl Store {
 struct App {
     store: Arc<Mutex<Store>>,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
+    tickets: Arc<Mutex<HashMap<String, (u64, String)>>>,
+    delegated_sessions: Arc<Mutex<BTreeSet<String>>>,
     admin_hash: Arc<Mutex<String>>,
     token_file: PathBuf,
     auth: Arc<chain_panel::security::AuthState>,
@@ -58,6 +64,7 @@ fn digest(s: &str) -> String {
 fn equal(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -118,7 +125,17 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
                 | "/api/auth/passkey/start"
                 | "/api/auth/passkey/finish"
                 | "/api/public/lookup"
+                | "/api/federation/pair"
+                | "/api/federation/login"
         ) {
+            let machine = request.headers().get("authorization").and_then(|h| h.to_str().ok())
+                .and_then(|h| h.strip_prefix("Bearer "));
+            let machine_ok = machine.is_some_and(|token| {
+                let s = app.store.lock().unwrap();
+                !s.doc.fleet.controller_hash.is_empty()
+                    && equal(&digest(token), &s.doc.fleet.controller_hash)
+                    && chain_panel::management::machine_route(request.method().as_str(), path)
+            });
             let token = cookie(request.headers());
             let hash = digest(&token);
             let expiry = app
@@ -128,7 +145,7 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
                 .get(&hash)
                 .copied()
                 .unwrap_or(0);
-            if expiry <= now() {
+            if expiry <= now() && !machine_ok {
                 return error(StatusCode::UNAUTHORIZED, "请先登录").into_response();
             }
         }
@@ -178,21 +195,26 @@ async fn login(State(app): State<App>, Json(input): Json<Login>) -> ApiResult<Re
     Ok(session_response(&app))
 }
 fn session_response(app: &App) -> Response {
+    session_response_as(app, false)
+}
+fn session_response_as(app: &App, delegated: bool) -> Response {
     let token = secret();
     {
         let mut sessions = app.sessions.lock().unwrap();
         sessions.retain(|_, t| *t > now());
         if sessions.len() > 100 {
             sessions.clear();
+            app.delegated_sessions.lock().unwrap().clear();
         }
         sessions.insert(digest(&token), now() + 28800);
+        if delegated { app.delegated_sessions.lock().unwrap().insert(digest(&token)); }
     }
     let mut response = Json(json!({"ok":true})).into_response();
     response.headers_mut().insert(
         "set-cookie",
         HeaderValue::from_str(&format!(
             "chain_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800{}",
-            if app.secure_cookie { "; Secure" } else { "" }
+            if app.secure_cookie || delegated { "; Secure" } else { "" }
         ))
         .unwrap(),
     );
@@ -565,6 +587,19 @@ async fn remove_external(State(app): State<App>, Path(id): Path<String>) -> ApiR
         Ok(())
     })?;
     Ok(Json(json!({"ok":true})))
+}
+async fn update_external(State(app): State<App>, Path(id): Path<String>, Json(input): Json<ExternalInput>) -> ApiResult<Json<Value>> {
+    let (url, imported_name) = chain_panel::external::import(&input.url)?;
+    let name = if input.name.trim().is_empty() { imported_name } else { input.name };
+    if name.trim().is_empty() || name.len() > 120 { return Err(error(StatusCode::BAD_REQUEST, "名称无效")); }
+    let item = edit(&app, |d| {
+        let external = d.externals.iter_mut().find(|e| e.id == id).context("外部代理不存在")?;
+        external.name = name; external.url = url;
+        let item = external.clone();
+        compile(d)?;
+        Ok(item)
+    })?;
+    Ok(Json(json!(item)))
 }
 #[derive(Deserialize)]
 struct HopInput {
@@ -1249,6 +1284,8 @@ async fn run() -> Result<()> {
     let app = App {
         store: Arc::new(Mutex::new(Store { conn, doc })),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        tickets: Arc::new(Mutex::new(HashMap::new())),
+        delegated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
         admin_hash: Arc::new(Mutex::new(digest(token.trim()))),
         token_file: token_file.clone(),
         auth: Arc::new(chain_panel::security::AuthState::default()),
@@ -1286,7 +1323,7 @@ async fn run() -> Result<()> {
         WEB.get_file("index.html").is_some(),
         "缺少前端构建：请先在 frontend/ 执行 npm ci && npm run build，再重新编译 chain-panel"
     );
-    let router = Router::new()
+    let router = monitor_api::routes(fleet_api::routes(Router::new()))
         .fallback(get(web_asset))
         .route("/api/login", post(login))
         .route("/api/auth/options", get(security_api::options))
@@ -1328,7 +1365,7 @@ async fn run() -> Result<()> {
         .route("/api/nodes/{id}", post(update_node).delete(remove_node))
         .route("/api/nodes/{id}/token", post(rotate_node))
         .route("/api/externals", post(add_external))
-        .route("/api/externals/{id}", delete(remove_external))
+        .route("/api/externals/{id}", delete(remove_external).post(update_external))
         .route(
             "/api/externals/{id}/export",
             get(delivery_api::external_export),
@@ -1352,6 +1389,8 @@ async fn run() -> Result<()> {
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app.clone());
     let local_app = app.clone();
+    let monitor_stop = tokio_util::sync::CancellationToken::new();
+    let monitor_task = tokio::spawn(monitor_api::run(app.clone(), monitor_stop.clone()));
     let local_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -1387,6 +1426,8 @@ async fn run() -> Result<()> {
     .await;
     local_task.abort();
     let _ = local_task.await;
+    monitor_stop.cancel();
+    let _ = monitor_task.await;
     app.local_agent.lock().await.stop().await;
     result?;
     Ok(())
