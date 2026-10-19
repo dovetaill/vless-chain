@@ -1,6 +1,9 @@
 export class ApiError extends Error {
   constructor(message: string, public status: number) { super(message); }
 }
+export function remoteApi(remote: string): typeof api {
+  return (path, method = 'GET', body, signal) => api(`/fleet/${encodeURIComponent(remote)}/forward`, 'POST', { path, method, body }, signal);
+}
 export async function api<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
   const remote = new URLSearchParams(location.search).get('remote');
   if (remote && !path.startsWith('/fleet') && !path.startsWith('/auth/') && !['/login', '/logout', '/federation/login'].includes(path)) {

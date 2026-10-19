@@ -281,6 +281,10 @@ async fn remote_state(State(app): State<App>) -> Json<Value> {
         "checks":s.doc.monitoring.checks,"conditions":s.doc.monitoring.conditions,
         "notices":s.doc.monitoring.notices.iter().rev().take(100).collect::<Vec<_>>()});
     value["version"] = json!(env!("CARGO_PKG_VERSION"));
+    let local_id = chain_panel::local_agent::node_id(app.token_file.parent().unwrap());
+    let agent = s.doc.nodes.iter().find(|n| Some(&n.id) == local_id.as_ref());
+    value["agent_version"] = agent.map(|n| n.report.system["agent_version"].clone()).unwrap_or(Value::Null);
+    value["agent_seen"] = json!(agent.map(|n| n.seen));
     value["cores"] = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent()?.parent().map(|p| p.join("release.json")))
@@ -299,8 +303,14 @@ fn version_valid(version: &str) -> bool {
             .iter()
             .all(|s| !s.is_empty() && s.len() <= 8 && s.bytes().all(|c| c.is_ascii_digit()))
 }
+fn release_version(release: &Value) -> Result<&str> {
+    ensure!(release["draft"] == false && release["prerelease"] == false, "请选择正式发行版本");
+    let version = release["tag_name"].as_str().and_then(|tag| tag.strip_prefix('v'))
+        .filter(|version| version_valid(version)).context("正式发行版本标签无效")?;
+    Ok(version)
+}
 async fn release_info(Path(version): Path<String>) -> ApiResult<Json<Value>> {
-    if !version_valid(&version) {
+    if version != "latest" && !version_valid(&version) {
         return Err(error(StatusCode::BAD_REQUEST, "正式版本无效"));
     }
     let client = reqwest::Client::builder()
@@ -310,9 +320,10 @@ async fn release_info(Path(version): Path<String>) -> ApiResult<Json<Value>> {
         .user_agent("chain-panel")
         .build()
         .map_err(anyhow::Error::from)?;
+    let endpoint = if version == "latest" { "latest".to_string() } else { format!("tags/v{version}") };
     let release: Value = client
         .get(format!(
-            "https://api.github.com/repos/dovetaill/vless-chain/releases/tags/v{version}"
+            "https://api.github.com/repos/dovetaill/vless-chain/releases/{endpoint}"
         ))
         .send()
         .await
@@ -322,9 +333,11 @@ async fn release_info(Path(version): Path<String>) -> ApiResult<Json<Value>> {
         .json()
         .await
         .map_err(anyhow::Error::from)?;
-    if release["draft"] != false || release["prerelease"] != false {
-        return Err(error(StatusCode::BAD_REQUEST, "请选择正式发行版本"));
+    let resolved = release_version(&release)?;
+    if version != "latest" && version != resolved {
+        return Err(error(StatusCode::BAD_REQUEST, "发行版本不匹配"));
     }
+    let version = resolved;
     let source = client.get(format!("https://raw.githubusercontent.com/dovetaill/vless-chain/v{version}/scripts/chain_release.py"))
         .send().await.map_err(anyhow::Error::from)?.error_for_status().map_err(anyhow::Error::from)?
         .text().await.map_err(anyhow::Error::from)?;
@@ -737,6 +750,19 @@ async fn verify_remote(app: &App, remote: &Remote) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn formal_release_tag_is_validated() {
+        let mut release = json!({"tag_name":"v0.2.30","draft":false,"prerelease":false});
+        assert_eq!(release_version(&release).unwrap(), "0.2.30");
+        release["prerelease"] = json!(true);
+        assert!(release_version(&release).is_err());
+        release["prerelease"] = json!(false);
+        release["draft"] = json!(true);
+        assert!(release_version(&release).is_err());
+        release["draft"] = json!(false);
+        release["tag_name"] = json!("v../../main");
+        assert!(release_version(&release).is_err());
+    }
     fn app(dir: &std::path::Path) -> App {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)")

@@ -267,14 +267,14 @@ pub struct Traffic {
     pub days: BTreeMap<String, [u64; 2]>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hop {
     pub node_id: String,
     pub port: u16,
     pub uuid: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Line {
     pub id: String,
     pub name: String,

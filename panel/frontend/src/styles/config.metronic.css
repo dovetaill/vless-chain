@@ -454,3 +454,16 @@ nav .nav-item {
     padding: 16px;
   }
 }
+
+/* Fleet tables become compact cards without moving actions off-screen. */
+@media (max-width: 767px) {
+  .fleet-responsive .data-table, .fleet-responsive tbody { display: block; width: 100%; }
+  .fleet-responsive thead { display: none; }
+  .fleet-responsive .data-table tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
+  .fleet-responsive .data-table td { display: block; min-width: 0; padding: 0; border: 0; white-space: normal; overflow-wrap: anywhere; }
+  .fleet-responsive td::before { content: attr(data-label); display: block; font-size: 11px; color: #64748b; margin-bottom: 4px; }
+  .fleet-responsive td:first-child { grid-column: 1 / -1; grid-row: 1; font-weight: 600; }
+  .fleet-responsive td:last-child { grid-column: 1 / -1; grid-row: 2; }
+  .fleet-responsive td:last-child::before { display: none; }
+  .fleet-responsive button { min-height: 40px; }
+}

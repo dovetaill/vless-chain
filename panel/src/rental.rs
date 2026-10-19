@@ -128,6 +128,9 @@ pub fn sync_status(doc: &Document, line: &Line) -> &'static str {
     if !node.report.error.is_empty() {
         return "error";
     }
+    if applied != line {
+        return "unpublished";
+    }
     if now().saturating_sub(node.seen) >= 15
         || !node.report.applied
         || !node.report.running
@@ -203,6 +206,32 @@ mod tests {
             paid_months: 1,
             ..Default::default()
         }
+    }
+    #[test]
+    fn edited_configuration_is_not_reported_as_synced() {
+        let mut doc = Document::default();
+        let mut line: Line = serde_json::from_value(json!({
+            "id":"line", "name":"proxy", "kind":"vless", "enabled":true,
+            "hops":[{"node_id":"node","port":443,"uuid":"uuid"}]
+        })).unwrap();
+        let node: Node = serde_json::from_value(json!({
+            "id":"node","name":"node","host":"192.0.2.1","token_hash":"",
+            "reality":{"target":"","server_name":"","private_key":"","public_key":"","short_id":""},
+            "seen":now(), "report":{"running":true,"applied":true,"revision":"r"},
+            "desired":{"revision":"r","config":{}}
+        })).unwrap();
+        doc.nodes.push(node);
+        doc.applied_lines.push(line.clone());
+        assert_eq!(sync_status(&doc, &line), "synced");
+        line.enabled = false;
+        assert_eq!(sync_status(&doc, &line), "unpublished");
+        doc.nodes[0].report.error = "apply failed".into();
+        assert_eq!(sync_status(&doc, &line), "error");
+        doc.nodes[0].report.error.clear();
+        doc.applied_lines[0] = line.clone();
+        assert_eq!(sync_status(&doc, &line), "synced");
+        line.hops[0].port = 8443;
+        assert_eq!(sync_status(&doc, &line), "unpublished");
     }
     #[test]
     fn calendar_months_keep_anchor_day_and_local_time() {

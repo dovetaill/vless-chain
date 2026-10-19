@@ -118,6 +118,8 @@ export function Modal({
   action,
   close,
   wide,
+  drawer,
+  protectChanges,
 }: {
   title: string;
   description?: string;
@@ -126,9 +128,15 @@ export function Modal({
   action?: (data: FormData) => Promise<void>;
   close: () => void;
   wide?: boolean;
+  drawer?: boolean;
+  protectChanges?: boolean;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const dismiss = () => {
+    if (!pending && (!(drawer || protectChanges) || !action || !dirty || window.confirm('放弃尚未保存的修改？'))) close();
+  };
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!action || pending) return;
@@ -147,12 +155,12 @@ export function Modal({
     <Dialog
       open
       onOpenChange={(open) => {
-        if (!open && !pending) close();
+        if (!open) dismiss();
       }}
     >
       <DialogContent
         {...(!description ? { "aria-describedby": undefined } : {})}
-        className={`max-h-[92dvh] w-[calc(100%-2rem)] ${wide ? "max-w-3xl" : "max-w-2xl"} overflow-y-auto rounded-xl p-6 sm:p-7`}
+        className={drawer ? "inset-y-0 right-0 left-auto top-0 h-dvh max-h-dvh w-full max-w-3xl translate-x-0 translate-y-0 overflow-y-auto rounded-none p-6 sm:rounded-none sm:p-7" : `max-h-[92dvh] w-[calc(100%-2rem)] ${wide ? "max-w-3xl" : "max-w-2xl"} overflow-y-auto rounded-xl p-6 sm:p-7`}
       >
         <DialogHeader>
           <DialogTitle className="break-words pe-6">{title}</DialogTitle>
@@ -160,7 +168,7 @@ export function Modal({
             {description}
           </DialogDescription>}
         </DialogHeader>
-        <form onSubmit={save} className="space-y-5">
+        <form onSubmit={save} onChangeCapture={() => setDirty(true)} className="space-y-5">
           {children}
           {error && (
             <p
@@ -175,7 +183,7 @@ export function Modal({
               type="button"
               variant="outline"
               disabled={pending}
-              onClick={close}
+              onClick={dismiss}
             >
               关闭
             </Button>

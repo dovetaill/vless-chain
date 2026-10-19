@@ -25,6 +25,8 @@ export function LineEditor({
   saved,
   ensureLocalServer,
   importExternal,
+  request = api,
+  remoteName,
 }: {
   line?: Line;
   kind: Line["kind"];
@@ -35,6 +37,8 @@ export function LineEditor({
   ensureLocalServer: (host: string) => Promise<NodeInfo>;
   importExternal?: (done: (external?: External) => void) => void;
   saved: (lines: Line[]) => Promise<void>;
+  request?: typeof api;
+  remoteName?: string;
 }) {
   const local = state.nodes.find(n => n.id === state.local_node_id);
   const existing = state.nodes.find(n => n.id === line?.hops[0]?.node_id);
@@ -68,9 +72,10 @@ export function LineEditor({
   return (
     <Modal
       wide
-      title={line ? "编辑代理" : "新建代理"}
-      description="在本机运行，创建后自动生成客户端链接。"
-      submit={line ? "保存并应用" : batch ? "创建所选组合" : "创建代理"}
+      drawer={!!remoteName}
+      title={`${line ? "编辑代理" : "新建代理"}${remoteName ? ` · ${remoteName}` : ''}`}
+      description={remoteName ? `操作目标：${remoteName}。保存后预览并应用到该 VPS。` : "在本机运行，创建后自动生成客户端链接。"}
+      submit={remoteName ? "保存并预览" : line ? "保存并应用" : batch ? "创建所选组合" : "创建代理"}
       close={close}
       action={async (data) => {
         if (["trojan", "hysteria2", "tuic"].includes(protocol) && !domain) throw new Error(`${protocolNames[protocol]} 需要 TLS，请填写解析到本机的域名。`);
@@ -124,9 +129,9 @@ export function LineEditor({
               fallback: security === "tls" && network === "tcp" ? field(data, "fallback") : "",
             } };
           });
-          await saved(await api<Line[]>("/lines/batch", "POST", rows));
+          await saved(await request<Line[]>("/lines/batch", "POST", rows));
         } else {
-          await saved([await api<Line>("/lines", "POST", payload)]);
+          await saved([await request<Line>("/lines", "POST", payload)]);
         }
       }}
     >
@@ -191,7 +196,7 @@ export function LineEditor({
         </div>
         <Field label="REALITY 目标地址" hint="目标网站的域名或 IP 加端口，需支持 TLS 1.3 与 H2；无需解析到本机。"><Input value={realityTarget} readOnly={checking} onChange={e => { setRealityTarget(e.target.value); setCheck(""); }} required /></Field>
         <Field label="REALITY SNI" hint="必须是目标网站证书覆盖的域名。无需申请自己的证书。"><Input value={sni} readOnly={checking} onChange={e => { setSni(e.target.value); setCheck(""); }} required /></Field>
-        <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await api<{ ok: boolean; detail: string; latency_ms: number }>("/reality/check", "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测目标与 SNI"}</Button>
+        <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await request<{ ok: boolean; detail: string; latency_ms: number }>("/reality/check", "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测目标与 SNI"}</Button>
         {check && <p className="muted" role="status">{check}</p>}
       </section>}
       {kind === "vless" && ["http", "socks", "trojan", "hysteria2", "tuic"].includes(protocol) && <details className="details">
