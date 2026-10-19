@@ -1,5 +1,6 @@
 """Discover and hand over explicitly selected proxy services; never kill by name."""
 import contextlib
+import hashlib
 import ipaddress
 import json
 import os
@@ -24,8 +25,8 @@ def json_config(raw):
     return json.loads(clean)
 
 
-def read_config(path):
-    require(path.is_file() and path.stat().st_size <= 2 * 1024**2, '配置文件缺失或超过 2 MiB。')
+def read_config(path, limit=2 * 1024**2):
+    require(path.is_file() and path.stat().st_size <= limit, f'配置或依赖文件缺失或超过 {limit // 1024**2} MiB。')
     return path.read_bytes()
 
 
@@ -112,6 +113,7 @@ def discover(proc=Path('/proc')):
             owner = owners.setdefault(key, {'id': identity, 'kind': kind, 'name': title, 'pids': [],
                                             'files': {}, 'sources': [], 'container': container})
             owner['pids'].append(int(process.name))
+            owner['is_xui'] = owner.get('is_xui', False) or bool(re.search(r'(?:3?x-ui)', title + executable.name))
             root = process / 'root'
             if kind == 'openrc':
                 for logical in ['/etc/init.d/' + identity, '/etc/conf.d/' + identity]:
@@ -140,39 +142,86 @@ def discover(proc=Path('/proc')):
                         if directory or len(paths) > 1:
                             source['error'] = '多文件组合配置需手动配置。'
                         hydrate(config, root, cwd, owner)
+                        source['original_ports'] = [i.get('port') for i in config.get('inbounds', [])]
+                        asset_dir = executable.parent
+                        with contextlib.suppress(OSError, UnicodeError):
+                            for item in (process / 'environ').read_bytes().decode().split('\0'):
+                                if item.startswith('XRAY_LOCATION_ASSET='):
+                                    asset_dir = Path(item.partition('=')[2])
+                        source['asset_files'] = collect_assets(config, root, cwd, asset_dir, owner)
                         if container and container['HostConfig']['NetworkMode'] != 'host':
                             published_ports(config, container)
                     except (OSError, ValueError, KeyError, TypeError) as error:
                         source['error'] = f'配置读取或依赖检查失败：{error}'
                     owner['sources'].append(source)
-            # Read only display names from x-ui; do not import its account/expiry rules.
+            # Keep connection settings, but never activate disabled users or import account/expiry rules.
             db = root / 'etc/x-ui/x-ui.db'
             if db.is_file():
                 with contextlib.suppress(sqlite3.Error, OSError):
                     with contextlib.closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)) as connection:
                         rows = connection.execute('SELECT port, remark FROM inbounds').fetchall()
+                        try:
+                            originals = xui_inbounds(connection)
+                            database_error = ''
+                        except (ValueError, TypeError) as error:
+                            originals, database_error = [], f'x-ui 入口配置读取失败：{error}'
                     names = dict(rows)
+                    present = {port for s in owner['sources'] if not s['error'] and s['config']
+                               for port in s.get('original_ports', []) if isinstance(port, int)}
+                    missing = [i for i in originals if i['enable'] and i['port'] not in present]
                     for source in owner['sources']:
                         if source['error'] or not source['config']:
                             continue
-                        for inbound in source['config'].get('inbounds', []):
-                            port = inbound.get('port')
+                        for index, inbound in enumerate(source['config'].get('inbounds', [])):
+                            port = source['original_ports'][index]
                             if isinstance(port, int) and names.get(port):
                                 inbound['remark'] = names[port]
+                        source['source_inbounds'] = originals
+                        if database_error or missing:
+                            source['error'] = database_error or ('原面板存在未包含在 Xray 运行配置中的启用入口（'
+                                + '、'.join(str(i['protocol']) for i in missing)
+                                + '）；可能使用面板内置内核或受限用户，不能自动停用原面板。')
                     owner['database'] = str(db)
         except (OSError, UnicodeError, ValueError):
             continue
     for owner in owners.values():
+        if owner.get('is_xui') and not owner.get('database'):
+            for source in owner['sources']:
+                source['error'] = source['error'] or '无法读取原面板入口数据库，不能确认是否有非 Xray 服务；保留原面板，不能自动接管。'
         if not owner['sources']:
             owner['sources'] = [{'id': owner['kind'] + ':' + owner['id'], 'name': owner['name'],
                                  'config': None, 'error': '未找到可读取的 Xray 配置，请手动配置。'}]
     return list(owners.values())
 
 
+def xui_inbounds(connection):
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(inbounds)')}
+    fields = ['port', 'protocol', 'enable', 'remark', 'settings', 'stream_settings', 'sniffing', 'listen', 'tag']
+    if not set(fields) <= columns:
+        return []
+    query = 'SELECT ' + ','.join(fields) + ' FROM inbounds'
+    if 'node_id' in columns:
+        query += ' WHERE node_id IS NULL OR node_id = 0'
+    rows = connection.execute(query).fetchmany(1025)
+    require(len(rows) <= 1024, '原面板入口超过 1024 条。')
+    result = []
+    for row in rows:
+        item = dict(zip(fields, row))
+        for field in ['settings', 'stream_settings', 'sniffing']:
+            value = item[field]
+            item[field] = json.loads(value) if isinstance(value, str) and value.strip() else None
+        item['streamSettings'] = item.pop('stream_settings')
+        item['enable'] = bool(item['enable'])
+        result.append(item)
+    return result
+
+
 def hydrate(config, root, cwd, owner):
     inbounds = config.get('inbounds', [])
     require(isinstance(inbounds, list), 'inbounds 必须是数组。')
-    for inbound in inbounds:
+    outbounds = config.get('outbounds') or []
+    require(isinstance(outbounds, list), 'outbounds 必须是数组。')
+    for inbound in inbounds + outbounds:
         require(isinstance(inbound, dict), 'inbounds 条目必须是对象。')
         stream = inbound.get('streamSettings')
         if stream is None:
@@ -222,6 +271,75 @@ def published_ports(config, container):
         inbound['port'] = host_ports.pop()
 
 
+def collect_assets(config, root, cwd, asset_dir, owner):
+    names = set()
+    def visit(value, field=''):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if field == 'hosts':
+                    visit(key, 'domain')
+                    visit(item, 'ip')
+                else:
+                    visit(item, key)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item, field)
+        elif isinstance(value, str) and field in ('ip', 'ips', 'domain', 'domains'):
+            if value.startswith('geoip:'):
+                names.add('geoip.dat')
+            elif value.startswith('geosite:'):
+                names.add('geosite.dat')
+            elif value.startswith(('ext:', 'ext-ip:')):
+                name = value.split(':', 2)[1]
+                require(re.fullmatch(r'[A-Za-z0-9_.-]+', name) and name not in ('.', '..'),
+                        '外部地理数据文件名无效，不能自动迁移。')
+                names.add(name)
+    visit(config)
+    require(len(names) <= 16, '旧配置引用了过多地理数据文件。')
+    if not asset_dir.is_absolute():
+        asset_dir = cwd / asset_dir
+    files = []
+    for name in sorted(names):
+        logical = asset_dir / name
+        path = root / str(logical).lstrip('/')
+        require(sum(len(f['body']) for f in owner['files'].values()) + path.stat().st_size <= 128 * 1024**2,
+                '旧配置及依赖文件合计超过 128 MiB。')
+        body = read_config(path, 64 * 1024**2)
+        owner['files'][str(logical)] = {'path': str(path), 'body': body, 'limit': 64 * 1024**2}
+        files.append({'name': name, 'logical': str(logical)})
+    return files
+
+
+def stage_assets(manager, owners):
+    for owner in owners:
+        for source in owner['sources']:
+            if source.get('error') or not source.get('asset_files'):
+                continue
+            files = {item['name']: owner['files'][item['logical']]['body'] for item in source['asset_files']}
+            digest = hashlib.sha256()
+            for name, body in sorted(files.items()):
+                digest.update(name.encode() + b'\0' + hashlib.sha256(body).digest())
+            base = manager.path('/var/lib/chain-legacy-assets')
+            directory = base / str(uuid.UUID(bytes=digest.digest()[:16]))
+            for path in (base, directory):
+                if path.exists() or path.is_symlink():
+                    marker = path / '.chain-owner'
+                    require(path.is_dir() and not path.is_symlink() and marker.is_file()
+                            and not marker.is_symlink() and marker.read_text() == 'chain-legacy-assets-v1',
+                            '旧配置地理数据目录归属不匹配，拒绝覆盖。')
+                else:
+                    path.mkdir(parents=True, mode=0o755)
+                    path.chmod(0o755)
+                    atomic_write(path / '.chain-owner', 'chain-legacy-assets-v1', 0o644)
+            for name, body in files.items():
+                path = directory / name
+                require(not path.is_symlink() and (not path.exists() or path.read_bytes() == body),
+                        '旧配置地理数据已变化，拒绝覆盖。')
+                if not path.exists():
+                    atomic_write(path, body, 0o644)
+            source['asset_dir'] = str(directory)
+
+
 def select(owners, choose):
     selected = []
     for owner in owners:
@@ -264,7 +382,7 @@ class Handover:
                 owner['active'] = run(['rc-service', owner['id'], 'status'], check=False, capture_output=True).returncode == 0
                 metadata.update(runlevels=owner['runlevels'], active=owner['active'])
             for number, (logical, file) in enumerate(owner['files'].items()):
-                require(read_config(Path(file['path'])) == file['body'], '旧配置在预检期间已变化，请重新运行安装。')
+                require(read_config(Path(file['path']), file.get('limit', 2 * 1024**2)) == file['body'], '旧配置在预检期间已变化，请重新运行安装。')
                 atomic_write(directory / f'file-{number}', file['body'])
             metadata['files'] = list(owner['files'])
             if owner.get('database'):
@@ -278,7 +396,7 @@ class Handover:
     def stop(self):
         for owner in self.selected:
             for file in owner['files'].values():
-                require(read_config(Path(file['path'])) == file['body'], '旧配置在安装期间已变化，取消切换；请重新运行安装。')
+                require(read_config(Path(file['path']), file.get('limit', 2 * 1024**2)) == file['body'], '旧配置在安装期间已变化，取消切换；请重新运行安装。')
             if owner['kind'] == 'systemd' and 'unit' in owner:
                 require(output(['systemctl', 'cat', owner['id']]) == owner['unit'], '旧服务定义在安装期间已变化，取消切换。')
             # Record before the first change so a failed stop also restores autostart.
@@ -344,14 +462,19 @@ class PanelAPI:
                 self.cookie = response.headers['Set-Cookie'].split(';', 1)[0]
             return json.loads(response.read())
 
-    def publish(self):
+    def wait_ready(self, preserve_config=False):
         deadline = time.monotonic() + 30
         while True:
             state = self.call('state')
-            if all((n['report'].get('system') or {}).get('gateway_version') == 2 for n in state['nodes']):
+            if state['nodes'] and all((n['report'].get('system') or {}).get('gateway_version') == 2
+                    and (not preserve_config or (n['report'].get('system') or {}).get('legacy_config_version') == 1)
+                    for n in state['nodes']):
                 break
             require(time.monotonic() < deadline, '本机 Agent 尚未就绪，旧服务将恢复。')
             time.sleep(.5)
+
+    def publish(self):
+        self.wait_ready()
         result = self.call('publish', {})
         deadline = time.monotonic() + 260
         while True:
@@ -432,6 +555,7 @@ def guided_install(manager, source, manifest, args):
     try:
         if handover:
             handover.prepare()
+            stage_assets(manager, selected)
         # Stage the panel and Agent while the original proxy is still serving.
         install_components(manager, source, manifest, args)
         api = PanelAPI(manager)
@@ -443,14 +567,18 @@ def guided_install(manager, source, manifest, args):
             require(not state['lines'] and not state['pending_imports'] and len(state['nodes']) == 1,
                     '自动接管用于新面板；当前已有代理或待配置项，请在 Web 处理后重试，旧服务未停止。')
             node_id = (manager.role_paths('panel')[1] / 'local-system-node').read_text().strip()
-            request = {'node_id': node_id, 'sources': sources, 'preview': True}
+            request = {'node_id': node_id, 'sources': sources, 'preview': True, 'preserve_config': True}
             preview = api.call('legacy-import', request)
             for item in preview['imported']:
                 exit_label = ' → 外部 VLESS 代理' if item.get('chain') else ''
                 print(f'可导入：{item["name"]}（{item["protocol"]}，端口 {item["port"]}）{exit_label}')
             for item in preview['pending']:
-                print(f'仅导入名称：{item["name"]}；{item["reason"]}')
-            require(not preview['pending'], '旧配置尚不能完整导入，取消切换；旧服务保持运行。')
+                print(f'无法自动导入：{item["name"]}；{item["reason"]}')
+            if preview['pending']:
+                print('旧配置尚不能完整导入：保留全部旧服务，不导入或停用任何旧代理；继续完成面板安装。')
+                print(f'旧配置备份保留于 {handover.backup}，可在安装完成后手动配置代理。')
+                selected, handover, request = [], None, None
+                preview = {'imported': [], 'pending': []}
         ports = {item['port'] for item in preview['imported']}
         selected_pids = {pid for owner in selected for pid in owner['pids']}
         for item in preview['imported']:
@@ -481,6 +609,7 @@ def guided_install(manager, source, manifest, args):
             sharing = False
             manual_certificate(site)
         if request:
+            api.wait_ready(preserve_config=True)
             request.update(preview=False, shared_443=sharing)
             database = manager.role_paths('panel')[1] / 'panel.db'
             backup_path = handover.backup / 'panel-before-import.db'

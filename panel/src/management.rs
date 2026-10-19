@@ -286,6 +286,9 @@ pub fn machine_route(method: &str, path: &str) -> bool {
         ("POST", ["api", "reality", "check"]) => true,
         ("POST" | "DELETE", ["api", "externals", id]) => uuid::Uuid::parse_str(id).is_ok(),
         ("DELETE", ["api", "lines", id]) => uuid::Uuid::parse_str(id).is_ok(),
+        ("GET" | "PUT" | "DELETE", ["api", "legacy-configs", id]) => {
+            uuid::Uuid::parse_str(id).is_ok()
+        }
         ("GET", ["api", "lines" | "externals", id, "export"]) => uuid::Uuid::parse_str(id).is_ok(),
         ("POST", ["api", "lines", id, "probe"]) => uuid::Uuid::parse_str(id).is_ok(),
         _ => false,
@@ -317,6 +320,9 @@ mod tests {
         assert!(!machine_route("GET", "/api/state"));
         assert!(!machine_route("POST", "/api/fleet/connect"));
         assert!(machine_route("POST", "/api/lines"));
+        let id = uuid::Uuid::new_v4();
+        assert!(machine_route("PUT", &format!("/api/legacy-configs/{id}")));
+        assert!(!machine_route("PUT", "/api/legacy-configs/not-a-uuid"));
         for url in [
             "http://panel.test",
             "https://a:b@panel.test",

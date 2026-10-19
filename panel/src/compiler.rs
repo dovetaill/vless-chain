@@ -336,6 +336,13 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         .iter()
         .flat_map(|l| l.hops.iter().map(|h| (h.node_id.clone(), h.port)))
         .collect();
+    for profile in doc.legacy_configs.iter().filter(|p| p.enabled) {
+        reserved.extend(
+            crate::legacy_config::ports(&profile.config)?
+                .into_iter()
+                .map(|port| (profile.node_id.clone(), port)),
+        );
+    }
     let mut ordered: Vec<_> = doc.lines.iter().collect();
     ordered.sort_by(|a, b| a.id.cmp(&b.id));
     for line in ordered {
@@ -628,6 +635,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             }
         }
     }
+    crate::legacy_config::attach(doc, &mut configs)?;
     Ok(configs)
 }
 

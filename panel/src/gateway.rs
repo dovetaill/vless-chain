@@ -1050,6 +1050,7 @@ pub fn xray_config(config: &serde_json::Value) -> serde_json::Value {
         m.remove("_chain");
         m.remove("_ingress");
         m.remove("_mihomo");
+        m.remove("_legacy");
     }
     v
 }
@@ -1179,7 +1180,7 @@ pub fn system_metrics() -> serde_json::Value {
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(target_os = "macos")]
@@ -1327,7 +1328,7 @@ pub fn system_metrics() -> serde_json::Value {
     let ephemeral = sysctl::<u32>(c"net.inet.ip.portrange.first")
         .zip(sysctl::<u32>(c"net.inet.ip.portrange.last"))
         .map(|(first, last)| [first, last]);
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(test)]

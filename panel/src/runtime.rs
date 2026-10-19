@@ -56,7 +56,13 @@ pub fn lock_dir(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 pub async fn validate(binary: &Path, config: &Path) -> Result<()> {
+    validate_legacy(binary, config, "").await
+}
+pub async fn validate_legacy(binary: &Path, config: &Path, asset_dir: &str) -> Result<()> {
     let mut cmd = Command::new(binary);
+    if !asset_dir.is_empty() {
+        cmd.env("XRAY_LOCATION_ASSET", asset_dir);
+    }
     cmd.args(["run", "-test", "-config"])
         .arg(config)
         .kill_on_drop(true);
@@ -331,6 +337,7 @@ pub struct ManagedXray {
     pub dir: PathBuf,
     pub child: Option<Child>,
     mihomo: Option<Child>,
+    legacy: Vec<Option<Child>>,
     pub active: Option<Desired>,
     pub traffic: std::sync::Arc<crate::gateway::Book>,
     gateway: Option<crate::gateway::Gateway>,
@@ -392,6 +399,7 @@ impl ManagedXray {
             dir,
             child: None,
             mihomo: None,
+            legacy: Vec::new(),
             active: None,
             traffic,
             gateway: None,
@@ -402,6 +410,11 @@ impl ManagedXray {
         Ok(x)
     }
     pub fn running(&mut self) -> bool {
+        for child in &mut self.legacy {
+            if !matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(None))) {
+                return false;
+            }
+        }
         if self.gateway.as_ref().is_some_and(|g| !g.running()) {
             eprintln!("Runtime stopped: Gateway listener or policy task finished");
             return false;
@@ -502,6 +515,22 @@ impl ManagedXray {
             &serde_json::to_vec_pretty(&self.xray_config(config)?)?,
         )?;
         self.child = Some(spawn_xray(&self.binary, &path, &self.dir.join("xray.log"))?);
+        for profile in crate::legacy_config::profiles(config)? {
+            let dir = self.dir.join(format!("legacy-{}", profile.id));
+            private_dir(&dir, "chain-legacy-config")?;
+            let path = dir.join("config.json");
+            atomic_write(
+                &path,
+                &serde_json::to_vec_pretty(&crate::legacy_config::runtime_config(&profile))?,
+            )?;
+            let mut command = Command::new(&self.binary);
+            command.args(["run", "-config"]).arg(&path);
+            if !profile.asset_dir.is_empty() {
+                command.env("XRAY_LOCATION_ASSET", &profile.asset_dir);
+            }
+            self.legacy
+                .push(Some(spawn_core(command, &dir.join("xray.log"))?));
+        }
         if let Some(value) = self.mihomo_config(config)? {
             let dir = self.dir.join("mihomo");
             std::fs::create_dir_all(&dir)?;
@@ -513,11 +542,12 @@ impl ManagedXray {
             )?);
         }
         // shortcut: Xray 26.3.27 samples REALITY targets for 5s; replace with a core readiness signal when available.
-        let reality = config["inbounds"].as_array().is_some_and(|inbounds| {
-            inbounds
-                .iter()
-                .any(|inbound| inbound["streamSettings"]["security"] == "reality")
-        });
+        let reality = !self.legacy.is_empty()
+            || config["inbounds"].as_array().is_some_and(|inbounds| {
+                inbounds
+                    .iter()
+                    .any(|inbound| inbound["streamSettings"]["security"] == "reality")
+            });
         tokio::time::sleep(if reality {
             Duration::from_secs(6)
         } else {
@@ -525,7 +555,13 @@ impl ManagedXray {
         })
         .await;
         if !self.running() {
-            let logs: Vec<_> = ["xray.log", "mihomo/mihomo.log"]
+            let mut names = vec!["xray.log".to_owned(), "mihomo/mihomo.log".to_owned()];
+            names.extend(
+                crate::legacy_config::profiles(config)?
+                    .iter()
+                    .map(|p| format!("legacy-{}/xray.log", p.id)),
+            );
+            let logs: Vec<_> = names
                 .iter()
                 .filter_map(|name| {
                     let log = std::fs::read_to_string(self.dir.join(name)).ok()?;
@@ -599,6 +635,17 @@ impl ManagedXray {
         Ok(())
     }
     pub async fn apply(&mut self, desired: &Desired) -> Result<()> {
+        for profile in crate::legacy_config::profiles(&desired.config)? {
+            let directory = tempfile::tempdir_in(&self.dir)?;
+            let candidate = directory.path().join("config.json");
+            atomic_write(
+                &candidate,
+                &serde_json::to_vec(&crate::legacy_config::runtime_config(&profile))?,
+            )?;
+            validate_legacy(&self.binary, &candidate, &profile.asset_dir)
+                .await
+                .with_context(|| format!("旧配置 {} 预检失败", profile.name))?;
+        }
         let specs = crate::gateway::specs(&desired.config)?;
         let existing_challenge = self
             .active
@@ -640,6 +687,7 @@ impl ManagedXray {
         if self.active.as_ref().is_some_and(|old| {
             crate::gateway::xray_config(&old.config) == crate::gateway::xray_config(&desired.config)
                 && old.config.get("_mihomo") == desired.config.get("_mihomo")
+                && old.config.get("_legacy") == desired.config.get("_legacy")
         }) && self.running()
         {
             if self.gateway.as_ref().is_some_and(|g| g.limits_only(&specs)) {
@@ -687,6 +735,10 @@ impl ManagedXray {
         }
         stop(&mut self.child).await;
         stop(&mut self.mihomo).await;
+        for child in &mut self.legacy {
+            stop(child).await;
+        }
+        self.legacy.clear();
     }
 }
 
@@ -911,6 +963,116 @@ pub async fn probe(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires CHAIN_TEST_XRAY and isolated loopback ports"]
+    async fn legacy_real_core_keeps_two_users_and_recovers_after_rejection() -> Result<()> {
+        let binary = PathBuf::from(std::env::var("CHAIN_TEST_XRAY")?);
+        let dir = tempfile::tempdir()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let destination = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut bytes = [0u8; 4096];
+                let _ = stream.read(&mut bytes).await;
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nlegacy-ok").await;
+            }
+        });
+        let port = {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+            socket.local_addr()?.port()
+        };
+        eprintln!(
+            "legacy test directory={} proxy_port={} destination={}",
+            dir.path().display(),
+            port,
+            destination
+        );
+        let profile = LegacyConfig {
+            id: id(),
+            node_id: "test".into(),
+            name: "3x-ui fixture".into(),
+            enabled: true,
+            asset_dir: String::new(),
+            source_inbounds: Vec::new(),
+            config: json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"http",
+                "settings":{"accounts":[{"user":"first","pass":"first-secret"},{"user":"second","pass":"second-secret"}]},
+                "sniffing":{"enabled":true,"destOverride":["http","tls"]}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"}],
+                "routing":{"rules":[{"type":"field","ip":["127.0.0.0/8"],"outboundTag":"direct"}]},
+                "transport":null,"reverse":null,"fakeDns":null}),
+        };
+        let mut config = compiler::empty_config();
+        config["_legacy"] = json!([profile]);
+        let desired = Desired {
+            revision: id(),
+            config,
+        };
+        let mut runtime = ManagedXray::open(binary.clone(), dir.path().into()).await?;
+        let result = async {
+            runtime.apply(&desired).await?;
+            eprintln!(
+                "legacy test core_pids={:?}",
+                runtime
+                    .legacy
+                    .iter()
+                    .filter_map(|c| c.as_ref().and_then(|c| c.id()))
+                    .collect::<Vec<_>>()
+            );
+            for user in ["first", "second"] {
+                let proxy = reqwest::Proxy::http(format!("http://127.0.0.1:{port}"))?
+                    .basic_auth(user, &format!("{user}-secret"));
+                let client = reqwest::Client::builder()
+                    .proxy(proxy)
+                    .timeout(Duration::from_secs(5))
+                    .build()?;
+                ensure!(
+                    client
+                        .get(format!("http://{destination}/test"))
+                        .send()
+                        .await?
+                        .text()
+                        .await?
+                        == "legacy-ok",
+                    "用户凭据未保留"
+                );
+            }
+            let old_pid = runtime.legacy[0].as_ref().unwrap().id();
+            let mut bad = desired.clone();
+            bad.revision = id();
+            bad.config["_legacy"][0]["config"]["inbounds"][0]["protocol"] =
+                json!("unsupported-fixture");
+            ensure!(runtime.apply(&bad).await.is_err(), "无效内核配置必须拒绝");
+            ensure!(
+                runtime.running() && runtime.legacy[0].as_ref().unwrap().id() == old_pid,
+                "预检失败不应停止运行中的代理"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        runtime.close().await;
+        let reopened = if result.is_ok() {
+            Some(ManagedXray::open(binary, dir.path().into()).await)
+        } else {
+            None
+        };
+        let restart_result = match reopened {
+            Some(Ok(mut runtime)) => {
+                let running = runtime.running();
+                runtime.close().await;
+                ensure!(running, "重启未恢复迁移配置");
+                Ok(())
+            }
+            Some(Err(error)) => Err(error),
+            None => Ok(()),
+        };
+        server.abort();
+        let _ = server.await;
+        let _released_proxy = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        let _released_destination = std::net::TcpListener::bind(destination)?;
+        result?;
+        restart_result
+    }
+
     #[test]
     fn local_probe_preserves_credentials_and_sni_without_changing_public_links() {
         let node: Node = serde_json::from_value(json!({
@@ -964,6 +1126,7 @@ mod tests {
             dir: dir.path().into(),
             child: None,
             mihomo: None,
+            legacy: Vec::new(),
             active: None,
             traffic: crate::gateway::Book::open(dir.path()).unwrap(),
             gateway: None,

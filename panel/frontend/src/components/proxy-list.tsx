@@ -7,6 +7,7 @@ import { expiringSoon, lowQuota, matchesLine } from "../lib/business";
 import { Button } from "./ui/button";
 import { Card, CardHeader, CardTitle } from "./ui/card";
 import { Input } from "./ui/input";
+import { LegacyConfigs } from "./legacy-configs";
 import { CopyButton, Empty, Modal, PathView, download, errorText, protocolNames } from "./shared";
 import { LimitsDialog, QueryLinkDialog, RentalEditor, RenewalDialog } from "./rental-editor";
 import { RentalDates, RentalPrices, RentalSpeed, RentalStatusBadge, RentalUsage, SyncLabel, rentalStatusNames } from "./rental-shared";
@@ -77,6 +78,7 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
   return <Card>
     <CardHeader><CardTitle>我的代理 <span className="ml-2 text-sm font-normal text-slate-400">{lines.length} / {all.length}</span></CardTitle>
     </CardHeader>
+    <LegacyConfigs state={state} saved={saved} apply={() => apply()} />
     {(state.pending_imports || []).map(item => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
       <div><p className="text-sm font-medium">{item.name} · 待手动配置</p><p className="mt-1 text-xs text-amber-700">{item.reason}；当前未运行。</p></div>
       <div className="flex gap-2"><Button variant="outline" size="sm" disabled={disabled} onClick={() => configureImport(item)}>配置代理</Button>

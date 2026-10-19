@@ -297,7 +297,12 @@ fn snapshot(doc: &Document) -> Value {
         .iter()
         .map(|s| json!({"id":s.id,"name":s.name,"line_ids":s.line_ids,"created":s.created}))
         .collect();
-    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"pending_imports":doc.pending_imports,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact})
+    let legacy: Vec<_> = doc.legacy_configs.iter().map(|p| json!({"id":p.id,"node_id":p.node_id,"name":p.name,"enabled":p.enabled,
+        "ports":chain_panel::legacy_config::ports(&p.config).unwrap_or_default(),
+        "published":doc.applied_legacy_configs.contains(p) && doc.nodes.iter().find(|n| n.id == p.node_id).is_some_and(|n|
+            n.report.applied && n.desired.as_ref().is_some_and(|d| d.revision == n.report.revision
+                && configs.as_ref().and_then(|c| c.get(&p.node_id)) == Some(&d.config)))})).collect();
+    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"legacy_configs":legacy,"pending_imports":doc.pending_imports,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact})
 }
 async fn state(State(app): State<App>) -> Json<Value> {
     let mut value = snapshot(&app.store.lock().unwrap().doc);
@@ -512,6 +517,13 @@ async fn remove_node(State(app): State<App>, Path(id): Path<String>) -> ApiResul
             "节点仍被草稿或已发布线路引用；请移除线路并发布后再删除"
         );
         ensure!(d.nodes.iter().any(|n| n.id == id), "节点不存在");
+        ensure!(
+            !d.legacy_configs
+                .iter()
+                .chain(d.applied_legacy_configs.iter())
+                .any(|p| p.node_id == id),
+            "节点仍有旧代理配置，请移除并发布后再删除节点"
+        );
         d.nodes.retain(|n| n.id != id);
         Ok(())
     })?;
@@ -751,8 +763,27 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
 }
 async fn import_legacy(
     State(app): State<App>,
-    Json(input): Json<chain_panel::legacy::Import>,
+    Json(mut input): Json<chain_panel::legacy::Import>,
 ) -> ApiResult<Json<Value>> {
+    if input.preserve_config {
+        for source in &mut input.sources {
+            if !source.error.is_empty() {
+                continue;
+            }
+            let profile = LegacyConfig {
+                id: id(),
+                node_id: input.node_id.clone(),
+                name: source.name.clone(),
+                config: source.config.clone(),
+                asset_dir: source.asset_dir.clone(),
+                source_inbounds: source.source_inbounds.clone(),
+                enabled: true,
+            };
+            if let Err(error) = validate_legacy_config(&app, &profile).await {
+                source.error = format!("{error:#}");
+            }
+        }
+    }
     if input.preview {
         let mut doc = app.store.lock().unwrap().doc.clone();
         if doc.busy() {
@@ -763,6 +794,67 @@ async fn import_legacy(
     Ok(Json(edit(&app, |doc| {
         chain_panel::legacy::import(doc, &input)
     })?))
+}
+
+async fn validate_legacy_config(app: &App, profile: &LegacyConfig) -> Result<()> {
+    chain_panel::legacy_config::validate(profile)?;
+    if !profile.enabled {
+        return Ok(());
+    }
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("config.json");
+    atomic_write(
+        &path,
+        &serde_json::to_vec(&chain_panel::legacy_config::runtime_config(profile))?,
+    )?;
+    validate_legacy(&app.xray, &path, &profile.asset_dir).await
+}
+
+async fn get_legacy_config(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<LegacyConfig>> {
+    let doc = &app.store.lock().unwrap().doc;
+    Ok(Json(
+        doc.legacy_configs
+            .iter()
+            .find(|p| p.id == id)
+            .context("旧配置不存在")?
+            .clone(),
+    ))
+}
+
+async fn save_legacy_config(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<LegacyConfig>,
+) -> ApiResult<Json<Value>> {
+    if input.id != id {
+        return Err(error(StatusCode::BAD_REQUEST, "旧配置 ID 不一致"));
+    }
+    validate_legacy_config(&app, &input).await?;
+    edit(&app, |doc| {
+        let old = doc
+            .legacy_configs
+            .iter_mut()
+            .find(|p| p.id == id)
+            .context("旧配置不存在")?;
+        *old = input;
+        compile(doc)?;
+        Ok(())
+    })?;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn delete_legacy_config(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    edit(&app, |doc| {
+        doc.legacy_configs.retain(|p| p.id != id);
+        Ok(())
+    })?;
+    Ok(Json(json!({"ok":true})))
 }
 
 async fn remove_pending_import(
@@ -820,7 +912,8 @@ fn changed(doc: &Document, configs: &BTreeMap<String, Value>) -> BTreeSet<String
             let config = &configs[&n.id];
             (n.desired.is_some()
                 || !config["inbounds"].as_array().unwrap().is_empty()
-                || config["_chain"].as_array().is_some_and(|v| !v.is_empty()))
+                || config["_chain"].as_array().is_some_and(|v| !v.is_empty())
+                || config["_legacy"].as_array().is_some_and(|v| !v.is_empty()))
                 && (n.desired.as_ref().map(|v| &v.config) != Some(config)
                     || !n.report.applied
                     || !n.report.running
@@ -880,6 +973,16 @@ async fn publish(State(app): State<App>) -> ApiResult<Json<Value>> {
         let configs = compile(d)?;
         let affected = changed(d, &configs);
         for node in d.nodes.iter().filter(|n| affected.contains(&n.id)) {
+            if configs[&node.id]["_legacy"]
+                .as_array()
+                .is_some_and(|s| !s.is_empty())
+            {
+                ensure!(
+                    node.report.system["legacy_config_version"] == 1,
+                    "{} 的 Agent 不支持完整配置迁移，请先升级 Agent",
+                    node.name
+                );
+            }
             if configs[&node.id]["_chain"]
                 .as_array()
                 .is_some_and(|s| !s.is_empty())
@@ -930,6 +1033,7 @@ async fn publish(State(app): State<App>) -> ApiResult<Json<Value>> {
             n.report = Report::default();
         }
         let job = Job {
+            legacy_configs: d.legacy_configs.clone(),
             id: job_id,
             state: "publishing".into(),
             started: now(),
@@ -1065,6 +1169,7 @@ async fn run_publish(app: App, job: Job, recovery: bool) {
         s.doc.applied_lines = job.lines;
         s.doc.applied_nodes = job.nodes;
         s.doc.applied_externals = job.externals;
+        s.doc.applied_legacy_configs = job.legacy_configs;
         s.doc.checks.clear();
     }
     if let Some(j) = s.doc.jobs.iter_mut().find(|j| j.id == job.id) {
@@ -1162,6 +1267,7 @@ async fn diagnose(
             nodes: s.doc.applied_nodes.clone(),
             lines: s.doc.applied_lines.clone(),
             externals: s.doc.applied_externals.clone(),
+            legacy_configs: s.doc.applied_legacy_configs.clone(),
             ..Default::default()
         }
     };
@@ -1223,6 +1329,51 @@ async fn web_asset(uri: Uri) -> Response {
 #[cfg(test)]
 mod web_tests {
     use super::*;
+
+    #[test]
+    fn legacy_profile_publication_and_snapshot_keep_secrets_out_of_summary() {
+        let node = Node {
+            id: id(),
+            name: "node".into(),
+            host: "127.0.0.1".into(),
+            reality: Reality::new("example.com:443".into(), "example.com".into()),
+            token_hash: String::new(),
+            seen: 0,
+            report: Report::default(),
+            desired: None,
+        };
+        let profile = LegacyConfig {
+            id: id(),
+            node_id: node.id.clone(),
+            name: "imported".into(),
+            enabled: true,
+            asset_dir: String::new(),
+            source_inbounds: Vec::new(),
+            config: json!({"inbounds":[{"port":12345,"protocol":"shadowsocks","settings":{"password":"must-stay-private"}}],
+                "outbounds":[{"protocol":"freedom"}]}),
+        };
+        let mut doc = Document {
+            nodes: vec![node],
+            legacy_configs: vec![profile.clone()],
+            ..Default::default()
+        };
+        let configs = compile(&doc).unwrap();
+        assert!(changed(&doc, &configs).contains(&profile.node_id));
+        let summary = snapshot(&doc);
+        assert!(!summary.to_string().contains("must-stay-private"));
+        assert_eq!(summary["legacy_configs"][0]["published"], false);
+        doc.applied_legacy_configs = vec![profile];
+        assert_eq!(snapshot(&doc)["legacy_configs"][0]["published"], false);
+        doc.nodes[0].desired = Some(Desired {
+            revision: "applied".into(),
+            config: configs[&doc.nodes[0].id].clone(),
+        });
+        doc.nodes[0].report.revision = "applied".into();
+        doc.nodes[0].report.applied = true;
+        assert_eq!(snapshot(&doc)["legacy_configs"][0]["published"], true);
+        doc.legacy_configs.clear();
+        assert!(changed(&doc, &compile(&doc).unwrap()).contains(&doc.nodes[0].id));
+    }
 
     #[tokio::test]
     async fn public_and_admin_entrypoints_serve_the_app() {
@@ -1371,7 +1522,14 @@ async fn run() -> Result<()> {
             get(delivery_api::external_export),
         )
         .route("/api/lines", post(save_line))
-        .route("/api/legacy-import", post(import_legacy))
+        .route("/api/legacy-import", post(import_legacy).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
+        .route(
+            "/api/legacy-configs/{id}",
+            get(get_legacy_config)
+                .put(save_legacy_config)
+                .delete(delete_legacy_config)
+                .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/api/legacy-import/{id}", delete(remove_pending_import))
         .route("/api/lines/batch", post(save_lines))
         .route("/api/lines/operate", post(rental_api::operate))

@@ -346,6 +346,8 @@ pub struct Event {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    pub legacy_configs: Vec<LegacyConfig>,
     pub id: String,
     pub state: String,
     pub started: u64,
@@ -365,8 +367,26 @@ pub struct PendingImport {
     pub reason: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegacyConfig {
+    pub id: String,
+    pub node_id: String,
+    pub name: String,
+    pub config: Value,
+    #[serde(default)]
+    pub asset_dir: String,
+    #[serde(default)]
+    pub source_inbounds: Vec<Value>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Document {
+    #[serde(default)]
+    pub legacy_configs: Vec<LegacyConfig>,
+    #[serde(default)]
+    pub applied_legacy_configs: Vec<LegacyConfig>,
     #[serde(default)]
     pub monitoring: crate::management::Monitoring,
     #[serde(default)]

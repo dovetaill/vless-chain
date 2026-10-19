@@ -20,6 +20,79 @@ import chain_network as network
 
 
 class Legacy(unittest.TestCase):
+    def test_xui_database_keeps_disabled_connection_settings_and_excludes_remote_nodes(self):
+        with contextlib.closing(sqlite3.connect(':memory:')) as connection:
+            connection.execute('CREATE TABLE inbounds(port INTEGER, protocol TEXT, enable INTEGER, remark TEXT, settings TEXT, stream_settings TEXT, sniffing TEXT, listen TEXT, tag TEXT, node_id INTEGER)')
+            for enabled, node in [(0, None), (1, 0), (1, 7)]:
+                connection.execute('INSERT INTO inbounds VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    (443, 'vless', enabled, 'old', '{"clients":[{"id":"keep-uuid"}]}', '{"network":"ws"}', 'null', '', 'inbound', node))
+            values = legacy.xui_inbounds(connection)
+            self.assertEqual(len(values), 2)
+            self.assertFalse(values[0]['enable'])
+            self.assertTrue(values[1]['enable'])
+            self.assertEqual(values[0]['settings']['clients'][0]['id'], 'keep-uuid')
+            self.assertEqual(values[0]['streamSettings']['network'], 'ws')
+
+    def test_non_xray_panel_inbound_blocks_automatic_handover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            process = proc / '20'
+            (process / 'ns').mkdir(parents=True)
+            (process / 'ns/pid').symlink_to('pid:[1]')
+            (process / 'exe').symlink_to('/usr/bin/xray')
+            (process / 'cwd').symlink_to('/')
+            (process / 'cmdline').write_bytes(b'xray\0-config\0/config.json\0')
+            (process / 'cgroup').write_text('0::/\n')
+            db = process / 'root/etc/x-ui/x-ui.db'
+            db.parent.mkdir(parents=True)
+            with contextlib.closing(sqlite3.connect(db)) as connection:
+                connection.execute('CREATE TABLE inbounds(port INTEGER, protocol TEXT, enable INTEGER, remark TEXT, settings TEXT, stream_settings TEXT, sniffing TEXT, listen TEXT, tag TEXT)')
+                connection.execute("INSERT INTO inbounds VALUES(8443,'tuic',1,'native','{}','{}','null','','native')")
+                connection.commit()
+            (process / 'root/config.json').write_text(json.dumps({'inbounds': [{'port': 443, 'protocol': 'vless'}]}))
+            with patch.object(legacy.shutil, 'which', return_value=None), patch.object(legacy, 'run') as run:
+                source = legacy.discover(proc)[0]['sources'][0]
+            run.assert_not_called()
+            self.assertIn('不能自动停用', source['error'])
+            self.assertEqual(source['source_inbounds'][0]['protocol'], 'tuic')
+
+    def test_geodata_is_copied_without_changing_original_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / 'old/usr/bin'
+            assets.mkdir(parents=True)
+            original = assets / 'geoip.dat'
+            original.write_bytes(b'fixture-geodata')
+            before = original.stat()
+            owner = {'files': {}, 'sources': []}
+            config = {'routing': {'rules': [{'ip': ['geoip:private', 'geoip:cn']}]}}
+            files = legacy.collect_assets(config, root / 'old', Path('/'), Path('/usr/bin'), owner)
+            source = {'error': '', 'asset_files': files}
+            owner['sources'].append(source)
+            manager = installer.Manager(root / 'new')
+            legacy.stage_assets(manager, [owner])
+            saved = Path(source['asset_dir']) / 'geoip.dat'
+            self.assertEqual(saved.read_bytes(), original.read_bytes())
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o644)
+            legacy.stage_assets(manager, [owner])
+            after = original.stat()
+            self.assertEqual((before.st_uid, before.st_gid, before.st_mode, before.st_ctime_ns),
+                             (after.st_uid, after.st_gid, after.st_mode, after.st_ctime_ns))
+            with self.assertRaisesRegex(ValueError, '文件名无效'):
+                legacy.collect_assets({'routing': {'rules': [{'domain': ['ext:../escape:all']}]}},
+                                      root / 'old', Path('/'), Path('/usr/bin'), owner)
+
+    def test_outbound_client_certificate_is_inlined(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'cert.pem').write_text('client certificate\n')
+            config = {'inbounds': [], 'outbounds': [{'streamSettings': {'tlsSettings': {
+                'certificates': [{'certificateFile': '/cert.pem'}]}}}]}
+            owner = {'files': {}}
+            legacy.hydrate(config, root, Path('/'), owner)
+            self.assertEqual(config['outbounds'][0]['streamSettings']['tlsSettings']['certificates'],
+                             [{'certificate': ['client certificate']}])
+
     def test_hydrate_nullable_tls_and_preserves_certificate_loading(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -406,7 +479,7 @@ class Legacy(unittest.TestCase):
             api.publish()
         self.assertEqual(api.call.call_count, 4)
 
-    def migration(self, temporary, failure=False, pending=False, target_pid=None):
+    def migration(self, temporary, failure=False, pending=False, target_pid=None, domain=None, retained_port=None):
         manager = installer.Manager(Path(temporary))
         etc, data, _ = manager.role_paths('panel')
         etc.mkdir(parents=True)
@@ -421,6 +494,8 @@ class Legacy(unittest.TestCase):
         installer.json_write(manager.state_file, {'owner': installer.OWNER, 'roles': {'panel': {}, 'agent': {}}})
         args = installer.make_parser().parse_args(['install'])
         args.domain, args.listen, args.public_url = None, '127.0.0.1:23456', 'http://example.com:23456'
+        if domain:
+            args.domain, args.public_url = domain, 'https://' + domain
         owner = {'import': True, 'name': 'x-ui', 'pids': [123], 'sources': [{'id': 'old'}]}
         events = []
         result = {'imported': [{'name': 'ok', 'port': 8443, 'protocol': 'vmess'}],
@@ -441,6 +516,7 @@ class Legacy(unittest.TestCase):
             if failure:
                 raise ValueError('publish failed')
         api.publish.side_effect = publish
+        api.wait_ready.side_effect = lambda **kwargs: events.append('agent ready')
         handover = Mock(backup=Path(temporary), changed=[])
         def stop():
             events.append('stop old')
@@ -456,28 +532,38 @@ class Legacy(unittest.TestCase):
             undo.setdefault(acme, None)
             acme.write_text('new HTTP-01 site')
             return True
+        @contextlib.contextmanager
+        def activate(site):
+            events.append('https')
+            yield
         with contextlib.ExitStack() as stack:
             for target, name, options in [
+                (legacy.shutil, 'which', {'return_value': None}),
                 (legacy, 'discover', {'return_value': [owner]}), (legacy, 'select', {'return_value': [owner]}),
                 (legacy, 'Handover', {'return_value': handover}), (legacy, 'PanelAPI', {'return_value': api}),
                 (installer, 'install_components', {'side_effect': lambda *a: events.append('install')}),
-                (network, 'foreign_listeners', {'return_value': ''}), (network, 'listeners', {'return_value': f'pid={target_pid}'}),
+                (network, 'foreign_listeners', {'side_effect': lambda ports=None:
+                    'pid=123' if retained_port and (ports is None or retained_port in ports) else ''}),
+                (network, 'listeners', {'return_value': f'pid={target_pid}'}),
+                (legacy, 'alternate_port', {'return_value': 2443}),
                 (network, 'install_proxy_acme', {'side_effect': provision}),
                 (network.HttpsSite, 'service_state', {'return_value': (False, False)}),
+                (network.HttpsSite, 'activate', {'new': activate}),
                 (network.HttpsSite, 'restore_service', {'side_effect': lambda *a: events.append('restore nginx')}),
                 (manager.system, 'call', {'side_effect': lambda *a: events.append(a[0] + ' ' + a[1])})]:
                 stack.enter_context(patch.object(target, name, **options))
             if target_pid == 123:
                 with self.assertRaisesRegex(ValueError, '会随旧代理停止'):
                     legacy.guided_install(manager, None, None, args)
-            elif pending:
-                with self.assertRaisesRegex(ValueError, '不能完整导入'):
-                    legacy.guided_install(manager, None, None, args)
             elif failure:
                 with self.assertRaisesRegex(ValueError, 'publish failed'):
                     legacy.guided_install(manager, None, None, args)
             else:
                 self.assertTrue(legacy.guided_install(manager, None, None, args))
+            if pending:
+                handover.stop.assert_not_called()
+                api.publish.assert_not_called()
+                self.assertTrue(acme.exists())
         return events
 
     def test_complete_import_precedes_stopping_old_service(self):
@@ -485,6 +571,7 @@ class Legacy(unittest.TestCase):
             events = self.migration(temporary)
         self.assertLess(events.index('install'), events.index('import'))
         self.assertLess(events.index('import'), events.index('stop old'))
+        self.assertLess(events.index('agent ready'), events.index('stop old'))
         self.assertLess(events.index('stop old'), events.index('publish'))
         self.assertNotIn('restore old', events)
 
@@ -492,6 +579,25 @@ class Legacy(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             events = self.migration(temporary, pending=True)
         self.assertEqual(events, ['install', 'preview'])
+
+    def test_pending_import_still_completes_https(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            events = self.migration(temporary, pending=True, domain='panel.example.com')
+            state = installer.Manager(Path(temporary)).state()
+            self.assertEqual(state['roles']['panel']['https_port'], 443)
+        self.assertIn('https', events)
+        self.assertNotIn('stop old', events)
+        self.assertNotIn('import', events)
+
+    def test_pending_import_does_not_reuse_retained_proxy_https_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            events = self.migration(temporary, pending=True, domain='panel.example.com', retained_port=443)
+            manager = installer.Manager(Path(temporary))
+            self.assertEqual(manager.state()['roles']['panel']['https_port'], 2443)
+            env = installer.parse_env(manager.role_paths('panel')[0] / 'panel.env')
+            self.assertEqual(env['CHAIN_PUBLIC_URL'], 'https://panel.example.com:2443')
+        self.assertIn('https', events)
+        self.assertNotIn('stop old', events)
 
     def test_local_reality_target_must_survive_handover(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -3,6 +3,7 @@ pub mod compiler;
 pub mod external;
 pub mod gateway;
 pub mod legacy;
+pub mod legacy_config;
 pub mod local_agent;
 pub mod model;
 pub mod management;

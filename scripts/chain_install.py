@@ -137,6 +137,23 @@ class Manager:
         require(value.get('owner') == OWNER, '安装目录归属不匹配。')
         return value
 
+    def panel_setup_pending(self):
+        panel = self.state()['roles'].get('panel')
+        if panel is None:
+            return False
+        if 'setup_complete' in panel:
+            return not panel['setup_complete']
+        env = parse_env(self.role_paths('panel')[0] / 'panel.env')
+        # Older installers committed the roles before configuring HTTPS.
+        return (self.live and env.get('CHAIN_PUBLIC_URL', '').startswith('https://')
+                and not shutil.which('nginx') and not panel.get('https_port'))
+
+    def complete_panel_setup(self):
+        with self.lock():
+            state = self.state()
+            state['roles']['panel']['setup_complete'] = True
+            json_write(self.state_file, state)
+
     @contextlib.contextmanager
     def lock(self):
         self.base.mkdir(parents=True, exist_ok=True)
@@ -471,6 +488,8 @@ class Manager:
                 state['roles'][role] = {'current': release_id, 'previous': old['current'] if old and old['current'] != release_id else (old or {}).get('previous'),
                                         'version': manifest['version']}
                 if role == 'panel':
+                    state['roles'][role]['setup_complete'] = (False if args.action == 'install'
+                                                             else (old or {}).get('setup_complete', True))
                     state['roles'][role]['manual_https'] = (old or retained or {}).get('manual_https')
                     state['roles'][role]['https_port'] = (old or retained or {}).get('https_port')
                     state['roles'][role]['panel_only'] = (getattr(args, 'panel_only', False) if args.action == 'install'
@@ -612,6 +631,12 @@ class Manager:
         directories.append(backups)
         maintenance_state = self.path('/var/lib/chain-maintenance')
         directories.append(maintenance_state)
+        legacy_assets = self.path('/var/lib/chain-legacy-assets')
+        directories.append(legacy_assets)
+        if legacy_assets.exists():
+            marker = legacy_assets / '.chain-owner'
+            require(marker.is_file() and not marker.is_symlink() and marker.read_text() == 'chain-legacy-assets-v1',
+                    '旧配置地理数据目录归属不匹配，拒绝删除。')
         if maintenance_state.exists():
             marker = maintenance_state / '.chain-owner'
             require(marker.is_file() and not marker.is_symlink() and marker.read_text() == OWNER,
@@ -672,7 +697,7 @@ class Manager:
                     remove_account('chain-' + role)
             remove = [ingress.directory, ingress.config, self.path('/var/lib/chain-acme'), https_temporary]
             if purge:
-                remove += [p for role in roles for p in self.role_paths(role)[:2]] + [backups, maintenance_state]
+                remove += [p for role in roles for p in self.role_paths(role)[:2]] + [backups, maintenance_state, legacy_assets]
             for p in remove:
                 if p.exists():
                     shutil.rmtree(p)
@@ -842,9 +867,15 @@ def install_package(manager, args):
         # Validate the downloaded package before asking for deployment details.
         compatible_release(manifest)
         if args.action == 'install' and args.component == 'panel':
-            retained = manager.state().get('retained_roles', {}).get('panel', {})
+            state = manager.state()
+            retained = state['roles'].get('panel') or state.get('retained_roles', {}).get('panel', {})
             if args.domain is None:
                 args.domain = retained.get('domain')
+                if args.domain is None and manager.panel_setup_pending():
+                    env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
+                    url = urllib.parse.urlsplit(env.get('CHAIN_PUBLIC_URL', ''))
+                    if url.scheme == 'https':
+                        args.domain = url.hostname
             args.panel_only = args.panel_only or retained.get('panel_only', False)
         if args.action == 'install' and args.component == 'panel' and (
                 getattr(args, 'guided', False) or getattr(args, 'domain', None) is not None):
@@ -855,6 +886,7 @@ def install_package(manager, args):
             from chain_legacy import guided_install
             if guided_install(manager, source, manifest, args):
                 manager.maintenance_units()
+                manager.complete_panel_setup()
                 manager.show_access()
                 return
         site = None
@@ -881,6 +913,8 @@ def install_package(manager, args):
             provision_local_agent(manager, source, manifest, args)
         if manager.live and args.component == 'panel':
             manager.maintenance_units()
+            if args.action == 'install':
+                manager.complete_panel_setup()
             manager.show_access()
             if site:
                 print('HTTPS 已配置，证书由原工具续期。' if site.certificate else 'HTTPS 与证书自动续期已配置。')
@@ -888,6 +922,8 @@ def install_package(manager, args):
                 env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
                 if env.get('CHAIN_PUBLIC_URL', '').startswith('http://'):
                     print(f'如无法访问，请在云安全组/防火墙放行 TCP {listen_address(env["CHAIN_LISTEN"])[1]}。')
+        elif args.component == 'panel' and args.action == 'install':
+            manager.complete_panel_setup()
 
     if getattr(args, 'reuse_current', False):
         source = (manager.base / ('current-' + args.component)).resolve(strict=True)
@@ -928,6 +964,10 @@ def panel_questions(manager, args):
     etc, _, _ = manager.role_paths('panel')
     prior = parse_env(etc / 'panel.env')
     if (args.listen or prior) and getattr(args, 'domain', None) is None:
+        args.listen = args.listen or prior.get('CHAIN_LISTEN')
+        args.public_url = args.public_url or prior.get('CHAIN_PUBLIC_URL')
+        if args.secure_cookie is None:
+            args.secure_cookie = prior.get('CHAIN_SECURE_COOKIE')
         return
     host = args.local_host or public_ipv4()
     if not host:
@@ -1127,7 +1167,8 @@ def main(argv=None):
         installed = manager.state()['roles']
         retry_agent = (args.component == 'panel' and 'panel' in installed and 'agent' not in installed
                        and not installed['panel'].get('panel_only', False) and not args.panel_only and manager.live)
-        if args.component in installed and not retry_agent:
+        retry_setup = args.component == 'panel' and manager.panel_setup_pending()
+        if args.component in installed and not retry_agent and not retry_setup:
             if args.component == 'panel':
                 manager.show_access()
             else:
@@ -1135,6 +1176,8 @@ def main(argv=None):
                 manager.operate(args)
             print('已经安装；升级运行 chainctl update，日常管理运行 chainctl。')
             return
+        if retry_setup:
+            print('检测到面板安装尚未完成，继续配置访问入口；保留已有数据和节点身份。')
         require(sys.stdin.isatty() or args.non_interactive,
                 '首次安装需要交互终端；请在 SSH 终端运行，自动化部署使用 install --non-interactive。')
         args.action = 'install'

@@ -404,7 +404,8 @@ class Delivery(unittest.TestCase):
         self.assertFalse(list(self.root.glob('chain-install-*')))
 
     def test_guided_migration_installs_maintenance_before_showing_access(self):
-        source, _ = self.package()
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
         archive = self.archive(source)
         args = installer.make_parser().parse_args([
             'install', '--root', str(self.manager.root), '--package', str(archive)])
@@ -419,6 +420,60 @@ class Delivery(unittest.TestCase):
         guided.assert_called_once()
         install.assert_not_called()
         self.assertEqual(events, ['maintenance', 'access'])
+        self.assertTrue(self.manager.state()['roles']['panel']['setup_complete'])
+
+    def test_setup_retries_incomplete_panel_without_reregistering_agent(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        state = self.manager.state()
+        state['roles']['agent'] = {'version': '0.1.0'}
+        installer.json_write(self.manager.state_file, state)
+        with patch.object(installer, 'Manager', return_value=self.manager), \
+                patch('sys.stdin.isatty', return_value=True), \
+                patch.object(installer, 'install_wizard') as wizard, \
+                patch.object(self.manager, 'show_access') as access:
+            installer.main(['setup', '--root', str(self.manager.root)])
+        wizard.assert_called_once()
+        access.assert_not_called()
+        self.assertEqual(wizard.call_args.args[1].action, 'install')
+
+    def test_retry_preserves_existing_ip_access_settings(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        installer.write_env(self.manager.role_paths('panel')[0] / 'panel.env', {
+            'CHAIN_LISTEN': '0.0.0.0:38906', 'CHAIN_PUBLIC_URL': 'http://192.0.2.1:38906',
+            'CHAIN_SECURE_COOKIE': '0'})
+        args = installer.make_parser().parse_args(['install'])
+        with patch('builtins.input', side_effect=AssertionError('must preserve access')):
+            installer.panel_questions(self.manager, args)
+        self.assertEqual((args.listen, args.public_url, args.secure_cookie),
+                         ('0.0.0.0:38906', 'http://192.0.2.1:38906', '0'))
+
+    def test_legacy_incomplete_https_retries_and_restores_domain(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        state = self.manager.state()
+        del state['roles']['panel']['setup_complete']
+        installer.json_write(self.manager.state_file, state)
+        env_path = self.manager.role_paths('panel')[0] / 'panel.env'
+        installer.write_env(env_path, {'CHAIN_LISTEN': '127.0.0.1:38906',
+                                     'CHAIN_PUBLIC_URL': 'https://panel.example.com'})
+        args = installer.make_parser().parse_args([
+            'install', '--root', str(self.manager.root), '--package', str(self.archive(source))])
+        with patch.object(self.manager, 'live', True), \
+                patch.object(installer.shutil, 'which', return_value=None), \
+                patch.object(installer, 'panel_questions') as questions, \
+                patch('chain_legacy.guided_install', return_value=True), \
+                patch.object(self.manager, 'maintenance_units', side_effect=ValueError('maintenance failed')), \
+                patch.object(self.manager, 'show_access') as access:
+            self.assertTrue(self.manager.panel_setup_pending())
+            with self.assertRaisesRegex(ValueError, 'maintenance failed'):
+                installer.install_wizard(self.manager, args)
+            self.assertTrue(self.manager.panel_setup_pending())
+        questions.assert_called_once()
+        self.assertEqual(args.domain, 'panel.example.com')
+        access.assert_not_called()
+        self.assertEqual(installer.parse_env(env_path)['CHAIN_LISTEN'], '127.0.0.1:38906')
 
     def test_repeated_setup_retries_missing_default_agent(self):
         source, manifest = self.package()

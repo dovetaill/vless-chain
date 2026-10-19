@@ -9,6 +9,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 #[derive(Deserialize)]
 pub struct Import {
+    #[serde(default)]
+    pub preserve_config: bool,
     pub node_id: String,
     pub sources: Vec<Source>,
     #[serde(default)]
@@ -19,6 +21,10 @@ pub struct Import {
 
 #[derive(Deserialize)]
 pub struct Source {
+    #[serde(default)]
+    pub source_inbounds: Vec<Value>,
+    #[serde(default)]
+    pub asset_dir: String,
     pub id: String,
     pub name: String,
     pub config: Value,
@@ -31,9 +37,14 @@ fn only(value: &Value, keys: &[&str]) -> Result<()> {
         return Ok(());
     }
     let object = value.as_object().context("配置必须是对象")?;
+    let unknown: Vec<_> = object
+        .keys()
+        .filter(|k| !keys.contains(&k.as_str()))
+        .collect();
     ensure!(
-        object.keys().all(|k| keys.contains(&k.as_str())),
-        "存在尚不支持的配置字段"
+        unknown.is_empty(),
+        "尚不支持的配置字段：{}",
+        unknown.into_iter().cloned().collect::<Vec<_>>().join("、")
     );
     Ok(())
 }
@@ -539,6 +550,53 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
             source.id.len() <= 256 && !source.id.is_empty(),
             "旧服务标识无效"
         );
+        if request.preserve_config {
+            let digest = Sha256::digest(format!("{}:complete", source.id));
+            let id = uuid::Uuid::from_slice(&digest[..16])?.to_string();
+            let profile = LegacyConfig {
+                id: id.clone(),
+                node_id: request.node_id.clone(),
+                name: name(&source.name),
+                config: source.config.clone(),
+                asset_dir: source.asset_dir.clone(),
+                source_inbounds: source.source_inbounds.clone(),
+                enabled: true,
+            };
+            let result = (|| -> Result<()> {
+                ensure!(source.error.is_empty(), "{}", source.error);
+                crate::legacy_config::validate(&profile)?;
+                if let Some(old) = doc.legacy_configs.iter().find(|p| p.id == id) {
+                    ensure!(
+                        old == &profile,
+                        "该旧配置已经导入且内容已改变，请在面板中编辑，避免覆盖"
+                    );
+                } else {
+                    let mut candidate = doc.clone();
+                    candidate.legacy_configs.push(profile.clone());
+                    compile(&candidate)?;
+                    doc.legacy_configs.push(profile.clone());
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    for port in crate::legacy_config::ports(&profile.config)? {
+                        let reality_target = profile.config["inbounds"].as_array().into_iter().flatten()
+                            .find(|i| i["port"].as_u64() == Some(port as u64))
+                            .and_then(|i| {
+                                let r = &i["streamSettings"]["realitySettings"];
+                                r.get("target").filter(|v| !v.is_null()).or_else(|| r.get("dest"))
+                            }).and_then(Value::as_str);
+                        imported.push(json!({"id":id,"name":profile.name,"port":port,"protocol":"原始 Xray 配置",
+                        "can_share":false,"sni":"","chain":[],"preserved":true,"reality_target":reality_target}));
+                    }
+                }
+                Err(error) => {
+                    pending.push(json!({"id":id,"name":profile.name,"reason":format!("{error:#}")}))
+                }
+            }
+            continue;
+        }
         let entries = source.config["inbounds"]
             .as_array()
             .filter(|v| !v.is_empty())
@@ -633,10 +691,13 @@ mod tests {
             desired: None,
         };
         let request = Import {
+            preserve_config: false,
             node_id: node.id.clone(),
             preview: false,
             shared_443: false,
             sources: vec![Source {
+                asset_dir: String::new(),
+                source_inbounds: Vec::new(),
                 id: "systemd:xray.service:/config.json".into(),
                 name: "old".into(),
                 error: String::new(),
@@ -655,6 +716,41 @@ mod tests {
     fn vmess() -> Value {
         json!({"tag":"original","port":23456,"protocol":"vmess","settings":{"clients":[{"id":"c88bd6c0-0194-4718-a699-a1674058767c","alterId":0}]},
             "streamSettings":{"network":"tcp","security":"none"}})
+    }
+
+    #[test]
+    fn complete_xui_import_preserves_users_sniffing_routes_and_null_fields() {
+        let (mut doc, mut request) = fixture(vmess());
+        request.preserve_config = true;
+        let config = &mut request.sources[0].config;
+        config["inbounds"][0]["settings"]["clients"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":id()}));
+        config["inbounds"][0]["sniffing"] = json!({"enabled":true,"destOverride":["http","tls"]});
+        config["routing"] = json!({"rules":[{"ip":["geoip:private"],"outboundTag":"blocked"}]});
+        config["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tag":"blocked","protocol":"blackhole"}));
+        config["dns"] = json!({"servers":["1.1.1.1"]});
+        config["transport"] = Value::Null;
+        config["reverse"] = Value::Null;
+        config["fakeDns"] = Value::Null;
+        let original = config.clone();
+        let result = import(&mut doc, &request).unwrap();
+        assert_eq!(result["pending"], json!([]));
+        assert_eq!(doc.legacy_configs[0].config, original);
+        assert!(doc.lines.is_empty());
+        import(&mut doc, &request).unwrap();
+        assert_eq!(doc.legacy_configs.len(), 1);
+        let compiled = compile(&doc).unwrap();
+        assert_eq!(compiled[&request.node_id]["_legacy"][0]["config"], original);
+        assert!(
+            crate::gateway::xray_config(&compiled[&request.node_id])
+                .get("_legacy")
+                .is_none()
+        );
     }
 
     #[test]
