@@ -110,8 +110,9 @@ pub async fn check_reality(input: &RealityTarget) -> Result<Value> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let valid = output.status.success() && stdout.contains("Verify return code: 0 (ok)");
     let h2 = stdout.contains("ALPN protocol: h2");
+    let mismatch = String::from_utf8_lossy(&output.stderr).contains("hostname mismatch");
     Ok(
-        json!({"ok":valid && h2,"tls13":valid,"certificate_valid":valid,"h2":h2,
+        json!({"ok":valid && h2,"sni_mismatch":mismatch,"tls13":valid,"certificate_valid":valid,"h2":h2,
         "latency_ms":start.elapsed().as_millis(),"target":input.target,"server_name":input.server_name,
         "detail":if !valid {"TLS 1.3 握手或证书/SNI 验证失败"} else if !h2 {"证书与 SNI 匹配，但目标未协商 H2"} else {"TLS 1.3、证书/SNI 与 H2 检查通过"}}),
     )
@@ -121,18 +122,24 @@ pub fn spawn_xray(binary: &Path, config: &Path, log: &Path) -> Result<Child> {
     cmd.args(["run", "-config"]).arg(config);
     spawn_core(cmd, log)
 }
+static LOG_TASKS: std::sync::Mutex<std::collections::BTreeMap<u32, Vec<tokio::task::JoinHandle<()>>>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 fn spawn_core(mut cmd: Command, log: &Path) -> Result<Child> {
-    let output = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(log)?;
+    let args: Vec<_> = cmd.as_std().get_args().collect();
+    let secrets = args.windows(2).find(|args| args[0] == "-config" || args[0] == "-f")
+        .and_then(|args| std::fs::read(args[1]).ok()).and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map(|value| crate::diagnostics::secrets(&value)).unwrap_or_default();
+    crate::diagnostics::append(log, "代理组件启动；此前日志保留")?;
     cmd.stdin(std::process::Stdio::null())
-        .stdout(output.try_clone()?)
-        .stderr(output)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    spawn_owned(cmd)
+    let mut child = spawn_owned(cmd)?;
+    let tasks = vec![crate::diagnostics::capture(child.stdout.take().unwrap(), log.to_path_buf(), secrets.clone()),
+        crate::diagnostics::capture(child.stderr.take().unwrap(), log.to_path_buf(), secrets)];
+    let mut logs = LOG_TASKS.lock().unwrap();
+    logs.retain(|_,tasks| !tasks.iter().all(|task| task.is_finished()));
+    logs.insert(child.id().unwrap(),tasks);
+    Ok(child)
 }
 
 pub fn spawn_owned(mut cmd: Command) -> Result<Child> {
@@ -317,6 +324,7 @@ async fn validate_mihomo(xray: &Path, config: &Path, dir: &Path) -> Result<()> {
 }
 pub async fn stop(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
+        let log_pid = c.id();
         if let Some(pid) = c.id() {
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
@@ -328,6 +336,10 @@ pub async fn stop(child: &mut Option<Child>) {
         {
             let _ = c.kill().await;
             let _ = c.wait().await;
+        }
+        let tasks = log_pid.and_then(|pid| LOG_TASKS.lock().unwrap().remove(&pid)).unwrap_or_default();
+        for mut task in tasks {
+            if tokio::time::timeout(Duration::from_secs(2), &mut task).await.is_err() { task.abort(); let _ = task.await; }
         }
     }
 }
@@ -1159,4 +1171,36 @@ mod tests {
             json!(cert)
         );
     }
+}
+
+/// Probe only the applied outbound route, keeping the live listener and accounting bridge intact.
+pub async fn diagnose_path(binary: &Path, dir: &Path, line: &str, target: &str) -> Result<Value> {
+    uuid::Uuid::parse_str(line)?;
+    let url = url::Url::parse(target)?;
+    ensure!(matches!(url.scheme(), "http" | "https") && url.username().is_empty() && url.password().is_none(), "请输入不含凭据的 HTTP/HTTPS 地址");
+    let config: Value = serde_json::from_slice(&std::fs::read(dir.join("xray.json"))?)?;
+    let tag = format!("line-{line}-out");
+    ensure!(config["outbounds"].as_array().is_some_and(|o| o.iter().any(|o| o["tag"] == tag)), "该节点没有此代理的已应用出口");
+    let temporary = tempfile::tempdir()?;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut isolated = json!({"log":{"loglevel":"debug"},"inbounds":[{"tag":"diagnostic","listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":config["outbounds"],"routing":{"rules":[{"type":"field","inboundTag":["diagnostic"],"outboundTag":tag}]}});
+    if config["dns"].is_object() { isolated["dns"] = config["dns"].clone(); }
+    let path = temporary.path().join("probe.json"); atomic_write(&path, &serde_json::to_vec(&isolated)?)?;
+    validate(binary, &path).await?;
+    let log = temporary.path().join("probe.log");
+    let mut child = Some(spawn_xray(binary, &path, &log)?);
+    let result = async {
+        for _ in 0..40 {
+            if child.as_mut().unwrap().try_wait()?.is_some() { bail!("诊断内核提前退出"); }
+            if TcpStream::connect(("127.0.0.1",port)).await.is_ok() { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let response = reqwest::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?).timeout(Duration::from_secs(12)).redirect(reqwest::redirect::Policy::none()).build()?.get(url).send().await?;
+        ensure!(response.status().is_success(), "目标返回 HTTP {}",response.status());
+        Ok::<_,anyhow::Error>(format!("出口实际收到 HTTP {}；没有验证公网入口或本机计量转发桥",response.status()))
+    }.await;
+    stop(&mut child).await;
+    tokio::task::yield_now().await;
+    let detail = match result {Ok(v)=>json!({"ok":true,"detail":v}), Err(e)=>json!({"ok":false,"detail":crate::diagnostics::redact(&format!("{e:#}\n{}",std::fs::read_to_string(&log).unwrap_or_default()))})};
+    Ok(json!({"stage":"本机出口 → 后续代理 → 检查网站","result":detail,"checked_at":now(),"note":"独立诊断进程使用 debug 日志，完成即退出；未重启运行中的代理。出口成功而整链失败时，继续检查入口与本机转发。"}))
 }

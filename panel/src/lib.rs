@@ -13,3 +13,4 @@ pub mod meter;
 pub mod runtime;
 pub mod security;
 pub mod website;
+pub mod diagnostics;

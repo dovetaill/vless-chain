@@ -180,8 +180,8 @@ class Harness:
         token = (self.root / "control" / "admin-token").read_text()
         self.request("/api/login", "POST", {"token": token})
 
-    def publish(self, expected="applied"):
-        job = self.request("/api/publish", "POST", {})["job_id"]
+    def publish(self, expected="applied", *, allow_unverified_reality=False):
+        job = self.request("/api/publish", "POST", {"allow_unverified_reality": allow_unverified_reality})["job_id"]
         def done():
             j = next(j for j in self.state()["jobs"] if j["id"] == job)
             return j if j["state"] not in ("publishing", "rolling_back") else None
@@ -263,7 +263,8 @@ class Harness:
         assert len(self.state()["lines"]) == 2
         preview = self.request("/api/preview", "POST", {})
         assert len(preview["nodes"]) == 3
-        self.publish()
+        # The deliberately HTTP/1-only local TLS fixture cannot pass the H2 preflight.
+        self.publish(allow_unverified_reality=True)
         if os.environ.get("CHAIN_TEST_FEATURES_ONLY") == "1":
             from features import exercise
             exercise(self, nodes, echo_port, agents, agent_envs)

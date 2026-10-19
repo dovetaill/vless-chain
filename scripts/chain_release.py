@@ -190,6 +190,14 @@ def default_output():
     return ROOT / 'release-output' / f'v{version()}-{operating_system()}-{architecture()}'
 
 
+def configure_ci_cache(env):
+    # Only hosted workflow builds retain caches; local Workspace cleanup is unchanged.
+    if os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('CHAIN_BUILD_CACHE') == '1':
+        cache = Path(os.environ['RUNNER_TEMP']).resolve() / 'chain-build-cache'
+        env.update(CARGO_TARGET_DIR=str(cache / 'target'),
+                   CARGO_HOME=str(cache / 'cargo'), npm_config_cache=str(cache / 'npm'))
+
+
 def check(args):
     run(['bash', '-n', ROOT / 'scripts/version-release.sh', ROOT / 'scripts/install-server.sh'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_delivery.py'])
@@ -198,6 +206,7 @@ def check(args):
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_platform.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_ingress.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_maintenance.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_time_diagnostics.py'])
     if args.full:
         with Workspace(args.work_parent or ROOT.parent) as work:
             xray = work.root / 'bin/xray'
@@ -227,6 +236,7 @@ def build(args):
     dirty = bool(source_status())
     commit = output(['git', 'rev-parse', 'HEAD'], cwd=ROOT)
     with Workspace(args.work_parent or ROOT.parent) as work:
+        configure_ci_cache(work.env)
         project = work.root / 'project'
         project.mkdir()
         for name in ['Cargo.toml', 'Cargo.lock', 'build.rs']:
@@ -247,7 +257,7 @@ def build(args):
         stage = work.root / 'stage'
         (stage / 'bin').mkdir(parents=True)
         for binary in ['chain-panel', 'chain-agent']:
-            shutil.copy2(work.root / 'target' / target / 'release' / binary, stage / 'bin' / binary)
+            shutil.copy2(Path(work.env['CARGO_TARGET_DIR']) / target / 'release' / binary, stage / 'bin' / binary)
             if operating_system() == 'linux':
                 headers = output(['readelf', '-l', '-d', stage / 'bin' / binary])
                 require('INTERP' not in headers and '(NEEDED)' not in headers, f'{binary} 不是完全静态发行程序。')
@@ -255,7 +265,7 @@ def build(args):
         work.run([stage / 'bin/xray', 'version'])
         fetch_mihomo(work, stage / 'bin/mihomo')
         work.run([stage / 'bin/mihomo', '-v'])
-        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py']:
+        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_time.py']:
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')

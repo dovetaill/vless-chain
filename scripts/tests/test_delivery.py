@@ -27,6 +27,23 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def test_build_cache_requires_explicit_github_workflow_opt_in(self):
+        original = {'CARGO_TARGET_DIR': str(self.root / 'target'),
+                    'CARGO_HOME': str(self.root / 'cargo'), 'npm_config_cache': str(self.root / 'npm')}
+        for flags in ({}, {'CHAIN_BUILD_CACHE': '1'}, {'GITHUB_ACTIONS': 'true'}):
+            with patch.dict(os.environ, flags, clear=True):
+                env = original.copy()
+                release.configure_ci_cache(env)
+                self.assertEqual(env, original)
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'CHAIN_BUILD_CACHE': '1',
+                                     'RUNNER_TEMP': str(self.root)}, clear=True):
+            env = original.copy()
+            release.configure_ci_cache(env)
+            cache = self.root / 'chain-build-cache'
+            self.assertEqual(env, {'CARGO_TARGET_DIR': str(cache / 'target'),
+                                   'CARGO_HOME': str(cache / 'cargo'), 'npm_config_cache': str(cache / 'npm')})
+            self.assertFalse(cache.exists())
+
     def test_openrc_claims_data_before_start_and_retries_failed_first_install(self):
         source, manifest = self.package()
         data = self.manager.role_paths('panel')[1]
@@ -304,7 +321,7 @@ class Delivery(unittest.TestCase):
         (root / 'scripts').mkdir()
         for name in ['chain-panel', 'chain-agent', 'xray']:
             (root / 'bin' / name).write_text('fixture-' + version)
-        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'install-server.sh']:
+        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_time.py', 'install-server.sh']:
             shutil.copy2(Path(__file__).resolve().parents[1] / name, root / 'scripts' / name)
         files = {str(p.relative_to(root)): {'sha256': common.sha256(p), 'mode': 0o755 if p.parent.name == 'bin' or p.suffix == '.sh' else 0o644}
                  for p in root.rglob('*') if p.is_file()}

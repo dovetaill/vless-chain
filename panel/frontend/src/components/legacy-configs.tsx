@@ -35,12 +35,12 @@ export function LegacyConfigs({ state, saved, apply }: { state: PanelState; save
     <p className="muted">每组配置独立运行，保留原面板的多用户、传输设置及路由。通过编辑配置管理；不与下方单条代理表单混用。</p>
     {error && <p role="alert" className="text-destructive">{error}</p>}
     {profiles.map(p => <div key={p.id} className="flex flex-wrap items-center justify-between gap-2 border-t py-3">
-      <div><p>{p.name} · {p.enabled ? "启用" : "停用"} · {p.published ? "已下发" : "待下发"}</p><p className="muted">{state.nodes.find(n => n.id === p.node_id)?.name || "未知节点"} · 端口 {p.ports.slice(0, 12).join("、")}{p.ports.length > 12 ? ` 等 ${p.ports.length} 个` : ""}</p></div>
-      <div className="flex gap-2"><Button variant="outline" disabled={state.busy || loading} onClick={async () => {
+      <div><p>{p.name} · {p.pending_delete ? "待下发删除" : `${p.enabled ? "启用" : "停用"} · ${p.published ? "已下发" : "待下发"}`}</p>{p.pending_delete && <p className="muted">删除尚未下发，运行中的配置仍然保留。</p>}<p className="muted">{state.nodes.find(n => n.id === p.node_id)?.name || "未知节点"} · 端口 {p.ports.slice(0, 12).join("、")}{p.ports.length > 12 ? ` 等 ${p.ports.length} 个` : ""}</p></div>
+      {!p.pending_delete && <div className="flex gap-2"><Button variant="outline" disabled={state.busy || loading} onClick={async () => {
         setLoading(true); setError("");
         try { setEditing(await api<Config>(`/legacy-configs/${p.id}`)); }
         catch (e) { setError(errorText(e)); } finally { setLoading(false); }
-      }}>查看与编辑</Button><Button variant="ghost" disabled={state.busy || loading} onClick={() => setRemoving(p.id)}>删除</Button></div>
+      }}>查看与编辑</Button><Button variant="ghost" disabled={state.busy || loading} onClick={() => setRemoving(p.id)}>删除</Button></div>}
     </div>)}
     {editing && <Editor value={editing} close={() => setEditing(null)} saved={saved} />}
     {removing && <Modal title="删除整组迁移配置" description="这会删除该组的所有入口、用户和路由草稿。下发后停止这组代理；原服务备份不会删除。" submit="删除草稿" close={() => setRemoving(null)} action={async () => {

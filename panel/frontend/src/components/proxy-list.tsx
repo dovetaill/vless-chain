@@ -1,3 +1,4 @@
+import { Diagnostics } from "./diagnostics";
 import { useState, type ReactNode } from "react";
 import { Download, MoreHorizontal, Plus, Search } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
@@ -124,6 +125,7 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
           {!remote && <DropdownMenu.Item disabled={!line.rental || !line.published} onSelect={() => setModal(<QueryLinkDialog line={line} close={close} saved={saved} />)}>客户私密查询链接</DropdownMenu.Item>}
           <DropdownMenu.Item onSelect={() => edit(line)}>编辑代理配置</DropdownMenu.Item>
           <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => probe(line)}>检查连接</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => setModal(<Diagnostics nodes={state.nodes.filter(n => line.hops.some(h => h.node_id === n.id))} lineId={line.id} close={close} />)}>日志与诊断</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => apply(line)}>应用配置修改</DropdownMenu.Item>
           <DropdownMenu.Item className="text-red-600" onSelect={() => remove([line])}>删除代理</DropdownMenu.Item>
         </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>

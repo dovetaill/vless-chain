@@ -1,3 +1,4 @@
+import { Diagnostics } from "./components/diagnostics";
 import {
   useCallback,
   useEffect,
@@ -27,7 +28,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { api, ApiError } from "./api";
+import { api, ApiError, publishChecked } from "./api";
 import { LineEditor } from "./components/line-editor";
 import { AccessDialog } from "./components/access-dialog";
 import { SecuritySettings } from "./components/security-settings";
@@ -247,7 +248,7 @@ export function App() {
   async function apply(id?: string, share = false, created: string[] = []) {
     const preview = await api<Preview>("/preview", "POST", {});
     const otherLines = preview.affected_line_ids.filter((n) => n !== id && !created.includes(n));
-    if (otherLines.length) {
+    if (otherLines.length || preview.affected_legacy_configs?.length) {
       setModal(
         <Modal
           title="应用这些修改"
@@ -255,7 +256,7 @@ export function App() {
           submit="确认并应用"
           close={close}
           action={async () => {
-            await api("/publish", "POST", {});
+            await publishChecked();
             await refresh();
             if (share && id) setPendingShare(id);
             close();
@@ -266,12 +267,15 @@ export function App() {
             {preview.affected_lines.map((n) => (
               <Status key={n}>{n}</Status>
             ))}
+            {preview.affected_legacy_configs?.map((n) => (
+              <Status key={`legacy-${n}`}>迁移配置：{n}</Status>
+            ))}
           </div>
           <p className="muted">{preview.message}</p>
         </Modal>,
       );
     } else {
-      await api("/publish", "POST", {});
+      await publishChecked();
       await refresh();
       if (share && id) setPendingShare(id);
       close();
@@ -600,7 +604,7 @@ export function App() {
           {page === "dashboard" && <Dashboard state={state} manage={line => setModal(<RentalEditor line={line} state={state} close={close} saved={refresh} />)} />}
           {remotePanel && <p role="status" className="mb-4 rounded border p-3">正在管理远端 VPS；此页面操作作用于该 VPS。<a className="ml-2 underline" href="/admin#fleet">返回总控</a></p>}
           {page === "fleet" && <Fleet />}
-          {page === "monitoring" && <Monitoring />}
+          {page === "monitoring" && <><Button className="mb-4" variant="outline" onClick={() => setModal(<Diagnostics nodes={state.nodes} close={close} />)}>日志与诊断</Button><Monitoring /></>}
           {page === "customers" && <Customers state={state} saved={refresh} />}
           {page === "lines" && <ProxyList state={state} saved={refresh} remote={!!remotePanel}
             configureImport={pendingImport => setEditor({ kind: "vless", pendingImport })}

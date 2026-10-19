@@ -97,7 +97,11 @@ def main():
             assert len({line['name'] for line in state['lines']}) == 4
             h.request('/api/legacy-import', 'POST', request)
             assert len(h.state()['externals']) == 3
-            h.publish()
+            # This self-signed HTTP/1-only target is intentionally unverifiable;
+            # require an explicit override, without disabling production checks.
+            warning = h.request('/api/publish', 'POST', {}, status=400)
+            assert 'REALITY_UNVERIFIED' in warning['error'], warning
+            h.publish(allow_unverified_reality=True)
             for index, (source, line) in enumerate(zip(sources, state['lines'])):
                 inbound = source['config']['inbounds'][0]
                 reality = inbound['streamSettings']['realitySettings']

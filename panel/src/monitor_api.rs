@@ -102,6 +102,24 @@ fn local_conditions(doc: &mut Document, policy: &Policy) {
             policy,
             true,
         );
+        let clock = &n.report.system["clock"];
+        let sample = clock["checked_at"].as_u64().unwrap_or(0);
+        let key = format!("clock:{}", n.id);
+        let previous = doc.monitoring.checks.get(&key).and_then(|v| v["checked_at"].as_u64()).unwrap_or(0);
+        if sample != 0 && sample != previous {
+            doc.monitoring.checks.insert(key.clone(), json!({"checked_at":sample,"ok":clock["verified"] == true && clock["offset_seconds"].as_i64().is_some_and(|v| v.abs() <= 60),"detail":clock["detail"]}));
+            let mut clock_policy = policy.clone(); clock_policy.failures = 3;
+            if clock["verified"] == true {
+                if let Some(offset) = clock["offset_seconds"].as_i64() {
+                    observe(doc, key, offset.unsigned_abs() > 60, format!("{}：系统时钟偏差 {} 秒，请启用时间同步", n.name, offset), &clock_policy, false);
+                }
+            } else if let Some(condition) = doc.monitoring.conditions.get_mut(&key) {
+                condition.bad = 0; condition.good = 0;
+            }
+            if let Some(enabled) = clock["ntp_enabled"].as_bool() {
+                observe(doc, format!("ntp:{}", n.id), !enabled, format!("{}：自动时间同步未启用", n.name), &clock_policy, false);
+            }
+        }
         let cert = &n.report.system["certificate"];
         if cert["ok"].is_boolean() {
             observe(
@@ -544,6 +562,24 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_clock_requires_distinct_samples_and_reports_recovery() {
+        let mut doc = Document::default(); let at = now();
+        doc.nodes.push(serde_json::from_value(json!({"id":"clock-node","name":"node","host":"192.0.2.1","token_hash":"","reality":Reality::new("example.com:443".into(),"example.com".into()),"seen":at,"report":{"running":true}})).unwrap());
+        let p = Policy::default();
+        for sample in 1..=3 {
+            doc.nodes[0].report.system = json!({"clock":{"checked_at":sample,"verified":true,"offset_seconds":120,"detail":"late"}});
+            local_conditions(&mut doc,&p); local_conditions(&mut doc,&p);
+            assert_eq!(doc.monitoring.notices.len(),if sample==3 {1} else {0});
+        }
+        doc.nodes[0].report.system["clock"] = json!({"checked_at":4,"verified":false,"detail":"unverified"});
+        local_conditions(&mut doc,&p); assert!(doc.monitoring.conditions["clock:clock-node"].active);
+        for sample in 5..=6 {
+            doc.nodes[0].report.system["clock"] = json!({"checked_at":sample,"verified":true,"offset_seconds":0,"detail":"ok"});
+            local_conditions(&mut doc,&p);
+        }
+        assert_eq!(doc.monitoring.notices.len(),2); assert!(!doc.monitoring.conditions["clock:clock-node"].active);
+    }
     #[test]
     fn offline_threshold_and_recovery_do_not_repeat_notices() {
         let at = now();

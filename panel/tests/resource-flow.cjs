@@ -5,7 +5,7 @@ const path = require('node:path');
 const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
 const assets = path.resolve(process.argv[2]);
 (async () => {
-  const server = await chromium.launchServer({ headless: true });
+  const server = await chromium.launchServer({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
   const browser = await chromium.connect(server.wsEndpoint());
   const root = process.env.CHAIN_TEST_ROOT;
   if (root) fs.writeFileSync(path.join(root, 'ui-ownership.json'), JSON.stringify({ pid: process.pid, browser: server.process().pid, artifacts: root }));
@@ -30,7 +30,7 @@ const assets = path.resolve(process.argv[2]);
           if (url.pathname === '/api/local-node') { state.local_node_id = 'local'; state.nodes = [{ ...node, host: data.host }]; body = { id: 'local' }; }
           else if (url.pathname === '/api/lines') { body = { ...data, id: data.id || String(state.lines.length + 1), published: false, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' }; state.lines = [...state.lines.filter(l => l.id !== body.id), body]; }
           else if (url.pathname === '/api/lines/batch') { body = data.map((line, index) => ({ ...line, id: String(state.lines.length + index + 1), published: false, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' })); state.lines.push(...body); }
-          else if (url.pathname === '/api/reality/check') body = { ok: true, detail: 'TLS 1.3、证书/SNI 与 H2 检查通过', latency_ms: 12 };
+          else if (url.pathname === '/api/diagnostics/local/reality') body = { ok: true, detail: 'TLS 1.3、证书/SNI 与 H2 检查通过', latency_ms: 12 };
           else if (url.pathname === '/api/preview') body = { affected_line_ids: [], affected_lines: [], message: '', nodes: [] };
           else if (url.pathname === '/api/publish') { state.lines.forEach(l => { l.published = true; l.rental_status = 'active'; l.sync_status = 'synced'; }); state.jobs = [{ id: 'job', state: 'applied', events: [] }]; body = { job_id: 'job' }; }
           else if (url.pathname === '/api/externals') { body = { id: 'imported', name: data.name || 'Mihomo 落地', url: state.externals[0].url }; state.externals.push(body); }
@@ -73,10 +73,10 @@ const assets = path.resolve(process.argv[2]);
       assert.equal(await sni.inputValue(), host);
     }
     assert.equal(writes.filter(w => w.path === '/api/lines').length, 0);
-    await button('检测目标与 SNI').click();
+    await button('在节点验证 REALITY 握手').click();
     const checked = page.getByText('通过：TLS 1.3、证书/SNI 与 H2 检查通过（12 ms）');
     await checked.waitFor();
-    assert.deepEqual(writes.find(w => w.path === '/api/reality/check').body, { target: 'www.cloudflare.com:443', server_name: 'www.cloudflare.com' });
+    assert.deepEqual(writes.find(w => w.path === '/api/diagnostics/local/reality').body, { target: 'www.cloudflare.com:443', server_name: 'www.cloudflare.com' });
     await button('苹果').click();
     await checked.waitFor({ state: 'hidden' });
     if (root) await page.screenshot({ path: path.join(root, 'local-create.png') });
@@ -130,7 +130,7 @@ const assets = path.resolve(process.argv[2]);
     await button('微软').click();
     await page.getByLabel('REALITY 目标地址', { exact: true }).fill('cover.example.com:443');
     await page.getByLabel('REALITY SNI', { exact: true }).fill('cover.example.com');
-    await button('检测目标与 SNI').click();
+    await button('在节点验证 REALITY 握手').click();
     await page.getByText('通过：TLS 1.3、证书/SNI 与 H2 检查通过（12 ms）').waitFor();
     await page.getByLabel('XHTTP 路径', { exact: true }).fill('/batch-path');
     await page.getByText('监听端口 · 自动分配', { exact: true }).click();

@@ -128,7 +128,8 @@ stream {{
             h.request('/api/lines/batch','POST',[inputs[0],bad],status=400)
             assert len(h.state()['lines'])==count,'partial batch was saved'
             lines=h.request('/api/lines/batch','POST',inputs)
-            h.publish()
+            # The local cover fixture implements HTTP/1, not a public H2 target.
+            h.publish(allow_unverified_reality=True)
             for line in lines:
                 h.probe(line)
                 exported=h.request('/api/lines/'+line['id']+'/export')

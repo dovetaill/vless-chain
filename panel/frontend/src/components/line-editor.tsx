@@ -196,7 +196,7 @@ export function LineEditor({
         </div>
         <Field label="REALITY 目标地址" hint="目标网站的域名或 IP 加端口，需支持 TLS 1.3 与 H2；无需解析到本机。"><Input value={realityTarget} readOnly={checking} onChange={e => { setRealityTarget(e.target.value); setCheck(""); }} required /></Field>
         <Field label="REALITY SNI" hint="必须是目标网站证书覆盖的域名。无需申请自己的证书。"><Input value={sni} readOnly={checking} onChange={e => { setSni(e.target.value); setCheck(""); }} required /></Field>
-        <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await request<{ ok: boolean; detail: string; latency_ms: number }>("/reality/check", "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测目标与 SNI"}</Button>
+        <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await request<{ ok: boolean; detail: string; latency_ms: number }>(`/diagnostics/${(existing || local)?.id || (await ensureLocalServer(host.trim())).id}/reality`, "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "在节点验证 REALITY 握手"}</Button>
         {check && <p className="muted" role="status">{check}</p>}
       </section>}
       {kind === "vless" && ["http", "socks", "trojan", "hysteria2", "tuic"].includes(protocol) && <details className="details">

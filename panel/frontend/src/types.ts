@@ -154,7 +154,7 @@ export interface Security {
   passkeys: { id: string; name: string; created: number }[];
 }
 export interface PanelState {
-  legacy_configs?: { id: string; node_id: string; name: string; enabled: boolean; published: boolean; ports: number[] }[];
+  legacy_configs?: { id: string; node_id: string; name: string; enabled: boolean; published: boolean; pending_delete?: boolean; ports: number[] }[];
   pending_imports?: { id: string; name: string; reason: string }[];
   local_node_id: string | null;
   nodes: NodeInfo[];
@@ -195,5 +195,6 @@ export interface Preview {
   message: string;
   affected_lines: string[];
   affected_line_ids: string[];
+  affected_legacy_configs?: string[];
   nodes: { id: string; name: string; online: boolean; ports: number[] }[];
 }

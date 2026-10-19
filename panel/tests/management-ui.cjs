@@ -45,12 +45,13 @@ const root = process.env.CHAIN_TEST_ROOT;
         else if (/^\/api\/fleet\/vps-\d+\/forward$/.test(url.pathname)) {
           const body = request.postDataJSON(), remote = fleet.remotes.find(r=>url.pathname.includes(`/${r.id}/`));
           if (body.path === '/state') result = remote.snapshot;
+          else if (body.path === '/diagnostics/local/logs') result={text:'remote-agent-log',sampled_at:now,sources:['xray'],detail:''};
           else if (body.path === '/externals/ext-a') { const external=remote.snapshot.externals[0];Object.assign(external,body.body);result=external; }
           else if (body.path === '/lines') {
             if(failSave) return route.fulfill({status:400,json:{error:'模拟保存失败'}});
             const old=remote.snapshot.lines.find(l=>l.id===body.body.id);Object.assign(old,body.body);result=old;
           }
-          else if (body.path === '/reality/check') result={ok:true,detail:'通过',latency_ms:10};
+          else if (body.path === '/diagnostics/local/reality') result={ok:true,detail:'通过',latency_ms:10};
           else if (body.path === '/preview') result = {affected_line_ids:['line-0','line-1'],affected_lines:['代理 0','代理 1'],nodes:[],message:'影响两条代理'};
           else if (body.path !== '/publish') throw new Error('Unexpected remote operation: '+body.path);
         } else if(url.pathname==='/api/fleet/batch') {
@@ -110,6 +111,12 @@ const root = process.env.CHAIN_TEST_ROOT;
     await page.getByRole('button',{name:'清除筛选',exact:true}).click();
     await page.getByRole('button',{name:'刷新总控',exact:true}).click();
     await page.getByRole('region',{name:'VPS 列表',exact:true}).getByText('版本不一致',{exact:true}).waitFor({state:'hidden'});
+    await page.getByRole('button',{name:'查看 VPS',exact:true}).first().click();
+    await dialog().getByRole('button',{name:'日志与诊断',exact:true}).click();
+    await dialog().getByText('remote-agent-log',{exact:true}).waitFor();
+    assert.ok(writes.some(w=>w.path==='/api/fleet/vps-0/forward'&&w.body.path==='/diagnostics/local/logs'));
+    assert.ok(!page.url().includes('remote='));
+    await closeDialog();
     fleet.remotes[0].snapshot.agent_version=null;fleet.remotes[0].error='模拟远端失联';
     await page.getByRole('button',{name:'刷新总控',exact:true}).click();
     await page.getByText(/Agent 版本未知（尚未上报）/).waitFor();
@@ -146,7 +153,7 @@ const root = process.env.CHAIN_TEST_ROOT;
     await dialog().getByRole('heading',{name:'编辑代理 · VPS 01'}).waitFor();
     assert.ok(!page.url().includes('remote='));
     await page.waitForFunction(()=>{const r=document.querySelector('[role=dialog]').getBoundingClientRect();return Math.abs(r.right-window.innerWidth)<2 && r.width>600;});
-    await dialog().getByRole('button',{name:'检测目标与 SNI',exact:true}).click();await dialog().getByText('通过：通过（10 ms）',{exact:true}).waitFor();
+    await dialog().getByRole('button',{name:'在节点验证 REALITY 握手',exact:true}).click();await dialog().getByText('通过：通过（10 ms）',{exact:true}).waitFor();
     await dialog().getByLabel('名称',{exact:true}).fill('原位修改');
     failSave=true;await dialog().getByRole('button',{name:'保存并预览',exact:true}).click();await dialog().getByText('模拟保存失败',{exact:true}).waitFor();
     assert.equal(await dialog().getByLabel('名称',{exact:true}).inputValue(),'原位修改');
@@ -158,8 +165,8 @@ const root = process.env.CHAIN_TEST_ROOT;
     await rows.first().getByText('原位修改',{exact:true}).waitFor();
     assert.equal(fleet.remotes[0].snapshot.lines[0].name,'代理 0');
     assert.equal(fleet.remotes[1].snapshot.lines[0].name,'原位修改');
-    for(const path of ['/lines','/reality/check','/preview','/publish']) assert.ok(writes.some(w=>w.path==='/api/fleet/vps-1/forward'&&w.body.path===path),path);
-    assert.equal(writes.filter(w=>['/api/lines','/api/publish','/api/reality/check'].includes(w.path)).length,0);
+    for(const path of ['/lines','/diagnostics/local/reality','/preview','/publish']) assert.ok(writes.some(w=>w.path==='/api/fleet/vps-1/forward'&&w.body.path===path),path);
+    assert.equal(writes.filter(w=>['/api/lines','/api/publish','/api/diagnostics/local/reality'].includes(w.path)).length,0);
     await go('外部代理');await page.getByLabel('筛选 VPS').selectOption('vps-2');
     await page.getByRole('region',{name:'外部代理列表'}).getByRole('button',{name:'编辑',exact:true}).click();
     await dialog().getByLabel('名称',{exact:true}).fill('修改后的落地');acceptDialog=false;await page.keyboard.press('Escape');assert.equal(await dialog().getByLabel('名称',{exact:true}).inputValue(),'修改后的落地');acceptDialog=true;await dialog().getByRole('button',{name:'保存',exact:true}).click();

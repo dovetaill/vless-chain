@@ -175,7 +175,9 @@ pub async fn request(
 ) -> Result<Value> {
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(if path.ends_with("/probe") {
+        .timeout(Duration::from_secs(if path.contains("/diagnostics/") || path == "/api/publish" {
+            600
+        } else if path.ends_with("/probe") {
             45
         } else {
             15
@@ -768,6 +770,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)")
             .unwrap();
         App {
+            diagnostics: Arc::new(diagnostics_api::Broker::default()),
             store: Arc::new(Mutex::new(Store {
                 conn,
                 doc: Document::default(),

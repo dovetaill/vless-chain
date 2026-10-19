@@ -166,12 +166,16 @@ class Platforms(unittest.TestCase):
                     subprocess.run(['/bin/sh', '-c', value.replace('/var/lib/' + name, temporary)
                                     + '\nprintf log-check >> "$output_log"'], check=True)
                     self.assertEqual((Path(temporary) / 'service.log').read_text(), 'log-check')
-                manager = installer.Manager.__new__(installer.Manager)
-                manager.live, manager.root = True, Path('/')
-                args = SimpleNamespace(action='logs', component=role)
-                with patch.object(manager, 'require_role'), patch.object(installer, 'run') as run:
-                    manager.operate(args)
-                run.assert_called_once_with(['tail', '-n', '100', log])
+                with tempfile.TemporaryDirectory() as temporary:
+                    manager = installer.Manager.__new__(installer.Manager)
+                    manager.live, manager.root = True, Path(temporary)
+                    isolated_log = manager.root / log.lstrip('/')
+                    isolated_log.parent.mkdir(parents=True)
+                    isolated_log.write_text('log-check')
+                    args = SimpleNamespace(action='logs', component=role)
+                    with patch.object(manager, 'require_role'), patch.object(installer, 'run') as run:
+                        manager.operate(args)
+                    run.assert_called_once_with(['tail', '-n', '100', str(isolated_log)])
 
     def test_launchd_restart_unloads_old_definition_before_bootstrap(self):
         with patch.object(platform, 'service_kind', return_value='launchd'), \

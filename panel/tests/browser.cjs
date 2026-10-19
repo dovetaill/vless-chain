@@ -12,7 +12,7 @@ const base = address.replace('127.0.0.1', 'localhost');
   const record = { cwd: process.cwd(), pid: process.pid, artifacts, browserPid: null };
   const recordFile = path.join(artifacts, 'browser-ownership.json');
   fs.writeFileSync(recordFile, JSON.stringify(record));
-  const server = await chromium.launchServer({ headless: true });
+  const server = await chromium.launchServer({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
   record.browserPid = server.process().pid;
   fs.writeFileSync(recordFile, JSON.stringify(record));
   let browser;
@@ -62,7 +62,8 @@ const base = address.replace('127.0.0.1', 'localhost');
     await first.getByRole('button', { name: '三跳代理 更多操作' }).click();
     const menu = page.getByRole('menu');
     await menu.waitFor();
-    assert.equal(await menu.getByRole('menuitem').count(), 9);
+    assert.equal(await menu.getByRole('menuitem').count(), 10);
+    assert.equal(await menu.getByRole('menuitem', {name:'日志与诊断',exact:true}).count(), 1);
     assert.equal(await menu.evaluate(el => el.closest('.overflow-x-auto')), null);
     const remove = menu.getByRole('menuitem', { name: '删除代理', exact: true });
     assert.ok(await remove.evaluate(el => {

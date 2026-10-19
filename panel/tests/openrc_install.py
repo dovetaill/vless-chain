@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
@@ -143,6 +144,12 @@ def main():
                 '--local-target', f'localhost:{tls_port}'])
             choices = []
             def choose(question, options, default='3'):
+                if question == '为新平台选择公网 HTTPS 端口，原代理端口保持不变':
+                    return '1'
+                if question.startswith('REALITY_UNVERIFIED'):
+                    # This isolated cover server intentionally serves HTTP/1 only.
+                    assert default == '2'
+                    return '1'
                 choices.append(question)
                 assert '如何处理该服务' in question
                 return '1'
@@ -154,11 +161,17 @@ def main():
             assert (data.stat().st_uid, data.stat().st_gid, data.stat().st_mode) == old_meta
             h.request('/api/login', 'POST', {'token': (data / 'admin-token').read_text()})
             state = h.state()
-            assert len(state['lines']) == 4 and len(state['externals']) == 3 and not state['pending_imports']
+            assert len(state['legacy_configs']) == 4, state['legacy_configs']
+            assert all(profile['published'] for profile in state['legacy_configs'])
+            assert not state['lines'] and not state['externals'] and not state['pending_imports']
+            https_port = urlsplit(args.public_url).port or 443
+            # Raw native configurations retain their original listener, so the
+            # panel uses the alternate HTTPS port selected by the real installer.
+            assert https_port not in {443, 8443, 8444, 8445, port}
             def https(path):
                 return subprocess.check_output(['curl', '--noproxy', '*', '-fsS', '--max-time', '10',
-                    '--cacert', str(panel_cert / 'fullchain.pem'), '--resolve', 'panel.test:443:127.0.0.1',
-                    'https://panel.test' + path])
+                    '--cacert', str(panel_cert / 'fullchain.pem'), '--resolve', f'panel.test:{https_port}:127.0.0.1',
+                    f'https://panel.test:{https_port}' + path])
             html = https('/')
             assert html == h.request('/')
             assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', html.decode())
@@ -193,7 +206,7 @@ def main():
             for role in ['panel', 'agent']:
                 subprocess.run(['/usr/local/bin/chainctl', 'logs', '--component', role], check=True,
                                stdout=subprocess.DEVNULL)
-            print('PASS real OpenRC installer: failed-log recovery; panel and Agent; HTTPS assets and shared 443; four old services imported; three external exits; four original clients carry traffic', flush=True)
+            print('PASS real OpenRC installer: failed-log recovery; panel and Agent; complete HTTPS assets on alternate port; original proxy 443 preserved; four old services imported; three external exits; four original clients carry traffic', flush=True)
         finally:
             for name in ['chain-ingress', 'chain-panel-cert-renew', 'chain-agent', 'chain-panel', 'nginx', *reversed(names)]:
                 if Path('/etc/init.d', name).exists():

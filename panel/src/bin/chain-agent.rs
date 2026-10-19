@@ -57,7 +57,73 @@ async fn run() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let diagnostic_binary = binary.clone();
     let mut runtime = ManagedXray::open(binary, dir.clone()).await?;
+    chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "Agent 已启动")?;
+    let clock = std::sync::Arc::new(std::sync::Mutex::new(serde_json::json!({"verified":false,"detail":"正在检查系统时间"})));
+    let clock_value = clock.clone();
+    let cleanup_dir = dir.clone();
+    let clock_task = tokio::spawn(async move {
+        loop {
+            let value = chain_panel::diagnostics::clock_status().await;
+            *clock_value.lock().unwrap() = value;
+            let _ = chain_panel::diagnostics::maintain(&cleanup_dir);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+    let diagnostic_client = client.clone();
+    let diagnostic_token = token.trim().to_string();
+    let diagnostic_dir = dir.clone();
+    let diagnostic_clock = clock.clone();
+    let diagnostic_url = format!("{}/api/agent/{}/diagnostics", panel.trim_end_matches('/'), node);
+    let diagnostics = tokio::spawn(async move {
+        let mut reply = serde_json::json!({});
+        loop {
+            if let Ok(response) = diagnostic_client.post(&diagnostic_url).bearer_auth(&diagnostic_token).json(&reply).send().await {
+                if response.status().is_success() {
+                    if let Ok(value) = response.json::<serde_json::Value>().await {
+                        reply = serde_json::json!({});
+                        if let Some(id) = value["id"].as_str() {
+                            let task = &value["request"];
+                            let result = match task["operation"].as_str() {
+                                Some("logs") => {
+                                    match serde_json::from_value::<chain_panel::diagnostics::LogRequest>(task["request"].clone()) {
+                                        Ok(request) if request.source != "panel" => {
+                                            let path = diagnostic_dir.clone();
+                                            match tokio::task::spawn_blocking(move || chain_panel::diagnostics::read(&path, &request)).await {
+                                                Ok(result) => result,
+                                                Err(e) => Err(anyhow::anyhow!("日志读取失败: {e}")),
+                                            }
+                                        },
+                                        _ => Err(anyhow::anyhow!("日志来源无效")),
+                                    }
+                                },
+                                Some("path") => {
+                                    match tokio::time::timeout(Duration::from_secs(35), chain_panel::runtime::diagnose_path(&diagnostic_binary, &diagnostic_dir, task["request"]["line_id"].as_str().unwrap_or(""), task["request"]["url"].as_str().unwrap_or(""))).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(anyhow::anyhow!("出口诊断超时；隔离进程已停止")),
+                                    }
+                                },
+                                Some("reality") => match serde_json::from_value::<RealityTarget>(task["request"].clone()) {
+                                    Ok(input) => match tokio::time::timeout(Duration::from_secs(45), chain_panel::diagnostics::reality(&diagnostic_binary, &input)).await {
+                                        Ok(result) => result,
+                                        Err(_) => Ok(serde_json::json!({"ok":false,"status":"unverified","detail":"隔离 REALITY 检测超时，临时进程已终止；没有修改运行中的代理"})),
+                                    },
+                                    Err(e) => Err(e.into()),
+                                },
+                                _ => Err(anyhow::anyhow!("诊断操作无效")),
+                            };
+                            let mut result = result.unwrap_or_else(|e| serde_json::json!({"error":chain_panel::diagnostics::redact(&format!("{e:#}"))}));
+                            result["clock"] = diagnostic_clock.lock().unwrap().clone();
+                            reply = serde_json::json!({"id":id,"result":result});
+                            continue;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
     let mut report = Report {
         revision: runtime
             .active
@@ -116,6 +182,8 @@ async fn run() -> Result<()> {
                 }
                 certificate_checked = now();
             }
+            report.system["clock"] = clock.lock().unwrap().clone();
+            report.system["diagnostics_version"] = serde_json::json!(1);
             report.system["certificate_expiry"] = certificate_expiry.clone();
             let ingress_status = std::env::var_os("CHAIN_INGRESS_STATUS")
                 .map(PathBuf::from)
@@ -155,6 +223,7 @@ async fn run() -> Result<()> {
                     };
                     drop(application);
                     let applied = outcome.is_ok();
+                    let _ = chain_panel::diagnostics::append(&dir.join("diagnostics.log"), &match &outcome {Ok(_)=>format!("配置 {} 应用成功",desired.revision),Err(e)=>format!("配置 {} 应用失败: {e:#}",desired.revision)});
                     report = Report {
                         revision: desired.revision.clone(),
                         applied: outcome.is_ok(),
@@ -163,6 +232,8 @@ async fn run() -> Result<()> {
                         traffic: traffic.snapshot(),
                         system: chain_panel::gateway::system_metrics(),
                     };
+                    report.system["diagnostics_version"] = serde_json::json!(1);
+                    report.system["clock"] = clock.lock().unwrap().clone();
                     // Acknowledge immediately; do not report a saved config as running before application.
                     client
                         .post(&url)
@@ -175,10 +246,15 @@ async fn run() -> Result<()> {
             }
             Ok::<(), anyhow::Error>(())
         };
-        tokio::select! { _=&mut shutdown=>break, result=step=>{if let Err(e)=result {eprintln!("同步失败: {e}");}} }
+        tokio::select! { _=&mut shutdown=>break, result=step=>{if let Err(e)=result {eprintln!("同步失败: {e}"); let _=chain_panel::diagnostics::append(&dir.join("diagnostics.log"), &format!("同步失败: {e}"));}} }
         tokio::select! {_=&mut shutdown=>break,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
     }
+    clock_task.abort();
+    let _ = clock_task.await;
+    diagnostics.abort();
+    let _ = diagnostics.await;
     runtime.close().await;
+    let _ = chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "Agent 已停止");
     eprintln!("Agent 已停止，所属 Xray 已退出");
     Ok(())
 }

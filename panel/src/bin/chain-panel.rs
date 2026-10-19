@@ -31,6 +31,8 @@ mod security_api;
 mod fleet_api;
 #[path = "../monitor_api.rs"]
 mod monitor_api;
+#[path = "../diagnostics_api.rs"]
+mod diagnostics_api;
 
 struct Store {
     conn: Connection,
@@ -44,6 +46,7 @@ impl Store {
 }
 #[derive(Clone)]
 struct App {
+    diagnostics: Arc<diagnostics_api::Broker>,
     store: Arc<Mutex<Store>>,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
     tickets: Arc<Mutex<HashMap<String, (u64, String)>>>,
@@ -297,7 +300,8 @@ fn snapshot(doc: &Document) -> Value {
         .iter()
         .map(|s| json!({"id":s.id,"name":s.name,"line_ids":s.line_ids,"created":s.created}))
         .collect();
-    let legacy: Vec<_> = doc.legacy_configs.iter().map(|p| json!({"id":p.id,"node_id":p.node_id,"name":p.name,"enabled":p.enabled,
+    let legacy: Vec<_> = doc.legacy_configs.iter().chain(doc.applied_legacy_configs.iter().filter(|p| !doc.legacy_configs.iter().any(|draft| draft.id == p.id))).map(|p| json!({"id":p.id,"node_id":p.node_id,"name":p.name,"enabled":p.enabled,
+        "pending_delete":!doc.legacy_configs.iter().any(|draft| draft.id == p.id),
         "ports":chain_panel::legacy_config::ports(&p.config).unwrap_or_default(),
         "published":doc.applied_legacy_configs.contains(p) && doc.nodes.iter().find(|n| n.id == p.node_id).is_some_and(|n|
             n.report.applied && n.desired.as_ref().is_some_and(|d| d.revision == n.report.revision
@@ -924,6 +928,9 @@ fn changed(doc: &Document, configs: &BTreeMap<String, Value>) -> BTreeSet<String
 }
 async fn preview(State(app): State<App>) -> ApiResult<Json<Value>> {
     let doc = &app.store.lock().unwrap().doc;
+    Ok(Json(publication_preview(doc)?))
+}
+fn publication_preview(doc: &Document) -> Result<Value> {
     let configs = compile(doc)?;
     let affected = changed(doc, &configs);
     let restarting: BTreeSet<_> = doc
@@ -935,6 +942,7 @@ async fn preview(State(app): State<App>) -> ApiResult<Json<Value>> {
             chain_panel::gateway::xray_config(&old.config)
                 != chain_panel::gateway::xray_config(&configs[&n.id])
                 || old.config.get("_mihomo") != configs[&n.id].get("_mihomo")
+                || old.config.get("_legacy") != configs[&n.id].get("_legacy")
                 || !chain_panel::gateway::same_listeners(
                     &chain_panel::gateway::specs(&old.config).unwrap_or_default(),
                     &chain_panel::gateway::specs(&configs[&n.id]).unwrap_or_default(),
@@ -960,17 +968,22 @@ async fn preview(State(app): State<App>) -> ApiResult<Json<Value>> {
         .filter(|l| l.hops.iter().any(|h| restarting.contains(&h.node_id)))
         .map(|l| l.id.clone())
         .collect();
-    Ok(Json(
-        json!({"nodes":nodes,"affected_lines":lines,"affected_line_ids":affected_ids,"message":if restarting.is_empty(){"流量和限速设置会在线更新，无需重启线路。"}else{"应用会重启受影响服务器上由本平台管理的实例；共享该实例的线路会短暂重连。"}}),
-    ))
+    let legacy: BTreeSet<_> = doc.legacy_configs.iter().chain(doc.applied_legacy_configs.iter())
+        .filter(|p| restarting.contains(&p.node_id)).map(|p| p.name.clone()).collect();
+    Ok(json!({"nodes":nodes,"affected_lines":lines,"affected_line_ids":affected_ids,"affected_legacy_configs":legacy,"message":if restarting.is_empty(){"流量和限速设置会在线更新，无需重启线路。"}else{"应用会重启受影响服务器上由本平台管理的实例；共享该实例的线路会短暂重连。"}}))
 }
-async fn publish(State(app): State<App>) -> ApiResult<Json<Value>> {
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishOptions { #[serde(default)] allow_unverified_reality: bool }
+async fn publish(State(app): State<App>, input: Option<Json<PublishOptions>>) -> ApiResult<Json<Value>> {
     let _probe_guard = app
         .probe_lock
         .try_lock()
         .map_err(|_| error(StatusCode::CONFLICT, "正在执行整链探测，请完成后发布"))?;
+    let checked = diagnostics_api::preflight(&app, input.map(|v| v.0.allow_unverified_reality).unwrap_or(false)).await?;
     let job = edit(&app, |d| {
         let configs = compile(d)?;
+        ensure!(configs == checked, "检测期间配置已改变，请重新预览并下发");
         let affected = changed(d, &configs);
         for node in d.nodes.iter().filter(|n| affected.contains(&n.id)) {
             if configs[&node.id]["_legacy"]
@@ -1068,6 +1081,7 @@ fn log_event(app: &App, id: &str, message: String) {
     }
     if let Err(e) = s.save() {
         eprintln!("记录发布事件失败: {e}");
+        let _ = chain_panel::diagnostics::append(&app.token_file.parent().unwrap().join("diagnostics.log"), &format!("记录发布事件失败: {e}"));
     }
 }
 async fn push(app: &App, node_id: &str, desired: Desired) -> Result<()> {
@@ -1185,6 +1199,7 @@ async fn run_publish(app: App, job: Job, recovery: bool) {
     }
     if let Err(e) = s.save() {
         eprintln!("保存发布结果失败: {e}");
+        let _ = chain_panel::diagnostics::append(&app.token_file.parent().unwrap().join("diagnostics.log"), &format!("保存发布结果失败: {e}"));
     }
 }
 async fn sync(
@@ -1370,9 +1385,20 @@ mod web_tests {
         });
         doc.nodes[0].report.revision = "applied".into();
         doc.nodes[0].report.applied = true;
+        doc.nodes[0].report.running = true;
         assert_eq!(snapshot(&doc)["legacy_configs"][0]["published"], true);
+        assert_eq!(publication_preview(&doc).unwrap()["affected_legacy_configs"], json!([]));
+        doc.legacy_configs[0].config["inbounds"][0]["port"] = json!(12346);
+        assert_eq!(publication_preview(&doc).unwrap()["affected_legacy_configs"], json!(["imported"]));
         doc.legacy_configs.clear();
         assert!(changed(&doc, &compile(&doc).unwrap()).contains(&doc.nodes[0].id));
+        let summary = snapshot(&doc);
+        assert_eq!(summary["legacy_configs"][0]["pending_delete"], true);
+        assert_eq!(summary["legacy_configs"][0]["published"], false);
+        assert!(!summary.to_string().contains("must-stay-private"));
+        assert_eq!(publication_preview(&doc).unwrap()["affected_legacy_configs"], json!(["imported"]));
+        doc.applied_legacy_configs.clear();
+        assert_eq!(snapshot(&doc)["legacy_configs"], json!([]));
     }
 
     #[tokio::test]
@@ -1417,6 +1443,7 @@ async fn run() -> Result<()> {
     let dir = PathBuf::from(std::env::var("CHAIN_DATA_DIR").unwrap_or_else(|_| "data".into()));
     private_dir(&dir, "chain-panel")?;
     let _lock = lock_dir(&dir)?;
+    chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "面板启动")?;
     let token_file = dir.join("admin-token");
     if !token_file.exists() {
         atomic_write(&token_file, secret().as_bytes())?;
@@ -1433,6 +1460,7 @@ async fn run() -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     let app = App {
+        diagnostics: Arc::new(diagnostics_api::Broker::default()),
         store: Arc::new(Mutex::new(Store { conn, doc })),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         tickets: Arc::new(Mutex::new(HashMap::new())),
@@ -1474,7 +1502,7 @@ async fn run() -> Result<()> {
         WEB.get_file("index.html").is_some(),
         "缺少前端构建：请先在 frontend/ 执行 npm ci && npm run build，再重新编译 chain-panel"
     );
-    let router = monitor_api::routes(fleet_api::routes(Router::new()))
+    let router = diagnostics_api::routes(monitor_api::routes(fleet_api::routes(Router::new())))
         .fallback(get(web_asset))
         .route("/api/login", post(login))
         .route("/api/auth/options", get(security_api::options))
@@ -1553,6 +1581,7 @@ async fn run() -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
+            let _ = chain_panel::diagnostics::maintain(local_app.token_file.parent().unwrap());
             if let Err(error) = local_app
                 .local_agent
                 .lock()
@@ -1565,6 +1594,7 @@ async fn run() -> Result<()> {
                 .await
             {
                 eprintln!("本机 Agent: {error:#}");
+                let _ = chain_panel::diagnostics::append(&local_app.token_file.parent().unwrap().join("diagnostics.log"), &format!("本机 Agent: {error:#}"));
             }
         }
     });

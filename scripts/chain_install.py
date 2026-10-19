@@ -498,8 +498,8 @@ class Manager:
                 json_write(self.state_file, state)
                 manager = self.base / 'manager'
                 manager.mkdir(exist_ok=True)
-                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py']:
-                    if name == 'chain_legacy.py' and not (release / 'scripts' / name).exists():
+                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_time.py']:
+                    if name in ('chain_legacy.py', 'chain_time.py') and not (release / 'scripts' / name).exists():
                         continue
                     if name == 'chain_platform.py' and 'os' not in manifest and not (release / 'scripts' / name).exists():
                         continue
@@ -723,10 +723,31 @@ class Manager:
             self.system.call('status', 'chain-' + role + '.service', '--no-pager', check=False)
         elif action == 'logs':
             require(self.live, '--root 离线安装树没有服务日志。')
-            log = (str(self.role_paths(role)[1] / 'service.log') if service_kind() == 'openrc'
-                   else '/var/log/chain-' + role + '.log')
-            run(['journalctl', '-u', 'chain-' + role + '.service', '--no-pager', '-n', '100']
-                if service_kind() == 'systemd' else ['tail', '-n', '100', log])
+            source = getattr(args, 'log_source', 'service')
+            follow = getattr(args, 'follow', False)
+            data = self.role_paths(role)[1]
+            if source == 'service' and service_kind() == 'systemd':
+                command = ['journalctl', '-u', 'chain-' + role + '.service', '--no-pager', '-n', '100']
+                if follow:
+                    command.append('-f')
+            else:
+                logs = {'application': data / 'diagnostics.log', 'xray': data / 'xray.log',
+                        'mihomo': data / 'mihomo' / 'mihomo.log',
+                        'service': data / 'service.log' if service_kind() == 'openrc' else Path('/var/log/chain-' + role + '.log')}
+                if source.startswith('legacy-'):
+                    import uuid
+                    require(str(uuid.UUID(source[7:])) == source[7:], '迁移配置 ID 无效。')
+                    logs[source] = data / source / 'xray.log'
+                require(source in logs, '日志来源无效。')
+                log = logs[source]
+                require(not log.is_symlink() and not log.parent.is_symlink(), '拒绝读取日志符号链接。')
+                require(log.is_file() or follow, '该日志尚未产生；可添加 --follow 等待。')
+                command = ['tail', '-n', '100'] + (['-F'] if follow else []) + [str(log)]
+            print('持续查看日志，Ctrl+C 返回。' if follow else '最近 100 行；添加 --follow 持续查看。')
+            try:
+                run(command)
+            except KeyboardInterrupt:
+                print('已停止跟随日志。')
         elif action == 'token':
             require(role == 'panel', 'Agent 令牌只在 Web 创建或重置时显示。')
             print((self.role_paths(role)[1] / 'admin-token').read_text().strip())
@@ -882,6 +903,16 @@ def install_package(manager, args):
             panel_questions(manager, args)
         elif args.action == 'install' and args.component == 'agent' and getattr(args, 'guided', False):
             agent_questions(manager, args)
+        if manager.live and args.action == 'install' and getattr(args, 'guided', False):
+            from chain_time import status, synchronize
+            clock = status()
+            if clock.get('NTPSynchronized') != 'yes':
+                print('系统尚未确认时间同步；错误时间会导致 TLS / REALITY 握手失败。')
+                if not args.non_interactive and sys.stdin.isatty() and input('启用时间同步？必要时安装时间服务，保持现有时区 [y/N]: ').strip().lower() == 'y':
+                    try:
+                        synchronize()
+                    except (ValueError, OSError, subprocess.SubprocessError) as error:
+                        print(f'时间同步未完成：{error}；请处理后再进行连接检查。')
         if manager.live and args.action == 'install' and args.component == 'panel' and getattr(args, 'guided', False):
             from chain_legacy import guided_install
             if guided_install(manager, source, manifest, args):
@@ -1089,6 +1120,14 @@ def menu(root):
             action = {'1': 'install', '2': 'install', '3': 'update', '4': 'status', '5': 'logs',
                       '6': 'restart', '7': 'backup', '8': 'rollback', '9': 'access', '10': 'start', '11': 'stop', '13': 'reset-auth'}[choice]
             args = make_parser().parse_args([action, '--component', role, '--root', str(root)])
+            if action == 'logs':
+                print('日志来源：1) 服务 2) 应用 3) Xray 4) Mihomo 5) 迁移内核')
+                source = input('选择 [1]: ').strip() or '1'
+                require(source in ('1', '2', '3', '4', '5'), '日志来源无效。')
+                args.log_source = {'1': 'service', '2': 'application', '3': 'xray', '4': 'mihomo', '5': 'legacy-'}[source]
+                if source == '5':
+                    args.log_source += input('迁移配置 UUID: ').strip()
+                args.follow = True
             if action in ('install', 'update'):
                 install_wizard(manager, args)
             else:
@@ -1109,6 +1148,7 @@ def make_parser():
 
 高级命令（也可在菜单中选择，无需记忆）：
   status / logs             查看状态 / 最近日志
+  logs --component agent --log-source xray --follow   持续查看 Xray 日志
   start / stop / restart    启动 / 停止 / 重启
   backup / rollback         私有备份 / 回滚程序版本
   access / token            查看登录信息 / 仅输出管理令牌
@@ -1122,6 +1162,8 @@ def make_parser():
 
 安装脚本同样支持 help 和以上子命令。""")
     parser.add_argument('action', nargs='?', default='menu', choices=['menu', 'setup', 'help', 'install', 'update', 'status', 'start', 'stop', 'restart', 'logs', 'backup', 'rollback', 'access', 'token', 'reset-auth', 'ingress-enable', 'ingress-disable', 'uninstall'])
+    parser.add_argument('--follow', '-f', action='store_true', help='持续查看日志，Ctrl+C 返回')
+    parser.add_argument('--log-source', default='service', help='service/application/xray/mihomo/legacy-UUID')
     parser.add_argument('--purge', action='store_true', help='卸载时同时删除应用配置、数据、备份和服务账户；保留面板证书')
     parser.add_argument('--component', choices=ROLES, default='panel', help='默认 panel；节点机器选择 agent')
     parser.add_argument('--package', type=Path, help='本地发行包，同目录需有 SHA256SUMS')

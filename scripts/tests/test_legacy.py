@@ -1,6 +1,7 @@
 """Migration checks use fixtures and mocked service managers only."""
 import contextlib
 import grp
+import io
 import json
 import os
 from pathlib import Path
@@ -478,6 +479,23 @@ class Legacy(unittest.TestCase):
         with patch.object(legacy.time, 'sleep'):
             api.publish()
         self.assertEqual(api.call.call_count, 4)
+
+    def test_publish_unverified_requires_explicit_confirmation(self):
+        for choice in ['1', '2']:
+            api = legacy.PanelAPI.__new__(legacy.PanelAPI)
+            failure = legacy.urllib.error.HTTPError('http://fixture', 400, 'bad', {},
+                io.BytesIO(b'{"error":"REALITY_UNVERIFIED: fixture"}'))
+            api.wait_ready = Mock()
+            api.call = Mock(side_effect=[failure, {'job_id': 'job'}, {'jobs': [{'id':'job','state':'applied'}]}])
+            with patch.object(installer, 'choose', return_value=choice) as choose:
+                if choice == '1':
+                    api.publish()
+                    self.assertEqual(api.call.call_args_list[1].args, ('publish', {'allow_unverified_reality': True}))
+                else:
+                    with self.assertRaisesRegex(ValueError, '取消切换'):
+                        api.publish()
+                    self.assertEqual(api.call.call_count, 1)
+                self.assertEqual(choose.call_args.args[2], '2')
 
     def migration(self, temporary, failure=False, pending=False, target_pid=None, domain=None, retained_port=None):
         manager = installer.Manager(Path(temporary))

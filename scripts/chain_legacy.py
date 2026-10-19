@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import time
 import urllib.request
+import urllib.error
 import uuid
 
 from chain_common import atomic_write, json_write, output, require, run
@@ -457,7 +458,7 @@ class PanelAPI:
     def call(self, path, payload=None):
         request = urllib.request.Request(self.base + '/api/' + path, data=None if payload is None else json.dumps(payload).encode(),
                                          headers={'Content-Type': 'application/json', 'X-Chain-Request': '1', 'Cookie': self.cookie})
-        with self.opener.open(request, timeout=30) as response:
+        with self.opener.open(request, timeout=600 if path == 'publish' else 30) as response:
             if path == 'login':
                 self.cookie = response.headers['Set-Cookie'].split(';', 1)[0]
             return json.loads(response.read())
@@ -475,7 +476,15 @@ class PanelAPI:
 
     def publish(self):
         self.wait_ready()
-        result = self.call('publish', {})
+        try:
+            result = self.call('publish', {})
+        except urllib.error.HTTPError as error:
+            detail = json.loads(error.read()).get('error', str(error))
+            require(error.code == 400 and detail.startswith('REALITY_UNVERIFIED'), detail)
+            from chain_install import choose
+            require(choose(detail, {'1': '接受未验证风险并继续迁移', '2': '取消切换并恢复旧服务'}, '2') == '1',
+                    'REALITY 尚未验证，已取消切换。')
+            result = self.call('publish', {'allow_unverified_reality': True})
         deadline = time.monotonic() + 260
         while True:
             job = next((j for j in self.call('state')['jobs'] if j['id'] == result['job_id']), None)

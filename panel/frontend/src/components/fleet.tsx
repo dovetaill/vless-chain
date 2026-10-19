@@ -1,3 +1,5 @@
+import { publishChecked } from "../api";
+import { Diagnostics } from "./diagnostics";
 import {
   useCallback,
   useEffect,
@@ -477,7 +479,7 @@ export function Fleet() {
         submit="确认并应用"
         close={close}
         action={async () => {
-          await remoteApi(r.id)("/publish", "POST", {});
+          await publishChecked(remoteApi(r.id));
           setPendingApply((old) => old.filter((id) => id !== r.id));
           setMessage(`${r.name}：已提交应用，请查看代理的同步状态。`);
           close();
@@ -1632,6 +1634,11 @@ export function Fleet() {
             >
               管理外部代理
             </Button>
+            <Button type="button" variant="outline" onClick={() => {
+              const remote = activeDetail;
+              setDetail(undefined);
+              setModal(<Diagnostics nodes={remote.snapshot?.nodes || []} request={remoteApi(remote.id)} close={() => setModal(null)} />);
+            }}>日志与诊断</Button>
             <Button
               type="button"
               variant="outline"

@@ -10,6 +10,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,7 +22,7 @@ STATE = Path('/var/lib/chain-maintenance')
 INSTALL_STATE = Path('/opt/chain/.chain-install.json')
 LOCK = threading.Lock()
 RELOAD = threading.Event()
-ACTIONS = {'upgrade', 'restart-panel', 'restart-agent'}
+ACTIONS = {'upgrade', 'restart-panel', 'restart-agent', 'sync-time'}
 
 
 def validate(value):
@@ -57,6 +58,8 @@ def execute(job, directory=STATE):
                 require(manifest['version'] == job['version'] and 'scripts/chain_maintenance.py' in manifest['files'],
                         '目标版本不支持远程维护，拒绝升级以免丢失控制能力')
                 command = ['/usr/local/bin/chainctl', 'update', '--component', 'panel', '--package', str(archive), '--non-interactive']
+            elif job['action'] == 'sync-time':
+                command = [sys.executable, '-B', str(Path(__file__).with_name('chain_time.py'))]
             else:
                 role = job['action'].removeprefix('restart-')
                 require(role in before, '该组件未安装')
@@ -90,7 +93,7 @@ def execute(job, directory=STATE):
                         f'{role} 服务未运行')
                 if job['action'] == 'upgrade':
                     require(job['after'][role] == job['version'], f'{role} 版本未达到目标')
-            job.update(state='succeeded', detail='组件检查通过；总控还需检查整链')
+            job.update(state='succeeded', detail='时间同步已确认，时区保持不变' if job['action'] == 'sync-time' else '组件检查通过；总控还需检查整链')
     except Exception as error:
         job.update(state='failed', error=str(error))
         try:

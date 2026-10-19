@@ -26,3 +26,12 @@ export async function api<T>(path: string, method = 'GET', body?: unknown, signa
   }
   return result;
 }
+
+export async function publishChecked(request: typeof api = api) {
+  try { return await request('/publish', 'POST', {}); }
+  catch (error) {
+    if (!(error instanceof Error) || !error.message.includes('REALITY_UNVERIFIED')) throw error;
+    if (!window.confirm(`${error.message}\n仍要继续下发未验证的配置吗？`)) throw new Error('已保留草稿，尚未下发。');
+    return request('/publish', 'POST', {allow_unverified_reality:true});
+  }
+}
