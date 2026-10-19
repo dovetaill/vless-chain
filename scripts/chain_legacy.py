@@ -153,9 +153,12 @@ def discover(proc=Path('/proc')):
                         rows = connection.execute('SELECT port, remark FROM inbounds').fetchall()
                     names = dict(rows)
                     for source in owner['sources']:
-                        for inbound in (source['config'] or {}).get('inbounds', []):
-                            if names.get(inbound.get('port')):
-                                inbound['remark'] = names[inbound['port']]
+                        if source['error'] or not source['config']:
+                            continue
+                        for inbound in source['config'].get('inbounds', []):
+                            port = inbound.get('port')
+                            if isinstance(port, int) and names.get(port):
+                                inbound['remark'] = names[port]
                     owner['database'] = str(db)
         except (OSError, UnicodeError, ValueError):
             continue
@@ -167,7 +170,10 @@ def discover(proc=Path('/proc')):
 
 
 def hydrate(config, root, cwd, owner):
-    for inbound in config.get('inbounds', []):
+    inbounds = config.get('inbounds', [])
+    require(isinstance(inbounds, list), 'inbounds 必须是数组。')
+    for inbound in inbounds:
+        require(isinstance(inbound, dict), 'inbounds 条目必须是对象。')
         stream = inbound.get('streamSettings')
         if stream is None:
             continue
@@ -185,23 +191,31 @@ def hydrate(config, root, cwd, owner):
             for key, field in [('certificateFile', 'certificate'), ('keyFile', 'key')]:
                 if key not in certificate:
                     continue
-                logical = Path(certificate.pop(key))
+                require(isinstance(certificate[key], str) and certificate[key].strip(),
+                        f'{key} 必须是非空文件路径。')
+                logical = Path(certificate[key])
                 if not logical.is_absolute():
                     logical = cwd / logical
                 path = root / str(logical).lstrip('/')
                 body = read_config(path)
                 owner['files'][str(logical)] = {'path': str(path), 'body': body}
                 certificate[field] = body.decode().splitlines()
+                del certificate[key]
 
 
 def published_ports(config, container):
-    ports = container.get('NetworkSettings', {}).get('Ports', {})
+    network = container.get('NetworkSettings')
+    require(isinstance(network, dict), '容器网络信息不可用，请重新扫描。')
+    ports = network.get('Ports')
+    require(isinstance(ports, dict), '容器端口映射不可用。')
     for inbound in config.get('inbounds', []):
         if inbound.get('tag') == 'api':
             continue
         kinds = ['tcp', 'udp'] if inbound.get('protocol') == 'shadowsocks' else ['tcp']
         mappings = [ports.get(f'{inbound.get("port")}/{kind}') or [] for kind in kinds]
         require(all(mappings), '容器入口没有完整的公网端口映射。')
+        require(all(isinstance(group, list) and all(isinstance(p, dict) for p in group) for group in mappings),
+                '容器端口映射格式无效。')
         host_ports = {int(p['HostPort']) for group in mappings for p in group}
         require(len(host_ports) == 1 and all(p['HostIp'] in ('', '0.0.0.0', '::') for group in mappings for p in group),
                 '容器入口使用特定地址或不同 TCP/UDP 端口，需手动配置。')

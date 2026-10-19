@@ -36,6 +36,54 @@ class Legacy(unittest.TestCase):
             self.assertEqual(certs, [{'certificate': ['certificate', 'second line']}, {'certificate': ['inline']}])
             self.assertEqual(owner['files']['/cert.pem']['body'], cert.read_bytes())
 
+    def test_invalid_inbounds_with_xui_database_do_not_abort_discovery(self):
+        for inbounds in [None, {}, 'invalid', [None], ['invalid'], [{'port': []}]]:
+            with self.subTest(inbounds=inbounds), tempfile.TemporaryDirectory() as temporary:
+                proc = Path(temporary)
+                process = proc / '20'
+                (process / 'ns').mkdir(parents=True)
+                (process / 'ns/pid').symlink_to('pid:[1]')
+                (process / 'exe').symlink_to('/usr/bin/xray')
+                (process / 'cwd').symlink_to('/')
+                (process / 'cmdline').write_bytes(b'xray\0-config\0/config.json\0')
+                (process / 'cgroup').write_text('0::/\n')
+                db = process / 'root/etc/x-ui/x-ui.db'
+                db.parent.mkdir(parents=True)
+                with contextlib.closing(sqlite3.connect(db)) as connection:
+                    connection.execute('CREATE TABLE inbounds(port INTEGER, remark TEXT)')
+                    connection.execute("INSERT INTO inbounds VALUES(443, 'existing proxy')")
+                    connection.commit()
+                config = process / 'root/config.json'
+                config.write_text(json.dumps({'inbounds': inbounds}))
+                before = {p: p.stat() for p in [db, config]}
+                with patch.object(legacy.shutil, 'which', return_value=None), \
+                        patch.object(legacy, 'run') as run, patch.object(legacy, 'output') as output:
+                    owners = legacy.discover(proc)
+                run.assert_not_called()
+                output.assert_not_called()
+                self.assertEqual(len(owners), 1)
+                self.assertEqual(bool(owners[0]['sources'][0]['error']), inbounds != [{'port': []}])
+                for path, old in before.items():
+                    new = path.stat()
+                    self.assertEqual((old.st_uid, old.st_gid, old.st_mode, old.st_ctime_ns),
+                                     (new.st_uid, new.st_gid, new.st_mode, new.st_ctime_ns))
+
+    def test_invalid_certificate_paths_preserve_original_reference(self):
+        for value in [None, '', [], 'missing.pem']:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                cert = {'certificateFile': value}
+                config = {'inbounds': [{'streamSettings': {'tlsSettings': {'certificates': [cert]}}}]}
+                with self.assertRaises((ValueError, OSError)):
+                    legacy.hydrate(config, Path(temporary), Path('/'), {'files': {}})
+                self.assertEqual(cert, {'certificateFile': value})
+
+    def test_missing_container_mapping_is_a_configuration_error(self):
+        for network in [None, {}, {'Ports': None}, {'Ports': {'443/tcp': 'invalid'}},
+                        {'Ports': {'443/tcp': [None]}}]:
+            with self.subTest(network=network), self.assertRaises(ValueError):
+                legacy.published_ports({'inbounds': [{'protocol': 'vless', 'port': 443}]},
+                                       {'NetworkSettings': network})
+
     def test_discovery_null_stream_does_not_abort_installation(self):
         variants = [None, {'tlsSettings': None}, {'tlsSettings': {'certificates': None}},
                     'invalid', {'tlsSettings': 'invalid'}, {'tlsSettings': {'certificates': {}}},

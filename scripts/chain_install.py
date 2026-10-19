@@ -854,6 +854,7 @@ def install_package(manager, args):
         if manager.live and args.action == 'install' and args.component == 'panel' and getattr(args, 'guided', False):
             from chain_legacy import guided_install
             if guided_install(manager, source, manifest, args):
+                manager.maintenance_units()
                 manager.show_access()
                 return
         site = None

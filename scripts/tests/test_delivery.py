@@ -403,6 +403,23 @@ class Delivery(unittest.TestCase):
                 installer.install_wizard(self.manager, args)
         self.assertFalse(list(self.root.glob('chain-install-*')))
 
+    def test_guided_migration_installs_maintenance_before_showing_access(self):
+        source, _ = self.package()
+        archive = self.archive(source)
+        args = installer.make_parser().parse_args([
+            'install', '--root', str(self.manager.root), '--package', str(archive)])
+        events = []
+        with patch.object(self.manager, 'live', True), \
+                patch.object(installer, 'panel_questions'), \
+                patch('chain_legacy.guided_install', return_value=True) as guided, \
+                patch.object(self.manager, 'install') as install, \
+                patch.object(self.manager, 'maintenance_units', side_effect=lambda: events.append('maintenance')), \
+                patch.object(self.manager, 'show_access', side_effect=lambda: events.append('access')):
+            installer.install_wizard(self.manager, args)
+        guided.assert_called_once()
+        install.assert_not_called()
+        self.assertEqual(events, ['maintenance', 'access'])
+
     def test_repeated_setup_retries_missing_default_agent(self):
         source, manifest = self.package()
         self.manager.install(source, manifest, self.args())
