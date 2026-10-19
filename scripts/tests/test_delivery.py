@@ -203,13 +203,19 @@ class Delivery(unittest.TestCase):
         def questions(manager, values):
             self.assertEqual(values.domain, 'panel.example.com')
             values.listen = '127.0.0.1:22305'
+        real_install = self.manager.install
+        def install_saved_state(source, manifest, values):
+            with patch.object(self.manager, 'live', False):
+                real_install(source, manifest, values)
         with patch.object(installer, 'panel_questions', side_effect=questions), \
                 patch.object(installer, 'HttpsSite') as https, \
-                patch.object(self.manager, 'install') as install, patch.object(self.manager, 'show_access'):
+                patch.object(self.manager, 'install', side_effect=install_saved_state) as install, \
+                patch.object(self.manager, 'show_access'):
             https.return_value.activate.return_value = contextlib.nullcontext()
             installer.install_package(self.manager, args)
         https.assert_called_once_with('panel.example.com', 22305, False)
         install.assert_called_once()
+        self.assertTrue(self.manager.state()['roles']['panel']['setup_complete'])
 
     def test_uninstall_restores_other_sites_before_removing_unified_ingress(self):
         from chain_ingress import Ingress
