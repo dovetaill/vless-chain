@@ -20,6 +20,53 @@ import chain_network as network
 
 
 class Legacy(unittest.TestCase):
+    def test_hydrate_nullable_tls_and_preserves_certificate_loading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cert = root / 'cert.pem'
+            cert.write_text('certificate\nsecond line\n')
+            config = {'inbounds': [{}, {'streamSettings': None},
+                {'streamSettings': {'tlsSettings': None}},
+                {'streamSettings': {'tlsSettings': {'certificates': None}}},
+                {'streamSettings': {'tlsSettings': {'certificates': [
+                    {'certificateFile': 'cert.pem'}, {'certificate': ['inline']}]}}}]}
+            owner = {'files': {}}
+            legacy.hydrate(config, root, Path('/'), owner)
+            certs = config['inbounds'][-1]['streamSettings']['tlsSettings']['certificates']
+            self.assertEqual(certs, [{'certificate': ['certificate', 'second line']}, {'certificate': ['inline']}])
+            self.assertEqual(owner['files']['/cert.pem']['body'], cert.read_bytes())
+
+    def test_discovery_null_stream_does_not_abort_installation(self):
+        variants = [None, {'tlsSettings': None}, {'tlsSettings': {'certificates': None}},
+                    'invalid', {'tlsSettings': 'invalid'}, {'tlsSettings': {'certificates': {}}},
+                    {'tlsSettings': {'certificates': [None]}}]
+        for index, stream in enumerate(variants):
+            with self.subTest(stream=stream), tempfile.TemporaryDirectory() as temporary:
+                proc = Path(temporary)
+                process = proc / '20'
+                (process / 'ns').mkdir(parents=True)
+                (process / 'ns/pid').symlink_to('pid:[1]')
+                (process / 'exe').symlink_to('/usr/bin/xray')
+                (process / 'cwd').symlink_to('/')
+                (process / 'cmdline').write_bytes(b'xray\0-config\0/config.json\0')
+                (process / 'cgroup').write_text('0::/\n')
+                (process / 'root').mkdir()
+                config = process / 'root/config.json'
+                config.write_text(json.dumps({'inbounds': [{'streamSettings': stream}]}))
+                before = config.stat()
+                with patch.object(legacy.shutil, 'which', return_value=None), \
+                        patch.object(legacy, 'run') as run, patch.object(legacy, 'output') as output:
+                    owners = legacy.discover(proc)
+                run.assert_not_called()
+                output.assert_not_called()
+                self.assertEqual(len(owners), 1)
+                source = owners[0]['sources'][0]
+                self.assertEqual(bool(source['error']), index >= 3)
+                self.assertEqual(source['config']['inbounds'][0]['streamSettings'], stream)
+                after = config.stat()
+                self.assertEqual((before.st_uid, before.st_gid, before.st_mode, before.st_ctime_ns),
+                                 (after.st_uid, after.st_gid, after.st_mode, after.st_ctime_ns))
+
     def test_acme_directory_preserves_existing_metadata_and_rejects_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / 'acme/panel'

@@ -168,8 +168,20 @@ def discover(proc=Path('/proc')):
 
 def hydrate(config, root, cwd, owner):
     for inbound in config.get('inbounds', []):
-        certs = inbound.get('streamSettings', {}).get('tlsSettings', {}).get('certificates', [])
+        stream = inbound.get('streamSettings')
+        if stream is None:
+            continue
+        require(isinstance(stream, dict), 'streamSettings 必须是对象或 null。')
+        tls = stream.get('tlsSettings')
+        if tls is None:
+            continue
+        require(isinstance(tls, dict), 'tlsSettings 必须是对象或 null。')
+        certs = tls.get('certificates')
+        if certs is None:
+            continue
+        require(isinstance(certs, list), 'certificates 必须是数组或 null。')
         for certificate in certs:
+            require(isinstance(certificate, dict), 'TLS 证书条目必须是对象。')
             for key, field in [('certificateFile', 'certificate'), ('keyFile', 'key')]:
                 if key not in certificate:
                     continue
