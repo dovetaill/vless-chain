@@ -59,6 +59,8 @@ async fn run() -> Result<()> {
         .build()?;
     let diagnostic_binary = binary.clone();
     let mut runtime = ManagedXray::open(binary, dir.clone()).await?;
+    *runtime.traffic.resources.write().unwrap() = Some(chain_panel::resources::Client::open(
+        &dir, format!("{}/api/agent/{}/resources",panel.trim_end_matches('/'),node), token.trim().into())?);
     chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "Agent 已启动")?;
     let clock = std::sync::Arc::new(std::sync::Mutex::new(serde_json::json!({"verified":false,"detail":"正在检查系统时间"})));
     let clock_value = clock.clone();

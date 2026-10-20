@@ -101,6 +101,7 @@ pub fn safe_traffic(
         if value.cycle_start != start {
             value.upload = 0;
             value.download = 0;
+            value.charged = Some(0);
             value.blocked = false;
             value.cycle_start = start;
             value.cycle_end = end;
@@ -158,7 +159,7 @@ pub fn status(doc: &Document, line: &Line, at: u64) -> &'static str {
     }
     let traffic = safe_traffic(doc.rentals.get(&line.id), traffic(doc, line), at);
     if let (Some(t), Some(limit)) = (&traffic, line.limits.monthly_gib) {
-        if t.upload.saturating_add(t.download) >= (limit * 1073741824.0) as u64 {
+        if t.used() >= (limit * 1073741824.0) as u64 {
             return "quota_exhausted";
         }
     }
@@ -184,7 +185,12 @@ pub fn view(doc: &Document, line: &Line, at: u64) -> Value {
             "query_link_exists":!r.query_token_hash.is_empty()
         })
     });
-    json!({"rental":value,"rental_status":status(doc,line,at),"sync_status":sync_status(doc,line),
+    let multiplier=doc.applied_lines.iter().find(|l|l.id==line.id)
+        .and_then(|l|l.hops.first()).and_then(|h|doc.nodes.iter().find(|n|n.id==h.node_id))
+        .and_then(|n|n.desired.as_ref()).and_then(|d|d.config["_chain"].as_array())
+        .and_then(|specs|specs.iter().find(|s|s["id"]==line.id)).and_then(|s|s["multiplier"].as_u64())
+        .unwrap_or_else(||crate::resources::multiplier(doc,line).unwrap_or(1) as u64);
+    json!({"multiplier":multiplier,"rental":value,"rental_status":status(doc,line,at),"sync_status":sync_status(doc,line),
         "traffic":safe_traffic(rental,traffic(doc,line),at)})
 }
 

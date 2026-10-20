@@ -69,7 +69,8 @@ def main(cases=()):
             config = h.root/'nginx.conf'
             config.write_text(f'pid {h.root}/nginx.pid;\nworker_processes 1;\nerror_log {h.root}/nginx-error.log;\n'
                 'events { worker_connections 512; }\nhttp { access_log off;\n'
-                f'server {{ listen 127.0.0.1:{tls_port} ssl; http2 on; server_name localhost;\n'
+                + ''.join(f'{kind}_temp_path {h.root}/{kind};\n' for kind in ['client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi'])
+                + f'server {{ listen 127.0.0.1:{tls_port} ssl; http2 on; server_name localhost;\n'
                 f'ssl_certificate {cert}; ssl_certificate_key {key}; ssl_protocols TLSv1.3;\n'
                 "location / { return 200 'target-ok'; } } }\n")
             h.launch('nginx', 'nginx', {}, ['-p', str(h.root), '-c', str(config), '-g', 'daemon off;'])
@@ -98,12 +99,6 @@ def main(cases=()):
             middles = [create('middle-'+p[0], p) for p in PROFILES]
             entries = [create('entry-'+p[0], p, ['line:'+exits[1]['id']]) for p in PROFILES]
             drivers = [create('driver-'+p[0], PROFILES[8]) for p in PROFILES]
-            occupied = h.state()['nodes'][0]['report']['system']['listening_ports']
-            line_ports = {l['hops'][0]['port'] for l in exits+middles+entries+drivers}
-            for reserved in (set(occupied) | h.ports) - line_ports:
-                if 50000 <= reserved < 65535:
-                    h.request('/api/lines', 'POST', {'name': f'reserved-{reserved}', 'kind': 'vless',
-                        'enabled': False, 'hops': [{'node_id': node['id'], 'port': reserved}]})
             h.publish()
             middle_refs, exit_refs, proxies = [], [], []
             for group, refs in [(middles, middle_refs), (exits, exit_refs)]:
@@ -271,7 +266,7 @@ def main(cases=()):
                     test(PROFILES[a][0]+' -> '+PROFILES[b][0], drivers[a], [middles[a], exit_line],
                          PROFILES[b][1] != 'http' and not (PROFILES[a][1] == 'http' and PROFILES[b][1] in ('shadowsocks', 'socks')), udp_bytes)
                 print('COLUMN_DONE '+PROFILES[b][0], flush=True)
-            for order in [[4, 2, 11, 12], [12, 11, 3, 5]]:
+            for order in [[4, 2, 11, 12], [12, 11, 3, 5], [8, 4, 11], [4, 11, 12]]:
                 label = 'mixed '+ ' -> '.join(PROFILES[i][0] for i in order)
                 if not selected(label):
                     continue

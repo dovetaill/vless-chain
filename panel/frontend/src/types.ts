@@ -1,4 +1,5 @@
 export interface Traffic {
+  charged?: number | null;
   epoch: string;
   month: string;
   upload: number;
@@ -117,6 +118,7 @@ export interface Payment {
   note: string;
 }
 export interface Line {
+  multiplier?: number;
   id: string;
   name: string;
   kind: "vless" | "forward" | "website";
@@ -154,6 +156,7 @@ export interface Security {
   passkeys: { id: string; name: string; created: number }[];
 }
 export interface PanelState {
+  resources?: Resource[];
   version?: string;
   agent_version?: string | null;
   agent_seen?: number | null;
@@ -183,6 +186,7 @@ export interface PanelState {
   renewal_contact: string;
 }
 export interface PublicLine {
+  multiplier?: number;
   id: string;
   name: string;
   status: RentalStatus;
@@ -204,3 +208,7 @@ export interface Preview {
   affected_legacy_configs?: string[];
   nodes: { id: string; name: string; online: boolean; ports: number[] }[];
 }
+
+export interface Resource { id:string; name:string; members:string[]; monthly_gib:number|null; mbps:number|null; reset_day:number; reset_hour:number; timezone:string; }
+export interface Source { id:string; name:string; category:string; url:string; auto_apply:boolean; checked_at:number; applied_at:number; error:string; active:{count:number;excluded_count:number;excluded:string[]}|null; pending:{count:number;excluded_count:number;excluded:string[]}|null; added:number|null; removed:number|null; }
+export interface AccessPolicy { restricted:boolean; sources:string[]; domains:string[]; denied_ports:number[]; udp:string; udp_ports:number[]; max_connections:number|null; }

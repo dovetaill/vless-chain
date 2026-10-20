@@ -504,7 +504,20 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                         proxy["udp"] = json!(true);
                     }
                     if index > 0 {
-                        proxy["dialer-proxy"] = external[index - 1]["tag"].clone();
+                        let previous = &external[index - 1];
+                        proxy["dialer-proxy"] = previous["tag"].clone();
+                        if proxy["type"] == "hysteria2"
+                            && previous["protocol"] == "shadowsocks"
+                            && previous["settings"]["servers"][0]["method"].as_str().is_some_and(|m| m.starts_with("2022-"))
+                        {
+                            // QUIC's receive buffer excludes SS2022 overhead. A SOCKS hop strips
+                            // that framing before QUIC reads it, including larger PMTU probes.
+                            let bridge_port = backend_port(&mut reserved, node)?;
+                            let bridge = format!("{}-udp-bridge", original["tag"].as_str().unwrap());
+                            sidecar["listeners"].as_array_mut().unwrap().push(json!({"name":bridge,"type":"socks","listen":"127.0.0.1","port":bridge_port,"udp":true,"proxy":previous["tag"]}));
+                            sidecar["proxies"].as_array_mut().unwrap().push(json!({"name":bridge,"type":"socks5","server":"127.0.0.1","port":bridge_port,"udp":true}));
+                            proxy["dialer-proxy"] = json!(bridge);
+                        }
                     }
                     sidecar["proxies"].as_array_mut().unwrap().push(proxy);
                 }
@@ -600,6 +613,9 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
                     "limits":line.limits,"tls":line.access.tls,"target":line.target,
                     "enabled":line.enabled,"lease":doc.rentals.get(&line.id).map(Rental::policy),"meter":meter,
+                    "multiplier":crate::resources::multiplier(doc,line)?,
+                    "resource_ids":crate::resources::pools(doc,line),
+                    "access_policy":crate::rules::compile(doc,&line.id)?,
                 }));
                 if line.kind == Kind::Website {
                     continue;
@@ -837,6 +853,35 @@ mod tests {
             assert!(needs_mihomo(&json!({"protocol":protocol})));
         }
         assert!(!needs_mihomo(&json!({"protocol":"vless"})));
+    }
+    #[test]
+    fn ss2022_hysteria_udp_bridge_preserves_the_complete_chain() {
+        let mut d = fixture();
+        d.lines[0].hops.truncate(1);
+        for (id, url) in [
+            ("first", "socks5://127.0.0.1:1080"),
+            ("ss", "ss://2022-blake3-aes-128-gcm:YWFhYWFhYWFhYWFhYWFhYQ%3D%3D@ss.example.com:443"),
+            ("hy", "hysteria2://secret@hy.example.com:443"),
+        ] {
+            d.externals.push(External { id: id.into(), name: id.into(), url: url.into() });
+        }
+        d.lines[0].chain = vec!["external:first".into(), "external:ss".into(), "external:hy".into()];
+        let c = compile(&d).unwrap();
+        let sidecar = &c["a"]["_mihomo"];
+        let proxies = sidecar["proxies"].as_array().unwrap();
+        let ss = proxies.iter().find(|p| p["type"] == "ss").unwrap();
+        let hy = proxies.iter().find(|p| p["type"] == "hysteria2").unwrap();
+        assert_eq!(ss["dialer-proxy"], proxies[0]["name"]);
+        let bridge = proxies.iter().find(|p| p["name"] == hy["dialer-proxy"]).unwrap();
+        assert_eq!(bridge["type"], "socks5");
+        assert_eq!(bridge["server"], "127.0.0.1");
+        let listener = sidecar["listeners"].as_array().unwrap().iter().find(|l| l["port"] == bridge["port"]).unwrap();
+        assert_eq!(listener["listen"], "127.0.0.1");
+        assert_eq!(listener["proxy"], ss["name"]);
+        assert_eq!(listener["udp"], true);
+        assert_ne!(listener["port"], c["a"]["_chain"][0]["port"]);
+        // This internal compatibility bridge is not an additional billable hop.
+        assert_eq!(c["a"]["_chain"][0]["multiplier"], 4);
     }
     #[test]
     fn xhttp_and_custom_reality_roundtrip_without_vision_flow() {

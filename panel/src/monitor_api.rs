@@ -175,7 +175,7 @@ fn local_conditions(doc: &mut Document, policy: &Policy) {
             ),
             line.limits.monthly_gib,
         ) {
-            let ratio = t.upload.saturating_add(t.download) as f64 / (limit * 1073741824.0) * 100.0;
+            let ratio = t.used() as f64 / (limit * 1073741824.0) * 100.0;
             for threshold in &policy.quota {
                 if ratio >= f64::from(*threshold) {
                     doc.monitoring.milestone(

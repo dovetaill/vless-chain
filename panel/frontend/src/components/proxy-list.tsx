@@ -1,3 +1,4 @@
+import { AccessPolicyEditor } from "./sharing";
 import { Diagnostics } from "./diagnostics";
 import { useState, type ReactNode } from "react";
 import { Download, MoreHorizontal, Plus, Search } from "lucide-react";
@@ -123,6 +124,7 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
           {!remote && <DropdownMenu.Item onSelect={() => unlimited([line])}>设为无限期（自用）</DropdownMenu.Item>}
           <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => share(line)}>分享配置</DropdownMenu.Item>
           {!remote && <DropdownMenu.Item disabled={!line.rental || !line.published} onSelect={() => setModal(<QueryLinkDialog line={line} close={close} saved={saved} />)}>客户私密查询链接</DropdownMenu.Item>}
+          <DropdownMenu.Item onSelect={()=>setModal(<AccessPolicyEditor line={line} close={close} saved={saved}/>)}>网站 / 端口 / 连接限制</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => edit(line)}>编辑代理配置</DropdownMenu.Item>
           <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => probe(line)}>检查连接</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => setModal(<Diagnostics nodes={state.nodes.filter(n => line.hops.some(h => h.node_id === n.id))} lineId={line.id} close={close} />)}>日志与诊断</DropdownMenu.Item>

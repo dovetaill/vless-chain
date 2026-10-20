@@ -25,6 +25,12 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Spec {
+    #[serde(default = "one")]
+    pub multiplier: u32,
+    #[serde(default)]
+    pub access_policy: crate::rules::CompiledPolicy,
+    #[serde(default)]
+    pub resource_ids: Vec<String>,
     #[serde(default = "enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -48,6 +54,9 @@ pub struct Spec {
     pub limits: Limits,
     pub tls: Tls,
     pub target: String,
+}
+fn one() -> u32 {
+    1
 }
 fn enabled() -> bool {
     true
@@ -75,6 +84,7 @@ async fn proxy_peer(stream: &mut TcpStream) -> Result<std::net::IpAddr> {
 }
 
 pub struct Book {
+    pub resources: RwLock<Option<Arc<crate::resources::Client>>>,
     path: PathBuf,
     items: Mutex<BTreeMap<String, Traffic>>,
     sample: Mutex<(Instant, BTreeMap<String, [u64; 2]>)>,
@@ -189,6 +199,7 @@ impl Book {
             .name("chain-traffic".into())
             .spawn(move || commit_batches(database, receiver, writer_failure))?;
         Ok(Arc::new(Self {
+            resources: RwLock::new(None),
             path,
             items: Mutex::new(items),
             sample: Mutex::new((Instant::now(), BTreeMap::new())),
@@ -264,6 +275,7 @@ fn rollover(t: &mut Traffic, lease: Option<&LeasePolicy>, at: u64) {
         t.cycle_start = start;
         t.upload = 0;
         t.download = 0;
+        t.charged = Some(0);
         t.blocked = false;
     }
     t.cycle_end = end;
@@ -276,6 +288,9 @@ fn rollover(t: &mut Traffic, lease: Option<&LeasePolicy>, at: u64) {
 
 #[derive(Clone)]
 struct Policy {
+    multiplier: u32,
+    access_policy: crate::rules::CompiledPolicy,
+    resource_ids: Vec<String>,
     enabled: bool,
     lease: Option<LeasePolicy>,
     limits: Limits,
@@ -298,6 +313,7 @@ pub struct Lane {
     rates: tokio::sync::watch::Sender<[Option<f64>; 2]>,
     stopped: Mutex<CancellationToken>,
     changed: tokio::sync::Notify,
+    admissions: AtomicUsize,
     transferring: AtomicUsize,
     drained: tokio::sync::Notify,
     quota_deadline: Mutex<Option<Instant>>,
@@ -316,6 +332,9 @@ impl Lane {
             id: spec.id.clone(),
             book,
             policy: RwLock::new(Policy {
+                multiplier: spec.multiplier.max(1),
+                access_policy: spec.access_policy.clone(),
+                resource_ids: spec.resource_ids.clone(),
                 enabled: spec.enabled,
                 lease: spec.lease.clone(),
                 limits: spec.limits.clone(),
@@ -328,6 +347,7 @@ impl Lane {
             .0,
             stopped: Mutex::new(CancellationToken::new()),
             changed: tokio::sync::Notify::new(),
+            admissions: AtomicUsize::new(0),
             transferring: AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
             quota_deadline: Mutex::new(None),
@@ -335,6 +355,9 @@ impl Lane {
     }
     pub fn update(&self, spec: &Spec) {
         *self.policy.write().unwrap() = Policy {
+            multiplier: spec.multiplier.max(1),
+            access_policy: spec.access_policy.clone(),
+            resource_ids: spec.resource_ids.clone(),
             enabled: spec.enabled,
             lease: spec.lease.clone(),
             limits: spec.limits.clone(),
@@ -378,7 +401,7 @@ impl Lane {
         let exhausted = policy
             .limits
             .monthly_gib
-            .is_some_and(|q| t.upload.saturating_add(t.download) >= (q * 1073741824.0) as u64);
+            .is_some_and(|q| t.used() >= (q * 1073741824.0) as u64 || ((q * 1073741824.0) as u64).saturating_sub(t.used()) < policy.multiplier as u64);
         t.blocked = forced || exhausted;
         if self.should_stop(forced, exhausted) {
             self.stopped.lock().unwrap().cancel();
@@ -395,7 +418,7 @@ impl Lane {
         let exhausted = policy
             .limits
             .monthly_gib
-            .is_some_and(|q| t.upload.saturating_add(t.download) >= (q * 1073741824.0) as u64);
+            .is_some_and(|q| t.used() >= (q * 1073741824.0) as u64 || ((q * 1073741824.0) as u64).saturating_sub(t.used()) < policy.multiplier as u64);
         t.blocked = forced || exhausted;
         let mut stopped = self.stopped.lock().unwrap();
         if self.should_stop(forced, exhausted) {
@@ -500,6 +523,30 @@ impl Lane {
                 _ = tokio::time::sleep(Duration::from_secs_f64(amount as f64 / (rate * 125000.0))) => break,
             }
         }
+        let (resource_ids, quota_left) = {
+            let p = self.policy.read().unwrap();
+            let items = self.book.items.lock().unwrap();
+            let t = &items[&self.id];
+            (p.resource_ids.clone(), p.limits.monthly_gib.map(|q| ((q * 1073741824.0) as u64).saturating_sub(t.used()) / p.multiplier as u64).unwrap_or(u64::MAX))
+        };
+        if datagram && amount as u64 > quota_left {
+            drop(_direction);
+            self.drain_transfers().await;
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let amount = amount.min(quota_left.min(usize::MAX as u64) as usize);
+        if amount == 0 {
+            drop(_direction);
+            self.drain_transfers().await;
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        if !resource_ids.is_empty() {
+            let client = self.book.resources.read().unwrap().clone().ok_or_else(|| io::Error::other("Agent 尚未连接资源额度服务"))?;
+            tokio::select! {
+                _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
+                result = client.charge(&resource_ids, amount, upload) => result.map_err(io::Error::other)?,
+            }
+        }
         let permit = tokio::select! {
             _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
             permit = self.book.commits.as_ref().unwrap().reserve() => {
@@ -519,12 +566,12 @@ impl Lane {
             let left = limits
                 .monthly_gib
                 .map(|q| {
-                    ((q * 1073741824.0) as u64).saturating_sub(t.upload.saturating_add(t.download))
+                    ((q * 1073741824.0) as u64).saturating_sub(t.used())
                 })
                 .unwrap_or(u64::MAX);
-            let allowed = amount.min(left.min(usize::MAX as u64) as usize);
+            let allowed = amount.min((left / policy.multiplier as u64).min(usize::MAX as u64) as usize);
             if allowed == 0 || datagram && allowed < amount {
-                t.blocked = left == 0;
+                t.blocked = left < policy.multiplier as u64;
                 if t.blocked {
                     self.changed.notify_one();
                 }
@@ -533,6 +580,7 @@ impl Lane {
                     "本月线路额度不足",
                 ));
             }
+            t.charged = Some(t.used().saturating_add((allowed as u64).saturating_mul(policy.multiplier as u64)));
             let day = t
                 .days
                 .entry(
@@ -555,7 +603,7 @@ impl Lane {
             }
             t.blocked = limits
                 .monthly_gib
-                .is_some_and(|q| t.upload.saturating_add(t.download) >= (q * 1073741824.0) as u64);
+                .is_some_and(|q| t.used() >= (q * 1073741824.0) as u64 || ((q * 1073741824.0) as u64).saturating_sub(t.used()) < policy.multiplier as u64);
             if t.blocked {
                 self.changed.notify_one();
             }
@@ -595,6 +643,13 @@ impl Lane {
         }
         Ok(transfer)
     }
+    pub fn admit(self: &Arc<Self>) -> io::Result<Admission> {
+        let limit = self.policy.read().unwrap().access_policy.policy.max_connections.unwrap_or(1024);
+        self.admissions.fetch_update(Ordering::AcqRel,Ordering::Acquire,|n|(n<limit).then_some(n+1))
+            .map_err(|_|io::Error::new(io::ErrorKind::PermissionDenied,"代理并发连接达到上限"))?;
+        Ok(Admission(self.clone()))
+    }
+    pub fn access_policy(&self) -> crate::rules::CompiledPolicy { self.policy.read().unwrap().access_policy.clone() }
     pub fn connection(self: &Arc<Self>) -> Connection {
         self.book
             .items
@@ -606,6 +661,8 @@ impl Lane {
         Connection(self.clone())
     }
 }
+pub struct Admission(Arc<Lane>);
+impl Drop for Admission { fn drop(&mut self) { self.0.admissions.fetch_sub(1,Ordering::AcqRel); } }
 pub struct Transfer {
     pub amount: usize,
     lane: Arc<Lane>,
@@ -1180,7 +1237,7 @@ pub fn system_metrics() -> serde_json::Value {
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(target_os = "macos")]
@@ -1328,14 +1385,41 @@ pub fn system_metrics() -> serde_json::Value {
     let ephemeral = sysctl::<u32>(c"net.inet.ip.portrange.first")
         .zip(sysctl::<u32>(c"net.inet.ip.portrange.last"))
         .map(|(first, last)| [first, last]);
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn multiplier_is_charged_at_transfer_time_and_persisted() {
+        let dir=tempfile::tempdir().unwrap();
+        let book=Book::open(dir.path()).unwrap();
+        let mut s=spec(Limits {monthly_gib:Some(10.0/1073741824.0),..Default::default()});
+        s.multiplier=2;
+        let lane=Lane::new(&s,book.clone());
+        assert_eq!(lane.charge(2,true,false).await.unwrap(),2);
+        assert_eq!(book.snapshot()[&s.id].used(),4);
+        s.multiplier=3;lane.update(&s);
+        assert!(lane.charge(3,false,true).await.is_err());
+        assert_eq!(lane.charge(8,false,false).await.unwrap(),2);
+        let t=book.snapshot()[&s.id].clone();
+        assert_eq!((t.upload,t.download,t.used()),(2,2,10));
+        assert!(!lane.available());drop(lane);drop(book);
+        let reopened=Book::open(dir.path()).unwrap();assert_eq!(reopened.snapshot()[&s.id].used(),10);
+    }
+    #[test]
+    fn connection_admission_is_atomic_and_released() {
+        let dir=tempfile::tempdir().unwrap();let mut s=spec(Limits::default());
+        s.access_policy.policy.max_connections=Some(1);
+        let lane=Lane::new(&s,Book::open(dir.path()).unwrap());
+        let first=lane.admit().unwrap();assert!(lane.admit().is_err());drop(first);assert!(lane.admit().is_ok());
+    }
     fn spec(limits: Limits) -> Spec {
         Spec {
+            multiplier: 1,
+            access_policy: Default::default(),
+            resource_ids: vec![],
             enabled: true,
             lease: None,
             meter: None,

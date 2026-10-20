@@ -33,6 +33,8 @@ mod fleet_api;
 mod monitor_api;
 #[path = "../diagnostics_api.rs"]
 mod diagnostics_api;
+#[path = "../sharing_api.rs"]
+mod sharing_api;
 
 struct Store {
     conn: Connection,
@@ -306,7 +308,7 @@ fn snapshot(doc: &Document) -> Value {
         "published":doc.applied_legacy_configs.contains(p) && doc.nodes.iter().find(|n| n.id == p.node_id).is_some_and(|n|
             n.report.applied && n.desired.as_ref().is_some_and(|d| d.revision == n.report.revision
                 && configs.as_ref().and_then(|c| c.get(&p.node_id)) == Some(&d.config)))})).collect();
-    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"legacy_configs":legacy,"pending_imports":doc.pending_imports,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact})
+    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"legacy_configs":legacy,"pending_imports":doc.pending_imports,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact,"resources":doc.resources.resources})
 }
 async fn state(State(app): State<App>) -> Json<Value> {
     let mut value = snapshot(&app.store.lock().unwrap().doc);
@@ -609,6 +611,20 @@ async fn add_external(
     })?;
     Ok(Json(json!(item)))
 }
+#[derive(Deserialize)]
+struct BatchExternalInput { urls: Vec<String> }
+async fn batch_external(State(app):State<App>,Json(input):Json<BatchExternalInput>)->ApiResult<Json<Value>> {
+    if input.urls.is_empty() || input.urls.len()>500 {return Err(error(StatusCode::BAD_REQUEST,"一次导入 1–500 条链接"));}
+    let mut values=Vec::new();
+    for value in input.urls {
+        let (url,name)=chain_panel::external::import(&value)?;
+        let name=if name.is_empty(){url::Url::parse(&url)?.host_str().unwrap_or("外部代理").to_owned()}else{name};
+        if name.trim().is_empty() || name.len()>120 {return Err(error(StatusCode::BAD_REQUEST,"名称无效"));}
+        values.push(External{id:id(),name,url});
+    }
+    edit(&app,|doc|{doc.externals.extend(values.clone());Ok(())})?;
+    Ok(Json(json!(values)))
+}
 async fn remove_external(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     edit(&app, |d| {
         ensure!(
@@ -619,6 +635,7 @@ async fn remove_external(State(app): State<App>, Path(id): Path<String>) -> ApiR
             "外部节点仍被草稿或已发布线路引用"
         );
         d.externals.retain(|e| e.id != id);
+        for r in &mut d.resources.resources {r.members.retain(|m|m!=&format!("external:{id}"));}
         Ok(())
     })?;
     Ok(Json(json!({"ok":true})))
@@ -1019,6 +1036,9 @@ async fn publish(State(app): State<App>, input: Option<Json<PublishOptions>>) ->
                 .as_array()
                 .is_some_and(|s| !s.is_empty())
             {
+                if configs[&node.id]["_chain"].as_array().unwrap().iter().any(|s|s["multiplier"].as_u64().unwrap_or(1)>1 || s["resource_ids"].as_array().is_some_and(|p|!p.is_empty()) || chain_panel::rules::requires_capability(&s["access_policy"]["policy"])) {
+                    ensure!(node.report.system["sharing_version"]==1,"请先升级 Agent 以支持倍率和访问控制");
+                }
                 ensure!(
                     node.report.system["gateway_version"] == 2,
                     "{} 的 Agent 尚未就绪或版本过旧，请先更新 Agent 并等待心跳后再应用",
@@ -1470,14 +1490,15 @@ async fn run() -> Result<()> {
     let token = std::fs::read_to_string(&token_file)?;
     ensure!(token.trim().len() >= 32, "管理令牌至少需要 32 个字符");
     let conn = Connection::open(dir.join("panel.db"))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY,body TEXT NOT NULL);")?;
-    let doc = match conn.query_row("SELECT body FROM state WHERE id=1", [], |r| {
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY,body TEXT NOT NULL);")?;
+    let mut doc: Document = match conn.query_row("SELECT body FROM state WHERE id=1", [], |r| {
         r.get::<_, String>(0)
     }) {
         Ok(v) => serde_json::from_str(&v)?,
         Err(rusqlite::Error::QueryReturnedNoRows) => Document::default(),
         Err(e) => return Err(e.into()),
     };
+    chain_panel::rules::seed_presets(&mut doc.rule_sources);
     let app = App {
         diagnostics: Arc::new(diagnostics_api::Broker::default()),
         store: Arc::new(Mutex::new(Store { conn, doc })),
@@ -1521,7 +1542,7 @@ async fn run() -> Result<()> {
         WEB.get_file("index.html").is_some(),
         "缺少前端构建：请先在 frontend/ 执行 npm ci && npm run build，再重新编译 chain-panel"
     );
-    let router = diagnostics_api::routes(monitor_api::routes(fleet_api::routes(Router::new())))
+    let router = sharing_api::routes(diagnostics_api::routes(monitor_api::routes(fleet_api::routes(Router::new()))))
         .fallback(get(web_asset))
         .route("/api/login", post(login))
         .route("/api/auth/options", get(security_api::options))
@@ -1563,6 +1584,7 @@ async fn run() -> Result<()> {
         .route("/api/nodes/{id}", post(update_node).delete(remove_node))
         .route("/api/nodes/{id}/token", post(rotate_node))
         .route("/api/externals", post(add_external))
+        .route("/api/externals/batch", post(batch_external))
         .route("/api/externals/{id}", delete(remove_external).post(update_external))
         .route(
             "/api/externals/{id}/export",
@@ -1595,6 +1617,7 @@ async fn run() -> Result<()> {
         .with_state(app.clone());
     let local_app = app.clone();
     let monitor_stop = tokio_util::sync::CancellationToken::new();
+    let rules_task = tokio::spawn(sharing_api::run(app.clone(), monitor_stop.clone()));
     let monitor_task = tokio::spawn(monitor_api::run(app.clone(), monitor_stop.clone()));
     let local_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -1635,6 +1658,7 @@ async fn run() -> Result<()> {
     let _ = local_task.await;
     monitor_stop.cancel();
     let _ = monitor_task.await;
+    let _ = rules_task.await;
     app.local_agent.lock().await.stop().await;
     result?;
     Ok(())

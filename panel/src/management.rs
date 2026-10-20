@@ -283,6 +283,14 @@ pub fn machine_route(method: &str, path: &str) -> bool {
         ("POST", ["api", "federation", "policy" | "ticket" | "revoke" | "task"]) => true,
         ("POST", ["api", "lines" | "externals" | "preview" | "publish"]) => true,
         ("POST", ["api", "lines", "operate" | "batch"]) => true,
+        ("GET" | "POST", ["api", "resources" | "rules"]) => true,
+        ("POST", ["api", "resources", "groups" | "candidates"]) => true,
+        ("POST", ["api", "externals", "batch"]) => true,
+        ("DELETE", ["api", "resources", id]) => uuid::Uuid::parse_str(id).is_ok(),
+        ("GET" | "POST", ["api", "access", id]) => uuid::Uuid::parse_str(id).is_ok(),
+        ("POST", ["api", "rules", id, "update" | "apply"]) => {
+            uuid::Uuid::parse_str(id).is_ok() || crate::rules::presets().iter().any(|s| s.id == *id)
+        }
         ("POST", ["api", "reality", "check"]) => true,
         ("POST", ["api", "diagnostics", id, "logs" | "reality" | "path"]) => uuid::Uuid::parse_str(id).is_ok(),
         ("POST" | "DELETE", ["api", "externals", id]) => uuid::Uuid::parse_str(id).is_ok(),
@@ -336,6 +344,25 @@ mod tests {
             panel_url("https://panel.test/").unwrap(),
             "https://panel.test"
         );
+    }
+    #[test]
+    fn sharing_routes_preserve_machine_scope() {
+        let id = uuid::Uuid::new_v4();
+        for (method, path) in [
+            ("GET", "/api/resources".into()), ("POST", "/api/resources".into()),
+            ("POST", "/api/resources/groups".into()), ("POST", "/api/resources/candidates".into()),
+            ("DELETE", format!("/api/resources/{id}")), ("POST", "/api/externals/batch".into()),
+            ("GET", "/api/rules".into()), ("POST", "/api/rules".into()),
+            ("POST", format!("/api/rules/{id}/update")),
+            ("POST", "/api/rules/preset-netflix/apply".into()),
+            ("POST", "/api/rules/ai-openai/update".into()),
+            ("GET", format!("/api/access/{id}")), ("POST", format!("/api/access/{id}")),
+        ] { assert!(machine_route(method, &path), "{method} {path}"); }
+        for (method, path) in [
+            ("DELETE", "/api/resources/groups".into()), ("GET", "/api/access/invalid".into()),
+            ("POST", "/api/rules/unknown/apply".into()), ("POST", format!("/api/rules/{id}/delete")),
+            ("POST", format!("/api/agent/{id}/resources")), ("POST", "/api/security/token".into()),
+        ] { assert!(!machine_route(method, &path), "{method} {path}"); }
     }
     #[test]
     fn override_preserves_local_and_milestone_deduplicates() {

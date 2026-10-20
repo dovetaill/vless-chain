@@ -89,7 +89,7 @@ async fn address(stream: &mut TcpStream, kind: u8) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn handshake(client: &mut TcpStream, spec: &Spec, user: &str) -> Result<Session> {
+async fn handshake(client: &mut TcpStream, spec: &Spec, user: &str, policy: &crate::rules::CompiledPolicy) -> Result<Session> {
     let mut greeting = [0; 2];
     client.read_exact(&mut greeting).await?;
     ensure!(greeting[0] == 5 && greeting[1] > 0, "SOCKS 版本无效");
@@ -118,7 +118,14 @@ async fn handshake(client: &mut TcpStream, spec: &Spec, user: &str) -> Result<Se
         request[0] == 5 && request[2] == 0 && matches!(request[1], 1 | 3),
         "SOCKS 请求无效"
     );
-    let destination = address(client, request[3]).await?;
+    let mut destination = address(client, request[3]).await?;
+    if request[1] == 1 {
+        match policy.destination(request[3], &destination, false).await {
+            Ok((kind,bytes)) => { request[3]=kind; destination=bytes; },
+            Err(e) => { client.write_all(&[5,2,0,1,0,0,0,0,0,0]).await?; return Err(e); }
+        }
+    } else { ensure!(policy.policy.udp != "deny", "此代理禁止 UDP"); }
+
     let mut backend = TcpStream::connect(("127.0.0.1", spec.backend)).await?;
     backend.set_nodelay(true)?;
     backend.write_all(&[5, 1, 2]).await?;
@@ -195,8 +202,10 @@ pub(crate) fn payload_size(packet: &[u8]) -> io::Result<usize> {
 
 async fn connection(mut client: TcpStream, spec: &Spec, user: &str, lane: Arc<Lane>) -> Result<()> {
     client.set_nodelay(true)?;
+    let _admission = lane.admit()?;
+    let policy = lane.access_policy();
     let session =
-        tokio::time::timeout(Duration::from_secs(15), handshake(&mut client, spec, user)).await??;
+        tokio::time::timeout(Duration::from_secs(15), handshake(&mut client, spec, user, &policy)).await??;
     match session {
         Session::Tcp(backend) => relay(client, backend, lane).await?,
         Session::Udp {
@@ -218,9 +227,13 @@ async fn connection(mut client: TcpStream, spec: &Spec, user: &str, lane: Arc<La
                         let (n, source) = received?;
                         if !source.ip().is_loopback() || peer.is_some_and(|p| p != source) { continue }
                         let Ok(size) = payload_size(&input[..n]) else { continue };
+                        let address_end=n-size;
+                        let Ok((kind,destination))=policy.destination(input[3],&input[4..address_end],true).await else {continue};
+                        let mut packet=vec![0,0,0,kind];
+                        packet.extend(destination);packet.extend_from_slice(&input[address_end..n]);
                         peer = Some(source);
                         let transfer = lane.transfer(size, true, true).await?;
-                        backend.send(&input[..n]).await?;
+                        backend.send(&packet).await?;
                         drop(transfer);
                     },
                     received = backend.recv(&mut output) => {

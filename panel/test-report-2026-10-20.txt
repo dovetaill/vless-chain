@@ -1,0 +1,285 @@
+Chain Panel 全流程隔离测试报告
+测试日期：2026-10-19 美国东部时间至 2026-10-20 UTC
+代码版本标识：0.2.37，当前未提交工作区快照；未部署生产。
+
+环境
+- 两个全新 Debian 13 Docker 容器：master / slave，独立文件系统、PID 与网络命名空间，专用 Docker bridge。
+- 应用、Agent、内核、浏览器和集成测试均以 UID/GID 65534 运行；容器初始化和安装依赖以容器 root 运行。
+- 不使用 host 网络、特权容器或生产目录挂载。只挂载本任务临时目录；源码与二进制只读，数据目录各自独立。
+- 真实 Xray 及 Mihomo v1.19.32 客户端、TCP/UDP 目标和 Nginx；不是仅测试 API 返回成功。
+- 跨面板 HTTPS 使用临时 CA 签发的证书。仅临时总控测试二进制追加该 CA，未更改生产源码、系统信任或部署。
+- 同一宿主机上的隔离环境，不等价于不同地区的两台物理 VPS。
+
+已完成验证
+1. Rust：102 项默认测试通过；另两项原本忽略的真实内核/REALITY 测试分别通过，合计 104 项。
+2. 安装与维护 Python 测试：138 项通过。初次 4 项因容器缺 git 失败；容器补充依赖后只重跑这 4 项并通过。
+3. 前端 TypeScript、生产构建、business.test.ts 均通过。Vite 有现有大包体警告。
+4. 控制面：登录、跨站拒绝、节点凭证隔离、密钥脱敏、TOTP 防重放、恢复码一次性、管理员密钥轮换、WebAuthn 注册/登录/撤销。
+5. 主从：跨容器 HTTPS 配对、远程创建/发布/实际转发、Agent/面板重启恢复；额外双面板套件验证接入码重放、策略覆盖、监控汇总、真实停机告警、恢复通知、总控离线独立工作及解绑后会话撤销。
+6. 代理：各接入协议的真实导出客户端 TCP/UDP、三跳 VLESS、外部导入落地、路径修改保留分享、监听冲突回滚、发布中断恢复、TUIC 前置与落地。
+7. 网站：HTTP/HTTPS、同端口虚拟主机、路径转发、WebSocket、SNI 分流、PROXY protocol、TLS 回落、既有站点保持可用、回滚与路由删除。
+8. 租户：客户 CRUD、报价、月/季/年开通收款、幂等续费、历史金额、限速/限额、无限期自用、手动禁用、离线待同步、删除撤销查询及收款历史保留；公开查询凭证隔离、私密链接轮换、供应商链接拒绝。
+9. 计费：两个独立环境的实际链路验证直连 (上传+下载)×1、链式×2；资源额度不重复乘租户倍率。
+10. 共享资源：额度用完同组代理停止、提高额度恢复、Agent 重启不返还额度、禁止额度降到已分配以下、账期/时区校验、控制面离线租约到期停止、恢复继续使用。实际双向合计带宽测试通过。月底/时区/DST 与跨周期额度在单元测试覆盖。
+11. 分组：单条/批量导入、域名候选、已有分组保持、匹配既有组、手动移出；真实浏览器批量导入后分组通过。
+12. 访问控制：真实端口拦截、严格模式拒绝裸 IP 和未选域名、允许域名由服务端解析后实际 HTTP 成功；UDP 允许/拒绝/端口白名单；并发连接限制与恢复。伪造域名后缀及非公网地址的拒绝在单元测试覆盖。
+13. 规则：HTTPS 导入、手动下载/应用、失败保留已应用规则、自动应用、后台定时任务真实触发；逐项检查预设来源。
+14. 浏览器：真实资源组增删改、周期/时区、规则过滤/导入/应用、网站勾选/自定义域名/端口/UDP/连接限制、租户操作/查询/收款/导出、手机布局；资源流程、管理、维护界面模拟请求测试及真实诊断界面通过。
+15. 故障恢复：Agent SIGKILL 后已确认业务载荷 4,456,448 字节无漏记；内核崩溃后监督恢复；主控崩溃不中断无共享资源限制的既有业务；6 次并发续费重试只记一笔；主控离线时真实租期周期重置/到期断开 TCP 和 UDP。
+16. 安装：全新独立安装树、本机自动接入、重复安装保留身份、HTTPS 页面、Secure Cookie、鉴权 API、HTTP-01 路径；旧完整配置迁移和原客户端实际流量通过。
+
+确认的问题（本次仅测试，未修改业务实现）
+A. SS2022 → Hysteria2：TCP 通过，UDP 21 字节请求到达目标但客户端收不到响应；在第二隔离环境定向复现。尚未确定是内核互操作还是本项目链路实现，不能宣称该组合 UDP 可用。
+B. 旧 Agent 能力校验遗漏：gateway_version=2、sharing_version=0 时，新代理只配置 UDP 禁止/端口禁止，POST /api/publish 仍返回 job_id。缺少首次发布升级阻断，不能保证旧 Agent 执行新限制。
+C. 主控远程操作缺口：转发 /resources、/rules、/access/{id} 均返回 403“总控不支持此操作”。从 VPS 本地可配置，主控远程页面也未提供对应完整操作。
+D. 预设规则实际可用 46/55：8 个没有独立来源；“Google 搜索”来源没有当前严格白名单解析器可采用的域名条目。不能把目录中显示的 55 项都当作可生效。
+E. 资源带宽 UI 写“上下行各自共享上限”，运行时实际限制上传+下载合计，文案与行为不一致。
+F. 资源时区输入框未正确关联 label：Field 包含 input 和 datalist 两个子元素，getByLabel 无法定位；实际输入保存有效，键盘/辅助技术标签有缺陷。
+
+测试夹具问题与处理（仅临时副本）
+- HTTP/1 本地 REALITY 目标未通过 H2 预检：测试显式接受本地未验证目标，真正 H2 正/负检查由 Nginx 与单独真实诊断测试验证。
+- 旧测试用“禁用代理”占位已有端口；当前禁用 VLESS 仍保留监听，造成伪冲突。临时删除这些占位代理后协议测试继续。
+- 数据库边界夹具只改 upload/download，遗漏新增 charged：同步夹具字段后全部故障恢复断言通过。
+- 故障恢复套件最后写报告的 results 目录不存在，业务断言和清理均已完成；不为创建报告目录重跑整套故障测试。
+- UI 导航/菜单数量断言未更新；租户 UI mock 未处理版本查询；浏览器路径未显式配置。修正临时测试副本后通过。
+- 旧 9 秒本地应用等待遇到复杂 REALITY 配置超时；采用 30 秒等待，定向 features-only 全部通过。
+- 完整矩阵单次 1200 秒时限到达后停止并清理，只补跑未完成项。
+
+边界
+- 未使用真实付费 AI/流媒体账号验证解锁；未验证不同地区网络质量、真实 Cox/VPS 运营商计费和全网卡额度。
+- 未对生产执行升级、卸载、重启、修改权限；维护 UI 使用模拟响应，安装脚本使用隔离树。macOS/ARM/OpenRC 真实系统运行不由本次 Debian 容器证明。
+- 未发送真实邮件/Telegram 通知，监控通知仅验证入队与状态。
+- 未做硬件断电、文件系统丢失或长期压力测试；SIGKILL 结论不等于断电保证。
+- 并发连接限制不等于安卓/PC 设备识别；加密内容不解密，不能证明允许网站内部的具体用途或承诺完整滥用审计。
+
+协议组合矩阵最终结果
+{
+  "total": 184,
+  "expected": 183,
+  "tcp": 180,
+  "udp": 147,
+  "rejected": 4,
+  "failed": [
+    {
+      "case": "ss2022 -> hysteria2",
+      "tcp": true,
+      "udp": false,
+      "hops": false,
+      "errors": [
+        "UDP timed out"
+      ],
+      "tcp_hops": true,
+      "udp_received": [
+        21
+      ]
+    }
+  ]
+}
+全部组合结果（OK 包含按预期拒绝的非法组合）：
+OK ingress reality-vision -> tls-vision
+OK ingress tls-vision -> tls-vision
+OK ingress reality-xhttp -> tls-vision
+OK ingress tls-xhttp -> tls-vision
+OK ingress ss2022 -> tls-vision
+OK ingress trojan -> tls-vision
+OK ingress http -> tls-vision
+OK ingress https -> tls-vision
+OK ingress socks5 -> tls-vision
+OK ingress vmess -> tls-vision
+OK ingress vmess-tls -> tls-vision
+OK ingress hysteria2 -> tls-vision
+OK ingress tuic5 -> tls-vision
+OK reality-vision -> reality-vision
+OK tls-vision -> reality-vision
+OK reality-xhttp -> reality-vision
+OK tls-xhttp -> reality-vision
+OK ss2022 -> reality-vision
+OK trojan -> reality-vision
+OK http -> reality-vision
+OK https -> reality-vision
+OK socks5 -> reality-vision
+OK vmess -> reality-vision
+OK vmess-tls -> reality-vision
+OK hysteria2 -> reality-vision
+OK tuic5 -> reality-vision
+OK reality-vision -> tls-vision
+OK tls-vision -> tls-vision
+OK reality-xhttp -> tls-vision
+OK tls-xhttp -> tls-vision
+OK ss2022 -> tls-vision
+OK trojan -> tls-vision
+OK http -> tls-vision
+OK https -> tls-vision
+OK socks5 -> tls-vision
+OK vmess -> tls-vision
+OK vmess-tls -> tls-vision
+OK hysteria2 -> tls-vision
+OK tuic5 -> tls-vision
+OK reality-vision -> reality-xhttp
+OK tls-vision -> reality-xhttp
+OK reality-xhttp -> reality-xhttp
+OK tls-xhttp -> reality-xhttp
+OK ss2022 -> reality-xhttp
+OK trojan -> reality-xhttp
+OK http -> reality-xhttp
+OK https -> reality-xhttp
+OK socks5 -> reality-xhttp
+OK vmess -> reality-xhttp
+OK vmess-tls -> reality-xhttp
+OK hysteria2 -> reality-xhttp
+OK tuic5 -> reality-xhttp
+OK reality-vision -> tls-xhttp
+OK tls-vision -> tls-xhttp
+OK reality-xhttp -> tls-xhttp
+OK tls-xhttp -> tls-xhttp
+OK ss2022 -> tls-xhttp
+OK trojan -> tls-xhttp
+OK http -> tls-xhttp
+OK https -> tls-xhttp
+OK socks5 -> tls-xhttp
+OK vmess -> tls-xhttp
+OK vmess-tls -> tls-xhttp
+OK hysteria2 -> tls-xhttp
+OK tuic5 -> tls-xhttp
+OK reality-vision -> ss2022
+OK tls-vision -> ss2022
+OK reality-xhttp -> ss2022
+OK tls-xhttp -> ss2022
+OK ss2022 -> ss2022
+OK trojan -> ss2022
+OK http -> ss2022
+OK https -> ss2022
+OK socks5 -> ss2022
+OK vmess -> ss2022
+OK vmess-tls -> ss2022
+OK hysteria2 -> ss2022
+OK tuic5 -> ss2022
+OK reality-vision -> trojan
+OK tls-vision -> trojan
+OK reality-xhttp -> trojan
+OK tls-xhttp -> trojan
+OK ss2022 -> trojan
+OK trojan -> trojan
+OK http -> trojan
+OK https -> trojan
+OK socks5 -> trojan
+OK vmess -> trojan
+OK vmess-tls -> trojan
+OK hysteria2 -> trojan
+OK tuic5 -> trojan
+OK reality-vision -> http
+OK tls-vision -> http
+OK reality-xhttp -> http
+OK tls-xhttp -> http
+OK ss2022 -> http
+OK trojan -> http
+OK http -> http
+OK https -> http
+OK socks5 -> http
+OK vmess -> http
+OK vmess-tls -> http
+OK hysteria2 -> http
+OK tuic5 -> http
+OK reality-vision -> https
+OK tls-vision -> https
+OK reality-xhttp -> https
+OK tls-xhttp -> https
+OK ss2022 -> https
+OK trojan -> https
+OK http -> https
+OK https -> https
+OK socks5 -> https
+OK vmess -> https
+OK vmess-tls -> https
+OK hysteria2 -> https
+OK tuic5 -> https
+OK reality-vision -> socks5
+OK tls-vision -> socks5
+OK reality-xhttp -> socks5
+OK tls-xhttp -> socks5
+OK ss2022 -> socks5
+OK trojan -> socks5
+OK http -> socks5
+OK https -> socks5
+OK socks5 -> socks5
+OK vmess -> socks5
+OK vmess-tls -> socks5
+OK hysteria2 -> socks5
+OK tuic5 -> socks5
+OK reality-vision -> vmess
+OK tls-vision -> vmess
+OK reality-xhttp -> vmess
+OK tls-xhttp -> vmess
+OK ss2022 -> vmess
+OK trojan -> vmess
+OK http -> vmess
+OK https -> vmess
+OK socks5 -> vmess
+OK vmess -> vmess
+OK vmess-tls -> vmess
+OK hysteria2 -> vmess
+OK tuic5 -> vmess
+OK reality-vision -> vmess-tls
+OK tls-vision -> vmess-tls
+OK reality-xhttp -> vmess-tls
+OK tls-xhttp -> vmess-tls
+OK ss2022 -> vmess-tls
+OK trojan -> vmess-tls
+OK http -> vmess-tls
+OK https -> vmess-tls
+OK socks5 -> vmess-tls
+OK vmess -> vmess-tls
+OK vmess-tls -> vmess-tls
+OK hysteria2 -> vmess-tls
+OK tuic5 -> vmess-tls
+OK http -> hysteria2（按预期拒绝）
+OK https -> hysteria2（按预期拒绝）
+OK reality-vision -> hysteria2
+OK tls-vision -> hysteria2
+OK reality-xhttp -> hysteria2
+OK tls-xhttp -> hysteria2
+FAIL ss2022 -> hysteria2：UDP timed out
+OK trojan -> hysteria2
+OK socks5 -> hysteria2
+OK vmess -> hysteria2
+OK vmess-tls -> hysteria2
+OK hysteria2 -> hysteria2
+OK tuic5 -> hysteria2
+OK http -> tuic5（按预期拒绝）
+OK https -> tuic5（按预期拒绝）
+OK reality-vision -> tuic5
+OK tls-vision -> tuic5
+OK reality-xhttp -> tuic5
+OK tls-xhttp -> tuic5
+OK ss2022 -> tuic5
+OK trojan -> tuic5
+OK socks5 -> tuic5
+OK vmess -> tuic5
+OK vmess-tls -> tuic5
+OK hysteria2 -> tuic5
+OK tuic5 -> tuic5
+OK mixed ss2022 -> reality-xhttp -> hysteria2 -> tuic5
+OK mixed tuic5 -> hysteria2 -> tls-xhttp -> trojan
+
+进程清理记录（容器内 PID/PGID；两个 PID 命名空间可能重号）
+971,1063,1230,1604,1695,1872,1907,1946,1980,1982,1995,2029,2062,2095,2542,2644,2670,2728,2755,2777,2800,2825,3335,3379,3380,3415,3570,3770,3771,3806,3961,9498,9532,9565,9598,9888,9922,10093,10127,10169,10203,10261,10319,10337,10355,10514,10581,10615,10687,10817,10937,10977,11011,11076,11167,11261,11263,11297,11458,11461,11497,11680,11714,11752,11758,11773,11871,11891,11912,11933,12465,12499,12536,12710,12753,12754,12789,12945,12991,13025,13106,13165,13219,13253,13286,13319,13888,13944,14010,14720,14754,15076,15101,15125,15147,15170,15194,15218,15251,15284,15467,15493,15516,15540,15561,15668,15702,15774,15875,15955,15995,16029,16094,16183,16186,16222,16444,16467,16490,16513,16576,16599,16622,17136,17170,17203,17236,17572,17573,17608,17790,17791,17826,17980,19583,19584,19619,19775
+已核验释放的测试监听端口集合
+8101,8120,8130,8150,18080,20000,32841,32847,32893,32923,32931,33019,33021,33087,33185,33187,33229,33293,33353,33385,33409,33447,33497,33609,33685,33699,33711,33739,33817,33923,33927,33951,33957,33959,34007,34139,34161,34173,34243,34245,34255,34263,34279,34301,34483,34497,34539,34547,34565,34619,34659,34737,34741,34817,34845,34853,34917,34993,35049,35073,35085,35119,35121,35177,35303,35331,35443,35445,35475,35509,35567,35577,35677,35699,35717,35731,35741,35751,35779,35861,35953,35976,36079,36093,36129,36293,36297,36309,36409,36565,36601,36701,36763,36847,36859,36907,36943,36965,36975,36981,36983,37023,37035,37093,37099,37111,37127,37129,37205,37245,37293,37307,37395,37403,37407,37419,37451,37577,37599,37603,37656,37665,37761,37763,37799,37833,37846,37879,37891,37893,37899,37949,38003,38011,38063,38107,38115,38241,38249,38255,38270,38281,38303,38321,38323,38395,38423,38451,38467,38499,38507,38547,38615,38681,38743,38795,38923,38937,38989,39011,39053,39095,39099,39143,39171,39179,39199,39217,39245,39261,39475,39493,39501,39583,39597,39607,39697,39739,39763,39817,40045,40059,40139,40197,40243,40313,40325,40349,40357,40377,40457,40553,40573,40655,40681,40689,40713,40831,40855,40927,40937,40975,40979,41035,41077,41105,41119,41131,41153,41189,41267,41275,41311,41399,41445,41483,41523,41563,41599,41617,41639,41731,41991,42015,42027,42033,42037,42083,42149,42301,42313,42323,42357,42525,42542,42555,42665,42669,42741,42755,42871,42875,42877,42941,43025,43043,43061,43069,43143,43287,43341,43349,43351,43369,43377,43481,43533,43563,43655,43665,43791,43851,43873,43923,44041,44047,44095,44107,44119,44131,44135,44273,44285,44341,44401,44443,44517,44528,44549,44563,44601,44667,44785,44845,44849,44875,44905,44975,45005,45129,45149,45151,45153,45161,45203,45281,45347,45517,45675,45711,45813,45855,45857,45861,45899,45941,45943,45963,46015,46033,46037,46106,46123,46127,46133,46177,46271,46409,46459,46471,46485,46991,47059,47197,47207,47219,47319,47367,47441,47497,47671,47691,47697,47839,47865,47873,47955,47961,48007,48103,48121,48125,48139,48215,48227,48275,48307,48311,48351,48423,48449,48481,48495,48755,48839,48879,48905,48949,49005,49013,49041,49065,49225,49227,49243,49259,49309,49339,49425,49501,49557,49687,49733,49799,49801,49933,50107,50307,50309,50455,50575,50639,50673,50787,50791,50793,50807,50871,51025,51041,51127,51149,51179,51199,51249,51259,51301,51331,51340,51357,51451,51497,51509,51519,51525,51537,51701,51759,51765,51795,51853,51873,51891,51943,52061,52231,52277,52351,52377,52423,52517,52525,52533,52538,52607,52637,52779,52787,52891,52963,52995,53009,53065,53069,53079,53089,53127,53133,53171,53215,53223,53231,53269,53321,53397,53445,53491,53507,53517,53633,53651,53687,53693,53777,53983,54071,54235,54271,54467,54483,54505,54547,54613,54637,54703,54799,54953,54995,55043,55181,55233,55305,55341,55371,55377,55415,55443,55485,55623,55651,55683,55707,55739,55762,55807,55819,55869,55939,56005,56131,56197,56215,56339,56403,56415,56417,56433,56449,56524,56525,56533,56579,56583,56587,56653,56660,56679,56725,56751,56785,56873,56943,56961,56995,57039,57063,57069,57111,57155,57181,57229,57239,57269,57521,57537,57589,57649,57679,57729,57837,57941,57989,58211,58253,58315,58375,58467,58471,58493,58515,58551,58721,58763,58775,58851,58967,58999,59031,59063,59065,59075,59107,59121,59147,59347,59433,59439,59453,59569,59607,59641,59707,59767,59807,59809,59897,60031,60063,60071,60103,60107,60179,60235,60271,60385,60413,60543,60595,60627,60643,60661,60667,60669,60769,60879,60895,60917,60953,60957,61000,61001,61002,61003,61004,61005,61006,61007,61008,61009,61010,61011,61012,61013,61014,61015,61016,61017,61018,61019,61021,61024,61027,61030,61033,61034,61035
+
+最终清理与生产元数据核验
+主从容器内最终仅剩 init/sleep，应用进程均退出；616 个测试端口集合按各套件核验释放，最后 ss 仅显示 Docker 内置 DNS。没有向宿主机发布端口。
+宿主机容器 init PID 2528511、2553520 随容器停止；测试编译 PGID 2528061、2531556、2552026、2553847 均已结束。
+已删除两个容器、专用 bridge 网络、临时运行镜像及本次拉取的 Debian 镜像；未运行 docker prune，保留其他容器/镜像。
+删除临时根目录前扫描 /proc 的 cwd、exe、fd 和 maps，没有持有本次文件的进程。
+临时目录 /var/tmp/chain-fulltest-ty5wpm6p 及定位文件已删除。移除文件逻辑大小 5382956998 字节；删除前磁盘可用 6965700378624，删除后 6971459411968，回收差值 5759033344 字节。任务开始可用 6971468599296 字节（全盘数据可能受其他服务影响）。
+核对 2690 个既有生产/项目路径，数值 UID/GID 与权限位均未变化。未更改生产权限，无需权限恢复。
+运行中的原生产服务仍有日志/数据库/流量快照更新，其 ctime 或快照 inode 与基线不同；没有将这些正常写入回滚，也不声称生产内容静止：
+/var/lib/nginx/body
+/var/log/nginx/access.log
+/var/lib/chain-panel/panel.db-shm
+/var/lib/chain-panel/panel.db-wal
+/var/lib/chain-panel/panel.db
+/var/lib/chain-agent
+/var/lib/chain-agent/traffic.json
+只保留本报告作为测试交付；测试数据库、证书/令牌、截图、日志、临时脚本、浏览器工具、node_modules 副本、Rust 工具/registry 副本、target 编译缓存均删除。原仓库既有缓存、文件和未提交改动保留。
+删除后复核：本次容器/网络/镜像查询无残留，指定宿主机进程均不存在，临时目录和定位文件不存在，无残留打开文件（含 deleted fd）。报告为新增文件，属主/属组 0:0，权限 0644。

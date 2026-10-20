@@ -166,6 +166,11 @@ if __name__ == "__main__":
         assert forward("/state")["lines"][0]["name"] == "edited-vless"
         forward(f"/lines/{line['id']}", method="DELETE")
         forward(f"/externals/{external['id']}", method="DELETE")
+        if os.environ.get("CHAIN_TEST_SHARING_ONLY"):
+            from fleet_sharing import exercise
+            exercise(master, slave, forward, node)
+            print("PASS focused fleet sharing regression", flush=True)
+            sys.exit(0)
         slave.api(f"/nodes/{node['id']}", method="DELETE")
         print("PASS HTTPS pairing, replay rejection, remote CRUD, data isolation, route boundary", flush=True)
 

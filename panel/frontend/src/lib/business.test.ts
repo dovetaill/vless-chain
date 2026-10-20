@@ -31,3 +31,7 @@ assert.equal(expiringSoon(line, line.rental!.expires_at), false);
 assert.equal(lowQuota(line), true);
 assert.equal(lowQuota({ ...line, traffic: null }), false);
 assert.equal(lowQuota({ ...line, limits: { ...line.limits, monthly_gib: null } }), false);
+
+// Charged quota uses the multiplier; raw transfer totals remain unchanged.
+assert.equal(lowQuota({...line, traffic:{...line.traffic!, upload:1, download:1, charged:1024 ** 3}}),true);
+assert.equal(lowQuota({...line, traffic:{...line.traffic!, upload:1024 ** 3, download:0, charged:0}}),false);

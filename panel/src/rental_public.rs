@@ -195,7 +195,7 @@ fn lookup_result(doc: &Document, input: Lookup, at: u64) -> ApiResult<Value> {
             let view = chain_panel::rental::view(doc, line, at);
             let rental = &view["rental"];
             json!({"id":line.id,"name":line.name,"status":view["rental_status"],
-            "traffic":view["traffic"],"limits":line.limits,"sync_status":view["sync_status"],
+            "multiplier":view["multiplier"],"traffic":view["traffic"],"limits":line.limits,"sync_status":view["sync_status"],
             "rental":{"prices":rental["prices"],"started_at":rental["started_at"],
                 "expires_at":rental["expires_at"],"next_reset_at":rental["next_reset_at"],"permanent":rental["permanent"]}})
         })

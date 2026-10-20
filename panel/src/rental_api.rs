@@ -314,6 +314,9 @@ fn remove_selected(doc: &mut Document, ids: &[String]) -> Result<()> {
             .collect(),
         externals: doc.applied_externals.clone(),
         rentals: doc.rentals.clone(),
+        resources: doc.resources.clone(),
+        rule_sources: doc.rule_sources.clone(),
+        access_policies: doc.access_policies.clone(),
         ..Default::default()
     };
     for id in ids {

@@ -49,4 +49,4 @@ export const expiringSoon = (line: Line, now: number) => Boolean(line.rental?.ex
   && line.rental.expires_at > now && line.rental.expires_at <= now + 7 * 86400);
 
 export const lowQuota = (line: Line) => Boolean(line.traffic && line.limits.monthly_gib
-  && (line.traffic.upload + line.traffic.download) >= line.limits.monthly_gib * 1024 ** 3 * 0.9);
+  && (line.traffic.charged ?? line.traffic.upload + line.traffic.download) >= line.limits.monthly_gib * 1024 ** 3 * 0.9);

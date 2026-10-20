@@ -1,3 +1,4 @@
+import { Resources, RulesLibrary, AutoGroups, ManualGroup, BatchImport } from "./components/sharing";
 import { Diagnostics } from "./components/diagnostics";
 import {
   useCallback,
@@ -65,13 +66,15 @@ const pages = [
   { id: "lines", label: "代理", icon: Network },
   { id: "customers", label: "客户与收款", icon: Users },
   { id: "nodes", label: "外部代理", icon: Server },
+  { id: "resources", label: "资源额度", icon: Server },
+  { id: "rules", label: "网站规则", icon: Network },
   { id: "fleet", label: "多机总控", icon: Network },
   { id: "monitoring", label: "监控告警", icon: Bell },
   { id: "settings", label: "设置", icon: Settings },
 ] as const;
 type Page = (typeof pages)[number]["id"];
 const remotePanel = new URLSearchParams(location.search).get('remote');
-const visiblePages = remotePanel ? pages.filter(p => ['lines', 'nodes'].includes(p.id)) : pages;
+const visiblePages = remotePanel ? pages.filter(p => ['lines', 'nodes', 'resources', 'rules'].includes(p.id)) : pages;
 const pageFromHash = (): Page =>
   visiblePages.find((p) => p.id === location.hash.slice(1))?.id || (remotePanel ? 'lines' : 'dashboard');
 const jobNames: Record<string, string> = {
@@ -307,10 +310,12 @@ export function App() {
       const value = await api<External>("/externals", "POST", { name: field(data, "name"), url: field(data, "url") });
       await refresh();
       if (done) { close(); done(value); return; }
+      if(data.has("group")){setModal(<AutoGroups state={{...state!,externals:[...state!.externals,value]}} ids={[value.id]} close={close} saved={refresh}/>);return;}
       setModal(<AccessDialog external={value} state={state!} close={close} />);
     }}>
       <Field label="名称" hint="留空使用节点中的名称"><Input name="name" maxLength={80} placeholder="自动识别" /></Field>
       <Field label="链接或 Mihomo 节点"><textarea className="textarea mono" name="url" rows={7} placeholder={'vless://…\n或 - {name: 落地 A, type: vless, server: …}'} required /></Field>
+      <label className="flex gap-2 text-sm"><input type="checkbox" name="group"/>导入后自动识别分组候选</label>
     </Modal>);
   }
   async function login(event: FormEvent<HTMLFormElement>) {
@@ -614,9 +619,11 @@ export function App() {
             probe={line => setModal(<ProbeEditor line={line} state={state} close={close} saved={refresh} />)}
             apply={line => void run(() => apply(line?.id))}
           />}
+          {page === "resources" && <Resources state={state} saved={refresh}/>}
+          {page === "rules" && <RulesLibrary/>}
           {page === "nodes" && (
             <div className="space-y-6">
-              <Button onClick={() => importExternal()}><Plus />导入外部代理</Button>
+              <div className="flex flex-wrap gap-2"><Button onClick={() => importExternal()}><Plus />导入外部代理</Button><Button variant="outline" onClick={()=>setModal(<BatchImport state={state} close={close} saved={refresh}/>)}>批量导入</Button><Button variant="outline" onClick={()=>setModal(<AutoGroups state={state} close={close} saved={refresh}/>)}>自动分组</Button></div>
               <Card>
                 <CardHeader>
                   <CardTitle>外部代理</CardTitle>
@@ -631,10 +638,11 @@ export function App() {
                         <div className="min-w-0 max-w-full">
                           <p className="break-all text-sm font-medium">{e.name}</p>
                           <p className="mt-1 text-xs text-slate-400">
-                            {e.url.split(":")[0].toUpperCase()} · 已导入
+                            {e.url.split(":")[0].toUpperCase()} · {state.resources?.find(r=>r.members.includes(`external:${e.id}`))?.name || "未分组"}
                           </p>
                         </div>
                         <div className="flex flex-wrap gap-2">
+                          <Button variant="outline" onClick={()=>setModal(<ManualGroup external={e} state={state} close={close} saved={refresh}/>)}>分组</Button>
                           <Button variant="outline" onClick={() => setModal(<AccessDialog external={e} state={state} close={close} />)}>链接 / Mihomo</Button>
                           <Button variant="outline" onClick={() => setModal(<Modal title="编辑外部代理" description="保留引用关系；保存后确认应用受影响代理。" submit="保存" close={close} action={async data => {
                             await api(`/externals/${e.id}`, 'POST', { name: field(data, 'name'), url: field(data, 'url') });

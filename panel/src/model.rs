@@ -249,6 +249,8 @@ pub struct Limits {
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Traffic {
     #[serde(default)]
+    pub charged: Option<u64>,
+    #[serde(default)]
     pub cycle_start: u64,
     #[serde(default)]
     pub cycle_end: u64,
@@ -265,6 +267,10 @@ pub struct Traffic {
     pub blocked: bool,
     #[serde(default)]
     pub days: BTreeMap<String, [u64; 2]>,
+}
+
+impl Traffic {
+    pub fn used(&self) -> u64 { self.charged.unwrap_or_else(|| self.upload.saturating_add(self.download)) }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -383,6 +389,12 @@ pub struct LegacyConfig {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Document {
+    #[serde(default)]
+    pub resources: crate::resources::State,
+    #[serde(default)]
+    pub rule_sources: Vec<crate::rules::Source>,
+    #[serde(default)]
+    pub access_policies: BTreeMap<String, crate::rules::Policy>,
     #[serde(default)]
     pub legacy_configs: Vec<LegacyConfig>,
     #[serde(default)]

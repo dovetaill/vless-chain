@@ -177,6 +177,8 @@ pub async fn request(
         .no_proxy()
         .timeout(Duration::from_secs(if path.contains("/diagnostics/") || path == "/api/publish" {
             600
+        } else if path.starts_with("/api/rules/") && path.ends_with("/update") {
+            30
         } else if path.ends_with("/probe") {
             45
         } else {
