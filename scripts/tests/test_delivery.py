@@ -27,6 +27,17 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def test_ci_check_accepts_branch_but_release_actions_require_tag(self):
+        with patch.object(sys, 'argv', ['ci_release.py', 'check', '--tag', 'main']), \
+                patch.object(ci, 'check') as check:
+            ci.main()
+            check.assert_called_once_with()
+        for action in ('validate', 'assemble', 'publish', 'smoke'):
+            with self.subTest(action=action), \
+                    patch.object(sys, 'argv', ['ci_release.py', action, '--tag', 'main']):
+                with self.assertRaisesRegex(ValueError, '只能发布'):
+                    ci.main()
+
     def test_build_cache_requires_explicit_github_workflow_opt_in(self):
         original = {'CARGO_TARGET_DIR': str(self.root / 'target'),
                     'CARGO_HOME': str(self.root / 'cargo'), 'npm_config_cache': str(self.root / 'npm')}
@@ -35,14 +46,18 @@ class Delivery(unittest.TestCase):
                 env = original.copy()
                 release.configure_ci_cache(env)
                 self.assertEqual(env, original)
-        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'CHAIN_BUILD_CACHE': '1',
-                                     'RUNNER_TEMP': str(self.root)}, clear=True):
-            env = original.copy()
-            release.configure_ci_cache(env)
-            cache = self.root / 'chain-build-cache'
-            self.assertEqual(env, {'CARGO_TARGET_DIR': str(cache / 'target'),
-                                   'CARGO_HOME': str(cache / 'cargo'), 'npm_config_cache': str(cache / 'npm')})
-            self.assertFalse(cache.exists())
+        alias = self.root / 'runner-temp-alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        for runner_temp in (self.root, alias):
+            with self.subTest(runner_temp=runner_temp), patch.dict(os.environ,
+                    {'GITHUB_ACTIONS': 'true', 'CHAIN_BUILD_CACHE': '1',
+                     'RUNNER_TEMP': str(runner_temp)}, clear=True):
+                env = original.copy()
+                release.configure_ci_cache(env)
+                cache = self.root.resolve() / 'chain-build-cache'
+                self.assertEqual(env, {'CARGO_TARGET_DIR': str(cache / 'target'),
+                                       'CARGO_HOME': str(cache / 'cargo'), 'npm_config_cache': str(cache / 'npm')})
+                self.assertFalse(cache.exists())
 
     def test_openrc_claims_data_before_start_and_retries_failed_first_install(self):
         source, manifest = self.package()

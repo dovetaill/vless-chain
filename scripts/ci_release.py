@@ -148,7 +148,8 @@ def main():
     parser.add_argument('--input', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    validate_tag(args.tag)
+    if args.action != 'check':
+        validate_tag(args.tag)
     if args.action == 'assemble':
         assemble(args.input, args.output, args.tag, args.commit)
     elif args.action == 'publish':
