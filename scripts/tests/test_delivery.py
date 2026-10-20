@@ -27,6 +27,30 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def test_menu_update_automatically_selects_installed_components(self):
+        for roles, expected in ((('panel', 'agent'), 'panel'), (('panel',), 'panel'), (('agent',), 'agent')):
+            with self.subTest(roles=roles), patch.object(installer, 'Manager') as manager, \
+                    patch.object(installer, 'choose', side_effect=['3', '0']) as choose, \
+                    patch.object(installer, 'install_wizard') as update, \
+                    patch.object(installer, 'select_role', side_effect=AssertionError('no component prompt')):
+                manager.return_value.state.return_value = {'roles': {role: {'version': '0.2.0'} for role in roles}}
+                installer.menu(self.root)
+                update.assert_called_once()
+                args = update.call_args.args[1]
+                self.assertEqual((args.action, args.component), ('update', expected))
+                self.assertEqual(choose.call_count, 2)
+
+    def test_menu_logs_offer_recent_and_follow_modes(self):
+        for mode, follow in (('1', False), ('2', True)):
+            with self.subTest(mode=mode), patch.object(installer, 'Manager') as manager, \
+                    patch.object(installer, 'choose', side_effect=['5', '1', mode, '0']), \
+                    patch('builtins.input', return_value='1'):
+                manager.return_value.state.return_value = {'roles': {'panel': {'version': '0.2.0'}}}
+                installer.menu(self.root)
+                manager.return_value.operate.assert_called_once()
+                args = manager.return_value.operate.call_args.args[0]
+                self.assertEqual((args.action, args.log_source, args.follow), ('logs', 'service', follow))
+
     def test_ci_check_accepts_branch_but_release_actions_require_tag(self):
         with patch.object(sys, 'argv', ['ci_release.py', 'check', '--tag', 'main']), \
                 patch.object(ci, 'check') as check:
@@ -289,8 +313,10 @@ class Delivery(unittest.TestCase):
             self.assertEqual(member.linkname, '../../archive/proxy.example/cert1.pem')
         link.unlink()
         link.symlink_to('/etc/passwd')
+        backups = set(backup.parent.iterdir())
         with self.assertRaisesRegex(ValueError, 'Certbot'):
             self.manager.backup_files('panel')
+        self.assertEqual(set(backup.parent.iterdir()), backups)
 
     def test_local_security_recovery_preserves_token_and_business_data(self):
         import sqlite3
@@ -591,6 +617,8 @@ class Delivery(unittest.TestCase):
     def test_update_downloads_release_without_explicit_package(self):
         source, manifest = self.package()
         self.manager.install(source, manifest, self.args())
+        installed_script = self.manager.base / 'manager/chain_install.py'
+        installed_script.write_text('old manager fixture')
         source2, _ = self.package('0.2.0')
         archive = self.archive(source2)
         args = installer.make_parser().parse_args(['update', '--root', str(self.manager.root), '--work-parent', str(self.root)])
@@ -598,6 +626,8 @@ class Delivery(unittest.TestCase):
             installer.install_package(self.manager, args)
         download.assert_called_once()
         self.assertEqual(self.manager.state()['roles']['panel']['version'], '0.2.0')
+        self.assertEqual(installed_script.read_bytes(), (source2 / 'scripts/chain_install.py').read_bytes())
+        self.assertIn(str(installed_script), self.manager.path('/usr/local/bin/chainctl').read_text())
 
     def test_existing_local_agent_is_not_registered_again(self):
         source, manifest = self.package()
@@ -700,7 +730,14 @@ class Delivery(unittest.TestCase):
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
         with tarfile.open(backups[0]) as bundle:
             self.assertEqual(bundle.extractfile('data/panel.db').read(), b'database-fixture')
+        state = self.manager.state()
+        metadata = {'setup_complete': True, 'panel_only': True, 'https_port': 8443,
+                    'manual_https': {'port': 8443, 'cert': '/fixture/cert', 'key': '/fixture/key'}}
+        state['roles']['panel'].update(metadata)
+        common.json_write(self.manager.state_file, state)
         self.manager.rollback('panel')
+        for key, value in metadata.items():
+            self.assertEqual(self.manager.state()['roles']['panel'][key], value)
         self.assertEqual(self.manager.state()['roles']['panel']['current'], initial)
         self.assertEqual((data / 'admin-token').read_text(), 'private-fixture')
 

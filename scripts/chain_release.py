@@ -207,6 +207,7 @@ def check(args):
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_ingress.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_maintenance.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_time_diagnostics.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_menu.py'])
     if args.full:
         with Workspace(args.work_parent or ROOT.parent) as work:
             xray = work.root / 'bin/xray'

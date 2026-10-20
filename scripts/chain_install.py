@@ -19,6 +19,7 @@ import shutil
 import shlex
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -38,6 +39,12 @@ ROOT = Path(__file__).resolve().parents[1]
 OWNER = 'chain-panel-installer-v1'
 ROLES = ('panel', 'agent')
 ROLE_NAMES = {'panel': 'Web 控制台', 'agent': '节点 Agent'}
+
+# Use terminal line editing so arrow keys do not appear as escape sequences.
+readline = None
+with contextlib.suppress(ImportError):
+    import readline
+    readline.set_auto_history(False)
 
 
 def decode_connection_code(value):
@@ -362,18 +369,22 @@ class Manager:
         name = f'{role}-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}.tar.gz'
         destination = directory / name
         with destination.open('xb') as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            with tarfile.open(fileobj=stream, mode='w:gz') as bundle:
-                for prefix, source in [('config', etc), ('data', data)]:
-                    if source.exists():
-                        for path in sorted(source.rglob('*')):
-                            if path.is_symlink():
-                                require(prefix == 'data' and path.relative_to(source).parts[:3] == ('acme', 'config', 'live')
-                                        and not path.readlink().is_absolute()
-                                        and path.resolve().is_relative_to(source / 'acme/config/archive') and path.is_file(),
-                                        '备份路径包含非 Certbot 内部证书链接，拒绝继续。')
-                            if path.is_file() and path.name not in ('xray.log', 'service.log', 'process.lock', 'candidate.json'):
-                                bundle.add(path, arcname=prefix + '/' + str(path.relative_to(source)), recursive=False)
+            try:
+                os.fchmod(stream.fileno(), 0o600)
+                with tarfile.open(fileobj=stream, mode='w:gz') as bundle:
+                    for prefix, source in [('config', etc), ('data', data)]:
+                        if source.exists():
+                            for path in sorted(source.rglob('*')):
+                                if path.is_symlink():
+                                    require(prefix == 'data' and path.relative_to(source).parts[:3] == ('acme', 'config', 'live')
+                                            and not path.readlink().is_absolute()
+                                            and path.resolve().is_relative_to(source / 'acme/config/archive') and path.is_file(),
+                                            '备份路径包含非 Certbot 内部证书链接，拒绝继续。')
+                                if path.is_file() and path.name not in ('xray.log', 'service.log', 'process.lock', 'candidate.json'):
+                                    bundle.add(path, arcname=prefix + '/' + str(path.relative_to(source)), recursive=False)
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
         print(f'私有备份：{destination}（权限 600，含连接凭据，请私下保存）')
         return destination
 
@@ -555,8 +566,10 @@ class Manager:
         token = data / 'admin-token'
         if token.is_file() and sys.stdin.isatty():
             print(f'登录管理令牌：{token.read_text().strip()}')
+        elif not token.is_file():
+            print('管理员令牌文件尚未生成；请检查控制台是否启动成功，并查看服务日志。')
         else:
-            print('输入 chainctl，在菜单选择「查看登录信息」。')
+            print('当前不是交互终端；请在 SSH 终端运行 chainctl access 查看登录令牌。')
         print('日常管理只需输入 chainctl；命令帮助：chainctl help。')
 
     def rollback(self, role):
@@ -576,7 +589,7 @@ class Manager:
                 self.link(role, prior)
                 self.system.call('start', 'chain-' + role + '.service')
                 self.healthy(role, env)
-                state['roles'][role] = {'current': prior, 'previous': current['current'], 'version': manifest['version']}
+                state['roles'][role] = {**current, 'current': prior, 'previous': current['current'], 'version': manifest['version']}
                 json_write(self.state_file, state)
             except BaseException:
                 self.system.call('stop', 'chain-' + role + '.service', check=False)
@@ -762,7 +775,6 @@ class Manager:
                 self.system.call('stop', 'chain-panel.service')
                 try:
                     self.backup_files(role)
-                    import sqlite3
                     database = self.role_paths(role)[1] / 'panel.db'
                     require(database.is_file(), '控制台数据库不存在。')
                     with contextlib.closing(sqlite3.connect(database)) as connection, connection:
@@ -905,16 +917,19 @@ def install_package(manager, args):
             panel_questions(manager, args)
         elif args.action == 'install' and args.component == 'agent' and getattr(args, 'guided', False):
             agent_questions(manager, args)
-        if manager.live and args.action == 'install' and getattr(args, 'guided', False):
+        if manager.live and (args.action == 'update' or
+                             (args.action == 'install' and getattr(args, 'guided', False))):
             from chain_time import status, synchronize
-            clock = status()
-            if clock.get('NTPSynchronized') != 'yes':
-                print('系统尚未确认时间同步；错误时间会导致 TLS / REALITY 握手失败。')
-                if not args.non_interactive and sys.stdin.isatty() and input('启用时间同步？必要时安装时间服务，保持现有时区 [y/N]: ').strip().lower() == 'y':
-                    try:
+            try:
+                clock = status()
+                if clock.get('NTPSynchronized') != 'yes' or (args.action == 'update' and clock.get('NTP') != 'yes'):
+                    print('时间同步尚未启用或未确认同步；错误时间会导致 TLS / REALITY 握手失败。')
+                    if args.action == 'update' or (not args.non_interactive and sys.stdin.isatty() and input('启用时间同步？必要时安装时间服务，保持现有时区 [y/N]: ').strip().lower() == 'y'):
+                        if args.action == 'update':
+                            print('更新时自动启用时间同步，必要时安装时间服务；保持现有时区。')
                         synchronize()
-                    except (ValueError, OSError, subprocess.SubprocessError) as error:
-                        print(f'时间同步未完成：{error}；请处理后再进行连接检查。')
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                print(f'时间同步未完成：{error}；继续组件操作，请处理后再进行连接检查。')
         if manager.live and args.action == 'install' and args.component == 'panel' and getattr(args, 'guided', False):
             from chain_legacy import guided_install
             if guided_install(manager, source, manifest, args):
@@ -943,7 +958,12 @@ def install_package(manager, args):
         if manager.live and args.component == 'panel' and (
                 (args.action == 'install' and not args.panel_only) or
                 (args.action == 'update' and 'agent' in manager.state()['roles'])):
-            provision_local_agent(manager, source, manifest, args)
+            try:
+                provision_local_agent(manager, source, manifest, args)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                if args.action == 'update':
+                    print('部分更新完成：控制台与 chainctl 已更新，本机 Agent 更新未完成；修复错误后重新选择更新。', file=sys.stderr)
+                raise
         if manager.live and args.component == 'panel':
             manager.maintenance_units()
             if args.action == 'install':
@@ -987,7 +1007,13 @@ def choose(title, options, default='1'):
         print('\n' + title)
         for key, label in options.items():
             print(f'{key}) {label}')
-        value = input(f'选择 [{default}]: ').strip() or default
+        prompt = f'输入编号后回车 [{default}]: '
+        if readline is None and sys.stdin.isatty():
+            value = getpass.getpass('当前终端不支持行编辑，编号输入不回显；' + prompt)
+            value = re.sub(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|O[@-~])', '', value)
+        else:
+            value = input(prompt)
+        value = value.strip() or default
         if value in options:
             return value
         print('请输入上面的选项编号。')
@@ -1047,7 +1073,9 @@ def agent_questions(manager, args):
     installed = 'agent' in state['roles'] or 'agent' in state.get('retained_roles', {})
     print('在 Web「服务器」中添加节点或重置接入码，然后复制完整接入码。')
     while True:
-        value = getpass.getpass('粘贴接入码（不回显）' + ('，直接回车保留当前身份' if installed else '') + ': ').strip()
+        value = getpass.getpass('粘贴接入码（不回显，输入 0 返回）' + ('，直接回车保留当前身份' if installed else '') + ': ').strip()
+        if value == '0':
+            raise KeyboardInterrupt
         if not value and installed:
             return
         try:
@@ -1082,7 +1110,9 @@ def select_role(manager):
     if len(installed) == 1:
         return installed[0]
     options = {str(i + 1): ROLE_NAMES[role] for i, role in enumerate(installed)}
-    return installed[int(choose('选择要管理的组件', options)) - 1]
+    options['0'] = '返回主菜单'
+    choice = choose('选择要管理的组件', options)
+    return None if choice == '0' else installed[int(choice) - 1]
 
 
 def menu(root):
@@ -1094,7 +1124,7 @@ def menu(root):
             running = ('运行中' if manager.system.active(role) else '已停止') if manager.live else '离线安装树'
             print(f'  {ROLE_NAMES[role]}  v{value["version"]}  {running}')
         choice = choose('请选择操作', {
-            '1': '安装 / 配置控制台与本机节点', '2': '接入 / 重新接入节点', '3': '更新到最新版本',
+            '1': '安装 / 修复控制台与本机节点', '2': '接入 / 重新接入节点', '3': '更新本机全部组件与 chainctl',
             '4': '查看状态', '5': '查看日志', '6': '重启服务', '7': '备份数据',
             '8': '回滚上一版本', '9': '查看登录信息', '10': '启动服务', '11': '停止服务',
             '12': '查看命令帮助', '13': '重置登录安全（TOTP / Passkey）', '14': '启用统一 443（保留已有网站）', '15': '关闭统一 443',
@@ -1116,25 +1146,55 @@ def menu(root):
             if choice in ('14', '15'):
                 from chain_ingress import Ingress
                 require(manager.live, '统一 443 仅用于实际系统安装。')
+                impact = '将调整网站 HTTPS 入口以共享 443。' if choice == '14' else '将关闭代理统一 443 入口并恢复网站原配置。'
+                if choose(impact, {'1': '继续', '0': '返回主菜单'}, '0') == '0':
+                    continue
                 Ingress().operate('enable' if choice == '14' else 'disable')
+                print('统一 443 已启用。' if choice == '14' else '统一 443 已关闭。')
                 continue
-            role = 'panel' if choice in ('1', '9', '13') else 'agent' if choice == '2' else select_role(manager)
+            if choice == '3':
+                require(installed, '请先从菜单安装控制台或接入节点。')
+                role = 'panel' if 'panel' in installed else 'agent'
+            else:
+                role = 'panel' if choice in ('1', '9', '13') else 'agent' if choice == '2' else select_role(manager)
             action = {'1': 'install', '2': 'install', '3': 'update', '4': 'status', '5': 'logs',
                       '6': 'restart', '7': 'backup', '8': 'rollback', '9': 'access', '10': 'start', '11': 'stop', '13': 'reset-auth'}[choice]
+            if role is None:
+                continue
             args = make_parser().parse_args([action, '--component', role, '--root', str(root)])
+            if action == 'install' and role in installed:
+                if choose('将使用当前版本重新安装，保留已有配置并重启服务。',
+                          {'1': '继续修复 / 重新接入', '0': '返回主菜单'}, '0') == '0':
+                    continue
+            if action in ('backup', 'rollback'):
+                print('此操作会短暂停止所选组件，完成后恢复服务；Agent 停止期间代理连接会中断。')
             if action == 'logs':
-                print('日志来源：1) 服务 2) 应用 3) Xray 4) Mihomo 5) 迁移内核')
-                source = input('选择 [1]: ').strip() or '1'
-                require(source in ('1', '2', '3', '4', '5'), '日志来源无效。')
+                sources = {'1': '服务', '2': '应用', '0': '返回主菜单'}
+                if role == 'agent':
+                    sources.update({'3': 'Xray', '4': 'Mihomo', '5': '迁移内核'})
+                source = choose('日志来源', sources)
+                if source == '0':
+                    continue
                 args.log_source = {'1': 'service', '2': 'application', '3': 'xray', '4': 'mihomo', '5': 'legacy-'}[source]
                 if source == '5':
-                    args.log_source += input('迁移配置 UUID: ').strip()
-                args.follow = True
+                    value = input('迁移配置 UUID（输入 0 返回）: ').strip()
+                    if value == '0':
+                        continue
+                    try:
+                        args.log_source += str(uuid.UUID(value))
+                    except ValueError:
+                        raise ValueError('迁移配置 UUID 无效，请从 Web 迁移配置中复制完整 UUID。') from None
+                args.follow = choose('日志查看方式',
+                                     {'1': '最近 100 行', '2': '持续查看（Ctrl+C 返回）'}, '2') == '2'
             if action in ('install', 'update'):
                 install_wizard(manager, args)
             else:
                 manager.operate(args)
-        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        except KeyboardInterrupt:
+            print('\n已取消操作，返回主菜单。')
+        except EOFError:
+            return
+        except (ValueError, OSError, subprocess.SubprocessError, sqlite3.Error) as error:
             print(f'操作未完成：{error}', file=sys.stderr)
 
 
