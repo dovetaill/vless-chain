@@ -282,20 +282,6 @@ async fn remote_state(State(app): State<App>) -> Json<Value> {
     value["monitoring"] = json!({"effective":s.doc.monitoring.policy(),"override":s.doc.monitoring.override_policy,
         "checks":s.doc.monitoring.checks,"conditions":s.doc.monitoring.conditions,
         "notices":s.doc.monitoring.notices.iter().rev().take(100).collect::<Vec<_>>()});
-    value["version"] = json!(env!("CARGO_PKG_VERSION"));
-    let local_id = chain_panel::local_agent::node_id(app.token_file.parent().unwrap());
-    let agent = s.doc.nodes.iter().find(|n| Some(&n.id) == local_id.as_ref());
-    value["agent_version"] = agent.map(|n| n.report.system["agent_version"].clone()).unwrap_or(Value::Null);
-    value["agent_seen"] = json!(agent.map(|n| n.seen));
-    value["cores"] = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent()?.parent().map(|p| p.join("release.json")))
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .map(|manifest| json!({"xray":manifest["xray"],"mihomo":manifest["mihomo"]}))
-        .unwrap_or(Value::Null);
-    value["maintenance"] =
-        json!(std::path::Path::new("/run/chain-maintenance/control.sock").exists());
     Json(value)
 }
 fn version_valid(version: &str) -> bool {
@@ -516,7 +502,7 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
     uuid::Uuid::parse_str(&input.id).map_err(|_| error(StatusCode::BAD_REQUEST, "任务 ID 无效"))?;
     if !matches!(
         input.action.as_str(),
-        "upgrade" | "restart-panel" | "restart-agent" | "enable" | "disable"
+        "upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "enable" | "disable"
     ) {
         return Err(error(StatusCode::BAD_REQUEST, "不支持的批量操作"));
     }
@@ -556,6 +542,12 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
                     .is_some_and(|r| r.snapshot["maintenance"] == true)),
                 "所选 VPS 尚未确认支持 systemd 维护；请先手工更新并等待状态同步"
             );
+            if input.action == "restart-all" {
+                ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter()
+                    .find(|r| &r.id == id).is_some_and(|r| r.snapshot["maintenance_actions"]
+                        .as_array().is_some_and(|actions| actions.iter().any(|a| a == "restart-all")))),
+                    "所选 VPS 尚不支持整套重启；请先升级并等待状态同步");
+            }
         }
         if matches!(input.action.as_str(), "enable" | "disable") {
             ensure!(
@@ -791,6 +783,42 @@ mod tests {
             local_url: "http://127.0.0.1:1".into(),
         }
     }
+    #[tokio::test]
+    async fn local_and_remote_state_expose_the_same_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let Json(local) = state(State(app.clone())).await;
+        let Json(remote) = remote_state(State(app)).await;
+        assert_eq!(local["version"], env!("CARGO_PKG_VERSION"));
+        assert!(local["agent_version"].is_null());
+        for key in ["version", "agent_version", "agent_seen", "cores", "maintenance", "maintenance_actions"] {
+            assert_eq!(local[key], remote[key], "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_all_requires_remote_capability_and_persists_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let remote_id = id();
+        app.store.lock().unwrap().doc.fleet.remotes.push(Remote {
+            id: remote_id.clone(), name: "test".into(), url: "https://unused.invalid".into(),
+            token: String::new(), seen: now(), error: String::new(),
+            snapshot: json!({"maintenance":true}),
+        });
+        let input = || Batch { id: id(), targets: vec![remote_id.clone()],
+            action: "restart-all".into(), version: String::new(), lines: BTreeMap::new() };
+        assert!(batch(State(app.clone()), Json(input())).await.is_err());
+        assert!(app.store.lock().unwrap().doc.fleet.receipts.is_empty());
+        app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["restart-all"]);
+        let Json(result) = batch(State(app.clone()), Json(input())).await.unwrap();
+        let store = app.store.lock().unwrap();
+        let job = &store.doc.fleet.receipts[result["id"].as_str().unwrap()];
+        assert_eq!(job["action"], "restart-all");
+        assert_eq!(job["targets"][0]["id"], remote_id);
+        assert_eq!(job["targets"][0]["state"], "pending");
+    }
+
     #[tokio::test]
     async fn machine_auth_is_scoped_and_keeps_origin_checks() {
         use axum::body::Body;

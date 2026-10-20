@@ -37,6 +37,7 @@ import {
   mismatch,
   recent,
   statuses,
+  requestId,
   type Remote,
   type Task,
 } from "./fleet-state";
@@ -65,13 +66,6 @@ type Point = {
 const key = (r: Remote, line: Line) => `${r.id}:${line.id}`;
 const rate = (value: number, valid: boolean) =>
   valid ? `${bytes(value)}/s` : "—";
-function requestId() {
-  const b = crypto.getRandomValues(new Uint8Array(16));
-  b[6] = (b[6] & 15) | 64;
-  b[8] = (b[8] & 63) | 128;
-  const h = Array.from(b, (v) => v.toString(16).padStart(2, "0")).join("");
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
-}
 function Pager({
   total,
   page,
@@ -594,12 +588,13 @@ export function Fleet() {
     const id = requestId(),
       version = release?.version || "";
     const blocked = targets.filter(
-      (r) => !connected(r, now) || (!isLines && !r.snapshot?.maintenance),
+      (r) => !connected(r, now) || (!isLines && !r.snapshot?.maintenance)
+        || (action === "restart-all" && !r.snapshot?.maintenance_actions?.includes(action)),
     );
     setModal(
       <Modal
         title={`确认${actions[action]}`}
-        description={`${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}` : ""}。升级、重启 Agent 或应用代理可能中断连接，失败后暂停后续机器。`}
+        description={`${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，升级后自动重启相关服务` : ""}。操作可能中断连接，失败后暂停后续机器。`}
         submit={
           blocked.length || (action === "upgrade" && !release)
             ? undefined
@@ -645,7 +640,7 @@ export function Fleet() {
             {blocked
               .map(
                 (r) =>
-                  `${r.name}（${!connected(r, now) ? "失联或数据过期" : "尚未安装维护组件"}）`,
+                  `${r.name}（${!connected(r, now) ? "失联或数据过期" : !r.snapshot?.maintenance ? "尚未安装维护组件" : "请先升级以支持整套重启"}）`,
               )
               .join("、")}
             。请修复或调整选择；不会自动跳过。
@@ -1070,7 +1065,7 @@ export function Fleet() {
                   >
                     {releaseLoading ? "正在获取最新版本…" : "检查最新版本"}
                   </Button>
-                  {["upgrade", "restart-panel", "restart-agent"].map(
+                  {["upgrade", "restart-all", "restart-panel", "restart-agent"].map(
                     (action) => (
                       <Button
                         key={action}
@@ -1093,7 +1088,7 @@ export function Fleet() {
                       : "尚未获取正式版本"}
                   </p>
                   <p className="muted">
-                    升级整套发行版本，失败暂停后续机器；需远端已安装 Linux
+                    升级整套发行版本并自动重启相关服务，失败暂停后续机器；需远端已安装 Linux
                     systemd 维护组件。
                   </p>
                 </div>

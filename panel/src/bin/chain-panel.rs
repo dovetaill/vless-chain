@@ -318,6 +318,25 @@ async fn state(State(app): State<App>) -> Json<Value> {
             .iter()
             .any(|n| n["id"] == *id)
     }));
+    let agent = value["nodes"].as_array().unwrap().iter()
+        .find(|n| n["id"] == value["local_node_id"]);
+    let agent_version = agent.map(|n| n["report"]["system"]["agent_version"].clone()).unwrap_or(Value::Null);
+    let agent_seen = agent.map(|n| n["seen"].clone()).unwrap_or(Value::Null);
+    value["version"] = json!(env!("CARGO_PKG_VERSION"));
+    value["agent_version"] = agent_version;
+    value["agent_seen"] = agent_seen;
+    value["cores"] = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent()?.parent().map(|p| p.join("release.json")))
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map(|manifest| json!({"xray":manifest["xray"],"mihomo":manifest["mihomo"]}))
+        .unwrap_or(Value::Null);
+    value["maintenance"] = json!(cfg!(target_os = "linux")
+        && std::path::Path::new("/run/chain-maintenance/control.sock").exists());
+    value["maintenance_actions"] = if value["maintenance"] == true {
+        json!(["upgrade", "restart-all", "restart-panel", "restart-agent"])
+    } else { json!([]) };
     Json(value)
 }
 #[derive(Deserialize)]

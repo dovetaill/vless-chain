@@ -804,20 +804,22 @@ def provision_local_agent(manager, source, manifest, args):
     if 'agent' in state['roles'] or 'agent' in state.get('retained_roles', {}):
         agent_env = parse_env(manager.role_paths('agent')[0] / 'agent.env')
         panel_env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
-        if 'CHAIN_LISTEN' not in panel_env:
-            return
-        agent_url = urllib.parse.urlsplit(agent_env.get('CHAIN_PANEL_URL', ''))
-        panel_host, panel_port = listen_address(panel_env['CHAIN_LISTEN'])
-        local_host = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(panel_host, panel_host)
-        same_host = agent_url.hostname == local_host or (
-            agent_url.hostname == 'localhost' and ipaddress.ip_address(local_host).is_loopback)
-        if agent_url.scheme == 'http' and same_host and agent_url.port == panel_port:
+        local = False
+        if 'CHAIN_LISTEN' in panel_env:
+            agent_url = urllib.parse.urlsplit(agent_env.get('CHAIN_PANEL_URL', ''))
+            panel_host, panel_port = listen_address(panel_env['CHAIN_LISTEN'])
+            local_host = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(panel_host, panel_host)
+            same_host = agent_url.hostname == local_host or (
+                agent_url.hostname == 'localhost' and ipaddress.ip_address(local_host).is_loopback)
+            local = agent_url.scheme == 'http' and same_host and agent_url.port == panel_port
+        if local or (args.action == 'update' and 'agent' in state['roles']):
             action = 'update' if 'agent' in state['roles'] else 'install'
             agent = make_parser().parse_args([action, '--component', 'agent', '--root', str(manager.root), '--non-interactive'])
-            agent.allow_http = True  # The existing endpoint was verified as this local panel.
+            agent.allow_http = local  # Preserve remote endpoints' existing HTTPS / HTTP consent.
             agent.defer_proxy_acme = getattr(args, 'defer_proxy_acme', False)
             manager.install(source, manifest, agent)
-            mark_local_node(manager, agent_env['CHAIN_NODE_ID'])
+            if local:
+                mark_local_node(manager, agent_env['CHAIN_NODE_ID'])
         return
     etc, data, _ = manager.role_paths('panel')
     env = parse_env(etc / 'panel.env')

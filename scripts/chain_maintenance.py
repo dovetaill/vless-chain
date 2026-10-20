@@ -17,12 +17,14 @@ import time
 import uuid
 
 from chain_common import VERSION_RE, download_release, json_write, require, safe_extract
+from chain_network import SITE_OWNER
 
 STATE = Path('/var/lib/chain-maintenance')
 INSTALL_STATE = Path('/opt/chain/.chain-install.json')
 LOCK = threading.Lock()
 RELOAD = threading.Event()
-ACTIONS = {'upgrade', 'restart-panel', 'restart-agent', 'sync-time'}
+ACTIONS = {'upgrade', 'restart-all', 'restart-panel', 'restart-agent', 'sync-time'}
+HTTPS_UNIT = Path('/etc/systemd/system/chain-panel-https.service')
 
 
 def validate(value):
@@ -40,11 +42,22 @@ def installed():
     return {role: data.get('version') for role, data in state['roles'].items()}
 
 
+def related_services(roles):
+    services = [f'chain-{role}.service' for role in ('panel', 'agent') if role in roles]
+    require(services, '未安装面板或 Agent')
+    if HTTPS_UNIT.exists() or HTTPS_UNIT.is_symlink():
+        require(not HTTPS_UNIT.is_symlink() and HTTPS_UNIT.is_file()
+                and HTTPS_UNIT.read_text().startswith(SITE_OWNER + '\n'), '独立 HTTPS 服务归属不匹配')
+        services.append(HTTPS_UNIT.name)
+    return services
+
+
 def execute(job, directory=STATE):
     path = directory / (job['id'] + '.json')
     process = None
     try:
         before = installed()
+        services = related_services(before) if job['action'] in ('upgrade', 'restart-all') else []
         job.update(state='running', before=before, started=int(time.time()))
         json_write(path, job)
         with tempfile.TemporaryDirectory(prefix='work-' + job['id'] + '-', dir=directory) as temporary:
@@ -52,47 +65,55 @@ def execute(job, directory=STATE):
             if job['action'] == 'upgrade':
                 current = before.get('panel')
                 require(current is not None, '未安装面板')
-                require(tuple(map(int, job['version'].split('.'))) >= tuple(map(int, current.split('.'))), '不允许自动降级数据库；请人工核对兼容性')
+                require(all(tuple(map(int, job['version'].split('.'))) >= tuple(map(int, before[role].split('.')))
+                            for role in ('panel', 'agent') if role in before),
+                        '不允许自动降级组件或数据库；请人工核对兼容性')
                 archive, _ = download_release(temporary, job['version'])
                 manifest = safe_extract(archive, temporary / 'inspect')
                 require(manifest['version'] == job['version'] and 'scripts/chain_maintenance.py' in manifest['files'],
                         '目标版本不支持远程维护，拒绝升级以免丢失控制能力')
-                command = ['/usr/local/bin/chainctl', 'update', '--component', 'panel', '--package', str(archive), '--non-interactive']
+                commands = [['/usr/local/bin/chainctl', 'update', '--component', 'panel', '--package', str(archive), '--non-interactive']]
+                if HTTPS_UNIT.name in services:
+                    commands.append(['/usr/bin/systemctl', 'restart', HTTPS_UNIT.name])
+            elif job['action'] == 'restart-all':
+                commands = [['/usr/bin/systemctl', 'restart', *services]]
             elif job['action'] == 'sync-time':
-                command = [sys.executable, '-B', str(Path(__file__).with_name('chain_time.py'))]
+                commands = [[sys.executable, '-B', str(Path(__file__).with_name('chain_time.py'))]]
             else:
                 role = job['action'].removeprefix('restart-')
                 require(role in before, '该组件未安装')
-                command = ['/usr/bin/systemctl', 'restart', 'chain-' + role + '.service']
+                commands = [['/usr/bin/systemctl', 'restart', 'chain-' + role + '.service']]
+                services = ['chain-' + role + '.service']
             with (temporary / 'operation.log').open('wb') as log:
-                process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                                           env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
-                job['pid'] = process.pid
-                json_write(path, job)
-                try:
-                    result = process.wait(timeout=1800)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGTERM)
+                for command in commands:
+                    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                               env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+                    job['pid'] = process.pid
+                    json_write(path, job)
                     try:
-                        process.wait(timeout=10)
+                        result = process.wait(timeout=1800)
                     except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-                    raise ValueError('维护操作超时；已停止本任务进程，请检查逐组件状态') from None
-                finally:
-                    try:
                         os.killpg(process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-            require(result == 0, '维护操作失败；请在该 VPS 检查安装状态与服务日志')
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait()
+                        raise ValueError('维护操作超时；已停止本任务进程，请检查逐组件状态') from None
+                    finally:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    require(result == 0, '维护操作失败；请在该 VPS 检查安装状态与服务日志')
             job['after'] = installed()
-            for role in (['panel', 'agent'] if job['action'] == 'upgrade' else [job['action'].removeprefix('restart-')]):
-                if role not in job['after']:
-                    continue
-                require(subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', f'chain-{role}.service']).returncode == 0,
-                        f'{role} 服务未运行')
-                if job['action'] == 'upgrade':
-                    require(job['after'][role] == job['version'], f'{role} 版本未达到目标')
+            for service in services:
+                require(subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', service], timeout=30).returncode == 0,
+                        f'{service} 服务未运行')
+            if job['action'] == 'upgrade':
+                for role in ('panel', 'agent'):
+                    if role in before:
+                        require(job['after'].get(role) == job['version'], f'{role} 版本未达到目标')
             job.update(state='succeeded', detail='时间同步已确认，时区保持不变' if job['action'] == 'sync-time' else '组件检查通过；总控还需检查整链')
     except Exception as error:
         job.update(state='failed', error=str(error))

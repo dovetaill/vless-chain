@@ -32,6 +32,7 @@ import { api, ApiError, publishChecked } from "./api";
 import { LineEditor } from "./components/line-editor";
 import { AccessDialog } from "./components/access-dialog";
 import { SecuritySettings } from "./components/security-settings";
+import { Maintenance } from "./components/maintenance";
 import { Dashboard } from "./components/dashboard";
 import { Customers } from "./components/customers";
 import { ProxyList } from "./components/proxy-list";
@@ -675,14 +676,17 @@ export function App() {
             </div>
           )}
           {page === "settings" && (
+            <div className="space-y-6">
+            <Maintenance state={state} />
             <SecuritySettings
               state={state}
               saved={refresh}
               sessionEnded={sessionEnded}
             />
+            </div>
           )}
           <footer className="mt-10 flex items-center justify-between border-t border-border pt-5 text-[11px] text-slate-400">
-            <span>Chain Panel · 节点租赁运营控制台</span>
+            <span>Chain Panel {state.version ? `v${state.version}` : "版本未知"} · 节点租赁运营控制台</span>
           </footer>
         </main>
       </div>

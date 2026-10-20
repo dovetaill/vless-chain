@@ -631,8 +631,11 @@ class Delivery(unittest.TestCase):
                 marker.unlink(missing_ok=True)
                 installer.write_env(panel_env_path, {'CHAIN_LISTEN': listen})
                 installer.write_env(agent_env_path, {'CHAIN_PANEL_URL': url, 'CHAIN_NODE_ID': node_id})
-                with patch('urllib.request.build_opener', side_effect=AssertionError('must not register')):
+                with patch('urllib.request.build_opener', side_effect=AssertionError('must not register')), \
+                        patch.object(self.manager, 'install', wraps=self.manager.install) as update:
                     installer.provision_local_agent(self.manager, source, manifest, self.args(action='update'))
+                update.assert_called_once()
+                self.assertEqual(installer.parse_env(agent_env_path)['CHAIN_PANEL_URL'], url)
                 self.assertEqual(marker.exists(), expected)
                 if expected:
                     self.assertEqual(marker.read_text().strip(), node_id)

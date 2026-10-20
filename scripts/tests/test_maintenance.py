@@ -14,6 +14,71 @@ from chain_install import Manager, OWNER
 
 
 class MaintenanceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        unit = patch.object(maintenance, 'HTTPS_UNIT', self.root / 'chain-panel-https.service')
+        unit.start()
+        self.addCleanup(unit.stop)
+        self.addCleanup(maintenance.RELOAD.clear)
+
+    def run_job(self, action, before, after=None, exit_code=0, active=True):
+        job = {'id': str(uuid.uuid4()), 'action': action, 'version': '1.2.4'}
+        process = Mock(pid=123456, **{'wait.return_value': exit_code})
+        with patch.object(maintenance, 'installed', side_effect=[before, after or before, after or before]), \
+                patch.object(maintenance, 'download_release', return_value=(self.root / 'release.tar.gz', '1.2.4')), \
+                patch.object(maintenance, 'safe_extract', return_value={'version': '1.2.4', 'files': ['scripts/chain_maintenance.py']}), \
+                patch.object(maintenance.subprocess, 'Popen', return_value=process) as popen, \
+                patch.object(maintenance.subprocess, 'run', return_value=Mock(returncode=0 if active else 1)) as run, \
+                patch.object(maintenance.os, 'killpg'):
+            maintenance.execute(job, self.root)
+        self.assertEqual(list(self.root.glob('work-*')), [])
+        result = json.loads((self.root / (job['id'] + '.json')).read_text())
+        return result, [call.args[0] for call in popen.call_args_list], [call.args[0] for call in run.call_args_list]
+
+    def test_restart_all_includes_only_installed_project_services(self):
+        maintenance.HTTPS_UNIT.write_text(maintenance.SITE_OWNER + '\n[Service]\n')
+        result, commands, checks = self.run_job('restart-all', {'panel': '1.2.3', 'agent': '1.2.3'})
+        services = ['chain-panel.service', 'chain-agent.service', 'chain-panel-https.service']
+        self.assertEqual(result['state'], 'succeeded')
+        self.assertEqual(commands, [['/usr/bin/systemctl', 'restart', *services]])
+        self.assertEqual(checks, [['/usr/bin/systemctl', 'is-active', '--quiet', service] for service in services])
+        maintenance.HTTPS_UNIT.unlink()
+        result, commands, _ = self.run_job('restart-all', {'panel': '1.2.3'})
+        self.assertEqual(commands, [['/usr/bin/systemctl', 'restart', 'chain-panel.service']])
+
+    def test_foreign_https_service_is_never_restarted(self):
+        maintenance.HTTPS_UNIT.write_text('foreign service')
+        result, commands, _ = self.run_job('restart-all', {'panel': '1.2.3'})
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('归属不匹配', result['error'])
+        self.assertEqual(commands, [])
+
+    def test_upgrade_restarts_https_and_verifies_all_installed_versions(self):
+        maintenance.HTTPS_UNIT.write_text(maintenance.SITE_OWNER + '\n[Service]\n')
+        before = {'panel': '1.2.3', 'agent': '1.2.3'}
+        result, commands, _ = self.run_job('upgrade', before, {'panel': '1.2.4', 'agent': '1.2.4'})
+        self.assertEqual(result['state'], 'succeeded')
+        self.assertEqual(commands[0][:4], ['/usr/local/bin/chainctl', 'update', '--component', 'panel'])
+        self.assertEqual(commands[1], ['/usr/bin/systemctl', 'restart', 'chain-panel-https.service'])
+        result, _, _ = self.run_job('upgrade', before, {'panel': '1.2.4', 'agent': '1.2.3'})
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('agent 版本未达到目标', result['error'])
+
+    def test_newer_agent_blocks_downgrade_and_failed_update_stops_sequence(self):
+        result, commands, _ = self.run_job('upgrade', {'panel': '1.2.3', 'agent': '1.2.5'})
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(commands, [])
+        maintenance.HTTPS_UNIT.write_text(maintenance.SITE_OWNER + '\n[Service]\n')
+        result, commands, checks = self.run_job('upgrade', {'panel': '1.2.3'}, exit_code=1)
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(checks, [])
+        result, _, _ = self.run_job('restart-all', {'panel': '1.2.3'}, active=False)
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('服务未运行', result['error'])
+
     def test_download_failure_records_result_and_removes_owned_work(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

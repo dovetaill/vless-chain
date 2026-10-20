@@ -8,11 +8,6 @@ export type Remote = {
   error: string;
   snapshot:
     | (PanelState & {
-        version?: string;
-        agent_version?: string | null;
-        agent_seen?: number | null;
-        maintenance?: boolean;
-        cores?: { xray?: string; mihomo?: string };
         monitoring?: {
           conditions: Record<string, { active: boolean; message: string }>;
           checks?: Record<string, Check>;
@@ -49,11 +44,19 @@ export const statuses: Record<string, string> = {
 };
 export const actions: Record<string, string> = {
   upgrade: "逐台升级",
+  "restart-all": "整套重启",
   "restart-panel": "重启面板",
   "restart-agent": "重启 Agent",
   enable: "启用所选代理",
   disable: "停用所选代理",
 };
+export function requestId() {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 15) | 64;
+  b[8] = (b[8] & 63) | 128;
+  const h = Array.from(b, (v) => v.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
 export const PAGE_SIZE = 20;
 export function recent(at: number | undefined, now: number) {
   return !!at && now - at <= 90 && now - at >= -30;

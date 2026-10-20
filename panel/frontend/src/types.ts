@@ -154,6 +154,12 @@ export interface Security {
   passkeys: { id: string; name: string; created: number }[];
 }
 export interface PanelState {
+  version?: string;
+  agent_version?: string | null;
+  agent_seen?: number | null;
+  maintenance?: boolean;
+  maintenance_actions?: string[];
+  cores?: { xray?: string; mihomo?: string } | null;
   legacy_configs?: { id: string; node_id: string; name: string; enabled: boolean; published: boolean; pending_delete?: boolean; ports: number[] }[];
   pending_imports?: { id: string; name: string; reason: string }[];
   local_node_id: string | null;
