@@ -30,8 +30,14 @@ def synchronize():
 def _synchronize():
     before = status()
     require(before, '无法查询系统时间状态；本操作需要可用的 systemd/timedatectl。')
-    installed = subprocess.run(['systemctl', 'list-unit-files', *TIME_UNITS, '--no-legend'],
-                               capture_output=True, text=True, check=True, timeout=10).stdout
+    result = subprocess.run(['systemctl', 'list-unit-files', *TIME_UNITS, '--no-legend', '--no-pager'],
+                            capture_output=True, text=True, timeout=10)
+    # systemctl returns 1 with empty output when no requested unit files exist.
+    if result.returncode != 0 and not (result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip()):
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end='', flush=True)
+        result.check_returncode()
+    installed = result.stdout
     units = [unit for unit in TIME_UNITS if any(
         fields[0] == unit and fields[1] != 'alias'
         for fields in (line.split() for line in installed.splitlines()) if len(fields) >= 2)]

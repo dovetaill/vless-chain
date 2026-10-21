@@ -661,12 +661,18 @@ pub async fn work_batch(app: &App) -> Result<()> {
                 .as_object_mut()
                 .unwrap()
                 .remove("unreachable_since");
+            if !matches!(action.as_str(), "enable" | "disable") {
+                result["maintenance_state"] = result["state"].clone();
+                result["verification"] = json!({"state":"pending","detail":"等待组件维护完成后执行整链验证"});
+            }
             if result["state"] == "succeeded" && !matches!(action.as_str(), "enable" | "disable") {
                 match verify_remote(app, &remote).await {
                     Ok(detail) => {
+                        result["verification"] = json!({"state":"succeeded","detail":detail});
                         result["detail"] = json!(detail);
                     }
                     Err(e) => {
+                        result["verification"] = json!({"state":"failed","detail":format!("{e:#}")});
                         result["state"] = json!("failed");
                         result["error"] = json!(format!(
                             "组件维护已完成，但整链验证失败：{e:#}；未回退业务数据库"
@@ -732,11 +738,8 @@ async fn verify_remote(app: &App, remote: &Remote) -> Result<String> {
             ),
         )
         .await;
-        ensure!(
-            matches!(result, Ok(Ok(_))),
-            "{}：公网入口整链检测未通过",
-            line.name
-        );
+        result.with_context(|| format!("{}：公网入口整链检测超时（40 秒）", line.name))?
+            .with_context(|| format!("{}：公网入口整链检测未通过", line.name))?;
     }
     Ok(format!(
         "组件及 Agent 心跳通过；{} 条可用代理公网整链检测通过（不含 UDP）",
@@ -786,6 +789,78 @@ mod tests {
             local_url: "http://127.0.0.1:1".into(),
         }
     }
+    #[tokio::test]
+    async fn maintenance_success_verification_failure_pauses_and_resume_rechecks_same_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task_ids = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded_ids = task_ids.clone();
+        let mut document = Document::default();
+        document.lines.push(serde_json::from_value(json!({
+            "id":id(),"name":"fixture broken entry","kind":"vless","hops":[]
+        })).unwrap());
+        let document = Arc::new(Mutex::new(document));
+        let served_document = document.clone();
+        let router = Router::new()
+            .route("/api/federation/task", post(move |Json(body): Json<Value>| {
+                let ids = recorded_ids.clone();
+                async move {
+                    ids.lock().unwrap().push(body["id"].clone());
+                    Json(json!({"state":"succeeded","detail":"components updated"}))
+                }
+            }))
+            .route("/api/federation/state", get(|| async {
+                Json(json!({"nodes":[],"monitoring":{"effective":Policy::default()}}))
+            }))
+            .route("/api/federation/document", get(move || {
+                let doc = served_document.clone();
+                async move { Json(serde_json::to_value(&*doc.lock().unwrap()).unwrap()) }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let remote_id = id();
+        let job_id = id();
+        let task_id = id();
+        {
+            let mut store = app.store.lock().unwrap();
+            store.doc.fleet.remotes.push(Remote {
+                id: remote_id.clone(), name: "fixture".into(), url: format!("http://{address}"),
+                token: "test".into(), seen: now(), error: String::new(),
+                policy_error: String::new(), snapshot: Value::Null,
+            });
+            store.doc.fleet.receipts.insert(job_id.clone(), json!({
+                "id":job_id,"action":"upgrade","version":"0.2.40","state":"running",
+                "targets":[{"id":remote_id,"task_id":task_id,"state":"pending"}]
+            }));
+        }
+        let first = work_batch(&app).await;
+        let failed = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
+        let resumed = resume_batch(State(app.clone()), Path(job_id.clone())).await;
+        let second = work_batch(&app).await;
+        let failed_again = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
+        document.lock().unwrap().lines.clear();
+        let resumed_again = resume_batch(State(app.clone()), Path(job_id.clone())).await;
+        let third = work_batch(&app).await;
+        let passed = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
+        server.abort();
+        let _ = server.await;
+        first.unwrap(); let _ = resumed.unwrap(); second.unwrap(); let _ = resumed_again.unwrap(); third.unwrap();
+        for job in [&failed, &failed_again] {
+            assert_eq!(job["state"], "paused");
+            assert_eq!(job["targets"][0]["state"], "failed");
+            let result = &job["targets"][0]["result"];
+            assert_eq!(result["maintenance_state"], "succeeded");
+            assert_eq!(result["verification"]["state"], "failed");
+            assert!(result["verification"]["detail"].as_str().unwrap().contains("无入口"));
+            assert!(result["verification"]["detail"].as_str().unwrap().contains("fixture broken entry"));
+        }
+        assert_eq!(passed["state"], "succeeded");
+        assert_eq!(passed["targets"][0]["result"]["maintenance_state"], "succeeded");
+        assert_eq!(passed["targets"][0]["result"]["verification"]["state"], "succeeded");
+        assert_eq!(*task_ids.lock().unwrap(), vec![json!(task_id); 3]);
+    }
+
     #[tokio::test]
     async fn policy_failure_keeps_fresh_remote_state_and_controller_clock() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

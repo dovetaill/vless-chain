@@ -31,9 +31,15 @@ export type Task = {
       detail?: string;
       error?: string;
       after?: Record<string, string>;
+      maintenance_state?: string;
+      verification?: { state: string; detail?: string };
     };
   }[];
 };
+export function verificationFailed(target: Task["targets"][number]) {
+  if (target.result?.verification) return target.result.verification.state === "failed";
+  return (target.error || target.result?.error || "").startsWith("组件维护已完成，但整链验证失败");
+}
 export const statuses: Record<string, string> = {
   pending: "等待执行",
   queued: "已排队",

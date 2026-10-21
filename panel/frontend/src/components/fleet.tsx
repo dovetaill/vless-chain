@@ -39,6 +39,7 @@ import {
   mismatch,
   recent,
   statuses,
+  verificationFailed,
   requestId,
   type Remote,
   type Task,
@@ -924,11 +925,11 @@ export function Fleet() {
                   : "外部代理"}
             </CardTitle>
           </CardHeader>
-          <div className="flex flex-wrap gap-3 border-b p-4">
+          <div className={tab === "vps" ? "grid grid-cols-1 gap-3 border-b bg-muted/10 p-4 sm:grid-cols-[minmax(12rem,1fr)_auto_auto_auto] sm:items-center" : "flex flex-wrap gap-3 border-b p-4"} aria-label={tab === "vps" ? "搜索与筛选 VPS" : undefined}>
             <Input
-              className="sm:max-w-72"
+              className={tab === "vps" ? "w-full" : "sm:max-w-72"}
               aria-label="搜索总控列表"
-              placeholder="搜索 VPS、地址或代理名称"
+              placeholder={tab === "vps" ? "搜索 VPS 名称或地址" : "搜索 VPS、地址或代理名称"}
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
@@ -938,7 +939,7 @@ export function Fleet() {
             {tab !== "externals" && (
               <select
                 aria-label="列表排序"
-                className="select w-auto"
+                className={tab === "vps" ? "select w-full sm:w-auto" : "select w-auto"}
                 value={sort}
                 onChange={(e) => {
                   setSort(e.target.value);
@@ -975,7 +976,7 @@ export function Fleet() {
             )}
             {tab !== "externals" && (
               <select
-                className="select w-auto"
+                className={tab === "vps" ? "select w-full sm:w-auto" : "select w-auto"}
                 aria-label="筛选总控状态"
                 value={filter}
                 onChange={(e) => {
@@ -1036,90 +1037,40 @@ export function Fleet() {
           </div>
           {tab === "vps" && (
             <>
-              <div className="flex flex-wrap items-center gap-2 border-b p-4">
-                <span className="text-sm">
-                  已选 {chosen.length} 台 VPS（含其他页与隐藏项）
-                </span>
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    setSelected([
-                      ...new Set([
-                        ...selected,
-                        ...slice(filteredVps).map((r) => r.id),
-                      ]),
-                    ])
-                  }
-                >
-                  选择本页
-                </Button>
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    setSelected([
-                      ...new Set([
-                        ...selected,
-                        ...filteredVps.map((r) => r.id),
-                      ]),
-                    ])
-                  }
-                >
-                  选择全部筛选结果
-                </Button>
-                <Button
-                  variant="ghost"
-                  disabled={!chosen.length}
-                  onClick={() => setSelected([])}
-                >
-                  清空选择
-                </Button>
-              </div>
-              {chosen.length > 0 && (
-                <div className="flex flex-wrap gap-2 border-b p-4">
-                  <Button
-                    variant="outline"
-                    disabled={busy || releaseLoading}
-                    onClick={() => void fetchRelease()}
-                  >
-                    {releaseLoading ? "正在获取最新版本…" : "检查最新版本"}
-                  </Button>
-                  {["upgrade", "restart-all", "restart-panel", "restart-agent"].map(
-                    (action) => (
-                      <Button
-                        key={action}
-                        variant="outline"
-                        disabled={
-                          busy ||
-                          !chosen.length ||
-                          running.some((t) => t.state === "running") ||
-                          (action === "upgrade" && (!release || releaseLoading))
-                        }
-                        onClick={() => batch(action)}
-                      >
-                        {actions[action]}
-                      </Button>
-                    ),
-                  )}
-                  <p className="w-full muted">
-                    {release
-                      ? `最新正式版：面板／Agent ${release.version} · Xray ${release.xray || "未知"} · Mihomo ${release.mihomo || "未知"}`
-                      : "尚未获取正式版本"}
-                  </p>
-                  <p className="muted">
-                    升级整套发行版本并自动重启相关服务，失败暂停后续机器；需远端已安装 Linux
-                    systemd 维护组件。
-                  </p>
+              <div className="space-y-3 border-b p-4" aria-label="VPS 批量操作">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm"><strong>已选 {chosen.length} 台 VPS</strong><span className="ml-2 text-xs text-muted-foreground">含其他页与隐藏项</span></p>
+                  <div className="flex flex-wrap gap-1">
+                    <Button size="sm" variant="ghost" onClick={() => setSelected([...new Set([...selected, ...slice(filteredVps).map(r => r.id)])])}>选择本页</Button>
+                    <Button size="sm" variant="ghost" onClick={() => setSelected([...new Set([...selected, ...filteredVps.map(r => r.id)])])}>选择全部筛选结果</Button>
+                    <Button size="sm" variant="ghost" disabled={!chosen.length} onClick={() => setSelected([])}>清空选择</Button>
+                  </div>
                 </div>
-              )}
+                {chosen.length > 0 && <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button disabled={busy || releaseLoading || !release || running.some(t => t.state === "running")} onClick={() => batch("upgrade")}>逐台升级</Button>
+                    <Button variant="outline" disabled={busy || releaseLoading} onClick={() => void fetchRelease()}>{releaseLoading ? "正在获取最新版本…" : "检查最新版本"}</Button>
+                    <span className="text-xs text-muted-foreground">{release ? `最新正式版 ${release.version}` : "先检查版本，再升级所选 VPS"}</span>
+                  </div>
+                  <details className="text-sm">
+                    <summary className="cursor-pointer text-muted-foreground">重启与维护说明</summary>
+                    <div className="mt-3 space-y-3 border-t pt-3">
+                      <div className="flex flex-wrap gap-2">{["restart-all", "restart-panel", "restart-agent"].map(action => <Button key={action} variant="outline" disabled={busy || running.some(t => t.state === "running")} onClick={() => batch(action)}>{actions[action]}</Button>)}</div>
+                      <p className="text-xs leading-5 text-muted-foreground">升级会更新整套发行版本并重启相关服务，失败后暂停后续机器。远端需已安装 Linux systemd 维护组件。</p>
+                      {release && <p className="text-xs text-muted-foreground">版本包含：控制台／Agent {release.version} · Xray {release.xray || "未知"} · Mihomo {release.mihomo || "未知"}</p>}
+                    </div>
+                  </details>
+                </div>}
+              </div>
               {table(
                 "VPS 列表",
-                <table className="data-table">
+                <table className="data-table [&_td]:align-top">
                   <thead>
                     <tr>
-                      <th>选择 / VPS</th>
-                      <th>状态 / 版本</th>
+                      <th>VPS</th>
+                      <th>状态</th>
                       <th>网卡速率</th>
-                      <th>代理用量</th>
+                      <th>周期用量</th>
                       <th>操作</th>
                     </tr>
                   </thead>
@@ -1140,18 +1091,18 @@ export function Fleet() {
                               />
                               <span>{r.name}</span>
                             </label>
-                            <p className="muted max-w-56 break-all">{r.url}</p>
+                            <div className="ml-6 mt-1 space-y-1 text-xs text-muted-foreground">
+                              <p className="max-w-56 break-all">{r.url}</p>
+                              <Versions remote={r} />
+                            </div>
                           </td>
-                          <td data-label="状态 / 版本">
+                          <td data-label="状态" className="align-top">
                             <Status
                               tone={health(r, now) === "在线" ? "good" : "warn"}
                             >
                               {health(r, now)}
                             </Status>
-                            <p className="mt-2">
-                              <Versions remote={r} />
-                            </p>
-                            <p className="muted max-w-sm">{issues(r, now)[0]?.detail}</p>
+                            <p className="mt-2 max-w-sm text-xs leading-5 text-muted-foreground">{issues(r, now)[0]?.detail}</p>
                             <p className="muted">最近同步 {stamp(r.seen)}</p>
                           </td>
                           <td
@@ -1161,7 +1112,7 @@ export function Fleet() {
                             ↓ {rate(m.rx, m.hosts > 0)}
                             <br />↑ {rate(m.tx, m.hosts > 0)}
                           </td>
-                          <td data-label="代理用量">
+                          <td data-label="周期用量">
                             {m.usage ? bytes(m.used) : "—"}
                             <p className="muted">
                               {m.lines} 条 · 最近已知周期用量
@@ -1707,61 +1658,65 @@ export function Fleet() {
           )}
           {activeTask ? (
             <>
-              <p>
-                {actions[activeTask.action] || activeTask.action} ·{" "}
-                {statuses[activeTask.state] || activeTask.state}
-                {activeTask.version && ` · 目标 ${activeTask.version}`}
-              </p>
-              <p>
-                成功{" "}
-                {
-                  activeTask.targets.filter((t) => t.state === "succeeded")
-                    .length
-                }{" "}
-                / {activeTask.targets.length} · 失败{" "}
-                {activeTask.targets.filter((t) => t.state === "failed").length}
-              </p>
-              {activeTask.targets.map((t) => (
-                <div key={t.id} className="border-b py-3">
-                  <p>
-                    {remotes.find((r) => r.id === t.id)?.name || t.id}：
-                    {statuses[t.state] || t.state}
-                  </p>
-                  <p className="muted">
-                    {t.error || t.result?.error || t.result?.detail}
-                  </p>
-                  {t.result?.after && (
-                    <p className="muted">
-                      {Object.entries(t.result.after)
-                        .map(([k, v]) => `${k} ${v}`)
-                        .join(" · ")}
-                    </p>
-                  )}
+              <div className="rounded-xl border bg-muted/30 p-4 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="font-semibold">{actions[activeTask.action] || activeTask.action}</h3>
+                  <Status tone={activeTask.state === "paused" ? "warn" : activeTask.state === "succeeded" ? "good" : "muted"}>{statuses[activeTask.state] || activeTask.state}</Status>
                 </div>
-              ))}
-              {activeTask.state === "paused" && (
-                <p className="text-sm">
-                  {activeTask.targets.some((t) => t.state === "failed")
-                    ? "已有明确失败。重新核对只读取原任务结果，不会重新执行原操作。修复后请新建任务。"
-                    : "结果尚未确认。重新核对原任务，确认成功后才继续后续机器。"}{" "}
-                  尚未执行：
-                  {activeTask.targets
-                    .filter((t) => t.state === "pending")
-                    .map(
-                      (t) => remotes.find((r) => r.id === t.id)?.name || t.id,
-                    )
-                    .join("、") || "无"}
-                  。
+                {activeTask.version && <p className="text-sm">目标版本 <strong>{activeTask.version}</strong></p>}
+                <p className="text-sm text-muted-foreground">
+                  已完成 {activeTask.targets.filter(t => t.state === "succeeded").length} / {activeTask.targets.length}
+                  {` · 验证未通过 ${activeTask.targets.filter(verificationFailed).length}`}
+                  {` · 操作失败 ${activeTask.targets.filter(t => t.state === "failed" && !verificationFailed(t)).length}`}
                 </p>
+              </div>
+              <div className="space-y-3">
+              {activeTask.targets.map((t) => {
+                const remote = remotes.find(r => r.id === t.id);
+                const verifyFailed = verificationFailed(t);
+                const maintenanceDone = t.result?.maintenance_state === "succeeded" || verifyFailed || t.state === "succeeded";
+                const issue = verifyFailed
+                  ? t.result?.verification?.detail || (t.error || t.result?.error || "").replace(/^组件维护已完成，但整链验证失败[：:]?\s*/, "")
+                  : t.error || t.result?.error;
+                return <section key={t.id} className="min-w-0 space-y-3 rounded-xl border p-4" aria-label={`VPS 任务：${remote?.name || t.id}`}>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h4 className="font-semibold break-all">{remote?.name || t.id}</h4>
+                    <Status tone={verifyFailed ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? "维护完成 · 验证待处理" : statuses[t.state] || t.state}</Status>
+                  </div>
+                  <div className="grid gap-2 rounded-lg bg-muted/30 p-3 text-sm sm:grid-cols-2">
+                    <p>组件维护：<span className={maintenanceDone ? "text-emerald-700" : ""}>{maintenanceDone ? "已完成" : statuses[t.result?.maintenance_state || t.state] || t.state}</span></p>
+                    <p>后续验证：{verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" || t.state === "succeeded" ? "已通过" : "等待验证"}</p>
+                  </div>
+                  {t.result?.after && <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">{Object.entries(t.result.after).map(([key, value]) => <span key={key}>{({panel:"控制台",agent:"Agent",chainctl:"管理命令"} as Record<string,string>)[key] || key} <strong>{value}</strong></span>)}</div>}
+                  {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && <p className="mt-2">先查看日志并排查连接，再重新验证；无需重复升级。</p>}</div> : t.result?.detail && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result.detail}</p>}
+                  {remote && <Button type="button" variant="outline" onClick={() => {
+                    const returnTask = activeTask.id;
+                    setTaskId(undefined);
+                    setModal(<Diagnostics nodes={remote.snapshot?.nodes || []} request={remoteApi(remote.id)} close={() => { setModal(null); setTaskId(returnTask); }} />);
+                  }}>查看此 VPS 日志</Button>}
+                </section>;
+              })}
+              </div>
+              {activeTask.state === "paused" && (
+                <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+                  <p className="font-medium">已暂停后续 VPS，避免继续影响服务</p>
+                  <p>{activeTask.targets.some(verificationFailed)
+                    ? "维护已经完成。重新验证只核对原任务并检查连接，不会重新安装组件；全部通过后继续后续 VPS。"
+                    : activeTask.targets.some(t => t.state === "failed")
+                      ? "先排查失败原因。核对原任务不会重新执行已失败操作；确需重试时选择失败对象新建任务。"
+                      : "操作结果尚未确认。请先核对原任务，确认成功后继续后续 VPS。"}</p>
+                  <p>等待执行：{activeTask.targets.filter(t => t.state === "pending").map(t => remotes.find(r => r.id === t.id)?.name || t.id).join("、") || "无"}</p>
+                </div>
               )}
+              <div className="flex flex-wrap gap-2">
               {activeTask.state === "paused" &&
-                activeTask.targets.some((t) => t.state === "failed") && (
+                activeTask.targets.some((t) => t.state === "failed" && !verificationFailed(t)) && (
                   <Button
                     type="button"
                     variant="outline"
                     onClick={() => {
                       const ids = activeTask.targets
-                        .filter((t) => ["failed", "pending"].includes(t.state))
+                        .filter((t) => ["failed", "pending"].includes(t.state) && !verificationFailed(t))
                         .map((t) => t.id);
                       if (["enable", "disable"].includes(activeTask.action)) {
                         setSelectedLines(
@@ -1801,9 +1756,10 @@ export function Fleet() {
                     })
                   }
                 >
-                  重新核对原任务结果
+                  {activeTask.targets.some(verificationFailed) ? "重新验证并继续" : "重新核对原任务结果"}
                 </Button>
               )}
+              </div>
             </>
           ) : (
             <p>任务已提交，正在等待同步结果；关闭后可在维护任务中继续查看。</p>

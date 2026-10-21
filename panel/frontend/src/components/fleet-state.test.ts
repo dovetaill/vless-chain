@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { connected, health, issues, lineStatus, metrics, remoteNow, type Remote } from "./fleet-state";
+import { connected, health, issues, lineStatus, metrics, remoteNow, verificationFailed, type Remote } from "./fleet-state";
 import type { Line, PanelState } from "../types";
 
 const now = 1000;
@@ -50,3 +50,8 @@ warning.snapshot!.nodes[0].online = false;
 assert.ok(issues(warning, now).some((issue) => issue.title === "Agent 上报中断"));
 assert.equal(issues({ ...remote, snapshot: { ...remote.snapshot!, time: 0 } }, now).length, 0);
 console.log("fleet-state assertions passed");
+
+assert.equal(verificationFailed({id:"vps", state:"failed", result:{maintenance_state:"succeeded", verification:{state:"failed", detail:"probe failed"}}}), true);
+assert.equal(verificationFailed({id:"vps", state:"failed", error:"组件维护已完成，但整链验证失败：timeout"}), true);
+assert.equal(verificationFailed({id:"vps", state:"failed", error:"安装失败"}), false);
+assert.equal(verificationFailed({id:"vps", state:"succeeded", error:"组件维护已完成，但整链验证失败：old", result:{verification:{state:"succeeded"}}}), false);

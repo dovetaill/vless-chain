@@ -70,6 +70,35 @@ class TimeDiagnostics(unittest.TestCase):
         self.assertIn(['apt-get', 'install', '-y', 'chrony'], calls)
         self.assertLess(calls.index(['chronyc', 'waitsync', '30', '0', '0', '2']), calls.index(['chronyc', 'makestep']))
 
+    @unittest.skipUnless(chain_time.shutil.which('systemctl'), 'systemctl unavailable')
+    def test_real_empty_unit_inventory_installs_chrony(self):
+        run = subprocess.run
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / 'etc/systemd/system').mkdir(parents=True)
+            def command(args, **kwargs):
+                if args[:2] == ['systemctl', 'list-unit-files']:
+                    result = run([args[0], '--root', temporary, *args[1:]], **kwargs)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual((result.stdout, result.stderr), ('', ''))
+                    return result
+                return subprocess.CompletedProcess(args, 0, '', '')
+            with patch.object(chain_time, 'status', return_value={'Timezone': 'America/New_York'}), \
+                    patch.object(chain_time.shutil, 'which', return_value='/usr/bin/tool'), \
+                    patch.object(chain_time.subprocess, 'run', side_effect=command) as calls:
+                chain_time.synchronize()
+            self.assertIn(['apt-get', 'install', '-y', 'chrony'], [call.args[0] for call in calls.call_args_list])
+
+    def test_unit_inventory_failure_retains_stderr_and_does_not_install(self):
+        output = io.StringIO()
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC'}), \
+                patch.object(chain_time.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    ['systemctl', 'list-unit-files'], 1, '', 'Failed to list unit files: Permission denied\n')) as run, \
+                contextlib.redirect_stderr(output):
+            with self.assertRaisesRegex(ValueError, 'list-unit-files'):
+                chain_time.synchronize()
+        self.assertEqual(run.call_count, 1)
+        self.assertIn('Permission denied', output.getvalue())
+
     def test_chrony_without_source_never_steps_clock(self):
         def command(args, **kwargs):
             return Mock(stdout='chrony.service enabled', returncode=1 if args[:2] == ['chronyc', 'waitsync'] else 0)

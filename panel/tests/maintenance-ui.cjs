@@ -86,6 +86,7 @@ const assets = path.resolve(process.argv[2]);
     await page.goto('http://chain.test/admin#fleet');
     await page.getByRole('navigation',{name:'总控功能'}).getByRole('button',{name:'VPS',exact:true}).click();
     await page.getByLabel('选择 VPS 测试 VPS',{exact:true}).check();
+    await page.getByText('重启与维护说明',{exact:true}).click();
     await button('整套重启').click();
     await page.getByRole('dialog').getByText(/请先升级以支持整套重启/).waitFor();
     assert.equal(await page.getByRole('dialog').getByRole('button',{name:'确认执行',exact:true}).count(),0);
