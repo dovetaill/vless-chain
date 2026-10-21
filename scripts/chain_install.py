@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 
 from chain_common import (architecture, operating_system, compatible_release, atomic_write, json_write, output, require, restore_modes,
-                          run, safe_extract, sha256, verify_archive_checksum, verify_tree, download_release)
+                          run, safe_extract, sha256, verify_archive_checksum, verify_tree, download_release, latest_xray)
 from chain_platform import (service_kind, service_path, service, service_state, service_definition,
                             create_account, remove_account, nginx_conf, init_path)
 from chain_network import (HttpsSite, SITE_OWNER, available_port, domain_name, public_ipv4, server_addresses, validate_dns)
@@ -998,6 +998,9 @@ def install_package(manager, args):
         stage = Path(temporary) / 'stage'
         manifest = safe_extract(archive, stage)
         require(expected_version is None or manifest['version'] == expected_version, '下载包版本与发行信息不一致。')
+        if getattr(args, 'xray_channel', 'recommended') == 'latest':
+            latest_xray(stage, manifest, Path(temporary))
+        print(f'Xray {manifest.get("xray", "未知")} · {"官方最新版" if manifest.get("xray_channel") == "latest" else "发行包推荐版"}', flush=True)
         print(f'正在安装 {ROLE_NAMES[args.component]} v{manifest["version"]}…', flush=True)
         install_source(stage, manifest)
 
@@ -1230,6 +1233,8 @@ def make_parser():
     parser.add_argument('--component', choices=ROLES, default='panel', help='默认 panel；节点机器选择 agent')
     parser.add_argument('--package', type=Path, help='本地发行包，同目录需有 SHA256SUMS')
     parser.add_argument('--latest', action='store_true', help='下载最新正式版本')
+    parser.add_argument('--xray-channel', choices=['recommended', 'latest'], default='recommended',
+                        help='本次升级的 Xray 来源：推荐发行包内核，或主动选择官方最新（含预发布）')
     parser.add_argument('--non-interactive', action='store_true', help='不进行交互提问')
     parser.add_argument('--listen', help='高级：指定监听地址；首次交互安装自动选择空闲随机端口')
     parser.add_argument('--secure-cookie', choices=['0', '1'], help='HTTPS 反向代理设为 1')
@@ -1252,6 +1257,7 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = make_parser()
     args = parser.parse_args(argv)
+    require(args.xray_channel != 'latest' or args.action == 'update', '--xray-channel latest 仅用于主动 update。')
     if args.action == 'help' or (args.action == 'menu' and not sys.stdin.isatty()):
         parser.print_help()
         return

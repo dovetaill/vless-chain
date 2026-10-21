@@ -332,12 +332,13 @@ async fn state(State(app): State<App>) -> Json<Value> {
         .and_then(|path| path.parent()?.parent().map(|p| p.join("release.json")))
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .map(|manifest| json!({"xray":manifest["xray"],"mihomo":manifest["mihomo"]}))
+        .map(|manifest| json!({"xray":manifest["xray"],"mihomo":manifest["mihomo"],
+            "xray_channel":manifest["xray_channel"],"xray_prerelease":manifest["xray_prerelease"]}))
         .unwrap_or(Value::Null);
     value["maintenance"] = json!(cfg!(target_os = "linux")
         && std::path::Path::new("/run/chain-maintenance/control.sock").exists());
     value["maintenance_actions"] = if value["maintenance"] == true {
-        json!(["upgrade", "restart-all", "restart-panel", "restart-agent"])
+        json!(["upgrade", "upgrade-xray-latest", "restart-all", "restart-panel", "restart-agent"])
     } else { json!([]) };
     Json(value)
 }

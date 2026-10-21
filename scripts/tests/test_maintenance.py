@@ -24,8 +24,10 @@ class MaintenanceTests(unittest.TestCase):
         self.addCleanup(unit.stop)
         self.addCleanup(maintenance.RELOAD.clear)
 
-    def run_job(self, action, before, after=None, exit_code=0, active=True, output='', timeout=False):
+    def run_job(self, action, before, after=None, exit_code=0, active=True, output='', timeout=False, channel=None):
         job = {'id': str(uuid.uuid4()), 'action': action, 'version': '1.2.4'}
+        if channel is not None:
+            job['xray_channel'] = channel
         process = Mock(pid=123456, **{'wait.return_value': exit_code})
         if timeout:
             process.wait.side_effect = [subprocess.TimeoutExpired('fixture', 1800), 0, 0]
@@ -107,6 +109,18 @@ class MaintenanceTests(unittest.TestCase):
         result, _, _ = self.run_job('upgrade', before, {'panel': '1.2.4', 'agent': '1.2.3'})
         self.assertEqual(result['state'], 'failed')
         self.assertIn('agent 版本未达到目标', result['error'])
+
+    def test_latest_core_requires_explicit_choice_and_is_part_of_task_identity(self):
+        result, commands, _ = self.run_job('upgrade', {'panel': '1.2.3'}, {'panel': '1.2.4'}, channel='latest')
+        self.assertEqual(result['state'], 'succeeded')
+        self.assertEqual(commands[0][-2:], ['--xray-channel', 'latest'])
+        payload = {'id': str(uuid.uuid4()), 'action': 'upgrade', 'version': '1.2.4'}
+        pool = Mock(spec=concurrent.futures.ThreadPoolExecutor)
+        maintenance.submit(payload, pool, self.root)
+        with self.assertRaisesRegex(ValueError, '其他操作'):
+            maintenance.submit({**payload, 'xray_channel': 'latest'}, pool, self.root)
+        for value in ({**payload, 'xray_channel': 'nightly'}, {**payload, 'action': 'restart-all', 'xray_channel': 'latest'}):
+            with self.assertRaises(ValueError): maintenance.validate(value)
 
     def test_newer_agent_blocks_downgrade_and_failed_update_stops_sequence(self):
         result, commands, _ = self.run_job('upgrade', {'panel': '1.2.3', 'agent': '1.2.5'})

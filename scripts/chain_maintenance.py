@@ -28,11 +28,14 @@ HTTPS_UNIT = Path('/etc/systemd/system/chain-panel-https.service')
 
 
 def validate(value):
-    require(isinstance(value, dict) and set(value) <= {'id', 'action', 'version'}, '请求字段无效')
+    require(isinstance(value, dict) and set(value) <= {'id', 'action', 'version', 'xray_channel'}, '请求字段无效')
     require(isinstance(value.get('id'), str) and str(uuid.UUID(value['id'])) == value['id'], '任务 ID 无效')
     require(value.get('action') in ACTIONS | {'status'}, '不支持的维护操作')
     if value['action'] == 'upgrade':
         require(isinstance(value.get('version'), str) and re.fullmatch(VERSION_RE, value['version']), '请选择正式发行版本')
+        require(value.get('xray_channel', 'recommended') in ('recommended', 'latest'), 'Xray 来源无效')
+    else:
+        require('xray_channel' not in value, '只有升级操作可选择内核来源')
     return value
 
 
@@ -90,6 +93,8 @@ def execute(job, directory=STATE):
                 require(manifest['version'] == job['version'] and 'scripts/chain_maintenance.py' in manifest['files'],
                         '目标版本不支持远程维护，拒绝升级以免丢失控制能力')
                 commands = [['/usr/local/bin/chainctl', 'update', '--component', 'panel', '--package', str(archive), '--non-interactive']]
+                if job.get('xray_channel') == 'latest':
+                    commands[0].extend(['--xray-channel', 'latest'])
                 if HTTPS_UNIT.name in services:
                     commands.append(['/usr/bin/systemctl', 'restart', HTTPS_UNIT.name])
             elif job['action'] == 'restart-all':
@@ -169,8 +174,8 @@ def submit(value, pool, directory=STATE):
     with LOCK:
         if path.exists():
             job = json.loads(path.read_text())
-            require(value['action'] == 'status' or (job['action'], job.get('version', '')) ==
-                    (value['action'], value.get('version', '')), '任务 ID 已用于其他操作')
+            require(value['action'] == 'status' or (job['action'], job.get('version', ''), job.get('xray_channel', 'recommended')) ==
+                    (value['action'], value.get('version', ''), value.get('xray_channel', 'recommended')), '任务 ID 已用于其他操作')
             return job
         if value['action'] == 'status':
             return {'id': value['id'], 'state': 'not_found'}

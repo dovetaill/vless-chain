@@ -14,10 +14,59 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 
 FORMAT = 1
 VERSION_RE = r'[0-9]+\.[0-9]+\.[0-9]+'
 RELEASE_REPO = 'dovetaill/vless-chain'
+
+
+def latest_xray(stage, manifest, directory):
+    """An explicit opt-in replaces only the kernel in a verified, temporary release tree."""
+    request = urllib.request.Request('https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30',
+                                     headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'chainctl'})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = response.read(2 * 1024**2 + 1)
+    require(len(payload) <= 2 * 1024**2, 'Xray 发行信息过大。')
+    releases = [r for r in json.loads(payload) if not r.get('draft')
+                and re.fullmatch('v' + VERSION_RE, r.get('tag_name', ''))]
+    require(releases, '未找到官方 Xray 发行版本。')
+    release = max(releases, key=lambda r: tuple(map(int, r['tag_name'][1:].split('.'))))
+    tag = release['tag_name']
+    suffix = {('linux', 'x86_64'): 'linux-64', ('linux', 'aarch64'): 'linux-arm64-v8a',
+              ('darwin', 'x86_64'): 'macos-64', ('darwin', 'aarch64'): 'macos-arm64-v8a'}[operating_system(), architecture()]
+    name = f'Xray-{suffix}.zip'
+    asset = next((a for a in release.get('assets', []) if a.get('name') == name), None)
+    require(asset is not None, '官方 Xray 未提供本机架构附件。')
+    digest = asset.get('digest', '')
+    require(re.fullmatch(r'sha256:[0-9a-f]{64}', digest), '官方 Xray 附件缺少 SHA256，拒绝替换。')
+    url = f'https://github.com/XTLS/Xray-core/releases/download/{tag}/{name}'
+    require(asset.get('browser_download_url') == url, 'Xray 附件来源不匹配。')
+    archive = Path(directory) / name
+    print(f'本次主动选择官方最新版 Xray {tag}（{"预发布" if release.get("prerelease") else "正式版"}）；可能要求更新客户端。', flush=True)
+    with urllib.request.urlopen(url, timeout=60) as response, archive.open('xb') as stream:
+        require(response.geturl().startswith('https://'), '下载必须使用 HTTPS。')
+        total = 0
+        for chunk in iter(lambda: response.read(1024**2), b''):
+            total += len(chunk)
+            require(total <= 128 * 1024**2, 'Xray 附件过大。')
+            stream.write(chunk)
+    require(sha256(archive) == digest[7:], '官方 Xray 下载校验失败，未替换内核。')
+    with zipfile.ZipFile(archive) as bundle:
+        for entry in ('xray', 'LICENSE'):
+            info = bundle.getinfo(entry)
+            require(info.file_size <= 128 * 1024**2, 'Xray 解压大小超限。')
+        (stage / 'bin/xray').write_bytes(bundle.read('xray'))
+        (stage / 'share/Xray-LICENSE').write_bytes(bundle.read('LICENSE'))
+    provenance = stage / 'share/Xray-PATCHES.txt'
+    provenance.unlink(missing_ok=True)
+    manifest['files'].pop('share/Xray-PATCHES.txt', None)
+    for name in ('bin/xray', 'share/Xray-LICENSE'):
+        manifest['files'][name]['sha256'] = sha256(stage / name)
+    manifest.update(xray=tag[1:], xray_channel='latest', xray_prerelease=bool(release.get('prerelease')),
+                    xray_source=url, xray_archive_sha256=digest[7:])
+    json_write(stage / 'release.json', manifest, 0o644)
+    verify_tree(stage)
 
 
 def download_release(directory, version=None):

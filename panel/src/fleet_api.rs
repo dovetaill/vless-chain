@@ -486,6 +486,8 @@ struct Batch {
     #[serde(default)]
     version: String,
     #[serde(default)]
+    xray_channel: String,
+    #[serde(default)]
     lines: BTreeMap<String, Vec<String>>,
 }
 async fn archive_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -544,6 +546,10 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
     if input.action == "upgrade" && !version_valid(&input.version) {
         return Err(error(StatusCode::BAD_REQUEST, "请选择正式发行版本"));
     }
+    if !matches!(input.xray_channel.as_str(), "" | "recommended" | "latest")
+        || (input.xray_channel == "latest" && input.action != "upgrade") {
+        return Err(error(StatusCode::BAD_REQUEST, "Xray 来源无效"));
+    }
     edit(&app, |d| {
         if d.fleet.receipts.contains_key(&input.id) {
             return Ok(());
@@ -583,6 +589,12 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
                         .as_array().is_some_and(|actions| actions.iter().any(|a| a == "restart-all")))),
                     "所选 VPS 尚不支持整套重启；请先升级并等待状态同步");
             }
+            if input.xray_channel == "latest" {
+                ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter()
+                    .find(|r| &r.id == id).is_some_and(|r| r.snapshot["maintenance_actions"]
+                        .as_array().is_some_and(|actions| actions.iter().any(|a| a == "upgrade-xray-latest")))),
+                    "所选 VPS 尚不支持选择官方内核；请先使用推荐稳定版升级");
+            }
         }
         if matches!(input.action.as_str(), "enable" | "disable") {
             ensure!(
@@ -602,7 +614,7 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
             .collect();
         d.fleet.receipts.insert(
             input.id.clone(),
-            json!({"id":input.id,"action":input.action,"version":input.version,
+            json!({"id":input.id,"action":input.action,"version":input.version,"xray_channel":input.xray_channel,
             "lines":input.lines,"targets":targets,"state":"running","at":now()}),
         );
         if d.fleet.receipts.len() > 100 {
@@ -705,11 +717,13 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
         }
     } else {
         // The remote executor persists request IDs before starting, including across panel restarts.
+        let mut payload = json!({"id":target["task_id"],"action":action,"version":job["version"]});
+        if job["xray_channel"] == "latest" { payload["xray_channel"] = json!("latest"); }
         request(
             &remote,
             "POST",
             "/api/federation/task",
-            Some(json!({"id":target["task_id"],"action":action,"version":job["version"]})),
+            Some(payload),
         )
         .await
         }
@@ -928,7 +942,7 @@ mod tests {
         assert_eq!(saved["targets"][0]["result"]["verification"]["state"], "pending");
     }
     #[tokio::test]
-    async fn maintenance_success_retries_verification_without_reinstalling() {
+    async fn latest_xray_maintenance_retries_verification_without_reinstalling() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task_ids = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -943,6 +957,7 @@ mod tests {
             .route("/api/federation/task", post(move |Json(body): Json<Value>| {
                 let ids = recorded_ids.clone();
                 async move {
+                    assert_eq!(body["xray_channel"], "latest");
                     ids.lock().unwrap().push(body["id"].clone());
                     Json(json!({"state":"succeeded","detail":"components updated"}))
                 }
@@ -968,7 +983,7 @@ mod tests {
                 policy_error: String::new(), snapshot: Value::Null,
             });
             store.doc.fleet.receipts.insert(job_id.clone(), json!({
-                "id":job_id,"action":"upgrade","version":"0.2.40","state":"running",
+                "id":job_id,"action":"upgrade","version":"0.2.40","xray_channel":"latest","state":"running",
                 "targets":[{"id":remote_id,"task_id":task_id,"state":"pending"}]
             }));
         }
@@ -1140,6 +1155,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_xray_requires_capability_and_rejects_unknown_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let remote_id = id();
+        app.store.lock().unwrap().doc.fleet.remotes.push(Remote {
+            id: remote_id.clone(), name: "test".into(), url: "https://unused.invalid".into(),
+            token: String::new(), seen: now(), error: String::new(), policy_error: String::new(),
+            snapshot: json!({"maintenance":true}),
+        });
+        let input = |channel: &str| Batch { id: id(), targets: vec![remote_id.clone()],
+            action: "upgrade".into(), version: "0.2.47".into(), xray_channel: channel.into(), lines: BTreeMap::new() };
+        assert!(batch(State(app.clone()), Json(input("latest"))).await.is_err());
+        app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["upgrade-xray-latest"]);
+        assert!(batch(State(app.clone()), Json(input("nightly"))).await.is_err());
+        let Json(result) = batch(State(app.clone()), Json(input("latest"))).await.unwrap();
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[result["id"].as_str().unwrap()]["xray_channel"], "latest");
+    }
+
+    #[tokio::test]
     async fn restart_all_requires_remote_capability_and_persists_the_task() {
         let dir = tempfile::tempdir().unwrap();
         let app = app(dir.path());
@@ -1150,7 +1184,7 @@ mod tests {
             snapshot: json!({"maintenance":true}),
         });
         let input = || Batch { id: id(), targets: vec![remote_id.clone()],
-            action: "restart-all".into(), version: String::new(), lines: BTreeMap::new() };
+            action: "restart-all".into(), version: String::new(), xray_channel: String::new(), lines: BTreeMap::new() };
         assert!(batch(State(app.clone()), Json(input())).await.is_err());
         assert!(app.store.lock().unwrap().doc.fleet.receipts.is_empty());
         app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["restart-all"]);

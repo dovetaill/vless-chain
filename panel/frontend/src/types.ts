@@ -163,7 +163,7 @@ export interface PanelState {
   agent_seen?: number | null;
   maintenance?: boolean;
   maintenance_actions?: string[];
-  cores?: { xray?: string; mihomo?: string } | null;
+  cores?: { xray?: string; mihomo?: string; xray_channel?: string; xray_prerelease?: boolean } | null;
   legacy_configs?: { id: string; node_id: string; name: string; enabled: boolean; published: boolean; pending_delete?: boolean; ports: number[] }[];
   pending_imports?: { id: string; name: string; reason: string }[];
   local_node_id: string | null;

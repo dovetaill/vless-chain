@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import zipfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,6 +28,48 @@ import ci_release as ci
 
 
 class Delivery(unittest.TestCase):
+    def test_explicit_latest_xray_verifies_origin_checksum_and_manifest(self):
+        source, manifest = self.package()
+        (source / 'share').mkdir()
+        for name in ('Xray-LICENSE', 'Xray-PATCHES.txt'):
+            (source / 'share' / name).write_text('old')
+            manifest['files']['share/' + name] = {'sha256': common.sha256(source / 'share' / name), 'mode': 0o644}
+        content = io.BytesIO()
+        with zipfile.ZipFile(content, 'w') as bundle:
+            bundle.writestr('xray', b'new-official-core')
+            bundle.writestr('LICENSE', b'license')
+        content = content.getvalue()
+        url = 'https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-64.zip'
+        asset = {'name': 'Xray-linux-64.zip', 'digest': 'sha256:' + hashlib.sha256(content).hexdigest(), 'browser_download_url': url}
+        releases = [{'tag_name': 'v26.3.27', 'draft': False}, {'tag_name': 'v26.9.9', 'draft': False, 'prerelease': True, 'assets': [asset]},
+                    {'tag_name': 'v99.1.1', 'draft': True}, {'tag_name': 'latest', 'draft': False}]
+        def response(data):
+            stream = io.BytesIO(data)
+            stream.geturl = lambda: url
+            return stream
+        for variant in ('source', 'digest', 'checksum', 'ok'):
+            with self.subTest(variant=variant):
+                item = {**asset}
+                if variant == 'source': item['browser_download_url'] = 'https://other.example/xray.zip'
+                if variant == 'digest': item.pop('digest')
+                if variant == 'checksum': item['digest'] = 'sha256:' + '0' * 64
+                releases[1]['assets'] = [item]
+                downloads = self.root / variant
+                downloads.mkdir()
+                with patch.object(common, 'operating_system', return_value='linux'), \
+                        patch.object(common, 'architecture', return_value='x86_64'), \
+                        patch.object(common.urllib.request, 'urlopen', side_effect=[response(json.dumps(releases).encode()), response(content)]):
+                    if variant != 'ok':
+                        with self.assertRaises(ValueError): common.latest_xray(source, manifest, downloads)
+                        self.assertEqual((source / 'bin/xray').read_text(), 'fixture-0.1.0')
+                    else:
+                        common.latest_xray(source, manifest, downloads)
+        self.assertEqual(common.verify_tree(source), manifest)
+        self.assertEqual((manifest['xray'], manifest['xray_channel'], manifest['xray_prerelease']), ('26.9.9', 'latest', True))
+        self.assertNotIn('share/Xray-PATCHES.txt', manifest['files'])
+        self.assertFalse((source / 'share/Xray-PATCHES.txt').exists())
+        self.assertEqual(installer.make_parser().parse_args(['update']).xray_channel, 'recommended')
+
     def test_menu_update_automatically_selects_installed_components(self):
         for roles, expected in ((('panel', 'agent'), 'panel'), (('panel',), 'panel'), (('agent',), 'agent')):
             with self.subTest(roles=roles), patch.object(installer, 'Manager') as manager, \

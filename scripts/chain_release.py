@@ -14,20 +14,16 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
-import zipfile
 
 from chain_common import (Workspace, architecture, operating_system, atomic_write, json_write, output, require,
                           run, sha256, verify_archive_checksum, VERSION_RE)
 
 ROOT = Path(__file__).resolve().parents[1]
-XRAY_VERSION = '26.3.27'
-# Pinned official release ZIP checksums (GitHub asset digest); no unauthenticated latest download.
-XRAY_ASSETS = {
-    ('linux', 'x86_64'): ('Xray-linux-64.zip', '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae'),
-    ('linux', 'aarch64'): ('Xray-linux-arm64-v8a.zip', '4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c'),
-    ('darwin', 'x86_64'): ('Xray-macos-64.zip', 'f5b0471d3459eff1b82e48af0aeac186abcc3298210070afbbbd8437a4e8b203'),
-    ('darwin', 'aarch64'): ('Xray-macos-arm64-v8a.zip', '2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf'),
-}
+XRAY_VERSION = '26.3.27-chain.1'
+XRAY_SOURCES = (
+    ('github.com/xtls/xray-core@v1.260327.0', 'h1:g4TzxMwyPrxslZh6uD+FiG3lXKTrnNO+b4ky2OhogHE='),
+    ('github.com/xtls/reality@v0.0.0-20260322125925-9234c772ba8f', 'h1:iy2JRioxmUpoJ3SzbFPyTxHZMbR/rSHP7dOOgYaq1O8='),
+)
 MIHOMO_VERSION = '1.19.32'
 MIHOMO_ASSETS = {
     ('linux', 'x86_64'): ('amd64-compatible', 'ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20'),
@@ -170,20 +166,43 @@ def fetch_mihomo(work, destination):
 
 
 def fetch_xray(work, destination):
-    name, digest = XRAY_ASSETS[operating_system(), architecture()]
-    archive = work.root / name
-    url = f'https://github.com/XTLS/Xray-core/releases/download/v{XRAY_VERSION}/{name}'
-    print(f'下载固定版本 Xray v{XRAY_VERSION} 并校验 SHA256。', flush=True)
-    with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as stream:
-        shutil.copyfileobj(response, stream)
-    require(sha256(archive) == digest, 'Xray ZIP 校验失败。')
-    with zipfile.ZipFile(archive) as bundle:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(bundle.read('xray'))
-        license_path = destination.parent.parent / 'share/Xray-LICENSE'
-        license_path.parent.mkdir(parents=True, exist_ok=True)
-        license_path.write_bytes(bundle.read('LICENSE'))
-    destination.chmod(0o755)
+    require(shutil.which('go'), '构建补丁内核需要 Go；安装后的服务器无需 Go。')
+    work.env.update(GOTOOLCHAIN='go1.26.4', GOENV='off', GOFLAGS='-modcacherw', CGO_ENABLED='0',
+                    GOPATH=str(work.root / 'go'), GOMODCACHE=str(work.root / 'go/mod'),
+                    GOCACHE=str(work.root / 'go/cache'), GOPROXY='https://proxy.golang.org', GOSUMDB='sum.golang.org')
+    sources = []
+    for index, (module, digest) in enumerate(XRAY_SOURCES):
+        metadata = work.root / f'xray-source-{index}.json'
+        with metadata.open('wb') as stream:
+            work.run(['go', 'mod', 'download', '-json', module], cwd=work.root, stdout=stream)
+        info = json.loads(metadata.read_text())
+        require(info.get('Sum') == digest and not info.get('Error'), 'Xray 源码校验失败。')
+        source = work.root / f'xray-source-{index}'
+        shutil.copytree(info['Dir'], source, copy_function=shutil.copyfile)
+        source.chmod(0o700)
+        for directory in source.rglob('*'):
+            if directory.is_dir():
+                directory.chmod(0o700)
+        sources.append(source)
+    core, reality = sources
+    file = reality / 'tls.go'
+    original = file.read_text()
+    require(original.count('\tsize  = 8192\n') == 1, 'REALITY 补丁基线不匹配，拒绝构建。')
+    # Backport only XTLS/REALITY#33; retain the stable baseline's client compatibility.
+    file.write_text(original.replace('\tsize  = 8192\n', '\tsize  = 17 * 1024\n'))
+    work.run(['go', 'mod', 'edit', '-replace', f'github.com/xtls/reality={reality}'], cwd=core)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    work.run(['go', 'build', '-mod=readonly', '-trimpath', '-buildvcs=false', '-ldflags',
+              '-s -w -buildid= -X github.com/xtls/xray-core/core.build=chain.1-reality-buffer-17k',
+              '-o', destination, './main'], cwd=core)
+    share = destination.parent.parent / 'share'
+    share.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(core / 'LICENSE', share / 'Xray-LICENSE')
+    (share / 'Xray-PATCHES.txt').write_text(
+        f'{XRAY_VERSION}: 本项目补丁构建，并非官方原版二进制。\n'
+        '基线：Xray v26.3.27；仅回移 https://github.com/XTLS/REALITY/pull/33\n'
+        'tls.go: size = 8192 -> size = 17 * 1024；保留原 REALITY 客户端兼容性。\n'
+        'Go 1.26.4；源码模块及校验：\n' + '\n'.join(f'{m} {s}' for m, s in XRAY_SOURCES) + '\n')
 
 
 def default_output():
@@ -254,6 +273,7 @@ def build(args):
         work.run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=project / 'frontend')
         work.run(['npm', 'run', 'build'], cwd=project / 'frontend')
         work.run(['cargo', 'test', '--locked', '--lib', '--quiet'], cwd=project)
+        work.run(['cargo', 'test', '--locked', '--bin', 'chain-panel', 'latest_xray', '--quiet'], cwd=project)
         work.run(['cargo', 'build', '--locked', '--release', '--bins', '--target', target], cwd=project)
         stage = work.root / 'stage'
         (stage / 'bin').mkdir(parents=True)
@@ -264,6 +284,8 @@ def build(args):
                 require('INTERP' not in headers and '(NEEDED)' not in headers, f'{binary} 不是完全静态发行程序。')
         fetch_xray(work, stage / 'bin/xray')
         work.run([stage / 'bin/xray', 'version'])
+        work.env.update(CHAIN_TEST_ROOT=str(work.root), CHAIN_TEST_XRAY=str(stage / 'bin/xray'))
+        work.run(['node', ROOT / 'panel/tests/xray-reality.cjs'], cwd=ROOT)
         fetch_mihomo(work, stage / 'bin/mihomo')
         work.run([stage / 'bin/mihomo', '-v'])
         for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_time.py']:
@@ -282,7 +304,7 @@ def build(args):
                 file.chmod(mode)
                 files[name] = {'sha256': sha256(file), 'mode': mode}
         manifest = {'format': 1, 'version': ver, 'arch': arch, 'os': operating_system(), 'target': target,
-                    'commit': commit, 'dirty': dirty, 'xray': XRAY_VERSION, 'mihomo': MIHOMO_VERSION, 'files': files,
+                    'commit': commit, 'dirty': dirty, 'xray': XRAY_VERSION, 'xray_channel': 'recommended', 'mihomo': MIHOMO_VERSION, 'files': files,
                     'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
         manifest.update({'libc': 'musl'} if operating_system() == 'linux' else {'macos_min': '14.0'})
         json_write(stage / 'release.json', manifest, 0o644)

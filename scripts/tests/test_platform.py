@@ -94,7 +94,6 @@ class Platforms(unittest.TestCase):
                 with patch.object(common.platform, 'system', return_value=os_name), \
                         patch.object(common.platform, 'machine', return_value=machine):
                     self.assertEqual((common.operating_system(), common.architecture()), (system, arch))
-                    self.assertIn((system, arch), release.XRAY_ASSETS)
                     self.assertIn((system, arch), release.MIHOMO_ASSETS)
         with patch.object(common.platform, 'system', return_value='Windows'):
             with self.assertRaisesRegex(ValueError, 'Linux 和 macOS'):

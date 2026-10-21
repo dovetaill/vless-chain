@@ -26,7 +26,8 @@ export function Maintenance({ state }: { state: PanelState }) {
   const [taskId, setTaskId] = useState(() => localStorage.getItem(storageKey));
   const [task, setTask] = useState<Task>();
   const [submitting, setSubmitting] = useState(false);
-  const [confirm, setConfirm] = useState<{ id: string; action: string; version?: string }>();
+  const [xrayChannel, setXrayChannel] = useState("recommended");
+  const [confirm, setConfirm] = useState<{ id: string; action: string; version?: string; xray_channel?: string }>();
   const busy = submitting || (!!taskId && (!task || ["queued", "running"].includes(task.state)));
   const fetchRelease = useCallback(async () => {
     setChecking(true);
@@ -73,6 +74,7 @@ export function Maintenance({ state }: { state: PanelState }) {
           <dt>Xray（发行包）</dt><dd>{state.cores?.xray || "未知"}</dd>
           <dt>Mihomo（发行包）</dt><dd>{state.cores?.mihomo || "未知"}</dd>
         </dl>
+        {state.cores?.xray_channel === "latest" && <p className="text-sm">当前 Xray 来源：官方最新版{state.cores.xray_prerelease ? "（预发布）" : ""}</p>}
         {!!state.agent_seen && <p className="muted">Agent 最近上报：{stamp(state.agent_seen)}</p>}
         {state.agent_version && state.version !== state.agent_version && (
           <Status tone="warn">面板与 Agent 版本不一致</Status>
@@ -80,6 +82,15 @@ export function Maintenance({ state }: { state: PanelState }) {
         <p className="text-sm">
           {release ? `最新正式 Release：${release.version} · Xray ${release.xray || "未知"} · Mihomo ${release.mihomo || "未知"}` : "尚未获取最新正式 Release"}
         </p>
+        <label className="block space-y-2 text-sm">
+          <span>本次升级的 Xray 内核</span>
+          <select className="w-full rounded-md border bg-background p-2" value={xrayChannel}
+            disabled={busy} onChange={e => setXrayChannel(e.target.value)}>
+            <option value="recommended">推荐稳定版（随发行包，含本项目修复补丁）</option>
+            <option value="latest">官方最新版（含预发布，可能要求更新客户端）</option>
+          </select>
+        </label>
+        <p className="muted">默认使用发行包验证过的内核。选择官方最新版仅作用于本次主动升级，不会后台自动更换；可重新选择推荐稳定版并升级，恢复推荐内核。</p>
         {!supported && (
           <p role="status" className="text-sm text-amber-700">
             当前部署未提供网页维护。仅支持 Linux systemd；该平台请先手工升级以安装维护组件。OpenRC、macOS 和纯 Agent 安装暂不支持。
@@ -90,7 +101,7 @@ export function Maintenance({ state }: { state: PanelState }) {
             {checking ? "正在检查…" : "检查最新版本"}
           </Button>
           <Button disabled={!supported || !release || checking || busy}
-            onClick={() => setConfirm({ id: requestId(), action: "upgrade", version: release!.version })}>
+            onClick={() => setConfirm({ id: requestId(), action: "upgrade", version: release!.version, xray_channel: xrayChannel })}>
             升级并自动重启
           </Button>
           <Button variant="outline" disabled={!supported || !state.maintenance_actions?.includes("restart-all") || busy}
@@ -115,7 +126,7 @@ export function Maintenance({ state }: { state: PanelState }) {
         )}
         {confirm && (
           <Modal title={confirm.action === "upgrade" ? `升级到 ${confirm.version}` : "整套重启当前服务器"}
-            description="会自动重启本项目相关服务，代理连接将中断。面板恢复后可能需要重新登录，回到此处可继续查看原任务。"
+            description={`会自动重启本项目相关服务，代理连接将中断。${confirm.xray_channel === "latest" ? "本次选择官方最新 Xray，包含预发布版本，现有客户端可能需要升级。" : ""}面板恢复后可能需要重新登录，回到此处可继续查看原任务。`}
             submit="确认执行" close={() => setConfirm(undefined)} action={async () => {
               const request = confirm;
               localStorage.setItem(storageKey, request.id);

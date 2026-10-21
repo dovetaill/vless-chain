@@ -268,6 +268,7 @@ export function Fleet() {
       mihomo: string;
     }>(),
     [releaseLoading, setReleaseLoading] = useState(false);
+  const [xrayChannel, setXrayChannel] = useState("recommended");
   const [invite, setInvite] = useState(""),
     [policy, setPolicy] = useState<Policy>(defaultPolicy),
     [override, setOverride] = useState(false);
@@ -631,12 +632,13 @@ export function Fleet() {
       version = release?.version || "";
     const blocked = targets.filter(
       (r) => !connected(r, now) || (!isLines && !r.snapshot?.maintenance)
-        || (action === "restart-all" && !r.snapshot?.maintenance_actions?.includes(action)),
+        || (action === "restart-all" && !r.snapshot?.maintenance_actions?.includes(action))
+        || (action === "upgrade" && xrayChannel === "latest" && !r.snapshot?.maintenance_actions?.includes("upgrade-xray-latest")),
     );
     setModal(
       <Modal
         title={`确认${actions[action]}`}
-        description={`${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，升级后自动重启相关服务` : ""}。最多同时处理 5 台，单台失败不阻塞其他机器；操作可能中断对应机器的连接。`}
+        description={`${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，Xray 使用${xrayChannel === "latest" ? "官方最新版（含预发布，可能要求更新客户端）" : "推荐稳定版"}，升级后自动重启相关服务` : ""}。最多同时处理 5 台，单台失败不阻塞其他机器；操作可能中断对应机器的连接。`}
         submit={
           blocked.length || (action === "upgrade" && !release)
             ? undefined
@@ -649,6 +651,7 @@ export function Fleet() {
             targets: targets.map((r) => r.id),
             action,
             version,
+            xray_channel: action === "upgrade" ? xrayChannel : undefined,
             lines: lineMap,
           });
           close();
@@ -682,7 +685,7 @@ export function Fleet() {
             {blocked
               .map(
                 (r) =>
-                  `${r.name}（${!connected(r, now) ? "失联或数据过期" : !r.snapshot?.maintenance ? "尚未安装维护组件" : "请先升级以支持整套重启"}）`,
+                  `${r.name}（${!connected(r, now) ? "失联或数据过期" : !r.snapshot?.maintenance ? "尚未安装维护组件" : action === "upgrade" ? "请先使用推荐稳定版升级，以支持内核选择" : "请先升级以支持整套重启"}）`,
               )
               .join("、")}
             。请修复或调整选择；不会自动跳过。
@@ -1079,6 +1082,11 @@ export function Fleet() {
                 </div>
                 {chosen.length > 0 && <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
                   <div className="flex flex-wrap items-center gap-2">
+                    <select aria-label="批量升级的 Xray 内核" className="rounded-md border bg-background p-2 text-sm" value={xrayChannel}
+                      disabled={busy} onChange={e => setXrayChannel(e.target.value)}>
+                      <option value="recommended">推荐稳定版（含修复补丁）</option>
+                      <option value="latest">官方最新版（含预发布）</option>
+                    </select>
                     <Button disabled={busy || releaseLoading || !release || running.some(t => t.state === "running")} onClick={() => batch("upgrade")}>批量升级</Button>
                     <Button variant="outline" disabled={busy || releaseLoading} onClick={() => void fetchRelease()}>{releaseLoading ? "正在获取最新版本…" : "检查最新版本"}</Button>
                     <span className="text-xs text-muted-foreground">{release ? `最新正式版 ${release.version}` : "先检查版本，再升级所选 VPS"}</span>
