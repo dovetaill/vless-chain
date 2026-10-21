@@ -218,11 +218,28 @@ fn prune_probe_conditions(doc: &mut Document) {
 }
 
 fn record_probe(doc: &mut Document, key: String, name: &str, line: &Line, p: &Policy, local: bool, result: Value) {
+    if doc.monitoring.checks.get(&key).is_some_and(|previous| previous["checked_at"].as_u64() > result["checked_at"].as_u64()) {
+        return;
+    }
     let failed = result["ok"] == false;
     let summary: String = result["detail"].as_str().unwrap_or("").lines().take(2).collect::<Vec<_>>().join("；").chars().take(600).collect();
     doc.monitoring.checks.insert(key.clone(), result);
     observe(doc, key, failed, format!("{name} / {}：{}检测{}。{summary}", line.name,
         if local { "本机发起的连接" } else { "总控发起的连接" }, if failed { "未通过" } else { "通过" }), p, false);
+}
+
+pub fn record_manual_probe(doc: &mut Document, line: &Line, request: &ProbeRequest, result: Value) {
+    let policy = doc.monitoring.policy().clone();
+    let key = format!("probe:local:{}", line.id);
+    // A TCP-only check or a different destination cannot resolve the monitored HTTP failure.
+    if (!policy.enabled && !doc.monitoring.conditions.contains_key(&key))
+        || request.mode != "http" || request.url != policy.url || doc.busy()
+        || !doc.applied_lines.iter().any(|current| current.id == line.id
+            && chain_panel::rental::status(doc, current, now()) == "active"
+            && serde_json::to_value(current).ok() == serde_json::to_value(line).ok()) {
+        return;
+    }
+    record_probe(doc, key, "本机", line, &policy, true, result);
 }
 
 async fn notify(app: &App) -> Result<()> {
@@ -661,6 +678,39 @@ mod tests {
         assert_eq!(doc.monitoring.notices.len(), 2);
         assert!(doc.monitoring.notices[1].message.starts_with("恢复："));
         assert!(!doc.monitoring.checks[key]["outbound"].is_object(), "成功后不能沿用旧失败诊断");
+    }
+    #[test]
+    fn manual_probe_updates_the_same_alert_without_accepting_other_or_stale_checks() {
+        let line = line();
+        let node: Node = serde_json::from_value(json!({"id":"node","name":"node","host":"127.0.0.1",
+            "token_hash":"test","seen":now(),"reality":Reality::new("example.com:443".into(), "example.com".into()),
+            "report":{"running":true}})).unwrap();
+        let mut doc = Document { nodes: vec![node], applied_lines: vec![line.clone()], ..Default::default() };
+        let p = Policy::default();
+        let key = "probe:local:line";
+        for _ in 0..p.failures {
+            record_probe(&mut doc, key.into(), "本机", &line, &p, true,
+                json!({"ok":false,"detail":"failed","checked_at":now()}));
+        }
+        let mut request = ProbeRequest { mode:"tcp".into(), url:p.url.clone() };
+        let passed = json!({"ok":true,"detail":"HTTP 200","checked_at":now()});
+        record_manual_probe(&mut doc, &line, &request, passed.clone());
+        request.mode = "http".into(); request.url = "https://other.example/".into();
+        record_manual_probe(&mut doc, &line, &request, passed.clone());
+        request.url = p.url.clone();
+        let mut changed = line.clone(); changed.name = "changed".into();
+        record_manual_probe(&mut doc, &changed, &request, passed.clone());
+        record_manual_probe(&mut doc, &line, &request, json!({"ok":true,"checked_at":1}));
+        assert_eq!(doc.monitoring.conditions[key].good, 0);
+        for n in 1..=p.recoveries {
+            record_manual_probe(&mut doc, &line, &request, passed.clone());
+            assert_eq!(doc.monitoring.conditions[key].active, n < p.recoveries);
+        }
+        assert_eq!(doc.monitoring.checks[key], passed);
+        assert_eq!(doc.monitoring.notices.len(), 2);
+        doc.monitoring.conditions.clear();
+        record_manual_probe(&mut doc, &line, &request, json!({"ok":false,"checked_at":now()}));
+        assert!(doc.monitoring.conditions.is_empty(), "手动诊断不能擅自开启监控告警");
     }
     #[test]
     fn obsolete_probes_clear_but_offline_nodes_keep_their_evidence() {

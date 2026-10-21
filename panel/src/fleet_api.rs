@@ -12,6 +12,7 @@ pub fn routes(router: Router<App>) -> Router<App> {
         .route("/api/fleet/batch", post(batch))
         .route("/api/fleet/batch/{id}/resume", post(resume_batch))
         .route("/api/fleet/batch/{id}/archive", post(archive_batch))
+        .route("/api/fleet/batch/{id}/verify/{remote_id}", post(recheck_batch))
         .route("/api/fleet/release/{version}", get(release_info))
         .route("/api/fleet/{id}", delete(disconnect))
         .route("/api/fleet/{id}/forward", post(forward))
@@ -496,6 +497,23 @@ async fn archive_batch(State(app): State<App>, Path(id): Path<String>) -> ApiRes
     })?;
     Ok(Json(json!({"ok":true})))
 }
+async fn recheck_batch(State(app): State<App>, Path((id, remote_id)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    edit(&app, |d| {
+        let job = d.fleet.receipts.get_mut(&id).context("任务不存在")?;
+        ensure!(job["archived"] != true, "已归档任务不再复查");
+        ensure!(!matches!(job["action"].as_str(), Some("enable" | "disable")), "此任务没有维护后连接验证");
+        let target = job["targets"].as_array_mut().context("任务无效")?.iter_mut()
+            .find(|target| target["id"] == remote_id).context("VPS 不在此任务中")?;
+        ensure!(maintenance_succeeded(target), "请等待组件维护完成");
+        target["state"] = json!("succeeded");
+        target["result"]["maintenance_state"] = json!("succeeded");
+        target.as_object_mut().unwrap().remove("error");
+        target["result"].as_object_mut().unwrap().remove("error");
+        target["result"]["verification"] = json!({"state":"pending","retry_at":0});
+        Ok(())
+    })?;
+    Ok(Json(json!({"ok":true})))
+}
 async fn resume_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     edit(&app, |d| {
         ensure!(
@@ -879,6 +897,7 @@ mod tests {
         assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id], receipt);
         let _ = archive_batch(State(app.clone()), Path(job_id.clone())).await.unwrap();
         assert!(resume_batch(State(app.clone()), Path(job_id.clone())).await.is_err());
+        assert!(recheck_batch(State(app.clone()), Path((job_id.clone(), "no-remote".into()))).await.is_err());
         // There is no remote: dispatching anything would fail instead of completing here.
         work_batch(&app).await.unwrap();
         verify_batches(&app).await.unwrap();
@@ -886,6 +905,28 @@ mod tests {
         assert!(archive_batch(State(app), Path(id())).await.is_err());
     }
 
+    #[tokio::test]
+    async fn manual_recheck_preserves_maintenance_and_validates_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let job_id = id();
+        let receipt = json!({"id":job_id,"state":"paused","action":"upgrade","targets":[
+            {"id":"done","state":"failed","task_id":"original","error":"组件维护已完成，但整链验证失败：timeout"},
+            {"id":"waiting","state":"pending"}
+        ]});
+        app.store.lock().unwrap().doc.fleet.receipts.insert(job_id.clone(), receipt.clone());
+        for target in ["missing", "waiting"] {
+            assert!(recheck_batch(State(app.clone()), Path((job_id.clone(), target.into()))).await.is_err());
+        }
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id], receipt);
+        let _ = recheck_batch(State(app.clone()), Path((job_id.clone(), "done".into()))).await.unwrap();
+        let saved = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
+        assert_eq!(saved["state"], "paused", "连接复查不能启动未执行的维护");
+        assert_eq!(saved["targets"][1], receipt["targets"][1]);
+        assert_eq!(saved["targets"][0]["task_id"], "original");
+        assert!(maintenance_succeeded(&saved["targets"][0]));
+        assert_eq!(saved["targets"][0]["result"]["verification"]["state"], "pending");
+    }
     #[tokio::test]
     async fn maintenance_success_retries_verification_without_reinstalling() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -939,7 +980,8 @@ mod tests {
         verify_batches(&app).await.unwrap();
         let failed_again = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
         document.lock().unwrap().lines.clear();
-        app.store.lock().unwrap().doc.fleet.receipts.get_mut(&job_id).unwrap()["targets"][0]["result"]["verification"]["retry_at"] = json!(0);
+        let _ = recheck_batch(State(app.clone()), Path((job_id.clone(), remote_id.clone()))).await.unwrap();
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id]["targets"][0]["result"]["verification"]["state"], "pending");
         let third = verify_batches(&app).await;
         let passed = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
         server.abort();

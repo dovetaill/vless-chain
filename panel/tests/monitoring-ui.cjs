@@ -12,7 +12,7 @@ const assets = path.resolve(process.argv[2]);
     const now = Math.floor(Date.now() / 1000), writes = [], errors = [];
     page.on('pageerror', e => errors.push(e.message));
     const monitoring = {
-      effective: { interval: 300, recoveries: 2 },
+      effective: { interval: 300, recoveries: 2, url: 'https://google.com/' },
       conditions: { 'probe:local:line': { active: true, good: 0, message: 'REALITY：本机入口 127.0.0.1:20000 · SNI example.com 未通过' } },
       checks: { 'probe:local:line': { ok: false, checked_at: now, detail: 'Connection reset by peer\n自动分段检查：出口及后续链路通过', outbound: { ok: true, detail: 'HTTP 200' } } },
     };
@@ -25,6 +25,16 @@ const assets = path.resolve(process.argv[2]);
       if (url.hostname !== 'chain.test') return route.abort();
       if (url.pathname.startsWith('/api/')) {
         if (request.method() !== 'GET') writes.push(url.pathname);
+        if (url.pathname === '/api/fleet/vps/forward') {
+          const body = request.postDataJSON();
+          if (body.path === '/state') return route.fulfill({ json: snapshot });
+          assert.equal(body.path, '/lines/line/probe');
+          assert.deepEqual(body.body, { mode: 'http', url: monitoring.effective.url });
+          monitoring.checks['probe:local:line'] = { ok: true, checked_at: now + 600, detail: 'HTTP 200 after redirect' };
+          monitoring.conditions['probe:local:line'].good += 1;
+          monitoring.conditions['probe:local:line'].active = monitoring.conditions['probe:local:line'].good < 2;
+          return route.fulfill({ json: monitoring.checks['probe:local:line'] });
+        }
         return route.fulfill({ json: url.pathname === '/api/fleet' ? fleet : url.pathname === '/api/state' ? state : {} });
       }
       const file = path.join(assets, url.pathname === '/admin' ? 'index.html' : url.pathname);
@@ -45,8 +55,18 @@ const assets = path.resolve(process.argv[2]);
     monitoring.conditions['probe:local:line'].active = false;
     await dialog.getByText('入口恢复确认中', { exact: true }).first().waitFor({ state: 'hidden' });
     assert.deepEqual(writes, [], '恢复过程不能要求点击检测或修改业务配置');
+    monitoring.checks['probe:local:line'] = { ok: false, checked_at: now + 400, detail: 'fixture failure' };
+    monitoring.conditions['probe:local:line'].good = 0;
+    await dialog.getByText('连接检测待确认', { exact: true }).first().waitFor();
+    monitoring.conditions['probe:local:line'].active = true;
+    await dialog.getByRole('button', { name: '立即复查', exact: true }).click();
+    await dialog.getByRole('status').getByText(/本次连接检测通过.*恢复确认 1\/2/).waitFor();
+    await dialog.getByRole('button', { name: '立即复查', exact: true }).click();
+    await dialog.getByRole('button', { name: '立即复查', exact: true }).waitFor({ state: 'hidden' });
+    await dialog.getByRole('status').getByText('本次连接检测通过。', { exact: true }).waitFor();
+    assert.deepEqual(writes, Array(4).fill('/api/fleet/vps/forward'), '手动复查只检测并刷新状态');
     assert.deepEqual(errors, []);
-    console.log('monitoring UI: failure evidence, automatic recovery progress and dismissal passed');
+    console.log('monitoring UI: automatic recovery, pending status and manual recheck passed');
   } finally {
     await browser.close();
   }

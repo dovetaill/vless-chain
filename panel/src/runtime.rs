@@ -938,7 +938,7 @@ async fn probe_inner(
                 let proxy = crate::external::mihomo(&share, "probe")?;
                 json!({"listeners":[{"name":"probe-in","type":"socks","listen":"127.0.0.1","port":port,"proxy":"probe"}],"proxies":[proxy],"mode":"rule","rules":["MATCH,REJECT"],"log-level":"warning"})
             } else {
-                json!({"log":{"loglevel":log_level()},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[outbound]})
+                json!({"log":{"loglevel":"debug"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[outbound]})
             };
             let file = temp.path().join("probe.json");
             atomic_write(&file, &serde_json::to_vec(&config)?)?;
@@ -966,7 +966,7 @@ async fn probe_inner(
                     .no_proxy()
                     .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
                     .timeout(Duration::from_secs(12))
-                    .redirect(reqwest::redirect::Policy::none())
+                    .redirect(reqwest::redirect::Policy::limited(5))
                     .build()?;
                 let response = client.get(url).send().await?;
                 ensure!(
@@ -1011,6 +1011,52 @@ async fn probe_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CHAIN_TEST_XRAY and isolated loopback ports"]
+    async fn http_probe_follows_redirects_but_rejects_loops_and_http_errors() -> Result<()> {
+        let binary = PathBuf::from(std::env::var("CHAIN_TEST_XRAY")?);
+        let dir = tempfile::tempdir()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]);
+                let response = if request.starts_with("GET /start ") {
+                    "HTTP/1.1 301 Moved Permanently\r\nLocation: /finish\r\n"
+                } else if request.starts_with("GET /loop ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /loop\r\n"
+                } else if request.starts_with("GET /error ") {
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                } else { "HTTP/1.1 200 OK\r\n" };
+                let _ = stream.write_all(format!("{response}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
+            }
+        });
+        let node: Node = serde_json::from_value(json!({"id":"node","name":"fixture","host":"127.0.0.1",
+            "token_hash":"test","reality":Reality::new("example.com:443".into(), "example.com".into())}))?;
+        let line: Line = serde_json::from_value(json!({"id":id(),"name":"redirect fixture","kind":"forward","network":"tcp",
+            "hops":[{"node_id":"node","port":address.port(),"uuid":id()}]}))?;
+        let doc = Document { nodes:vec![node], lines:vec![line.clone()], ..Default::default() };
+        let result = async {
+            let request = |path| ProbeRequest { mode:"http".into(), url:format!("http://{address}/{path}") };
+            let passed = probe(&binary, &line, &doc, &request("start"), None).await?;
+            ensure!(passed["ok"] == true && passed["detail"].as_str().unwrap().contains("HTTP 200"), "redirect must reach its final response");
+            let loop_error = probe(&binary, &line, &doc, &request("loop"), None).await.unwrap_err();
+            ensure!(format!("{loop_error:#}").contains("redirect"), "redirect loops must remain failures");
+            let http_error = probe(&binary, &line, &doc, &request("error"), None).await.unwrap_err();
+            ensure!(format!("{http_error:#}").contains("503"), "HTTP errors must remain failures");
+            atomic_write(&dir.path().join("xray.json"), &serde_json::to_vec(&json!({"outbounds":[{"tag":format!("line-{}-out",line.id),"protocol":"freedom"}]}))?)?;
+            let outbound = diagnose_path(&binary, dir.path(), &line.id, &request("start").url).await?;
+            ensure!(outbound["result"]["ok"] == true, "outbound diagnosis must follow redirects too");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        server.abort();
+        let _ = server.await;
+        let _released = std::net::TcpListener::bind(address)?;
+        result
+    }
 
     #[tokio::test]
     #[ignore = "requires CHAIN_TEST_XRAY and isolated loopback ports"]
@@ -1241,7 +1287,7 @@ pub async fn diagnose_path(binary: &Path, dir: &Path, line: &str, target: &str) 
             if TcpStream::connect(("127.0.0.1",port)).await.is_ok() { break; }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let response = reqwest::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?).timeout(Duration::from_secs(12)).redirect(reqwest::redirect::Policy::none()).build()?.get(url).send().await?;
+        let response = reqwest::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?).timeout(Duration::from_secs(12)).redirect(reqwest::redirect::Policy::limited(5)).build()?.get(url).send().await?;
         ensure!(response.status().is_success(), "目标返回 HTTP {}",response.status());
         Ok::<_,anyhow::Error>(format!("出口实际收到 HTTP {}；没有验证公网入口或本机计量转发桥",response.status()))
     }.await;

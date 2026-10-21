@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { api, remoteApi } from "../api";
-import type { External, Line, PanelState, Preview } from "../types";
+import type { Check, External, Line, PanelState, Preview } from "../types";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
@@ -44,6 +44,7 @@ import {
   verificationFailed,
   maintenanceSucceeded,
   taskNeedsAttention,
+  taskStatus,
   requestId,
   type Remote,
   type Task,
@@ -255,6 +256,7 @@ export function Fleet() {
   const [modal, setModal] = useState<ReactNode>(null),
     [detail, setDetail] = useState<string>();
   const [taskId, setTaskId] = useState<string>();
+  const [probeFeedback, setProbeFeedback] = useState<{ key: string; text: string }>();
   const [editor, setEditor] = useState<{
     remote: Remote;
     state: PanelState;
@@ -475,6 +477,25 @@ export function Fleet() {
         },
     );
     return state;
+  }
+  async function recheck(r: Remote, lineId: string) {
+    const key = `${r.id}:${lineId}`;
+    setProbeFeedback({ key, text: "正在复查连接…" });
+    await run(async () => {
+      try {
+        const result = await remoteApi(r.id)<Check>(`/lines/${lineId}/probe`, "POST", {
+          mode: "http", url: r.snapshot?.monitoring?.effective?.url || defaultPolicy.url,
+        });
+        const state = await freshState(r);
+        const condition = state.monitoring?.conditions[`probe:local:${lineId}`];
+        setProbeFeedback({ key, text: result.ok
+          ? `本次连接检测通过。${condition?.active ? `恢复确认 ${condition.good || 0}/${state.monitoring?.effective?.recoveries || 2}，系统会继续自动复查。` : ""}`
+          : "本次连接检测未通过，已更新检测详情；系统会继续自动复查。" });
+      } catch (e) {
+        setProbeFeedback({ key, text: errorText(e) });
+        throw e;
+      }
+    });
   }
   const markPending = (r: Remote) =>
     setPendingApply((old) => [...new Set([...old, r.id])]);
@@ -1265,6 +1286,8 @@ export function Fleet() {
                                 </p>
                               </details>
                             )}
+                            {line.enabled && line.sync_status === "synced" && (line.kind !== "forward" || line.network.includes("tcp")) && <Button type="button" variant="outline" size="sm" className="mt-2" disabled={busy || !connected(r, now) || line.rental_status !== "active"} onClick={() => void recheck(r, line.id)}>立即复查</Button>}
+                            {probeFeedback?.key === key(r, line) && <p role="status" className="mt-2 text-sm">{probeFeedback.text}</p>}
                           </td>
                           <td
                             data-label="速率 / 用量"
@@ -1379,7 +1402,7 @@ export function Fleet() {
                 className="fleet-task-row"
               >
                 <div>
-                  <div className="fleet-task-title"><span className="fleet-task-icon"><Wrench aria-hidden="true" /></span><strong>{actions[t.action] || t.action}</strong><Status tone={t.state === "succeeded" ? "good" : t.state === "paused" || t.state === "failed" ? "warn" : "muted"}>{statuses[t.state] || t.state}</Status>{t.archived && <Status>已归档</Status>}</div>
+                  <div className="fleet-task-title"><span className="fleet-task-icon"><Wrench aria-hidden="true" /></span><strong>{actions[t.action] || t.action}</strong><Status tone={t.state === "succeeded" ? taskStatus(t) === "成功" ? "good" : "warn" : ["paused", "failed", "completed"].includes(t.state) ? "warn" : "muted"}>{taskStatus(t)}</Status>{t.archived && <Status>已归档</Status>}</div>
                   <p className="muted">
                     {stamp(t.at || 0)} · {t.targets.length} 台 VPS · 维护完成{" "}
                     {t.targets.filter(maintenanceSucceeded).length} 台 · 验证未通过 {t.targets.filter(verificationFailed).length} 台
@@ -1557,10 +1580,12 @@ export function Fleet() {
                   <p className="font-medium">{issue.title}</p>
                   <p className="mt-1 text-sm break-words">{issue.detail}</p>
                   {issue.evidence && <details className="mt-2"><summary className="cursor-pointer text-sm">自动检测详情</summary><p className="mt-1 whitespace-pre-wrap break-words text-xs">{issue.evidence}</p></details>}
+                  {issue.probeLineId && <Button type="button" variant="outline" size="sm" className="mt-2" disabled={busy} onClick={() => void recheck(activeDetail, issue.probeLineId!)}>立即复查</Button>}
                 </div>
               ))}
             </div>
           )}
+          {probeFeedback?.key.startsWith(`${activeDetail.id}:`) && <p role="status" className="text-sm">{probeFeedback.text}</p>}
           {localNode(activeDetail) && (
             <div className="grid gap-3 sm:grid-cols-2">
               {(() => {
@@ -1675,7 +1700,7 @@ export function Fleet() {
               <div className="rounded-xl border bg-muted/30 p-4 space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-semibold">{actions[activeTask.action] || activeTask.action}</h3>
-                  <Status tone={activeTask.state === "paused" ? "warn" : activeTask.state === "succeeded" ? "good" : "muted"}>{statuses[activeTask.state] || activeTask.state}</Status>{activeTask.archived && <Status>已归档</Status>}
+                  <Status tone={activeTask.state === "succeeded" ? taskStatus(activeTask) === "成功" ? "good" : "warn" : ["paused", "failed", "completed"].includes(activeTask.state) ? "warn" : "muted"}>{taskStatus(activeTask)}</Status>{activeTask.archived && <Status>已归档</Status>}
                 </div>
                 {activeTask.version && <p className="text-sm">目标版本 <strong>{activeTask.version}</strong></p>}
                 <p className="text-sm text-muted-foreground">
@@ -1688,6 +1713,7 @@ export function Fleet() {
               {activeTask.targets.map((t) => {
                 const remote = remotes.find(r => r.id === t.id);
                 const verifyFailed = verificationFailed(t);
+                const verifyPending = t.result?.verification?.state === "pending";
                 const maintenanceDone = maintenanceSucceeded(t);
                 const issue = verifyFailed
                   ? t.result?.verification?.detail || (t.error || t.result?.error || "").replace(/^组件维护已完成，但整链验证失败[：:]?\s*/, "")
@@ -1695,14 +1721,18 @@ export function Fleet() {
                 return <section key={t.id} className="min-w-0 space-y-3 rounded-xl border p-4" aria-label={`VPS 任务：${remote?.name || t.id}`}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h4 className="font-semibold break-all">{remote?.name || t.id}</h4>
-                    <Status tone={verifyFailed ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? activeTask.archived ? "维护完成 · 验证未通过" : "维护完成 · 自动复查中" : statuses[t.state] || t.state}</Status>
+                    <Status tone={verifyFailed || verifyPending ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? activeTask.archived ? "维护完成 · 验证未通过" : "维护完成 · 自动复查中" : verifyPending ? "维护完成 · 等待连接验证" : statuses[t.state] || t.state}</Status>
                   </div>
                   <div className="grid gap-2 rounded-lg bg-muted/30 p-3 text-sm sm:grid-cols-2">
                     <p>组件维护：<span className={maintenanceDone ? "text-emerald-700" : ""}>{maintenanceDone ? "已完成" : statuses[t.result?.maintenance_state || t.state] || t.state}</span></p>
                     <p>后续验证：{verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" ? "已通过" : "等待自动验证"}</p>
                   </div>
                   {t.result?.after && <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">{Object.entries(t.result.after).map(([key, value]) => <span key={key}>{({panel:"控制台",agent:"Agent",chainctl:"管理命令"} as Record<string,string>)[key] || key} <strong>{value}</strong></span>)}</div>}
-                  {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && !activeTask.archived && <p className="mt-2">系统会自动复查连接，不会重复升级，也不阻塞其他 VPS。{t.result?.verification?.retry_at ? `下次复查：${stamp(t.result.verification.retry_at)}` : ""}</p>}</div> : t.result?.detail && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result.detail}</p>}
+                  {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && !activeTask.archived && <p className="mt-2">系统会自动复查连接，不会重复升级，也不阻塞其他 VPS。{t.result?.verification?.retry_at ? `下次复查：${stamp(t.result.verification.retry_at)}` : ""}</p>}</div> : (t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail) && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail}</p>}
+                  {remote && maintenanceDone && !["enable", "disable"].includes(activeTask.action) && !activeTask.archived && <Button type="button" variant="outline" disabled={busy || verifyPending} onClick={() => void run(async () => {
+                    await api(`/fleet/batch/${activeTask.id}/verify/${t.id}`, "POST", {});
+                    await refresh();
+                  })}>{verifyPending ? "等待连接复查" : "立即复查连接"}</Button>}
                   {remote && <Button type="button" variant="outline" onClick={() => {
                     const returnTask = activeTask.id;
                     setTaskId(undefined);

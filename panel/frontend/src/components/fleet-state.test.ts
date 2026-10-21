@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { connected, health, issues, lineStatus, metrics, remoteNow, verificationFailed, maintenanceSucceeded, taskNeedsAttention, type Remote, type Task } from "./fleet-state";
+import { connected, health, issues, lineStatus, metrics, remoteNow, verificationFailed, maintenanceSucceeded, taskNeedsAttention, taskStatus, type Remote, type Task } from "./fleet-state";
 import type { Line, PanelState } from "../types";
 
 const now = 1000;
@@ -60,6 +60,11 @@ assert.equal(connected(probeWarning, now), true);
 assert.match(issues(probeWarning, now)[0].detail, /20000.*SNI example.com/);
 assert.match(issues(probeWarning, now)[0].detail, /自动复查.*300 秒/);
 assert.match(issues(probeWarning, now)[0].evidence!, /Connection reset by peer/);
+assert.equal(issues(probeWarning, now)[0].probeLineId, "line");
+probeWarning.snapshot!.monitoring.conditions["probe:local:line"].active = false;
+assert.equal(health(probeWarning, now), "连接检测待确认", "首次检测失败不能显示为在线且无异常");
+assert.match(issues(probeWarning, now)[0].detail, /尚未达到连续失败告警阈值/);
+probeWarning.snapshot!.monitoring.conditions["probe:local:line"].active = true;
 probeWarning.snapshot!.monitoring.checks!["probe:local:line"] = { ok: true, checked_at: now + 300, detail: "HTTP 200" };
 probeWarning.snapshot!.monitoring.conditions["probe:local:line"].good = 1;
 assert.equal(health(probeWarning, now), "入口恢复确认中");
@@ -75,7 +80,11 @@ assert.equal(verificationFailed({id:"vps", state:"succeeded", error:"组件维�
 const maintained: Task = {id:"task", action:"upgrade", state:"succeeded", targets:[{id:"vps", state:"succeeded", result:{maintenance_state:"succeeded", verification:{state:"failed"}}}]};
 assert.equal(maintenanceSucceeded(maintained.targets[0]), true);
 assert.equal(taskNeedsAttention(maintained), true);
+assert.equal(taskStatus(maintained), "维护完成 · 连接待确认");
+maintained.targets[0].result!.verification!.state = "pending";
+assert.equal(taskStatus(maintained), "维护完成 · 连接待确认");
 maintained.targets[0].result!.verification!.state = "succeeded";
+assert.equal(taskStatus(maintained), "成功");
 assert.equal(taskNeedsAttention(maintained), false, "验证恢复后自动移入历史");
 maintained.state = "completed";
 assert.equal(taskNeedsAttention(maintained), true);

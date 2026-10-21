@@ -60,6 +60,9 @@ const root = process.env.CHAIN_TEST_ROOT;
           fleet.tasks[url.pathname.split('/').at(-2)].archived=true;
         } else if(url.pathname.endsWith('/resume')) {
           const id=url.pathname.split('/').at(-2); fleet.tasks[id].state='succeeded';fleet.tasks[id].targets.forEach(t=>{t.state='succeeded';delete t.error;if(t.result){delete t.result.error;if(t.result.verification)t.result.verification={state:'succeeded'};}});
+        } else if(/^\/api\/fleet\/batch\/[^/]+\/verify\/[^/]+$/.test(url.pathname)) {
+          const parts=url.pathname.split('/'), target=fleet.tasks[parts[4]].targets.find(t=>t.id===parts[6]);
+          target.result.verification={state:'pending',retry_at:0};
         } else if (!['/api/fleet/policy','/api/monitoring/test','/api/federation/login'].includes(url.pathname)) throw new Error('Unexpected API: '+url.pathname);
         return route.fulfill({json:result});
       }
@@ -283,11 +286,18 @@ const root = process.env.CHAIN_TEST_ROOT;
     await page.locator('.fleet-tasks').getByText(/维护完成 1 台 · 验证未通过 1 台/).waitFor();
     await page.locator('.fleet-tasks').getByRole('button',{name:'查看任务',exact:true}).first().click();
     await dialog().getByText(/系统会自动复查连接，不会重复升级，也不阻塞其他 VPS/).waitFor();
+    await dialog().getByText('维护完成 · 连接待确认',{exact:true}).waitFor();
     assert.equal(await dialog().getByRole('button',{name:'继续未执行任务',exact:true}).count(),0);
+    const beforeRecheck=writes.length;
+    await dialog().getByRole('button',{name:'立即复查连接',exact:true}).click();
+    await dialog().getByRole('button',{name:'等待连接复查',exact:true}).waitFor();
+    assert.equal(writes.length,beforeRecheck+1);
+    assert.equal(writes.at(-1).path,'/api/fleet/batch/automatic/verify/vps-0');
     const beforeAutomatic=writes.length;
     fleet.tasks.automatic.targets[0].result.verification={state:'succeeded',detail:'fixture HTTP 200'};
     await page.clock.runFor(5000);
     await dialog().getByText('后续验证：已通过',{exact:true}).waitFor();
+    await dialog().getByText('fixture HTTP 200',{exact:true}).waitFor();
     assert.equal(writes.length,beforeAutomatic,'自动恢复无需触发操作');
     await closeDialog();
     assert.equal(await page.locator('.fleet-tasks .fleet-task-row').count(),0,'恢复后自动移入历史');

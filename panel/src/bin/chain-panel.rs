@@ -1345,6 +1345,7 @@ async fn diagnose(
     };
     {
         let mut s = app.store.lock().unwrap();
+        monitor_api::record_manual_probe(&mut s.doc, line, &request, result.clone());
         s.doc.checks.insert(id, result.clone());
         s.save()?;
     }
