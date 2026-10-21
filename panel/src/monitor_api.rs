@@ -252,23 +252,26 @@ async fn notify(app: &App) -> Result<()> {
     Ok(())
 }
 
-async fn poll_remote(
+pub(super) async fn poll_remote(
     app: &App,
     remote: chain_panel::management::Remote,
     fetch_document: bool,
 ) -> Result<Option<Document>> {
     let result = fleet_api::request(&remote, "GET", "/api/federation/state", None).await;
     let policy = app.store.lock().unwrap().doc.fleet.policy.clone();
+    let mut policy_error = String::new();
     if result.is_ok() {
         // Avoid an unnecessary disk write on the remote when its policy is already current.
         if result.as_ref().unwrap()["monitoring"]["override"] != json!(policy) {
-            fleet_api::request(
+            if let Err(error) = fleet_api::request(
                 &remote,
                 "POST",
                 "/api/federation/policy",
                 Some(json!(policy)),
             )
-            .await?;
+            .await {
+                policy_error = format!("{error:#}");
+            }
         }
     }
     let document = if fetch_document
@@ -311,6 +314,7 @@ async fn poll_remote(
             s.doc.fleet.remotes[index].snapshot = value;
             s.doc.fleet.remotes[index].seen = now();
             s.doc.fleet.remotes[index].error.clear();
+            s.doc.fleet.remotes[index].policy_error = policy_error;
             if p.enabled {
                 observe(
                     &mut s.doc,

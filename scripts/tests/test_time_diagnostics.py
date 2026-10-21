@@ -14,53 +14,142 @@ from chain_install import make_parser
 
 
 class TimeDiagnostics(unittest.TestCase):
-    def test_updates_enable_time_sync_without_prompting(self):
-        for role in ('panel', 'agent'):
-            for live, clock, failure, expected in (
-                (True, {'NTP': 'no', 'NTPSynchronized': 'no'}, None, True),
-                (True, {'NTP': 'no', 'NTPSynchronized': 'yes'}, None, True),
-                (True, {'NTP': 'yes', 'NTPSynchronized': 'no'}, None, True),
-                (True, {'NTP': 'yes', 'NTPSynchronized': 'yes'}, None, False),
-                (True, {}, ValueError('不支持的时间服务'), True),
-                (False, {}, None, False),
-                (True, subprocess.TimeoutExpired('timedatectl', 10), None, False),
-            ):
-                with self.subTest(role=role, live=live, clock=clock), tempfile.TemporaryDirectory() as temporary:
-                    base = Path(temporary)
-                    (base / ('current-' + role)).mkdir()
-                    manager = Mock(live=live, base=base)
-                    manager.state.return_value = {'roles': {role: {}}}
-                    manager.role_paths.return_value = (base, base, base)
-                    args = make_parser().parse_args(['update', '--component', role, '--non-interactive'])
-                    args.reuse_current = True
-                    output = io.StringIO()
-                    with patch.object(installer, 'verify_tree', return_value={}), \
-                            patch.object(installer, 'compatible_release'), \
-                            patch.object(chain_time, 'status', return_value=clock,
-                                         side_effect=clock if isinstance(clock, Exception) else None) as status, \
-                            patch.object(chain_time, 'synchronize', side_effect=failure) as sync, \
-                            patch('builtins.input', side_effect=AssertionError('update must not prompt')), \
-                            contextlib.redirect_stdout(output):
-                        installer.install_package(manager, args)
-                    self.assertEqual(status.call_count, int(live))
-                    self.assertEqual(sync.call_count, int(expected))
-                    manager.install.assert_called_once()
-                    if failure or isinstance(clock, Exception):
-                        self.assertIn('时间同步未完成', output.getvalue())
+    def test_install_and_update_enable_time_sync_without_prompting(self):
+        for action in ('install', 'update'):
+            for role in ('panel', 'agent'):
+                for live, clock, failure, expected in (
+                    (True, {'NTP': 'no', 'NTPSynchronized': 'no'}, None, True),
+                    (True, {'NTP': 'no', 'NTPSynchronized': 'yes'}, None, True),
+                    (True, {'NTP': 'yes', 'NTPSynchronized': 'no'}, None, True),
+                    (True, {'NTP': 'yes', 'NTPSynchronized': 'yes'}, None, False),
+                    (True, {}, ValueError('不支持的时间服务'), True),
+                    (False, {}, None, False),
+                    (True, subprocess.TimeoutExpired('timedatectl', 10), None, False),
+                ):
+                    with self.subTest(role=role, live=live, clock=clock), tempfile.TemporaryDirectory() as temporary:
+                        base = Path(temporary)
+                        (base / ('current-' + role)).mkdir()
+                        manager = Mock(live=live, base=base)
+                        manager.state.return_value = {'roles': {role: {}}}
+                        manager.role_paths.return_value = (base, base, base)
+                        args = make_parser().parse_args([action, '--component', role, '--panel-only', '--non-interactive'])
+                        args.reuse_current = True
+                        output = io.StringIO()
+                        with patch.object(installer, 'verify_tree', return_value={}), \
+                                patch.object(installer, 'compatible_release'), \
+                                patch.object(installer, 'service_kind', return_value='systemd'), \
+                                patch.object(chain_time, 'status', return_value=clock,
+                                             side_effect=clock if isinstance(clock, Exception) else None) as status, \
+                                patch.object(chain_time, 'synchronize', side_effect=failure) as sync, \
+                                patch('builtins.input', side_effect=AssertionError('update must not prompt')), \
+                                contextlib.redirect_stdout(output):
+                            installer.install_package(manager, args)
+                        self.assertEqual(status.call_count, int(live))
+                        self.assertEqual(sync.call_count, int(expected))
+                        manager.install.assert_called_once()
+                        if failure or isinstance(clock, Exception):
+                            self.assertIn('时间同步未完成', output.getvalue())
 
     def test_sync_preserves_timezone_and_uses_existing_daemon(self):
-        states = [{'Timezone': 'Asia/Hong_Kong', 'NTP': 'no', 'NTPSynchronized': 'no'},
-                  {'Timezone': 'Asia/Hong_Kong', 'NTP': 'yes', 'NTPSynchronized': 'yes'}]
-        with patch.object(chain_time, 'status', side_effect=states), patch.object(chain_time.subprocess, 'run', return_value=Mock(stdout='chrony.service enabled')) as run:
+        clock = {'Timezone': 'America/New_York', 'NTP': 'no', 'NTPSynchronized': 'no'}
+        with patch.object(chain_time, 'status', return_value=clock), \
+                patch.object(chain_time.shutil, 'which', return_value='/usr/bin/chronyc'), \
+                patch.object(chain_time.subprocess, 'run', return_value=Mock(stdout='chrony.service enabled', returncode=0)) as run:
             chain_time.synchronize()
         calls = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(calls[-1], ['timedatectl', 'set-ntp', 'true'])
-        self.assertFalse(any('apt-get' in call or 'set-timezone' in call for call in calls))
+        self.assertIn(['systemctl', 'enable', '--now', 'chrony.service'], calls)
+        self.assertIn(['chronyc', 'waitsync', '30', '0.1', '0', '2'], calls)
+        self.assertFalse(any('apt-get' in call or 'set-timezone' in call or 'set-ntp' in call for call in calls))
+
+    def test_missing_daemon_installs_chrony(self):
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC'}), \
+                patch.object(chain_time.shutil, 'which', return_value='/usr/bin/tool'), \
+                patch.object(chain_time.subprocess, 'run', return_value=Mock(stdout='', returncode=0)) as run:
+            chain_time.synchronize()
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertIn(['apt-get', 'install', '-y', 'chrony'], calls)
+        self.assertLess(calls.index(['chronyc', 'waitsync', '30', '0', '0', '2']), calls.index(['chronyc', 'makestep']))
+
+    def test_chrony_without_source_never_steps_clock(self):
+        def command(args, **kwargs):
+            return Mock(stdout='chrony.service enabled', returncode=1 if args[:2] == ['chronyc', 'waitsync'] else 0)
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC'}), \
+                patch.object(chain_time.shutil, 'which', return_value='/usr/bin/tool'), \
+                patch.object(chain_time.subprocess, 'run', side_effect=command) as run:
+            with self.assertRaisesRegex(ValueError, '有效同步时间源'):
+                chain_time.synchronize()
+        self.assertNotIn(['chronyc', 'makestep'], [call.args[0] for call in run.call_args_list])
+
+    def test_existing_active_timesyncd_is_preserved(self):
+        def command(args, **kwargs):
+            return Mock(stdout='chrony.service disabled\nsystemd-timesyncd.service enabled',
+                        returncode=1 if args == ['systemctl', 'is-active', '--quiet', 'chrony.service'] else 0)
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC', 'NTPSynchronized': 'yes'}), \
+                patch.object(chain_time.subprocess, 'run', side_effect=command) as run:
+            chain_time.synchronize()
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertIn(['systemctl', 'enable', '--now', 'systemd-timesyncd.service'], calls)
+        self.assertFalse(any(call[0] in ('chronyc', 'apt-get') for call in calls))
+
+    def test_chrony_alias_is_not_a_second_service(self):
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC'}), \
+                patch.object(chain_time.shutil, 'which', return_value='/usr/bin/chronyc'), \
+                patch.object(chain_time.subprocess, 'run', return_value=Mock(
+                    stdout='chrony.service enabled\nchronyd.service alias', returncode=0)) as run:
+            chain_time.synchronize()
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertNotIn(['systemctl', 'is-active', '--quiet', 'chronyd.service'], calls)
+
+    def test_conflicting_active_daemons_do_not_change_clock(self):
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC'}), \
+                patch.object(chain_time.subprocess, 'run', return_value=Mock(
+                    stdout='chrony.service enabled\nsystemd-timesyncd.service enabled', returncode=0)) as run:
+            with self.assertRaisesRegex(ValueError, '多个运行中的时间服务'):
+                chain_time.synchronize()
+        self.assertFalse(any('enable' in call.args[0] for call in run.call_args_list))
 
     def test_sync_timeout_does_not_claim_success(self):
-        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC', 'NTPSynchronized': 'no'}), patch.object(chain_time.subprocess, 'run', return_value=Mock(stdout='systemd-timesyncd.service enabled')), patch.object(chain_time.time, 'sleep'):
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC', 'NTPSynchronized': 'no'}), \
+                patch.object(chain_time.subprocess, 'run', return_value=Mock(stdout='systemd-timesyncd.service enabled', returncode=0)), \
+                patch.object(chain_time.time, 'sleep'):
             with self.assertRaisesRegex(ValueError, '尚未确认同步'):
                 chain_time.synchronize()
+
+    def test_package_failure_names_failed_step(self):
+        def command(args, **kwargs):
+            if args[0] == 'apt-get':
+                raise subprocess.CalledProcessError(100, args)
+            return Mock(stdout='', returncode=0)
+        with patch.object(chain_time, 'status', return_value={'Timezone': 'UTC'}), \
+                patch.object(chain_time.shutil, 'which', return_value='/usr/bin/tool'), \
+                patch.object(chain_time.subprocess, 'run', side_effect=command):
+            with self.assertRaisesRegex(ValueError, 'apt-get update.*100'):
+                chain_time.synchronize()
+
+    def test_time_sync_precedes_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = Mock(live=True, root=Path(temporary))
+            args = make_parser().parse_args(['install', '--component', 'agent', '--latest', '--non-interactive'])
+            calls = []
+            def download(*args):
+                calls.append('download')
+                raise ValueError('stop before download')
+            with patch.object(installer, 'service_kind', return_value='systemd'), \
+                    patch.object(chain_time, 'status', return_value={}), \
+                    patch.object(chain_time, 'synchronize', side_effect=lambda: calls.append('sync')), \
+                    patch.object(installer, 'download_release', side_effect=download):
+                with self.assertRaisesRegex(ValueError, 'stop before download'):
+                    installer.install_package(manager, args)
+            self.assertEqual(calls, ['sync', 'download'])
+
+    def test_uninstalled_update_does_not_change_time(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = installer.Manager(Path(temporary))
+            args = make_parser().parse_args(['update'])
+            with patch.object(chain_time, 'status') as status:
+                with self.assertRaisesRegex(ValueError, '尚未安装'):
+                    installer.install_package(manager, args)
+            status.assert_not_called()
 
     def test_cli_follow_explicit_source(self):
         args = make_parser().parse_args(['logs', '--component', 'agent', '--log-source', 'xray', '--follow'])

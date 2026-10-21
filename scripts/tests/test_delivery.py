@@ -264,6 +264,7 @@ class Delivery(unittest.TestCase):
             with patch.object(self.manager, 'live', False):
                 real_install(source, manifest, values)
         with patch.object(installer, 'panel_questions', side_effect=questions), \
+                patch('chain_time.status', return_value={'NTP': 'yes', 'NTPSynchronized': 'yes'}), \
                 patch.object(installer, 'HttpsSite') as https, \
                 patch.object(self.manager, 'install', side_effect=install_saved_state) as install, \
                 patch.object(self.manager, 'show_access'):

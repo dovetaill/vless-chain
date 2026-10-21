@@ -30,7 +30,7 @@ export const stamp = (n: number) =>
     ? new Date(n * 1000).toLocaleString("zh-CN", { hour12: false })
     : "尚未连接";
 export const bytes = (n: number) => {
-  const i = n > 0 ? Math.min(4, Math.floor(Math.log(n) / Math.log(1024))) : 0;
+  const i = n > 0 ? Math.max(0, Math.min(4, Math.floor(Math.log(n) / Math.log(1024)))) : 0;
   return `${(n / 1024 ** i).toFixed(i ? 1 : 0)} ${["B", "KiB", "MiB", "GiB", "TiB"][i]}`;
 };
 export const endpoint = (host: string, port: number | string) =>

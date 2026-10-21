@@ -7,7 +7,7 @@ import { Input } from './ui/input';
 type Logs = { clock?: { detail?:string; ntp_enabled?:boolean; timezone?:string }; text: string; sampled_at: number; sources: string[]; detail: string };
 export function Diagnostics({ nodes, lineId = '', close, request = api }: { nodes: {id:string;name:string}[]; lineId?:string; close:()=>void; request?:typeof api }) {
   const [node, setNode] = useState(nodes[0]?.id || '00000000-0000-0000-0000-000000000000');
-  const [source, setSource] = useState(nodes.length ? 'xray' : 'panel');
+  const [source, setSource] = useState(lineId && nodes.length ? 'xray' : 'panel');
   const [filter, setFilter] = useState(lineId);
   const [archive, setArchive] = useState(false);
   const [follow, setFollow] = useState(true);
@@ -19,39 +19,51 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
   const [until, setUntil] = useState(0);
   const [task, setTask] = useState<string>();
   const [taskMessage, setTaskMessage] = useState('');
+  const [taskFailed, setTaskFailed] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const requester = useRef(request);
+  requester.current = request;
+  const inFlight = useRef<Promise<unknown>>(Promise.resolve());
   const [tick, setTick] = useState(0);
-  const previous = useRef('');
+  const following = useRef(follow);
+  following.current = follow;
   useEffect(() => {
     if (!node || diagnosing) return;
-    const controller = new AbortController(); let timer: ReturnType<typeof setTimeout>;
-    const key = JSON.stringify([node, source, filter, archive, tick]);
-    if (!follow && previous.current === key) return;
-    if (previous.current !== key) { setData(undefined); setError(''); }
-    previous.current = key;
+    let stopped = false; let timer: ReturnType<typeof setTimeout>;
+    setData(undefined); setError('');
     async function refresh() {
+      // Let the remote request finish before switching sources or starting another read.
+      await inFlight.current;
+      if (stopped) return;
+      setLoading(true);
+      const pending = requester.current<Logs>(`/diagnostics/${node}/logs`, 'POST', {source,line_id:filter,archive});
+      inFlight.current = pending.catch(() => undefined);
       try {
-        const value = await request<Logs>(`/diagnostics/${node}/logs`, 'POST', {source,line_id:filter,archive}, controller.signal);
-        if (!controller.signal.aborted) { setData(value); setError(''); }
-      } catch (e) { if (!controller.signal.aborted) setError(errorText(e)); }
-      if (!controller.signal.aborted && follow) timer = setTimeout(() => void refresh(), 3000);
+        const value = await pending;
+        if (!stopped) { setData(value); setError(''); }
+      } catch (e) { if (!stopped) setError(errorText(e)); }
+      finally { if (!stopped) setLoading(false); }
+      if (!stopped && following.current) timer = setTimeout(() => { if (following.current) void refresh(); }, 3000);
     }
     void refresh();
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [node, source, filter, archive, follow, tick, request, diagnosing]);
+    return () => { stopped = true; clearTimeout(timer); setLoading(false); };
+  }, [node, source, filter, archive, tick, diagnosing]);
   useEffect(() => {
     if (!task) return;
     let stopped = false; let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
-        const value = await request<{state:string;detail?:string;error?:string}>('/federation/task','POST',{action:'status',id:task});
+        const value = await requester.current<{state:string;detail?:string;error?:string}>('/federation/task','POST',{action:'status',id:task});
         if (stopped) return;
-        setTaskMessage(value.error || value.detail || `校时任务：${value.state}`);
+        setTaskFailed(value.state === 'failed');
+        setTaskMessage([value.error, value.detail && !value.error?.includes(value.detail) ? value.detail : ''].filter(Boolean).join('\n') || ({queued:'校时任务排队中',running:'正在安装或启用时间服务并等待同步…',succeeded:'自动校时已完成',failed:'自动校时失败'}[value.state] || `校时任务：${value.state}`));
         if (['succeeded','failed'].includes(value.state)) { setTask(undefined); setTick(v=>v+1); }
         else timer = setTimeout(()=>void poll(), 3000);
-      } catch(e) { if (!stopped) { setTaskMessage(errorText(e)); setTask(undefined); } }
+      } catch(e) { if (!stopped) { setTaskFailed(true); setTaskMessage(`无法读取校时任务结果：${errorText(e)}；任务可能仍在运行，请在维护任务中查看。`); setTask(undefined); } }
     }
     void poll(); return () => { stopped = true; clearTimeout(timer); };
-  }, [task,request]);
+  }, [task]);
   useEffect(() => {
     if (!until) return;
     const timer = setTimeout(() => { setUntil(0); setDiagnostic('详细诊断窗口已到期。临时内核每次检查完成即退出。'); }, Math.max(0, until-Date.now()));
@@ -60,10 +72,11 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
   async function diagnose() {
     setDiagnosing(true); setFollow(false); setDiagnostic('正在分段检查…');
     try {
-      const result = await request<{stage:string;result:{ok:boolean;detail:string};note:string}>(`/diagnostics/${node}/path`,'POST',{line_id:lineId,url:target});
+      await inFlight.current;
+      const result = await requester.current<{stage:string;result:{ok:boolean;detail:string};note:string}>(`/diagnostics/${node}/path`,'POST',{line_id:lineId,url:target});
       let text = `${result.stage}：${result.result.ok ? '通过' : '失败'}\n${result.result.detail}\n${result.note}`;
       if (result.result.ok) {
-        const full = await request<{ok:boolean;detail:string}>(`/lines/${lineId}/probe`,'POST',{mode:'http',url:target});
+        const full = await requester.current<{ok:boolean;detail:string}>(`/lines/${lineId}/probe`,'POST',{mode:'http',url:target});
         text += `\n完整链路（面板发起）${full.ok ? '通过' : '失败'}：${full.detail}`;
         if (!full.ok) text += '\n出口已通过，故障范围缩小到入口、REALITY/TLS 握手或本机转发；请查看对应节点日志。';
       } else text += '\n入口尚未验证。先按出口日志检查证书时间、SNI、认证或后续节点。';
@@ -75,35 +88,71 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
     const url = URL.createObjectURL(new Blob([data.text], {type:'text/plain;charset=utf-8'}));
     const a = document.createElement('a'); a.href = url; a.download = `chain-${source}-logs.txt`; a.click(); URL.revokeObjectURL(url);
   }
+  const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const sourceNames: Record<string,string> = {panel:'控制台应用',agent:'节点 Agent',xray:'Xray 内核',mihomo:'Mihomo 内核'};
+  const readableLogs = data?.text.replace(/^(\d{10})(?=\s)/gm, value => stamp(Number(value)));
   return <Modal wide title="日志与诊断" close={close}>
-    <div className="flex flex-wrap items-center gap-3">
-      <label>节点 <select aria-label="日志节点" value={node} onChange={e=>setNode(e.target.value)}>{!nodes.length && <option value={node}>当前面板（无已接入节点）</option>}{nodes.map(n=><option key={n.id} value={n.id}>{n.name}</option>)}</select></label>
-      <label>来源 <select aria-label="日志来源" value={source} onChange={e=>setSource(e.target.value)}>{Array.from(new Set(['panel','agent','xray','mihomo',...(data?.sources || [])])).map(s=><option key={s} value={s}>{s}</option>)}</select></label>
-      {lineId && <label><input type="checkbox" checked={!!filter} onChange={e=>setFilter(e.target.checked ? lineId : '')}/>仅此代理（按线路标签过滤）</label>}
-      <label><input type="checkbox" checked={archive} onChange={e=>setArchive(e.target.checked)}/>包含近期归档</label>
-      <Button type="button" variant="outline" onClick={()=>setFollow(!follow)}>{follow ? '暂停跟随' : '继续跟随'}</Button>
-      <Button type="button" variant="outline" onClick={()=>setTick(tick+1)}>刷新</Button>
-      <Button type="button" variant="outline" disabled={!data} onClick={download}>下载脱敏片段</Button>
+    <div className="space-y-5 min-w-0">
+      <section className="space-y-3 rounded-xl border bg-muted/20 p-4" aria-label="日志筛选">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="space-y-1.5 text-sm font-medium">日志来源
+            <select className="block h-10 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm" aria-label="日志来源" value={source} disabled={diagnosing} onChange={e=>setSource(e.target.value)}>
+              {Array.from(new Set(['panel',...(nodes.length ? ['agent','xray','mihomo'] : []),...(data?.sources || [])])).map(s=><option key={s} value={s}>{sourceNames[s] || `旧版内核 · ${s.replace('legacy-', '')}`}</option>)}
+            </select>
+          </label>
+          <label className="space-y-1.5 text-sm font-medium">节点
+            <select className="block h-10 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm" aria-label="日志节点" value={node} disabled={source === 'panel' || diagnosing} onChange={e=>setNode(e.target.value)}>
+              {!nodes.length && <option value={node}>当前 VPS 控制台</option>}{nodes.map(n=><option key={n.id} value={n.id}>{n.name}</option>)}
+            </select>
+          </label>
+        </div>
+        <div className="flex flex-wrap gap-x-5 gap-y-2 text-sm">
+          {lineId && <label className="flex items-center gap-2"><input type="checkbox" disabled={diagnosing} checked={!!filter} onChange={e=>setFilter(e.target.checked ? lineId : '')}/>仅此代理</label>}
+          <label className="flex items-center gap-2"><input type="checkbox" disabled={diagnosing} checked={archive} onChange={e=>setArchive(e.target.checked)}/>包含近期归档</label>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+          <Button type="button" variant="outline" disabled={diagnosing} onClick={()=>{ setFollow(!follow); if (!follow) setTick(v=>v+1); }}>{follow ? '暂停跟随' : '继续跟随'}</Button>
+          <Button type="button" variant="outline" disabled={loading || diagnosing} onClick={()=>setTick(v=>v+1)}>{loading ? '读取中…' : '刷新日志'}</Button>
+          <Button type="button" variant="outline" disabled={!data} onClick={download}>下载脱敏日志</Button>
+          <span className="text-xs text-muted-foreground">{follow ? '每 3 秒自动读取，关闭窗口停止' : '已暂停自动读取'}</span>
+        </div>
+      </section>
+      <section className="min-w-0 space-y-2" aria-label="日志内容">
+        {error && <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><p className="font-medium">日志读取失败</p><p className="mt-1 break-words">{error}</p>{data && <p className="mt-1">下方保留上次成功读取的记录。</p>}</div>}
+        <div className="flex flex-wrap items-center justify-between gap-1 text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{sourceNames[source] || source}</span>
+          <span role="status">{data ? `采样 ${stamp(data.sampled_at)} · 最多 500 行` : error ? '未取得日志' : '等待日志返回…'}</span>
+        </div>
+        <pre tabIndex={0} aria-label="日志记录" className="min-h-48 max-h-[45vh] overflow-auto whitespace-pre-wrap break-all rounded-xl bg-slate-950 p-4 text-xs leading-6 text-slate-100">{readableLogs || (data ? '当前来源或筛选范围内没有日志。可取消代理筛选或切换来源。' : '正在读取…')}</pre>
+        <p className="text-xs text-muted-foreground">采样时间及行首数字时间戳按浏览器时区 {localZone} 显示；下载保留原始脱敏内容。</p>
+      </section>
+      <section className="space-y-3 rounded-xl border p-4" aria-label="VPS 时间同步">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1"><h3 className="text-sm font-semibold">VPS 时间同步</h3><p className="text-xs text-muted-foreground">作用于当前查看的控制台所在 VPS，保留系统时区；不会修改其他远程节点。</p></div>
+          <Button type="button" variant="outline" disabled={!!task || submitting} onClick={async()=>{
+            if (!window.confirm('在当前查看的控制台所在 VPS 启用并校准系统时间？必要时安装系统时间服务，可能改变整机时间；保持现有时区。此操作不修改其他远程 Agent。')) return;
+            setSubmitting(true); setTaskFailed(false); setTaskMessage('正在提交校时任务…');
+            const id = crypto.randomUUID();
+            try { await requester.current('/federation/task','POST',{id,action:'sync-time'}); setTask(id); setTaskMessage('校时任务已提交，正在等待结果…'); }
+            catch(e) { setTaskFailed(true); setTaskMessage(errorText(e)); }
+            finally { setSubmitting(false); }
+          }}>{task || submitting ? '正在校时…' : '启用本 VPS 自动校时'}</Button>
+        </div>
+        <p className="text-sm">{data?.clock ? `所选节点上报：${data.clock.detail || '时间状态未知'}` : '校时任务会检查此 VPS 的时间服务并返回结果。'}{data?.clock?.timezone && ` · 系统时区：${data.clock.timezone}`}{data?.clock?.ntp_enabled === false && ' · 自动时间同步未启用'}</p>
+        {taskMessage && <div role={taskFailed ? 'alert' : 'status'} className={`rounded-lg border p-3 text-sm ${taskFailed ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'bg-muted/30'}`}><p className="mb-1 font-medium">{taskFailed ? '自动校时未完成' : task || submitting ? '自动校时进行中' : '自动校时结果'}</p><pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words font-sans">{taskMessage}</pre></div>}
+      </section>
+      {lineId && <details className="space-y-3 rounded-xl border p-4">
+        <summary className="cursor-pointer text-sm font-semibold">分段连接检查</summary>
+        <p className="text-sm text-muted-foreground">先验证出口，再检查完整链路。会产生少量请求流量，不重启现有代理。</p>
+        <label className="block space-y-1 text-sm">检查网址<Input type="url" value={target} onChange={e=>setTarget(e.target.value)} /></label>
+        {!until ? <Button type="button" variant="outline" onClick={()=>setUntil(Date.now()+600000)}>开启 10 分钟详细诊断窗口</Button> : <Button type="button" disabled={diagnosing} onClick={()=>void diagnose()}>{diagnosing ? '正在分段检查…' : '执行详细检查'}</Button>}
+        {!!until && <p className="text-xs text-muted-foreground">每次检查的临时内核完成即退出；窗口到期后停止接受新检查。</p>}
+        {diagnostic && <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-muted p-3 text-xs">{diagnostic}</pre>}
+      </details>}
+      <details className="rounded-xl border p-4 text-sm text-muted-foreground">
+        <summary className="cursor-pointer font-medium text-foreground">日志保留与排障说明</summary>
+        <div className="mt-3 space-y-2"><p>控制台应用日志来自当前查看的 VPS；节点及内核日志来自所选节点。</p><p>日志保留 3 天，控制台和 Agent 各最多 50 MiB。达到限制先清理最旧记录，系统 journal 单独管理。</p><p>各跳 SNI 必须匹配该跳的 REALITY 目标或 TLS 证书。accepted 只表示已接收连接，不代表成功出网。</p></div>
+      </details>
     </div>
-    <p className="muted">日志保留 3 天，面板和 Agent 各最多 50 MiB，合计 100 MiB。达到任一限制先清理最旧记录。关闭窗口停止读取；系统 journal 单独管理。</p>
-    <p className="muted">链路各跳的 SNI 可以不同，但每一跳必须匹配该跳的 REALITY 目标或 TLS 证书。accepted 只表示已接收连接，不代表已成功出网。</p>
-    {lineId && <div className="space-y-3 rounded border p-3">
-      <p>分段连接检查：先隔离验证出口，再检查完整链路。会产生少量实际请求流量；不重启现有代理。</p>
-      <label>检查网址<Input type="url" value={target} onChange={e=>setTarget(e.target.value)} /></label>
-      {!until ? <Button type="button" variant="outline" onClick={()=>setUntil(Date.now()+600000)}>开启 10 分钟详细诊断窗口</Button> : <Button type="button" disabled={diagnosing} onClick={()=>void diagnose()}>{diagnosing ? '正在分段检查…' : '执行详细检查'}</Button>}
-      {!!until && <p className="muted">窗口 10 分钟后关闭；每次检查的临时 debug 内核完成即退出，无需重启恢复日志级别。</p>}
-      {diagnostic && <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">{diagnostic}</pre>}
-    </div>}
-    <p className="muted">{data?.clock?.detail} {data?.clock?.timezone && `时区：${data.clock.timezone}`} {data?.clock?.ntp_enabled === false && '自动时间同步未启用'}</p>
-    <Button type="button" variant="outline" disabled={!!task} onClick={async()=>{
-      if (!window.confirm('在当前面板所在 VPS 启用并校准系统时间？必要时安装系统时间服务，可能改变整机时间；保持现有时区。此操作不修改其他远程 Agent。')) return;
-      const id = crypto.randomUUID();
-      try { await request('/federation/task','POST',{id,action:'sync-time'}); setTask(id); setTaskMessage('校时任务已提交'); }
-      catch(e) { setTaskMessage(errorText(e)); }
-    }}>启用本 VPS 自动校时</Button>
-    {taskMessage && <p role="status">{taskMessage}</p>}
-    {error && <p role="alert" className="text-red-600">{error}{data && '；下方为上次成功读取的记录。'}</p>}
-    <p role="status" className="muted">{data ? `采样 ${stamp(data.sampled_at)} · 最多 500 行` : error ? '未取得日志' : '等待节点返回日志…'}</p>
-    <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-all rounded bg-slate-950 p-4 text-xs text-slate-100">{data?.text || (data ? '当前来源 / 筛选范围内没有日志。可取消代理筛选或切换来源。' : '')}</pre>
   </Modal>;
 }

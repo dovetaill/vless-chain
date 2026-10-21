@@ -898,6 +898,19 @@ def install_components(manager, source, manifest, args):
 
 
 def install_package(manager, args):
+    if args.action == 'update':
+        manager.require_role(args.component)
+    # Fix the clock before HTTPS downloads and enrollment can fail on certificate dates.
+    if manager.live and service_kind() == 'systemd' and args.action in ('install', 'update'):
+        from chain_time import status, synchronize
+        try:
+            clock = status()
+            if clock.get('NTPSynchronized') != 'yes' or clock.get('NTP') != 'yes':
+                print('自动检查并启用时间同步，必要时安装时间服务；保持现有时区。')
+                synchronize()
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            print(f'时间同步未完成：{error}；继续组件操作，连接可能因时钟偏差失败。')
+
     def install_source(source, manifest):
         # Validate the downloaded package before asking for deployment details.
         compatible_release(manifest)
@@ -917,19 +930,6 @@ def install_package(manager, args):
             panel_questions(manager, args)
         elif args.action == 'install' and args.component == 'agent' and getattr(args, 'guided', False):
             agent_questions(manager, args)
-        if manager.live and (args.action == 'update' or
-                             (args.action == 'install' and getattr(args, 'guided', False))):
-            from chain_time import status, synchronize
-            try:
-                clock = status()
-                if clock.get('NTPSynchronized') != 'yes' or (args.action == 'update' and clock.get('NTP') != 'yes'):
-                    print('时间同步尚未启用或未确认同步；错误时间会导致 TLS / REALITY 握手失败。')
-                    if args.action == 'update' or (not args.non_interactive and sys.stdin.isatty() and input('启用时间同步？必要时安装时间服务，保持现有时区 [y/N]: ').strip().lower() == 'y'):
-                        if args.action == 'update':
-                            print('更新时自动启用时间同步，必要时安装时间服务；保持现有时区。')
-                        synchronize()
-            except (ValueError, OSError, subprocess.SubprocessError) as error:
-                print(f'时间同步未完成：{error}；继续组件操作，请处理后再进行连接检查。')
         if manager.live and args.action == 'install' and args.component == 'panel' and getattr(args, 'guided', False):
             from chain_legacy import guided_install
             if guided_install(manager, source, manifest, args):

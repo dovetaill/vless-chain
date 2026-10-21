@@ -1,6 +1,6 @@
 use super::*;
 use chain_panel::diagnostics::LogRequest;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 #[derive(Default)]
 pub struct Broker(pub Mutex<HashMap<String, Pending>>);
@@ -8,7 +8,8 @@ pub struct Pending {
     id: String,
     request: Value,
     expires: std::time::Instant,
-    reply: Option<oneshot::Sender<Value>>,
+    reply: watch::Sender<Option<Value>>,
+    delivered: bool,
 }
 pub fn routes(router: Router<App>) -> Router<App> {
     router.route("/api/diagnostics/{id}/logs", post(logs))
@@ -41,23 +42,73 @@ pub async fn dispatch(app: &App, id: &str, request: Value, seconds: u64) -> Resu
         ensure!(now().saturating_sub(node.seen) < 30, "Agent 离线，无法读取新日志；历史日志保留在该 VPS");
         ensure!(node.report.system["diagnostics_version"] == 1, "请先升级该 Agent，以支持 Web 日志");
     }
-    let (tx, rx) = oneshot::channel();
-    let job_id = model_id();
-    {
-        let mut queue = app.diagnostics.0.lock().unwrap();
-        queue.retain(|_, p| p.expires > std::time::Instant::now() && p.reply.as_ref().is_some_and(|r| !r.is_closed()));
-        ensure!(queue.len() < 64 && !queue.contains_key(id), "该节点已有日志请求，请稍后刷新");
-        queue.insert(id.to_string(), Pending {id:job_id.clone(),request,expires:std::time::Instant::now()+Duration::from_secs(seconds),reply:Some(tx)});
-    }
-    let result = tokio::time::timeout(Duration::from_secs(seconds), rx).await;
-    {
-        let mut queue = app.diagnostics.0.lock().unwrap();
-        if queue.get(id).is_some_and(|p| p.id == job_id) { queue.remove(id); }
-    }
-    let value = result.context("Agent 日志读取超时，未返回旧日志")?.context("日志请求已结束")?;
-    if let Some(e) = value["error"].as_str() { return Err(anyhow::anyhow!("{e}")); }
-    Ok(value)
+    app.diagnostics.request(id, request, Duration::from_secs(seconds)).await
 }
+
+struct Waiting<'a> {
+    broker: &'a Broker,
+    node: String,
+    job: String,
+    reply: watch::Receiver<Option<Value>>,
+}
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut queue = self.broker.0.lock().unwrap();
+        if queue.get(&self.node).is_some_and(|p| p.id == self.job
+            && (p.expires <= std::time::Instant::now() || (!p.delivered && p.reply.receiver_count() == 1))) {
+            queue.remove(&self.node);
+        }
+    }
+}
+impl Broker {
+    async fn request(&self, node: &str, request: Value, timeout: Duration) -> Result<Value> {
+        let wait_until = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let (mut waiting, shared, expires) = {
+                let mut queue = self.0.lock().unwrap();
+                queue.retain(|_, p| p.expires > std::time::Instant::now());
+                let (job, reply, shared, expires) = if let Some(p) = queue.get(node) {
+                    ensure!(p.reply.receiver_count() < 64, "该节点诊断等待人数过多，请稍后重试；这不表示节点离线");
+                    (p.id.clone(), p.reply.subscribe(), request["operation"] == "logs" && p.request == request, p.expires)
+                } else {
+                    ensure!(queue.len() < 64, "诊断任务繁忙，请稍后重试；这不表示节点离线");
+                    let (tx, rx) = watch::channel(None);
+                    let job = model_id();
+                    let expires = std::time::Instant::now() + timeout;
+                    queue.insert(node.to_string(), Pending { id: job.clone(), request: request.clone(), expires, reply: tx, delivered: false });
+                    (job, rx, true, expires)
+                };
+                (Waiting { broker: self, node: node.into(), job, reply }, shared, expires)
+            };
+            let deadline = if shared { expires } else { expires.min(wait_until) };
+            let result = tokio::time::timeout_at(deadline.into(), waiting.reply.changed()).await;
+            if shared {
+                result.context("Agent 诊断响应超时，请检查节点服务和网络；未返回旧日志")?.context("诊断请求已结束，请重试")?;
+                let value = waiting.reply.borrow().clone().context("诊断未返回结果")?;
+                if let Some(e) = value["error"].as_str() { anyhow::bail!("{e}"); }
+                return Ok(value);
+            }
+            ensure!(std::time::Instant::now() < wait_until, "该节点仍在执行其他诊断，请稍后重试；这不表示节点离线");
+        }
+    }
+
+    fn exchange(&self, node: &str, reply: Reply) -> Result<Value> {
+        let mut queue = self.0.lock().unwrap();
+        if let Some(p) = queue.get_mut(node) {
+            if p.expires <= std::time::Instant::now() { queue.remove(node); }
+            else if reply.id == p.id {
+                ensure!(serde_json::to_vec(&reply.result)?.len() <= 300_000, "日志响应过大");
+                p.reply.send_replace(Some(reply.result));
+                queue.remove(node);
+            } else {
+                p.delivered = true;
+                return Ok(json!({"id":p.id,"request":p.request}));
+            }
+        }
+        Ok(Value::Null)
+    }
+}
+
 fn model_id() -> String { chain_panel::model::id() }
 #[derive(Deserialize)]
 struct Reply { #[serde(default)] id: String, #[serde(default)] result: Value }
@@ -68,16 +119,7 @@ async fn exchange(State(app): State<App>, Path(id): Path<String>, headers: Heade
         let n = s.doc.nodes.iter().find(|n| n.id == id).ok_or_else(|| error(StatusCode::UNAUTHORIZED,"节点身份无效"))?;
         if !equal(&digest(token), &n.token_hash) { return Err(error(StatusCode::UNAUTHORIZED,"节点身份无效")); }
     }
-    let mut queue = app.diagnostics.0.lock().unwrap();
-    if let Some(p) = queue.get_mut(&id) {
-        if p.expires <= std::time::Instant::now() { queue.remove(&id); }
-        else if reply.id == p.id {
-            if serde_json::to_vec(&reply.result)?.len() > 300_000 { return Err(error(StatusCode::BAD_REQUEST,"日志响应过大")); }
-            if let Some(tx) = p.reply.take() { let _ = tx.send(reply.result); }
-            queue.remove(&id);
-        } else { return Ok(Json(json!({"id":p.id,"request":p.request}))); }
-    }
-    Ok(Json(Value::Null))
+    Ok(Json(app.diagnostics.exchange(&id, reply)?))
 }
 
 pub fn targets(config: &Value) -> BTreeSet<(String, String)> {
@@ -119,6 +161,84 @@ pub async fn preflight(app: &App, allow_unverified: bool) -> Result<BTreeMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn log_request(source: &str) -> Value {
+        json!({"operation":"logs","request":{"source":source}})
+    }
+    fn poll_agent(broker: &Broker) -> Value {
+        broker.exchange("node", Reply { id: String::new(), result: Value::Null }).unwrap()
+    }
+    #[tokio::test]
+    async fn diagnostics_identical_logs_share_one_result() {
+        let broker = Broker::default();
+        let mut first = Box::pin(broker.request("node", log_request("agent"), Duration::from_secs(1)));
+        let mut second = Box::pin(broker.request("node", log_request("agent"), Duration::from_secs(1)));
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        assert_eq!(broker.0.lock().unwrap().len(), 1);
+        let task = poll_agent(&broker);
+        let result = json!({"lines":["same snapshot"]});
+        broker.exchange("node", Reply { id: task["id"].as_str().unwrap().into(), result: result.clone() }).unwrap();
+        assert_eq!(first.await.unwrap(), result);
+        assert_eq!(second.await.unwrap(), result);
+        assert!(broker.0.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn diagnostics_cancel_cleans_unstarted_but_preserves_running_probe() {
+        let broker = Broker::default();
+        let mut future = Box::pin(broker.request("node", log_request("agent"), Duration::from_secs(1)));
+        assert!(futures_util::poll!(&mut future).is_pending());
+        drop(future);
+        assert!(broker.0.lock().unwrap().is_empty());
+        let probe = json!({"operation":"path","request":{"line_id":"line"}});
+        let mut future = Box::pin(broker.request("node", probe.clone(), Duration::from_secs(1)));
+        assert!(futures_util::poll!(&mut future).is_pending());
+        let task = poll_agent(&broker);
+        drop(future);
+        let mut logs = Box::pin(broker.request("node", log_request("agent"), Duration::from_secs(1)));
+        assert!(futures_util::poll!(&mut logs).is_pending());
+        assert_eq!(poll_agent(&broker), task);
+        broker.exchange("node", Reply { id: task["id"].as_str().unwrap().into(), result: json!({"probe":true}) }).unwrap();
+        assert!(futures_util::poll!(&mut logs).is_pending());
+        let next = poll_agent(&broker);
+        assert_eq!(next["request"], log_request("agent"));
+        // A late reply for the previous job must never satisfy the new request.
+        let still_waiting = broker.exchange("node", Reply { id: task["id"].as_str().unwrap().into(), result: json!({"wrong":true}) }).unwrap();
+        assert_eq!(still_waiting["id"], next["id"]);
+        assert!(futures_util::poll!(&mut logs).is_pending());
+        broker.exchange("node", Reply { id: next["id"].as_str().unwrap().into(), result: json!({"lines":[]}) }).unwrap();
+        assert_eq!(logs.await.unwrap(), json!({"lines":[]}));
+        assert!(broker.0.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn diagnostics_different_sources_serialize_without_mixing_results() {
+        let broker = Broker::default();
+        let mut first = Box::pin(broker.request("node", log_request("agent"), Duration::from_secs(1)));
+        let mut second = Box::pin(broker.request("node", log_request("xray"), Duration::from_secs(1)));
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        let task = poll_agent(&broker);
+        broker.exchange("node", Reply { id: task["id"].as_str().unwrap().into(), result: json!({"source":"agent"}) }).unwrap();
+        assert_eq!(first.await.unwrap()["source"], "agent");
+        assert!(futures_util::poll!(&mut second).is_pending());
+        let task = poll_agent(&broker);
+        assert_eq!(task["request"], log_request("xray"));
+        broker.exchange("node", Reply { id: task["id"].as_str().unwrap().into(), result: json!({"source":"xray"}) }).unwrap();
+        assert_eq!(second.await.unwrap()["source"], "xray");
+    }
+    #[tokio::test]
+    async fn diagnostics_timeout_removes_job_and_allows_retry() {
+        let broker = Broker::default();
+        assert!(broker.request("node", log_request("agent"), Duration::from_millis(1)).await.unwrap_err().to_string().contains("超时"));
+        assert!(broker.0.lock().unwrap().is_empty());
+        let mut retry = Box::pin(broker.request("node", log_request("agent"), Duration::from_secs(1)));
+        assert!(futures_util::poll!(&mut retry).is_pending());
+        poll_agent(&broker);
+        drop(retry);
+        assert_eq!(broker.0.lock().unwrap().len(), 1);
+        broker.0.lock().unwrap().get_mut("node").unwrap().expires = std::time::Instant::now();
+        assert_eq!(poll_agent(&broker), Value::Null);
+        assert!(broker.0.lock().unwrap().is_empty());
+    }
     #[test]
     fn diagnostics_targets_keep_each_hop_sni_separate() {
         let config = json!({"inbounds":[

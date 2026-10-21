@@ -2,6 +2,7 @@ import concurrent.futures
 import json
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import Mock, patch
 import uuid
@@ -23,19 +24,60 @@ class MaintenanceTests(unittest.TestCase):
         self.addCleanup(unit.stop)
         self.addCleanup(maintenance.RELOAD.clear)
 
-    def run_job(self, action, before, after=None, exit_code=0, active=True):
+    def run_job(self, action, before, after=None, exit_code=0, active=True, output='', timeout=False):
         job = {'id': str(uuid.uuid4()), 'action': action, 'version': '1.2.4'}
         process = Mock(pid=123456, **{'wait.return_value': exit_code})
+        if timeout:
+            process.wait.side_effect = [subprocess.TimeoutExpired('fixture', 1800), 0, 0]
+
+        def start(command, **kwargs):
+            kwargs['stdout'].write(output.encode())
+            return process
+
         with patch.object(maintenance, 'installed', side_effect=[before, after or before, after or before]), \
                 patch.object(maintenance, 'download_release', return_value=(self.root / 'release.tar.gz', '1.2.4')), \
                 patch.object(maintenance, 'safe_extract', return_value={'version': '1.2.4', 'files': ['scripts/chain_maintenance.py']}), \
-                patch.object(maintenance.subprocess, 'Popen', return_value=process) as popen, \
+                patch.object(maintenance.subprocess, 'Popen', side_effect=start) as popen, \
                 patch.object(maintenance.subprocess, 'run', return_value=Mock(returncode=0 if active else 1)) as run, \
                 patch.object(maintenance.os, 'killpg'):
             maintenance.execute(job, self.root)
         self.assertEqual(list(self.root.glob('work-*')), [])
         result = json.loads((self.root / (job['id'] + '.json')).read_text())
         return result, [call.args[0] for call in popen.call_args_list], [call.args[0] for call in run.call_args_list]
+
+    def test_time_failure_retains_redacted_diagnostics_without_work_files(self):
+        output = ('正在安装时间服务\nFailed to fetch https://user:pass@mirror.example/p?token=hidden\n'
+                  'Authorization: Bearer bearer-secret\npassword=login-secret token=api-secret\n'
+                  '"password": "quoted secret with spaces"\n'
+                  'E: Unable to locate package chrony\n')
+        result, _, _ = self.run_job('sync-time', {'panel': '1.2.3'}, exit_code=1, output=output)
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('正在安装时间服务', result['detail'])
+        self.assertIn('Unable to locate package chrony', result['error'])
+        for secret in ['user:pass', 'mirror.example', 'bearer-secret', 'login-secret', 'api-secret', 'quoted secret']:
+            self.assertNotIn(secret, json.dumps(result))
+        result, _, _ = self.run_job('upgrade', {'panel': '1.2.3'}, exit_code=1, output=output)
+        self.assertNotIn('detail', result)
+        self.assertNotIn('Unable to locate', result['error'])
+
+    def test_time_output_is_bounded_and_timeout_keeps_last_stage(self):
+        result, _, _ = self.run_job('sync-time', {'panel': '1.2.3'}, output='x\n' * 40000 + '等待 NTP 响应', timeout=True)
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('超时', result['error'])
+        self.assertTrue(result['detail'].endswith('等待 NTP 响应'))
+        self.assertLessEqual(len(result['detail']), 4096)
+        result, _, _ = self.run_job('sync-time', {'panel': '1.2.3'}, exit_code=1,
+                                    output='https://user:pass@' + 'secret' * 20000)
+        self.assertEqual(result['detail'], '')
+        self.assertNotIn('secret', result['error'])
+
+    def test_time_success_retains_confirmation_and_timezone(self):
+        result, commands, _ = self.run_job('sync-time', {'panel': '1.2.3'},
+                                          output='时间同步已确认；时区保持 America/New_York\n')
+        self.assertEqual(result['state'], 'succeeded')
+        self.assertIn('America/New_York', result['detail'])
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(commands[0][-1].endswith('chain_time.py'))
 
     def test_restart_all_includes_only_installed_project_services(self):
         maintenance.HTTPS_UNIT.write_text(maintenance.SITE_OWNER + '\n[Service]\n')

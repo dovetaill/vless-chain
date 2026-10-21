@@ -52,6 +52,23 @@ def related_services(roles):
     return services
 
 
+def time_output(path):
+    with path.open('rb') as stream:
+        size = stream.seek(0, os.SEEK_END)
+        stream.seek(max(0, size - 65536))
+        if size > 65536:
+            if not stream.readline(65536).endswith(b'\n'):
+                return ''  # Never retain a partial line that could begin inside a credential.
+        output = stream.read(65536).decode('utf-8', errors='replace')
+    output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output)
+    output = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', output)
+    output = re.sub(r'(?i)\b[a-z][a-z0-9+.-]*://\S+', '[地址已隐藏]', output)
+    output = re.sub(r'(?im)\b(?:authorization|proxy-authorization)\s*[:=].*', '[认证信息已隐藏]', output)
+    output = re.sub(r'(?im)^.*\b(?:[\w-]*(?:token|password|passwd|secret|api[_-]?key))\b[\"\']?\s*[:=].*$',
+                    '[凭据已隐藏]', output)
+    return output.strip()[-4096:]
+
+
 def execute(job, directory=STATE):
     path = directory / (job['id'] + '.json')
     process = None
@@ -105,6 +122,9 @@ def execute(job, directory=STATE):
                             os.killpg(process.pid, signal.SIGTERM)
                         except ProcessLookupError:
                             pass
+                        if job['action'] == 'sync-time':
+                            log.flush()
+                            job['detail'] = time_output(temporary / 'operation.log')
                     require(result == 0, '维护操作失败；请在该 VPS 检查安装状态与服务日志')
             job['after'] = installed()
             for service in services:
@@ -114,9 +134,13 @@ def execute(job, directory=STATE):
                 for role in ('panel', 'agent'):
                     if role in before:
                         require(job['after'].get(role) == job['version'], f'{role} 版本未达到目标')
-            job.update(state='succeeded', detail='时间同步已确认，时区保持不变' if job['action'] == 'sync-time' else '组件检查通过；总控还需检查整链')
+            job.update(state='succeeded', detail=(job.get('detail') or '时间同步已确认，时区保持不变')
+                       if job['action'] == 'sync-time' else '组件检查通过；总控还需检查整链')
     except Exception as error:
-        job.update(state='failed', error=str(error))
+        message = str(error)
+        if job['action'] == 'sync-time' and job.get('detail'):
+            message += '\n' + job['detail']
+        job.update(state='failed', error=message)
         try:
             job['after'] = installed()
         except Exception:

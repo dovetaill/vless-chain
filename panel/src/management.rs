@@ -242,6 +242,8 @@ pub struct Remote {
     #[serde(default)]
     pub error: String,
     #[serde(default)]
+    pub policy_error: String,
+    #[serde(default)]
     pub snapshot: Value,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]

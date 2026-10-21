@@ -195,7 +195,7 @@ const root = process.env.CHAIN_TEST_ROOT;
     await page.setViewportSize({width:1280,height:900});
     // Total control-plane outage must still age cached metrics, then clear its own error on recovery.
     const fresh=Math.floor(await page.evaluate(()=>Date.now()/1000));
-    fleet.remotes.forEach(r=>{r.seen=fresh+1;r.snapshot.nodes[0].seen=fresh;r.snapshot.nodes[0].report.system.sampled_at=fresh;r.snapshot.lines.forEach(l=>l.traffic.sampled_at=fresh);});
+    fleet.remotes.forEach(r=>{r.seen=fresh+1;r.snapshot.time=fresh;r.snapshot.nodes[0].seen=fresh;r.snapshot.nodes[0].report.system.sampled_at=fresh;r.snapshot.lines.forEach(l=>l.traffic.sampled_at=fresh);});
     await go('总览');await page.getByRole('button',{name:'刷新总控',exact:true}).click();await page.getByText('↑ 100.0 KiB/s · 有效 50/50 台',{exact:true}).waitFor();
     await page.clock.install();disconnected=true;await page.clock.runFor(95000);
     await page.getByText('↑ — · 有效 0/50 台',{exact:true}).waitFor();await page.getByText(/总控连接中断：/).waitFor();

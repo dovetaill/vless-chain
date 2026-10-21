@@ -31,11 +31,11 @@ pub async fn view(State(app): State<App>) -> Json<Value> {
         .iter()
         .map(|r| {
             json!({"id":r.id,"name":r.name,"url":r.url,
-        "seen":r.seen,"error":r.error,"snapshot":r.snapshot})
+        "seen":r.seen,"error":r.error,"policy_error":r.policy_error,"snapshot":r.snapshot})
         })
         .collect();
     Json(
-        json!({"remotes":remotes,"controller":f.controller_name,"policy":f.policy,"tasks":f.receipts}),
+        json!({"server_now":now(),"remotes":remotes,"controller":f.controller_name,"policy":f.policy,"tasks":f.receipts}),
     )
 }
 async fn invite(State(app): State<App>) -> ApiResult<Json<Value>> {
@@ -126,6 +126,7 @@ async fn connect(State(app): State<App>, Json(input): Json<Connect>) -> ApiResul
         token: String::new(),
         seen: now(),
         error: String::new(),
+        policy_error: String::new(),
         snapshot: Value::Null,
     };
     let result = request(
@@ -786,6 +787,38 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn policy_failure_keeps_fresh_remote_state_and_controller_clock() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/api/federation/state", get(|| async {
+                Json(json!({"time":now(),"version":"fixture","monitoring":{"override":{"enabled":true}}}))
+            }))
+            .route("/api/federation/policy", post(|| async {
+                (StatusCode::BAD_REQUEST, Json(json!({"error":"fixture policy rejected"})))
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let remote = Remote {
+            id: id(), name: "fixture".into(), url: format!("http://{address}"),
+            token: "test".into(), seen: 1, error: "old connection error".into(),
+            policy_error: String::new(), snapshot: Value::Null,
+        };
+        app.store.lock().unwrap().doc.fleet.remotes.push(remote.clone());
+        let result = monitor_api::poll_remote(&app, remote, false).await;
+        server.abort();
+        let _ = server.await;
+        result.unwrap();
+        let Json(value) = view(State(app)).await;
+        assert!(value["server_now"].as_u64().unwrap() > 1);
+        assert!(value["remotes"][0]["seen"].as_u64().unwrap() > 1);
+        assert_eq!(value["remotes"][0]["snapshot"]["version"], "fixture");
+        assert_eq!(value["remotes"][0]["error"], "");
+        assert!(value["remotes"][0]["policy_error"].as_str().unwrap().contains("fixture policy rejected"));
+    }
+
+    #[tokio::test]
     async fn local_and_remote_state_expose_the_same_versions() {
         let dir = tempfile::tempdir().unwrap();
         let app = app(dir.path());
@@ -805,7 +838,7 @@ mod tests {
         let remote_id = id();
         app.store.lock().unwrap().doc.fleet.remotes.push(Remote {
             id: remote_id.clone(), name: "test".into(), url: "https://unused.invalid".into(),
-            token: String::new(), seen: now(), error: String::new(),
+            token: String::new(), seen: now(), error: String::new(), policy_error: String::new(),
             snapshot: json!({"maintenance":true}),
         });
         let input = || Batch { id: id(), targets: vec![remote_id.clone()],

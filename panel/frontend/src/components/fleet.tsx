@@ -30,6 +30,8 @@ import {
   actions,
   connected,
   health,
+  issues,
+  remoteNow,
   latestCheck,
   lineStatus,
   localNode,
@@ -43,6 +45,7 @@ import {
 } from "./fleet-state";
 
 type FleetState = {
+  server_now?: number;
   remotes: Remote[];
   controller: string;
   policy: Policy | null;
@@ -236,6 +239,8 @@ export function Fleet() {
     >
   >({});
   const [now, setNow] = useState(() => Date.now() / 1000);
+  const serverClock = useRef({ at: Date.now() / 1000, received: performance.now() });
+  const controllerNow = () => serverClock.current.at + (performance.now() - serverClock.current.received) / 1000;
   const [connectionError, setConnectionError] = useState("");
   const [pendingApply, setPendingApply] = useState<string[]>([]);
   const [selected, setSelected] = useState<string[]>([]),
@@ -261,6 +266,8 @@ export function Fleet() {
   const lastSample = useRef("");
   const refresh = useCallback(async (initial = false) => {
     const value = await api<FleetState>("/fleet");
+    serverClock.current = { at: value.server_now ?? Date.now() / 1000, received: performance.now() };
+    setNow(serverClock.current.at);
     setConnectionError("");
     setData((old) => ({
       ...value,
@@ -289,7 +296,7 @@ export function Fleet() {
     };
     void poll(true);
     const timer = setInterval(() => {
-      setNow(Date.now() / 1000);
+      setNow(controllerNow());
       void poll();
     }, 5000);
     return () => clearInterval(timer);
@@ -312,12 +319,11 @@ export function Fleet() {
     stats = metrics(remotes, now);
   useEffect(() => {
     if (!data) return;
-    const now = Date.now() / 1000,
-      m = metrics(data.remotes, now);
+    const m = metrics(data.remotes, now);
     const signature = data.remotes
       .map(
         (r) =>
-          `${r.id}:${localNode(r)?.report.system.sampled_at}:${connected(r, now)}:${recent(localNode(r)?.seen, now)}:${recent(localNode(r)?.report.system.sampled_at, now)}`,
+          `${r.id}:${localNode(r)?.report.system.sampled_at}:${connected(r, now)}:${recent(localNode(r)?.seen, remoteNow(r, now))}:${recent(localNode(r)?.report.system.sampled_at, remoteNow(r, now))}`,
       )
       .join("|");
     if (signature === lastSample.current) return;
@@ -455,7 +461,7 @@ export function Fleet() {
           ...old,
           remotes: old.remotes.map((item) =>
             item.id === r.id
-              ? { ...item, snapshot: state, seen: Date.now() / 1000, error: "" }
+              ? { ...item, snapshot: state, seen: controllerNow(), error: "" }
               : item,
           ),
         },
@@ -771,7 +777,7 @@ export function Fleet() {
             {[
               [
                 "VPS 状态",
-                `${remotes.filter((r) => health(r, now) === "在线").length} / ${remotes.length} 在线`,
+                `${remotes.filter((r) => connected(r, now)).length} / ${remotes.length} 可同步`,
                 `${remotes.filter((r) => health(r, now) !== "在线").length} 台需要关注 · ${remotes.filter(mismatch).length} 台版本不一致`,
               ],
               [
@@ -811,10 +817,10 @@ export function Fleet() {
               {
                 allLines.filter(
                   ({ r, line }) =>
-                    !["已启用", "已停用"].includes(lineStatus(r, line, now)),
+                    !["已启用", "已停用", "状态未知"].includes(lineStatus(r, line, now)),
                 ).length
               }{" "}
-              条需要关注 · {allLines.filter(({ line }) => !line.enabled).length}{" "}
+              条有状态提示 · {allLines.filter(({ r, line }) => lineStatus(r, line, now) === "状态未知").length} 条因 VPS 同步异常而状态未知（不等于代理故障） · {allLines.filter(({ r, line }) => lineStatus(r, line, now) === "已停用").length}{" "}
               条已停用
             </p>
             <Button
@@ -824,7 +830,7 @@ export function Fleet() {
                 setFilter("attention");
               }}
             >
-              查看异常代理
+              查看代理状态
             </Button>
           </div>
           <Trend points={points.filter((p) => now - p.at <= 600)} now={now} />
@@ -862,13 +868,25 @@ export function Fleet() {
                         {r.name} · {health(r, now)}
                       </p>
                       <Versions remote={r} />
+                      <ul className="mt-2 max-w-3xl space-y-2 text-sm">
+                        {issues(r, now).map((issue, i) => (
+                          <li key={i} className="break-words">{issue.detail}</li>
+                        ))}
+                      </ul>
                       <p className="muted">
-                        {r.error || `最近同步 ${stamp(r.seen)}`}
+                        最近同步 {stamp(r.seen)}
                       </p>
                     </div>
-                    <Button variant="outline" onClick={() => setDetail(r.id)}>
-                      查看 VPS
-                    </Button>
+                    <div className="flex flex-wrap gap-2">
+                      <Button variant="outline" onClick={() => setDetail(r.id)}>
+                        查看 VPS
+                      </Button>
+                      <Button variant="outline" onClick={() => setModal(
+                        <Diagnostics nodes={r.snapshot?.nodes || []} request={remoteApi(r.id)} close={() => setModal(null)} />,
+                      )}>
+                        日志与诊断
+                      </Button>
+                    </div>
                   </div>
                 ))}
               {!remotes.length ? (
@@ -1133,7 +1151,8 @@ export function Fleet() {
                             <p className="mt-2">
                               <Versions remote={r} />
                             </p>
-                            <p className="muted">{stamp(r.seen)}</p>
+                            <p className="muted max-w-sm">{issues(r, now)[0]?.detail}</p>
+                            <p className="muted">最近同步 {stamp(r.seen)}</p>
                           </td>
                           <td
                             data-label="网卡速率"
@@ -1567,7 +1586,16 @@ export function Fleet() {
             最近同步 {stamp(activeDetail.seen)} · Agent 最近上报{" "}
             {stamp(activeDetail.snapshot?.agent_seen || 0)}
           </p>
-          {activeDetail.error && <p role="alert">{activeDetail.error}</p>}
+          {issues(activeDetail, now).length > 0 && (
+            <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50/30 p-4">
+              {issues(activeDetail, now).map((issue, i) => (
+                <div key={i}>
+                  <p className="font-medium">{issue.title}</p>
+                  <p className="mt-1 text-sm break-words">{issue.detail}</p>
+                </div>
+              ))}
+            </div>
+          )}
           {localNode(activeDetail) && (
             <div className="grid gap-3 sm:grid-cols-2">
               {(() => {
@@ -1576,8 +1604,8 @@ export function Fleet() {
                   valid =
                     connected(activeDetail, now) &&
                     n.online &&
-                    recent(n.seen, now) &&
-                    recent(s.sampled_at, now);
+                    recent(n.seen, remoteNow(activeDetail, now)) &&
+                    recent(s.sampled_at, remoteNow(activeDetail, now));
                 return (
                   <>
                     <p>
@@ -1608,13 +1636,6 @@ export function Fleet() {
               })()}
             </div>
           )}
-          {Object.values(activeDetail.snapshot?.monitoring?.conditions || {})
-            .filter((c) => c.active)
-            .map((c, i) => (
-              <p key={i} className="text-amber-700">
-                {c.message}
-              </p>
-            ))}
           <div className="flex flex-wrap gap-2">
             <Button
               type="button"
