@@ -1,5 +1,6 @@
 use super::*;
 use chain_panel::management::{self, Policy, Remote};
+use futures_util::StreamExt;
 
 pub fn routes(router: Router<App>) -> Router<App> {
     router
@@ -503,11 +504,13 @@ async fn resume_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResu
         );
         let job = d.fleet.receipts.get_mut(&id).context("任务不存在")?;
         ensure!(job["archived"] != true, "已忽略的任务不能重新查询，请创建新任务");
-        ensure!(job["state"] == "paused", "只可重新查询暂停的任务");
+        ensure!(job["state"] == "paused" || job["state"] == "completed", "只可重新查询暂停或已结束的异常任务");
         for target in job["targets"].as_array_mut().context("任务无效")? {
             target.as_object_mut().unwrap().remove("unreachable_since");
+            target["state"] = json!(if maintenance_succeeded(target) { "succeeded" } else { "pending" });
         }
         job["state"] = json!("running");
+        finish_batch(job);
         Ok(())
     })?;
     Ok(Json(json!({"ok":true})))
@@ -601,6 +604,20 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
     Ok(Json(json!({"id":input.id})))
 }
 
+fn maintenance_succeeded(target: &Value) -> bool {
+    target["state"] == "succeeded" || target["result"]["maintenance_state"] == "succeeded"
+        || target["error"].as_str().or(target["result"]["error"].as_str())
+            .is_some_and(|e| e.starts_with("组件维护已完成，但整链验证失败"))
+}
+
+fn finish_batch(job: &mut Value) {
+    let targets = job["targets"].as_array().unwrap();
+    if targets.iter().any(|t| matches!(t["state"].as_str(), Some("pending" | "queued" | "running"))) {
+        return;
+    }
+    job["state"] = json!(if targets.iter().all(maintenance_succeeded) { "succeeded" } else { "completed" });
+}
+
 pub async fn work_batch(app: &App) -> Result<()> {
     let pending = app
         .store
@@ -612,32 +629,48 @@ pub async fn work_batch(app: &App) -> Result<()> {
         .values()
         .find(|v| v["state"] == "running")
         .cloned();
-    let Some(mut job) = pending else {
+    let Some(job) = pending else {
         return Ok(());
     };
-    let index = job["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .position(|v| v["state"] != "succeeded");
-    let Some(index) = index else {
-        return Ok(());
-    };
-    let target = job["targets"][index].clone();
-    let remote = remote(app, target["id"].as_str().unwrap())?;
+    let targets = job["targets"].as_array().unwrap();
+    // Count remote operations still running, not just concurrent HTTP requests.
+    let indices: Vec<_> = targets.iter().enumerate()
+        .filter(|(_, t)| matches!(t["state"].as_str(), Some("running" | "queued")))
+        .chain(targets.iter().enumerate().filter(|(_, t)| t["state"] == "pending"))
+        .take(5).map(|(i, _)| i).collect();
+    let mut work = futures_util::stream::iter(indices).map(|index| work_target(app, &job, index)).buffer_unordered(5);
+    while let Some(result) = work.next().await { result?; }
+    let mut s = app.store.lock().unwrap();
+    if let Some(current) = s.doc.fleet.receipts.get_mut(job["id"].as_str().unwrap()) {
+        finish_batch(current);
+    }
+    s.save()?;
+    Ok(())
+}
+
+async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
+    let mut target = job["targets"][index].clone();
     let action = job["action"].as_str().unwrap().to_string();
-    let result = if matches!(action.as_str(), "enable" | "disable") {
-        if target["dispatched"] != true {
-            job["targets"][index]["dispatched"] = json!(true);
-            job["targets"][index]["started"] = json!(now());
-            {
-                let mut s = app.store.lock().unwrap();
-                s.doc
-                    .fleet
-                    .receipts
-                    .insert(job["id"].as_str().unwrap().to_string(), job.clone());
-                s.save()?;
-            }
+    let lines = matches!(action.as_str(), "enable" | "disable");
+    let dispatch_lines = lines && target["dispatched"] != true;
+    target["state"] = json!("running");
+    if dispatch_lines {
+        target["dispatched"] = json!(true);
+        target["started"] = json!(now());
+    }
+    {
+        let mut s = app.store.lock().unwrap();
+        s.doc
+            .fleet
+            .receipts
+            .get_mut(job["id"].as_str().unwrap())
+            .context("任务不存在")?["targets"][index] = target.clone();
+        s.save()?;
+    }
+    let result = async {
+        let remote = remote(app, target["id"].as_str().unwrap())?;
+        if lines {
+        if dispatch_lines {
             request(&remote, "POST", "/api/lines/operate", Some(json!({"action":action,"line_ids":job["lines"][&remote.id]}))).await
                 .map(|value| json!({"state":"running","detail":"已提交，等待 Agent 确认","result":value}))
         } else {
@@ -661,62 +694,86 @@ pub async fn work_batch(app: &App) -> Result<()> {
             Some(json!({"id":target["task_id"],"action":action,"version":job["version"]})),
         )
         .await
-    };
+        }
+    }.await;
     match result {
         Ok(mut result) => {
-            job["targets"][index]
-                .as_object_mut()
-                .unwrap()
-                .remove("error");
-            job["targets"][index]
-                .as_object_mut()
-                .unwrap()
-                .remove("unreachable_since");
-            if !matches!(action.as_str(), "enable" | "disable") {
+            target.as_object_mut().unwrap().remove("error");
+            target.as_object_mut().unwrap().remove("unreachable_since");
+            if !lines {
                 result["maintenance_state"] = result["state"].clone();
-                result["verification"] = json!({"state":"pending","detail":"等待组件维护完成后执行整链验证"});
+                result["verification"] = json!({"state":"pending","detail":"组件维护完成后自动验证；验证失败不阻塞其他 VPS"});
             }
-            if result["state"] == "succeeded" && !matches!(action.as_str(), "enable" | "disable") {
-                match verify_remote(app, &remote).await {
-                    Ok(detail) => {
-                        result["verification"] = json!({"state":"succeeded","detail":detail});
-                        result["detail"] = json!(detail);
-                    }
-                    Err(e) => {
-                        result["verification"] = json!({"state":"failed","detail":format!("{e:#}")});
-                        result["state"] = json!("failed");
-                        result["error"] = json!(format!(
-                            "组件维护已完成，但整链验证失败：{e:#}；未回退业务数据库"
-                        ));
-                    }
-                }
-            }
-            job["targets"][index]["result"] = result.clone();
+            target["result"] = result.clone();
             let state = result["state"].as_str().unwrap_or("running");
-            job["targets"][index]["state"] = json!(state);
-            if state == "failed" || state == "unknown" {
-                job["state"] = json!("paused");
-            }
-            if state == "succeeded" && index + 1 == job["targets"].as_array().unwrap().len() {
-                job["state"] = json!("succeeded");
-            }
+            target["state"] = json!(state);
         }
         Err(e) => {
-            job["targets"][index]["error"] = json!(format!("{e:#}"));
+            target["error"] = json!(format!("{e:#}"));
             let first = target["unreachable_since"].as_u64().unwrap_or(now());
-            job["targets"][index]["unreachable_since"] = json!(first);
-            job["targets"][index]["state"] = json!("unknown");
-            if now().saturating_sub(first) >= 300 {
-                job["state"] = json!("paused");
-            }
+            target["unreachable_since"] = json!(first);
+            target["state"] = json!(if now().saturating_sub(first) >= 300 {
+                "unknown"
+            } else {
+                "running"
+            });
         }
     }
     let mut s = app.store.lock().unwrap();
-    s.doc
+    let current = s
+        .doc
         .fleet
         .receipts
-        .insert(job["id"].as_str().unwrap().to_string(), job);
+        .get_mut(job["id"].as_str().unwrap())
+        .context("任务不存在")?;
+    current["targets"][index] = target;
+    finish_batch(current);
     s.save()?;
+    Ok(())
+}
+
+pub async fn verify_batches(app: &App) -> Result<()> {
+    let pending: Vec<_> = {
+        let s = app.store.lock().unwrap();
+        s.doc.fleet.receipts.iter().filter(|(_, job)| job["archived"] != true
+            && !matches!(job["action"].as_str(), Some("enable" | "disable")))
+            .flat_map(|(id, job)| job["targets"].as_array().into_iter().flatten().enumerate()
+                .filter(|(_, t)| maintenance_succeeded(t) && t["result"]["verification"]["state"] != "succeeded"
+                    && t["result"]["verification"]["retry_at"].as_u64().unwrap_or(0) <= now())
+                .map(|(index, t)| (id.clone(), index, t["id"].as_str().unwrap().to_string())))
+            .collect()
+    };
+    let mut checks = futures_util::stream::iter(pending).map(|(id, index, remote_id)| async move {
+        if app.store.lock().unwrap().doc.fleet.receipts.get(&id).is_none_or(|job| job["archived"] == true) {
+            return (id, index, None);
+        }
+        let result = async {
+            let remote = remote(app, &remote_id)?;
+            verify_remote(app, &remote).await
+        }.await;
+        (id, index, Some(result))
+    }).buffer_unordered(5);
+    while let Some((id, index, result)) = checks.next().await {
+        let Some(result) = result else { continue; };
+        let mut s = app.store.lock().unwrap();
+        let interval = s.doc.monitoring.policy().interval;
+        let Some(job) = s.doc.fleet.receipts.get_mut(&id).filter(|j| j["archived"] != true) else { continue; };
+        let target = &mut job["targets"][index];
+        if !maintenance_succeeded(target) { continue; }
+        // Old paused receipts may encode successful maintenance as a failed target.
+        target["state"] = json!("succeeded");
+        target.as_object_mut().unwrap().remove("error");
+        target["result"]["state"] = json!("succeeded");
+        target["result"]["maintenance_state"] = json!("succeeded");
+        target["result"].as_object_mut().unwrap().remove("error");
+        target["result"]["verification"] = match result {
+            Ok(detail) => json!({"state":"succeeded","detail":detail,"checked_at":now()}),
+            Err(e) => json!({"state":"failed","detail":chain_panel::diagnostics::redact(&format!("{e:#}")),
+                "checked_at":now(),"retry_at":now() + interval}),
+        };
+        finish_batch(job);
+        s.save()?;
+    }
     Ok(())
 }
 
@@ -824,12 +881,13 @@ mod tests {
         assert!(resume_batch(State(app.clone()), Path(job_id.clone())).await.is_err());
         // There is no remote: dispatching anything would fail instead of completing here.
         work_batch(&app).await.unwrap();
+        verify_batches(&app).await.unwrap();
         assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id], receipt);
         assert!(archive_batch(State(app), Path(id())).await.is_err());
     }
 
     #[tokio::test]
-    async fn maintenance_success_verification_failure_pauses_and_resume_rechecks_same_task() {
+    async fn maintenance_success_retries_verification_without_reinstalling() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task_ids = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -874,20 +932,26 @@ mod tests {
             }));
         }
         let first = work_batch(&app).await;
+        let maintained = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
+        let checked = verify_batches(&app).await;
         let failed = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
-        let resumed = resume_batch(State(app.clone()), Path(job_id.clone())).await;
         let second = work_batch(&app).await;
+        verify_batches(&app).await.unwrap();
         let failed_again = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
         document.lock().unwrap().lines.clear();
-        let resumed_again = resume_batch(State(app.clone()), Path(job_id.clone())).await;
-        let third = work_batch(&app).await;
+        app.store.lock().unwrap().doc.fleet.receipts.get_mut(&job_id).unwrap()["targets"][0]["result"]["verification"]["retry_at"] = json!(0);
+        let third = verify_batches(&app).await;
         let passed = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
         server.abort();
         let _ = server.await;
-        first.unwrap(); let _ = resumed.unwrap(); second.unwrap(); let _ = resumed_again.unwrap(); third.unwrap();
+        first.unwrap(); checked.unwrap(); second.unwrap(); third.unwrap();
+        let _released = std::net::TcpListener::bind(address).unwrap();
+        assert_eq!(maintained["state"], "succeeded");
+        assert_eq!(maintained["targets"][0]["result"]["verification"]["state"], "pending");
+        assert_eq!(failed, failed_again, "未到复查时间，不重复检查");
         for job in [&failed, &failed_again] {
-            assert_eq!(job["state"], "paused");
-            assert_eq!(job["targets"][0]["state"], "failed");
+            assert_eq!(job["state"], "succeeded");
+            assert_eq!(job["targets"][0]["state"], "succeeded");
             let result = &job["targets"][0]["result"];
             assert_eq!(result["maintenance_state"], "succeeded");
             assert_eq!(result["verification"]["state"], "failed");
@@ -897,7 +961,95 @@ mod tests {
         assert_eq!(passed["state"], "succeeded");
         assert_eq!(passed["targets"][0]["result"]["maintenance_state"], "succeeded");
         assert_eq!(passed["targets"][0]["result"]["verification"]["state"], "succeeded");
-        assert_eq!(*task_ids.lock().unwrap(), vec![json!(task_id); 3]);
+        assert_eq!(*task_ids.lock().unwrap(), vec![json!(task_id)]);
+    }
+
+    #[tokio::test]
+    async fn hundred_upgrades_are_bounded_and_one_failure_does_not_stop_the_rest() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+        let operations = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let (seen, active, peak, http, parallel) = (calls.clone(), operations.clone(), maximum.clone(), requests.clone(), concurrent.clone());
+        let router = Router::new().route("/api/federation/task", post(move |Json(body): Json<Value>| {
+            let (seen, active, peak, http, parallel) = (seen.clone(), active.clone(), peak.clone(), http.clone(), parallel.clone());
+            async move {
+                let id = body["id"].as_str().unwrap().to_string();
+                parallel.fetch_max(http.fetch_add(1, SeqCst) + 1, SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                http.fetch_sub(1, SeqCst);
+                let mut seen = seen.lock().unwrap();
+                let count = seen.entry(id.clone()).or_default();
+                *count += 1;
+                if *count == 1 {
+                    peak.fetch_max(active.fetch_add(1, SeqCst) + 1, SeqCst);
+                    Json(json!({"state":"running"}))
+                } else {
+                    active.fetch_sub(1, SeqCst);
+                    Json(json!({"state":if id == "task-0" { "failed" } else { "succeeded" },"error":if id == "task-0" { "fixture install failed" } else { "" }}))
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let job_id = id();
+        {
+            let mut s = app.store.lock().unwrap();
+            let targets: Vec<_> = (0..100).map(|i| {
+                let remote_id = format!("remote-{i}");
+                s.doc.fleet.remotes.push(Remote { id:remote_id.clone(), name:remote_id.clone(), url:format!("http://{address}"),
+                    token:"test".into(), seen:now(), error:String::new(), policy_error:String::new(), snapshot:Value::Null });
+                json!({"id":remote_id,"task_id":format!("task-{i}"),"state":"pending"})
+            }).collect();
+            s.doc.fleet.receipts.insert(job_id.clone(), json!({"id":job_id,"action":"upgrade","version":"0.2.44","state":"running","targets":targets}));
+        }
+        let completed = async {
+            for _ in 0..40 { work_batch(&app).await?; }
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        server.abort(); let _ = server.await;
+        let _released = std::net::TcpListener::bind(address).unwrap();
+        completed.unwrap();
+        assert_eq!(maximum.load(SeqCst), 5, "远端运行的升级不能超过 5 台");
+        assert!((2..=5).contains(&concurrent.load(SeqCst)), "实际请求必须并发");
+        assert_eq!(operations.load(SeqCst), 0);
+        let seen = calls.lock().unwrap();
+        assert_eq!(seen.len(), 100);
+        assert!(seen.values().all(|count| *count == 2), "完成或失败的任务不能重复下发");
+        let s = app.store.lock().unwrap();
+        let job = &s.doc.fleet.receipts[&job_id];
+        assert_eq!(job["state"], "completed");
+        assert_eq!(job["targets"][0]["state"], "failed");
+        assert_eq!(job["targets"].as_array().unwrap().iter().filter(|t| t["state"] == "succeeded").count(), 99);
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_keeps_completed_upgrades_and_original_task_ids() {
+        let legacy = json!({"state":"failed","error":"组件维护已完成，但整链验证失败：timeout"});
+        assert!(maintenance_succeeded(&legacy));
+        assert!(!maintenance_succeeded(&json!({"state":"unknown"})));
+        let mut job = json!({"state":"paused","targets":[legacy,{"state":"pending"}]});
+        finish_batch(&mut job);
+        assert_eq!(job["state"], "paused", "旧任务未执行的升级不能自动恢复");
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let job_id = id();
+        job["targets"][0]["task_id"] = json!("completed-task");
+        job["targets"][1]["task_id"] = json!("pending-task");
+        app.store.lock().unwrap().doc.fleet.receipts.insert(job_id.clone(), job);
+        let _ = resume_batch(State(app.clone()), Path(job_id.clone())).await.unwrap();
+        let s = app.store.lock().unwrap();
+        let resumed = &s.doc.fleet.receipts[&job_id];
+        assert_eq!(resumed["state"], "running");
+        assert_eq!(resumed["targets"][0]["state"], "succeeded");
+        assert_eq!(resumed["targets"][0]["task_id"], "completed-task");
+        assert_eq!(resumed["targets"][1]["state"], "pending");
+        assert_eq!(resumed["targets"][1]["task_id"], "pending-task");
     }
 
     #[tokio::test]

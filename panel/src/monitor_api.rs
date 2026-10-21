@@ -462,6 +462,8 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
     let mut notification_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut next_batch = 0;
     let mut batch_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut next_verification = 0;
+    let mut verification_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
@@ -509,6 +511,18 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                 }
             }));
             next_batch = now() + 10;
+        }
+        if verification_task.as_ref().is_some_and(|task| task.is_finished()) {
+            let _ = verification_task.take().unwrap().await;
+        }
+        if now() >= next_verification && verification_task.is_none() {
+            let app = app.clone();
+            verification_task = Some(tokio::spawn(async move {
+                if let Err(e) = fleet_api::verify_batches(&app).await {
+                    eprintln!("维护后自动验证：{e}");
+                }
+            }));
+            next_verification = now() + 10;
         }
         for remote in &doc.fleet.remotes {
             if now() >= *poll_at.get(&remote.id).unwrap_or(&0) && jobs.len() < 8 {
@@ -607,6 +621,9 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
     // Let bounded probes finish so their core processes are stopped and reaped before shutdown.
     while jobs.join_next().await.is_some() {}
     if let Some(task) = batch_task {
+        let _ = task.await;
+    }
+    if let Some(task) = verification_task {
         let _ = task.await;
     }
     if let Some(task) = notification_task {

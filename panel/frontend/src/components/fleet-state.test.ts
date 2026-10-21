@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { connected, health, issues, lineStatus, metrics, remoteNow, verificationFailed, type Remote } from "./fleet-state";
+import { connected, health, issues, lineStatus, metrics, remoteNow, verificationFailed, maintenanceSucceeded, taskNeedsAttention, type Remote, type Task } from "./fleet-state";
 import type { Line, PanelState } from "../types";
 
 const now = 1000;
@@ -72,3 +72,12 @@ assert.equal(verificationFailed({id:"vps", state:"failed", result:{maintenance_s
 assert.equal(verificationFailed({id:"vps", state:"failed", error:"组件维护已完成，但整链验证失败：timeout"}), true);
 assert.equal(verificationFailed({id:"vps", state:"failed", error:"安装失败"}), false);
 assert.equal(verificationFailed({id:"vps", state:"succeeded", error:"组件维护已完成，但整链验证失败：old", result:{verification:{state:"succeeded"}}}), false);
+const maintained: Task = {id:"task", action:"upgrade", state:"succeeded", targets:[{id:"vps", state:"succeeded", result:{maintenance_state:"succeeded", verification:{state:"failed"}}}]};
+assert.equal(maintenanceSucceeded(maintained.targets[0]), true);
+assert.equal(taskNeedsAttention(maintained), true);
+maintained.targets[0].result!.verification!.state = "succeeded";
+assert.equal(taskNeedsAttention(maintained), false, "验证恢复后自动移入历史");
+maintained.state = "completed";
+assert.equal(taskNeedsAttention(maintained), true);
+maintained.archived = true;
+assert.equal(taskNeedsAttention(maintained), false, "归档不再占用待处理列表");

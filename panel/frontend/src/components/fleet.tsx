@@ -42,6 +42,8 @@ import {
   recent,
   statuses,
   verificationFailed,
+  maintenanceSucceeded,
+  taskNeedsAttention,
   requestId,
   type Remote,
   type Task,
@@ -227,6 +229,7 @@ export function Fleet() {
     [filter, setFilter] = useState(""),
     [host, setHost] = useState("");
   const [page, setPage] = useState(1);
+  const [showTaskHistory, setShowTaskHistory] = useState(false);
   const [sort, setSort] = useState("default");
   const views = useRef<
     Partial<
@@ -385,7 +388,8 @@ export function Fleet() {
   const tasks = Object.values(data?.tasks || {}).sort(
     (a, b) => (b.at || 0) - (a.at || 0),
   );
-  const running = tasks.filter((t) => !t.archived && ["running", "paused"].includes(t.state));
+  const running = tasks.filter(taskNeedsAttention);
+  const visibleTasks = showTaskHistory ? tasks : running;
   const matches = (text: string) =>
     text.toLowerCase().includes(search.toLowerCase());
   const filteredVps = remotes.filter(
@@ -450,7 +454,7 @@ export function Fleet() {
         ? filteredLines.length
         : tab === "externals"
           ? externals.length
-          : tasks.length;
+          : visibleTasks.length;
   const currentPage = Math.min(page, Math.max(1, Math.ceil(total / PAGE_SIZE)));
   const slice = <T,>(rows: T[]) =>
     rows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
@@ -585,6 +589,13 @@ export function Fleet() {
       </Modal>,
     );
   }
+  function archiveTask(task: Task) {
+    if (!window.confirm("移入历史任务？将停止此任务的自动复查，也不会继续未执行的 VPS；原始结果保留，这不代表连接问题已修复。")) return;
+    void run(async () => {
+      await api(`/fleet/batch/${task.id}/archive`, "POST", {});
+      await refresh();
+    });
+  }
   function batch(action: string) {
     const isLines = ["enable", "disable"].includes(action),
       targets = isLines
@@ -604,7 +615,7 @@ export function Fleet() {
     setModal(
       <Modal
         title={`确认${actions[action]}`}
-        description={`${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，升级后自动重启相关服务` : ""}。操作可能中断连接，失败后暂停后续机器。`}
+        description={`${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，升级后自动重启相关服务` : ""}。最多同时处理 5 台，单台失败不阻塞其他机器；操作可能中断对应机器的连接。`}
         submit={
           blocked.length || (action === "upgrade" && !release)
             ? undefined
@@ -621,7 +632,7 @@ export function Fleet() {
           });
           close();
           setTaskId(id);
-          setMessage("任务已提交，可在维护任务中查看逐台结果。");
+          setMessage("任务已提交，可在维护任务中查看各 VPS 的维护和自动验证结果。");
           try {
             await refresh();
           } catch (e) {
@@ -762,7 +773,7 @@ export function Fleet() {
       </nav>
       {running.length > 0 && (
         <div className="fleet-running-strip">
-          <span>{running.filter(t => t.state === "running").length} 个任务执行中 · {running.filter(t => t.state === "paused").length} 个待处理</span>
+          <span>{running.filter(t => t.state === "running").length} 个任务执行中 · {running.filter(t => t.state !== "running").length} 个待处理</span>
           <Button variant="outline" onClick={() => navigate("tasks")}>查看任务</Button>
         </div>
       )}
@@ -1047,7 +1058,7 @@ export function Fleet() {
                 </div>
                 {chosen.length > 0 && <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
                   <div className="flex flex-wrap items-center gap-2">
-                    <Button disabled={busy || releaseLoading || !release || running.some(t => t.state === "running")} onClick={() => batch("upgrade")}>逐台升级</Button>
+                    <Button disabled={busy || releaseLoading || !release || running.some(t => t.state === "running")} onClick={() => batch("upgrade")}>批量升级</Button>
                     <Button variant="outline" disabled={busy || releaseLoading} onClick={() => void fetchRelease()}>{releaseLoading ? "正在获取最新版本…" : "检查最新版本"}</Button>
                     <span className="text-xs text-muted-foreground">{release ? `最新正式版 ${release.version}` : "先检查版本，再升级所选 VPS"}</span>
                   </div>
@@ -1055,7 +1066,7 @@ export function Fleet() {
                     <summary className="cursor-pointer text-muted-foreground">重启与维护说明</summary>
                     <div className="mt-3 space-y-3 border-t pt-3">
                       <div className="flex flex-wrap gap-2">{["restart-all", "restart-panel", "restart-agent"].map(action => <Button key={action} variant="outline" disabled={busy || running.some(t => t.state === "running")} onClick={() => batch(action)}>{actions[action]}</Button>)}</div>
-                      <p className="text-xs leading-5 text-muted-foreground">升级会更新整套发行版本并重启相关服务，失败后暂停后续机器。远端需已安装 Linux systemd 维护组件。</p>
+                      <p className="text-xs leading-5 text-muted-foreground">最多同时维护 5 台 VPS，单台失败不阻塞其他机器。升级会更新整套发行版本并重启相关服务；连接验证在后台自动进行。远端需已安装 Linux systemd 维护组件。</p>
                       {release && <p className="text-xs text-muted-foreground">版本包含：控制台／Agent {release.version} · Xray {release.xray || "未知"} · Mihomo {release.mihomo || "未知"}</p>}
                     </div>
                   </details>
@@ -1359,9 +1370,10 @@ export function Fleet() {
         <Card className="fleet-tasks">
           <CardHeader>
             <CardTitle>维护任务</CardTitle>
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={showTaskHistory} onChange={e => { setShowTaskHistory(e.target.checked); setPage(1); }} />显示历史任务</label>
           </CardHeader>
           <CardContent>
-            {slice(tasks).map((t) => (
+            {slice(visibleTasks).map((t) => (
               <div
                 key={t.id}
                 className="fleet-task-row"
@@ -1369,18 +1381,19 @@ export function Fleet() {
                 <div>
                   <div className="fleet-task-title"><span className="fleet-task-icon"><Wrench aria-hidden="true" /></span><strong>{actions[t.action] || t.action}</strong><Status tone={t.state === "succeeded" ? "good" : t.state === "paused" || t.state === "failed" ? "warn" : "muted"}>{statuses[t.state] || t.state}</Status>{t.archived && <Status>已归档</Status>}</div>
                   <p className="muted">
-                    {stamp(t.at || 0)} · {t.targets.length} 台 VPS · 成功{" "}
-                    {t.targets.filter((v) => v.state === "succeeded").length} 台
+                    {stamp(t.at || 0)} · {t.targets.length} 台 VPS · 维护完成{" "}
+                    {t.targets.filter(maintenanceSucceeded).length} 台 · 验证未通过 {t.targets.filter(verificationFailed).length} 台
                   </p>
                 </div>
                 <Button variant="outline" onClick={() => setTaskId(t.id)}>
                   查看任务
                 </Button>
+                {!t.archived && t.state !== "running" && <Button variant="ghost" disabled={busy} onClick={() => archiveTask(t)}>移入历史</Button>}
               </div>
             ))}
-            {!tasks.length && <div className="fleet-empty"><ShieldCheck aria-hidden="true" /><p>暂无维护任务。</p><span>从 VPS 列表发起维护后，在这里查看结果。</span></div>}
+            {!visibleTasks.length && <div className="fleet-empty"><ShieldCheck aria-hidden="true" /><p>暂无待处理维护任务。</p><span>已完成或归档的记录可勾选“显示历史任务”查看。</span></div>}
           </CardContent>
-          <Pager total={tasks.length} page={currentPage} change={setPage} />
+          <Pager total={visibleTasks.length} page={currentPage} change={setPage} />
         </Card>
       )}
       {tab === "settings" && (
@@ -1651,7 +1664,7 @@ export function Fleet() {
         </Modal>
       )}
       {taskId && (
-        <Modal drawer title="逐台任务进度" close={() => setTaskId(undefined)}>
+        <Modal drawer title="批量任务进度" close={() => setTaskId(undefined)}>
           {error && (
             <p role="alert" className="text-red-700">
               {error}
@@ -1666,7 +1679,7 @@ export function Fleet() {
                 </div>
                 {activeTask.version && <p className="text-sm">目标版本 <strong>{activeTask.version}</strong></p>}
                 <p className="text-sm text-muted-foreground">
-                  已完成 {activeTask.targets.filter(t => t.state === "succeeded").length} / {activeTask.targets.length}
+                  维护完成 {activeTask.targets.filter(maintenanceSucceeded).length} / {activeTask.targets.length}
                   {` · 验证未通过 ${activeTask.targets.filter(verificationFailed).length}`}
                   {` · 操作失败 ${activeTask.targets.filter(t => t.state === "failed" && !verificationFailed(t)).length}`}
                 </p>
@@ -1675,21 +1688,21 @@ export function Fleet() {
               {activeTask.targets.map((t) => {
                 const remote = remotes.find(r => r.id === t.id);
                 const verifyFailed = verificationFailed(t);
-                const maintenanceDone = t.result?.maintenance_state === "succeeded" || verifyFailed || t.state === "succeeded";
+                const maintenanceDone = maintenanceSucceeded(t);
                 const issue = verifyFailed
                   ? t.result?.verification?.detail || (t.error || t.result?.error || "").replace(/^组件维护已完成，但整链验证失败[：:]?\s*/, "")
                   : t.error || t.result?.error;
                 return <section key={t.id} className="min-w-0 space-y-3 rounded-xl border p-4" aria-label={`VPS 任务：${remote?.name || t.id}`}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h4 className="font-semibold break-all">{remote?.name || t.id}</h4>
-                    <Status tone={verifyFailed ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? "维护完成 · 验证待处理" : statuses[t.state] || t.state}</Status>
+                    <Status tone={verifyFailed ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? activeTask.archived ? "维护完成 · 验证未通过" : "维护完成 · 自动复查中" : statuses[t.state] || t.state}</Status>
                   </div>
                   <div className="grid gap-2 rounded-lg bg-muted/30 p-3 text-sm sm:grid-cols-2">
                     <p>组件维护：<span className={maintenanceDone ? "text-emerald-700" : ""}>{maintenanceDone ? "已完成" : statuses[t.result?.maintenance_state || t.state] || t.state}</span></p>
-                    <p>后续验证：{verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" || t.state === "succeeded" ? "已通过" : "等待验证"}</p>
+                    <p>后续验证：{verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" ? "已通过" : "等待自动验证"}</p>
                   </div>
                   {t.result?.after && <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">{Object.entries(t.result.after).map(([key, value]) => <span key={key}>{({panel:"控制台",agent:"Agent",chainctl:"管理命令"} as Record<string,string>)[key] || key} <strong>{value}</strong></span>)}</div>}
-                  {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && <p className="mt-2">先查看日志并排查连接，再重新验证；无需重复升级。</p>}</div> : t.result?.detail && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result.detail}</p>}
+                  {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && !activeTask.archived && <p className="mt-2">系统会自动复查连接，不会重复升级，也不阻塞其他 VPS。{t.result?.verification?.retry_at ? `下次复查：${stamp(t.result.verification.retry_at)}` : ""}</p>}</div> : t.result?.detail && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result.detail}</p>}
                   {remote && <Button type="button" variant="outline" onClick={() => {
                     const returnTask = activeTask.id;
                     setTaskId(undefined);
@@ -1698,11 +1711,11 @@ export function Fleet() {
                 </section>;
               })}
               </div>
-              {!activeTask.archived && activeTask.state === "paused" && (
+              {!activeTask.archived && ["paused", "completed"].includes(activeTask.state) && (
                 <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
-                  <p className="font-medium">已暂停后续 VPS，避免继续影响服务</p>
+                  <p className="font-medium">{activeTask.state === "paused" ? "旧版暂停任务：未执行的 VPS 仍等待继续" : "维护已结束，请查看各 VPS 的独立结果"}</p>
                   <p>{activeTask.targets.some(verificationFailed)
-                    ? "维护已经完成。重新验证只核对原任务并检查连接，不会重新安装组件；全部通过后继续后续 VPS。"
+                    ? "已完成的维护不会重做，连接会自动复查；继续任务只处理未完成的 VPS。"
                     : activeTask.targets.some(t => t.state === "failed")
                       ? "先排查失败原因。核对原任务不会重新执行已失败操作；确需重试时选择失败对象新建任务。"
                       : "操作结果尚未确认。请先核对原任务，确认成功后继续后续 VPS。"}</p>
@@ -1711,7 +1724,7 @@ export function Fleet() {
               )}
               {activeTask.archived && <p className="rounded-lg border bg-muted/30 p-3 text-sm">此任务已忽略并归档，保留原始结果，不再继续后续 VPS。归档不代表线路问题已修复。</p>}
               <div className="flex flex-wrap gap-2">
-              {!activeTask.archived && activeTask.state === "paused" &&
+              {!activeTask.archived && ["paused", "completed"].includes(activeTask.state) &&
                 activeTask.targets.some((t) => t.state === "failed" && !verificationFailed(t)) && (
                   <Button
                     type="button"
@@ -1742,7 +1755,7 @@ export function Fleet() {
                     选择失败及未执行对象
                   </Button>
                 )}
-              {!activeTask.archived && activeTask.state === "paused" && (
+              {!activeTask.archived && ["paused", "completed"].includes(activeTask.state) && (
                 <Button
                   type="button"
                   variant="outline"
@@ -1758,16 +1771,10 @@ export function Fleet() {
                     })
                   }
                 >
-                  {activeTask.targets.some(verificationFailed) ? "重新验证并继续" : "重新核对原任务结果"}
+                  {activeTask.targets.some(t => t.state === "pending") ? "继续未执行任务" : "重新核对原任务结果"}
                 </Button>
               )}
-              {!activeTask.archived && activeTask.state !== "running" && <Button type="button" variant="ghost" disabled={busy} onClick={() => {
-                if (!window.confirm("忽略并归档此任务？这不会修复线路，也不会继续后续 VPS；原始结果将保留在维护任务中，不再显示顶部提醒。")) return;
-                void run(async () => {
-                  await api(`/fleet/batch/${activeTask.id}/archive`, "POST", {});
-                  await refresh();
-                });
-              }}>忽略并归档</Button>}
+              {!activeTask.archived && activeTask.state !== "running" && <Button type="button" variant="ghost" disabled={busy} onClick={() => archiveTask(activeTask)}>忽略并归档</Button>}
               </div>
             </>
           ) : (

@@ -34,13 +34,19 @@ export type Task = {
       error?: string;
       after?: Record<string, string>;
       maintenance_state?: string;
-      verification?: { state: string; detail?: string };
+      verification?: { state: string; detail?: string; checked_at?: number; retry_at?: number };
     };
   }[];
 };
 export function verificationFailed(target: Task["targets"][number]) {
   if (target.result?.verification) return target.result.verification.state === "failed";
   return (target.error || target.result?.error || "").startsWith("组件维护已完成，但整链验证失败");
+}
+export function maintenanceSucceeded(target: Task["targets"][number]) {
+  return target.state === "succeeded" || target.result?.maintenance_state === "succeeded" || verificationFailed(target);
+}
+export function taskNeedsAttention(task: Task) {
+  return !task.archived && (task.state !== "succeeded" || task.targets.some(t => verificationFailed(t) || t.result?.verification?.state === "pending"));
 }
 export const statuses: Record<string, string> = {
   pending: "等待执行",
@@ -50,9 +56,10 @@ export const statuses: Record<string, string> = {
   failed: "失败",
   unknown: "结果待确认",
   paused: "已暂停",
+  completed: "已结束，有异常",
 };
 export const actions: Record<string, string> = {
-  upgrade: "逐台升级",
+  upgrade: "批量升级",
   "restart-all": "整套重启",
   "restart-panel": "重启面板",
   "restart-agent": "重启 Agent",
