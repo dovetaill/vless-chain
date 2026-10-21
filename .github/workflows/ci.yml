@@ -52,6 +52,10 @@ jobs:
           package-manager-cache: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.4'
+          cache: false
       - name: Install WebAuthn build dependencies
         run: |
           if [ "${{ matrix.system }}" = linux ]; then

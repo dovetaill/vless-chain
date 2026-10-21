@@ -3,6 +3,7 @@ import io
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -20,6 +21,29 @@ import chain_release as release
 
 
 class Platforms(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('go'), 'Go is only required on build hosts')
+    def test_failed_xray_build_cleans_readonly_toolchain_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with common.Workspace(Path(directory)) as work:
+                execute = work.run
+                cache = work.root / 'go/mod'
+
+                def download_failure(command, **kwargs):
+                    if command[:3] == ['go', 'mod', 'download']:
+                        source = cache / 'golang.org/toolchain@v0.0.1-test/src'
+                        source.mkdir(parents=True)
+                        (source / 'go.env').write_text('test')
+                        source.chmod(0o555)
+                        source.parent.chmod(0o555)
+                        raise subprocess.CalledProcessError(42, command)
+                    return execute(command, **kwargs)
+
+                with patch.object(work, 'run', side_effect=download_failure):
+                    with self.assertRaises(subprocess.CalledProcessError) as error:
+                        release.fetch_xray(work, work.root / 'stage/bin/xray')
+                self.assertEqual(error.exception.returncode, 42)
+                self.assertFalse(cache.exists())
+
     def test_startup_failure_points_to_logs_without_requiring_chainctl(self):
         manager = installer.Manager.__new__(installer.Manager)
         manager.live, manager.root = True, Path('/')

@@ -170,39 +170,44 @@ def fetch_xray(work, destination):
     work.env.update(GOTOOLCHAIN='go1.26.4', GOENV='off', GOFLAGS='-modcacherw', CGO_ENABLED='0',
                     GOPATH=str(work.root / 'go'), GOMODCACHE=str(work.root / 'go/mod'),
                     GOCACHE=str(work.root / 'go/cache'), GOPROXY='https://proxy.golang.org', GOSUMDB='sum.golang.org')
-    sources = []
-    for index, (module, digest) in enumerate(XRAY_SOURCES):
-        metadata = work.root / f'xray-source-{index}.json'
-        with metadata.open('wb') as stream:
-            work.run(['go', 'mod', 'download', '-json', module], cwd=work.root, stdout=stream)
-        info = json.loads(metadata.read_text())
-        require(info.get('Sum') == digest and not info.get('Error'), 'Xray 源码校验失败。')
-        source = work.root / f'xray-source-{index}'
-        shutil.copytree(info['Dir'], source, copy_function=shutil.copyfile)
-        source.chmod(0o700)
-        for directory in source.rglob('*'):
-            if directory.is_dir():
-                directory.chmod(0o700)
-        sources.append(source)
-    core, reality = sources
-    file = reality / 'tls.go'
-    original = file.read_text()
-    require(original.count('\tsize  = 8192\n') == 1, 'REALITY 补丁基线不匹配，拒绝构建。')
-    # Backport only XTLS/REALITY#33; retain the stable baseline's client compatibility.
-    file.write_text(original.replace('\tsize  = 8192\n', '\tsize  = 17 * 1024\n'))
-    work.run(['go', 'mod', 'edit', '-replace', f'github.com/xtls/reality={reality}'], cwd=core)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    work.run(['go', 'build', '-mod=readonly', '-trimpath', '-buildvcs=false', '-ldflags',
-              '-s -w -buildid= -X github.com/xtls/xray-core/core.build=chain.1-reality-buffer-17k',
-              '-o', destination, './main'], cwd=core)
-    share = destination.parent.parent / 'share'
-    share.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(core / 'LICENSE', share / 'Xray-LICENSE')
-    (share / 'Xray-PATCHES.txt').write_text(
-        f'{XRAY_VERSION}: 本项目补丁构建，并非官方原版二进制。\n'
-        '基线：Xray v26.3.27；仅回移 https://github.com/XTLS/REALITY/pull/33\n'
-        'tls.go: size = 8192 -> size = 17 * 1024；保留原 REALITY 客户端兼容性。\n'
-        'Go 1.26.4；源码模块及校验：\n' + '\n'.join(f'{m} {s}' for m, s in XRAY_SOURCES) + '\n')
+    try:
+        sources = []
+        for index, (module, digest) in enumerate(XRAY_SOURCES):
+            metadata = work.root / f'xray-source-{index}.json'
+            with metadata.open('wb') as stream:
+                work.run(['go', 'mod', 'download', '-json', module], cwd=work.root, stdout=stream)
+            info = json.loads(metadata.read_text())
+            require(info.get('Sum') == digest and not info.get('Error'), 'Xray 源码校验失败。')
+            source = work.root / f'xray-source-{index}'
+            shutil.copytree(info['Dir'], source, copy_function=shutil.copyfile)
+            source.chmod(0o700)
+            for directory in source.rglob('*'):
+                if directory.is_dir():
+                    directory.chmod(0o700)
+            sources.append(source)
+        core, reality = sources
+        file = reality / 'tls.go'
+        original = file.read_text()
+        require(original.count('\tsize  = 8192\n') == 1, 'REALITY 补丁基线不匹配，拒绝构建。')
+        # Backport only XTLS/REALITY#33; retain the stable baseline's client compatibility.
+        file.write_text(original.replace('\tsize  = 8192\n', '\tsize  = 17 * 1024\n'))
+        work.run(['go', 'mod', 'edit', '-replace', f'github.com/xtls/reality={reality}'], cwd=core)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        work.run(['go', 'build', '-mod=readonly', '-trimpath', '-buildvcs=false', '-ldflags',
+                  '-s -w -buildid= -X github.com/xtls/xray-core/core.build=chain.1-reality-buffer-17k',
+                  '-o', destination, './main'], cwd=core)
+        share = destination.parent.parent / 'share'
+        share.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(core / 'LICENSE', share / 'Xray-LICENSE')
+        (share / 'Xray-PATCHES.txt').write_text(
+            f'{XRAY_VERSION}: 本项目补丁构建，并非官方原版二进制。\n'
+            '基线：Xray v26.3.27；仅回移 https://github.com/XTLS/REALITY/pull/33\n'
+            'tls.go: size = 8192 -> size = 17 * 1024；保留原 REALITY 客户端兼容性。\n'
+            'Go 1.26.4；源码模块及校验：\n' + '\n'.join(f'{m} {s}' for m, s in XRAY_SOURCES) + '\n')
+    finally:
+        # Go toolchain downloads stay read-only even with -modcacherw.
+        work.env['GOTOOLCHAIN'] = 'local'
+        work.run(['go', 'clean', '-modcache'], cwd=work.root)
 
 
 def default_output():
