@@ -20,7 +20,7 @@ const root = process.env.CHAIN_TEST_ROOT;
       monitoring:{conditions:{'ntp:local':{active:true,message:'本机节点：自动时间同步未启用'}}}};
     const fleet={time:now,remotes:[{id:'vps-1',name:'blo-wave',url:'https://example.invalid',seen:now,error:'',snapshot}],controller:'',policy:null,tasks:{}};
     let active=0,maxActive=0,reads=0,holdNext=false,releaseRead,heldSource,taskWrites=0;
-    const sources=[];
+    const sources=[];let extraLogs='';
     await page.route('**/*',async route=>{
       const url=new URL(route.request().url());
       if(url.hostname!=='localhost') return route.abort();
@@ -39,7 +39,7 @@ const root = process.env.CHAIN_TEST_ROOT;
           reads++;active++;maxActive=Math.max(maxActive,active);sources.push(body.body.source);
           if(holdNext) {holdNext=false;heldSource=body.body.source;await new Promise(resolve=>{releaseRead=resolve;});}
           active--;
-          result={text:`${now} ${body.body.source} log entry\n`+'long-line-'.repeat(80),sampled_at:now,sources:['xray','mihomo'],detail:'',clock:{ntp_enabled:false,timezone:'Asia/Shanghai',detail:'未发现可用时间服务'}};
+          result={text:`${now} ${body.body.source==='xray'?'2026/10/21 09:01:00.123456 ':''}${body.body.source} log entry\n`+'long-line-'.repeat(80)+extraLogs,sampled_at:now,sources:['xray','mihomo'],detail:'',clock:{ntp_enabled:false,timezone:'Asia/Shanghai',detail:'未发现可用时间服务'}};
         } else if(body.path==='/federation/task') {
           if(body.body.action==='status') result={state:'failed',error:'自动时间同步失败\napt-get update: Temporary failure resolving deb.debian.org\n未安装 chrony；请检查 DNS 后重试。',detail:'apt-get update: Temporary failure resolving deb.debian.org\n未安装 chrony；请检查 DNS 后重试。'};
           else {taskWrites++;result={};}
@@ -82,6 +82,20 @@ const root = process.env.CHAIN_TEST_ROOT;
     await button('暂停跟随').click();releaseRead();releaseRead=undefined;
     await log().filter({hasText:/xray log entry/}).waitFor();
     const afterPause=reads;await page.waitForTimeout(3200);assert.equal(reads,afterPause,'Pause retains in-flight response without another request');
+    assert.doesNotMatch(await log().innerText(),/2026\/10\/21 09:01:00/,'Xray duplicate timestamp is hidden');
+    await button('清屏').click();await log().filter({hasText:'已清屏，等待新日志'}).waitFor();
+    await button('刷新日志').click();await button('刷新日志').waitFor();
+    assert.doesNotMatch(await log().innerText(),/xray log entry/,'Refresh does not restore cleared history');
+    extraLogs=`\n${now} 2026/10/21 09:01:00.123456 new-after-clear`;
+    await button('继续跟随').click();await log().filter({hasText:'new-after-clear'}).waitFor();
+    assert.doesNotMatch(await log().innerText(),/xray log entry|2026\/10\/21 09:01:00/);
+    extraLogs+=`\n${now} 2026/10/21 09:01:00.123456 new-after-clear`;
+    await page.waitForFunction(()=>document.querySelector('[aria-label="日志记录"]').textContent.split('new-after-clear').length===3);
+    await button('暂停跟随').click();
+    await button('显示历史').click();await log().filter({hasText:'xray log entry'}).waitFor();
+    await button('清屏').click();await page.getByLabel('日志来源',{exact:true}).selectOption('agent');
+    await log().filter({hasText:'agent log entry'}).waitFor();
+    assert.equal(await button('显示历史').count(),0,'Changing source resets clear state');
     page.once('dialog',d=>d.dismiss());await button('启用本 VPS 自动校时').click();assert.equal(taskWrites,0);
     page.once('dialog',d=>d.accept());await button('启用本 VPS 自动校时').click();
     const failure=page.getByRole('alert').filter({hasText:'自动校时未完成'});

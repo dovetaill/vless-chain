@@ -1,4 +1,5 @@
 """Enable system time synchronization without changing time zone or time sources."""
+import os
 import shutil
 import subprocess
 import sys
@@ -45,8 +46,9 @@ def _synchronize():
     require(len(active) <= 1, '检测到多个运行中的时间服务：' + '、'.join(active) + '；请先解决服务冲突。')
     if not units:
         if shutil.which('apt-get'):
-            subprocess.run(['apt-get', 'update'], check=True, timeout=300)
-            subprocess.run(['apt-get', 'install', '-y', 'chrony'], check=True, timeout=300)
+            environment = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+            subprocess.run(['apt-get', 'update'], check=True, timeout=300, env=environment)
+            subprocess.run(['apt-get', 'install', '-y', 'chrony'], check=True, timeout=300, env=environment)
             units = ['chrony.service']
         elif shutil.which('dnf'):
             subprocess.run(['dnf', 'install', '-y', 'chrony'], check=True, timeout=300)

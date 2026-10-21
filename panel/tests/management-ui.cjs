@@ -56,6 +56,8 @@ const root = process.env.CHAIN_TEST_ROOT;
           else if (body.path !== '/publish') throw new Error('Unexpected remote operation: '+body.path);
         } else if(url.pathname==='/api/fleet/batch') {
           const body=request.postDataJSON(); fleet.tasks[body.id]={...body,at:now,state:'paused',targets:body.targets.map(id=>({id,state:'pending'}))}; result={id:body.id};
+        } else if(url.pathname.endsWith('/archive')) {
+          fleet.tasks[url.pathname.split('/').at(-2)].archived=true;
         } else if(url.pathname.endsWith('/resume')) {
           const id=url.pathname.split('/').at(-2); fleet.tasks[id].state='succeeded';fleet.tasks[id].targets.forEach(t=>{t.state='succeeded';delete t.error;if(t.result){delete t.result.error;if(t.result.verification)t.result.verification={state:'succeeded'};}});
         } else if (!['/api/fleet/policy','/api/monitoring/test','/api/federation/login'].includes(url.pathname)) throw new Error('Unexpected API: '+url.pathname);
@@ -226,7 +228,7 @@ const root = process.env.CHAIN_TEST_ROOT;
     disconnected=false;await page.clock.runFor(5000);await page.getByText(/总控连接中断：/).waitFor({state:'hidden'});
     fleet.tasks.failed={id:'failed',action:'upgrade',state:'paused',version:'0.2.30',at:now+10,targets:[{id:'vps-0',state:'succeeded'},{id:'vps-1',state:'failed',error:'升级失败'},{id:'vps-2',state:'unknown'},{id:'vps-3',state:'pending'}]};
     await page.getByRole('button',{name:'刷新总控',exact:true}).click();await go('维护任务');
-    await page.getByRole('button',{name:'查看任务',exact:true}).first().click();await dialog().getByText(/核对原任务不会重新执行已失败操作/).waitFor();
+    await page.locator('.fleet-tasks').getByRole('button',{name:'查看任务',exact:true}).first().click();await dialog().getByText(/核对原任务不会重新执行已失败操作/).waitFor();
     await dialog().getByRole('button',{name:'选择失败及未执行对象',exact:true}).click();
     await page.getByText('已选 2 台 VPS',{exact:true}).waitFor();
     assert.equal(await page.getByLabel('选择 VPS VPS 01',{exact:true}).isChecked(),true);assert.equal(await page.getByLabel('选择 VPS VPS 03',{exact:true}).isChecked(),true);
@@ -239,7 +241,7 @@ const root = process.env.CHAIN_TEST_ROOT;
       {id:'vps-1',state:'failed',error:'组件维护已完成，但整链验证失败：旧版本连接超时',result:{after:{panel:'0.2.40',agent:'0.2.40'}}},
       {id:'vps-2',state:'pending'}]};
     await page.getByRole('button',{name:'刷新总控',exact:true}).click();await go('维护任务');
-    await page.getByRole('button',{name:'查看任务',exact:true}).first().click();
+    await page.locator('.fleet-tasks').getByRole('button',{name:'查看任务',exact:true}).first().click();
     await dialog().getByText('已完成 0 / 3 · 验证未通过 2 · 操作失败 0',{exact:true}).waitFor();
     const upgraded=dialog().getByRole('region',{name:'VPS 任务：VPS 00',exact:true});
     const legacy=dialog().getByRole('region',{name:'VPS 任务：VPS 01',exact:true});
@@ -274,6 +276,27 @@ const root = process.env.CHAIN_TEST_ROOT;
     assert.equal(writes.filter(w=>w.path==='/api/fleet/batch/verify/resume').length,1,'Resume uses original task ID');
     await closeDialog();
 
+
+    for(const t of Object.values(fleet.tasks))t.archived=true;
+    fleet.tasks.archive={id:'archive',action:'upgrade',state:'paused',at:now+30,targets:[{id:'vps-0',state:'failed',error:'升级失败，原始错误保留'}]};
+    await page.getByRole('button',{name:'刷新总控',exact:true}).click();await go('维护任务');
+    await page.getByText('0 个任务执行中 · 1 个待处理',{exact:true}).waitFor();
+    await page.locator('.fleet-tasks').getByRole('button',{name:'查看任务',exact:true}).first().click();
+    acceptDialog=false;await dialog().getByRole('button',{name:'忽略并归档',exact:true}).click();
+    assert.equal(writes.filter(w=>w.path==='/api/fleet/batch/archive/archive').length,0);
+    acceptDialog=true;await dialog().getByRole('button',{name:'忽略并归档',exact:true}).click();
+    await dialog().getByText(/此任务已忽略并归档/).waitFor();
+    await dialog().getByText('升级失败，原始错误保留',{exact:true}).waitFor();
+    assert.equal(fleet.tasks.archive.state,'paused');assert.equal(fleet.tasks.archive.targets[0].state,'failed');
+    assert.equal(await dialog().getByRole('button',{name:'重新核对原任务结果',exact:true}).count(),0);
+    assert.equal(await dialog().getByRole('button',{name:'选择失败及未执行对象',exact:true}).count(),0);
+    await closeDialog();assert.equal(await page.locator('.fleet-running-strip').count(),0);
+    await page.locator('.fleet-tasks .fleet-task-row').first().getByText('已归档',{exact:true}).waitFor();
+    fleet.tasks.active={id:'active',action:'upgrade',state:'running',at:now+40,targets:[{id:'vps-0',state:'running'}]};
+    await page.getByRole('button',{name:'刷新总控',exact:true}).click();
+    await page.locator('.fleet-tasks').getByRole('button',{name:'查看任务',exact:true}).first().click();
+    assert.equal(await dialog().getByRole('button',{name:'忽略并归档',exact:true}).count(),0,'Running task cannot be archived');
+    await closeDialog();
 
     // Every fleet tab must remain usable at desktop and phone widths after restyling.
     for(const viewport of [{width:1280,height:900},{width:390,height:844}]) {

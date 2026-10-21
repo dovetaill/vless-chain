@@ -117,7 +117,8 @@ fn local_conditions(doc: &mut Document, policy: &Policy) {
                 condition.bad = 0; condition.good = 0;
             }
             if let Some(enabled) = clock["ntp_enabled"].as_bool() {
-                observe(doc, format!("ntp:{}", n.id), !enabled, format!("{}：自动时间同步未启用", n.name), &clock_policy, false);
+                // An explicit enabled state needs no repeated recovery samples.
+                observe(doc, format!("ntp:{}", n.id), !enabled, format!("{}：自动时间同步未启用", n.name), &clock_policy, enabled);
             }
         }
         let cert = &n.report.system["certificate"];
@@ -583,6 +584,27 @@ mod tests {
             local_conditions(&mut doc,&p);
         }
         assert_eq!(doc.monitoring.notices.len(),2); assert!(!doc.monitoring.conditions["clock:clock-node"].active);
+    }
+    #[test]
+    fn ntp_recovers_on_first_enabled_sample_without_treating_correct_time_as_enabled() {
+        let mut doc = Document::default();
+        doc.nodes.push(serde_json::from_value(json!({"id":"ntp-node","name":"node","host":"192.0.2.1","token_hash":"","reality":Reality::new("example.com:443".into(),"example.com".into()),"seen":now(),"report":{"running":true}})).unwrap());
+        let p = Policy::default();
+        for sample in 1..=3 {
+            doc.nodes[0].report.system = json!({"clock":{"checked_at":sample,"verified":true,"offset_seconds":0,"ntp_enabled":false}});
+            local_conditions(&mut doc, &p);
+            local_conditions(&mut doc, &p);
+            assert_eq!(doc.monitoring.conditions["ntp:ntp-node"].active, sample == 3);
+        }
+        doc.nodes[0].report.system["clock"] = json!({"checked_at":4,"verified":true,"offset_seconds":0});
+        local_conditions(&mut doc, &p);
+        assert!(doc.monitoring.conditions["ntp:ntp-node"].active);
+        doc.nodes[0].report.system["clock"] = json!({"checked_at":5,"ntp_enabled":true});
+        local_conditions(&mut doc, &p);
+        assert!(!doc.monitoring.conditions["ntp:ntp-node"].active);
+        assert_eq!(doc.monitoring.notices.len(), 2);
+        local_conditions(&mut doc, &p);
+        assert_eq!(doc.monitoring.notices.len(), 2);
     }
     #[test]
     fn offline_threshold_and_recovery_do_not_repeat_notices() {

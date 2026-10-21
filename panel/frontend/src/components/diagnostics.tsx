@@ -12,6 +12,7 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
   const [archive, setArchive] = useState(false);
   const [follow, setFollow] = useState(true);
   const [data, setData] = useState<Logs>();
+  const [cleared, setCleared] = useState<{previous:string[]; lines:string[]} | null>(null);
   const [error, setError] = useState('');
   const [target, setTarget] = useState('https://example.com/');
   const [diagnosing, setDiagnosing] = useState(false);
@@ -28,6 +29,7 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
   const [tick, setTick] = useState(0);
   const following = useRef(follow);
   following.current = follow;
+  useEffect(() => { setCleared(null); }, [node, source, filter, archive]);
   useEffect(() => {
     if (!node || diagnosing) return;
     let stopped = false; let timer: ReturnType<typeof setTimeout>;
@@ -41,7 +43,17 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
       inFlight.current = pending.catch(() => undefined);
       try {
         const value = await pending;
-        if (!stopped) { setData(value); setError(''); }
+        if (!stopped) {
+          setData(value); setError('');
+          setCleared(previous => {
+            if (!previous) return null;
+            const lines = value.text ? value.text.split('\n') : [];
+            // shortcut: identical full snapshots cannot reveal new duplicates; add a server cursor if exact delivery is needed.
+            let overlap = Math.min(previous.previous.length, lines.length);
+            while (overlap && !previous.previous.slice(-overlap).every((line, i) => line === lines[i])) overlap--;
+            return {previous:lines, lines:[...previous.lines, ...lines.slice(overlap)].slice(-500)};
+          });
+        }
       } catch (e) { if (!stopped) setError(errorText(e)); }
       finally { if (!stopped) setLoading(false); }
       if (!stopped && following.current) timer = setTimeout(() => { if (following.current) void refresh(); }, 3000);
@@ -90,7 +102,11 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
   }
   const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const sourceNames: Record<string,string> = {panel:'控制台应用',agent:'节点 Agent',xray:'Xray 内核',mihomo:'Mihomo 内核'};
-  const readableLogs = data?.text.replace(/^(\d{10})(?=\s)/gm, value => stamp(Number(value)));
+  const visibleLogs = cleared ? cleared.lines.join('\n') : data?.text;
+  const readableLogs = visibleLogs?.replace(/^(\d{10})\s+(.*)$/gm, (_, timestamp:string, body:string) => {
+    if (source === 'xray') body = body.replace(/^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?\s+/, '');
+    return `${stamp(Number(timestamp))} ${body}`;
+  });
   return <Modal wide title="日志与诊断" close={close}>
     <div className="space-y-5 min-w-0">
       <section className="space-y-3 rounded-xl border bg-muted/20 p-4" aria-label="日志筛选">
@@ -113,6 +129,8 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
         <div className="flex flex-wrap items-center gap-2 border-t pt-3">
           <Button type="button" variant="outline" disabled={diagnosing} onClick={()=>{ setFollow(!follow); if (!follow) setTick(v=>v+1); }}>{follow ? '暂停跟随' : '继续跟随'}</Button>
           <Button type="button" variant="outline" disabled={loading || diagnosing} onClick={()=>setTick(v=>v+1)}>{loading ? '读取中…' : '刷新日志'}</Button>
+          <Button type="button" variant="outline" disabled={!data} onClick={()=>setCleared({previous:data?.text ? data.text.split('\n') : [],lines:[]})}>清屏</Button>
+          {cleared && <Button type="button" variant="outline" onClick={()=>setCleared(null)}>显示历史</Button>}
           <Button type="button" variant="outline" disabled={!data} onClick={download}>下载脱敏日志</Button>
           <span className="text-xs text-muted-foreground">{follow ? '每 3 秒自动读取，关闭窗口停止' : '已暂停自动读取'}</span>
         </div>
@@ -123,7 +141,7 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
           <span className="font-medium text-foreground">{sourceNames[source] || source}</span>
           <span role="status">{data ? `采样 ${stamp(data.sampled_at)} · 最多 500 行` : error ? '未取得日志' : '等待日志返回…'}</span>
         </div>
-        <pre tabIndex={0} aria-label="日志记录" className="min-h-48 max-h-[45vh] overflow-auto whitespace-pre-wrap break-all rounded-xl bg-slate-950 p-4 text-xs leading-6 text-slate-100">{readableLogs || (data ? '当前来源或筛选范围内没有日志。可取消代理筛选或切换来源。' : '正在读取…')}</pre>
+        <pre tabIndex={0} aria-label="日志记录" className="min-h-48 max-h-[45vh] overflow-auto whitespace-pre-wrap break-all rounded-xl bg-slate-950 p-4 text-xs leading-6 text-slate-100">{readableLogs || (cleared ? '已清屏，等待新日志。服务器日志未删除，可点击“显示历史”恢复。' : data ? '当前来源或筛选范围内没有日志。可取消代理筛选或切换来源。' : '正在读取…')}</pre>
         <p className="text-xs text-muted-foreground">采样时间及行首数字时间戳按浏览器时区 {localZone} 显示；下载保留原始脱敏内容。</p>
       </section>
       <section className="space-y-3 rounded-xl border p-4" aria-label="VPS 时间同步">

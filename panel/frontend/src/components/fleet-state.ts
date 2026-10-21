@@ -18,6 +18,7 @@ export type Remote = {
 };
 export type Task = {
   id: string;
+  archived?: boolean;
   action: string;
   state: string;
   version?: string;

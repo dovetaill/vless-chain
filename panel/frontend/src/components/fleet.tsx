@@ -385,7 +385,7 @@ export function Fleet() {
   const tasks = Object.values(data?.tasks || {}).sort(
     (a, b) => (b.at || 0) - (a.at || 0),
   );
-  const running = tasks.filter((t) => ["running", "paused"].includes(t.state));
+  const running = tasks.filter((t) => !t.archived && ["running", "paused"].includes(t.state));
   const matches = (text: string) =>
     text.toLowerCase().includes(search.toLowerCase());
   const filteredVps = remotes.filter(
@@ -762,16 +762,8 @@ export function Fleet() {
       </nav>
       {running.length > 0 && (
         <div className="fleet-running-strip">
-          <span>{running.length} 个运行中或暂停的任务</span>
-          {running.slice(0, 3).map((t) => (
-            <Button
-              key={t.id}
-              variant="outline"
-              onClick={() => setTaskId(t.id)}
-            >
-              {actions[t.action] || t.action} · {statuses[t.state] || t.state}
-            </Button>
-          ))}
+          <span>{running.filter(t => t.state === "running").length} 个任务执行中 · {running.filter(t => t.state === "paused").length} 个待处理</span>
+          <Button variant="outline" onClick={() => navigate("tasks")}>查看任务</Button>
         </div>
       )}
       {!data && <p>正在加载总控…</p>}
@@ -1375,7 +1367,7 @@ export function Fleet() {
                 className="fleet-task-row"
               >
                 <div>
-                  <div className="fleet-task-title"><span className="fleet-task-icon"><Wrench aria-hidden="true" /></span><strong>{actions[t.action] || t.action}</strong><Status tone={t.state === "succeeded" ? "good" : t.state === "paused" || t.state === "failed" ? "warn" : "muted"}>{statuses[t.state] || t.state}</Status></div>
+                  <div className="fleet-task-title"><span className="fleet-task-icon"><Wrench aria-hidden="true" /></span><strong>{actions[t.action] || t.action}</strong><Status tone={t.state === "succeeded" ? "good" : t.state === "paused" || t.state === "failed" ? "warn" : "muted"}>{statuses[t.state] || t.state}</Status>{t.archived && <Status>已归档</Status>}</div>
                   <p className="muted">
                     {stamp(t.at || 0)} · {t.targets.length} 台 VPS · 成功{" "}
                     {t.targets.filter((v) => v.state === "succeeded").length} 台
@@ -1669,7 +1661,7 @@ export function Fleet() {
               <div className="rounded-xl border bg-muted/30 p-4 space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-semibold">{actions[activeTask.action] || activeTask.action}</h3>
-                  <Status tone={activeTask.state === "paused" ? "warn" : activeTask.state === "succeeded" ? "good" : "muted"}>{statuses[activeTask.state] || activeTask.state}</Status>
+                  <Status tone={activeTask.state === "paused" ? "warn" : activeTask.state === "succeeded" ? "good" : "muted"}>{statuses[activeTask.state] || activeTask.state}</Status>{activeTask.archived && <Status>已归档</Status>}
                 </div>
                 {activeTask.version && <p className="text-sm">目标版本 <strong>{activeTask.version}</strong></p>}
                 <p className="text-sm text-muted-foreground">
@@ -1705,7 +1697,7 @@ export function Fleet() {
                 </section>;
               })}
               </div>
-              {activeTask.state === "paused" && (
+              {!activeTask.archived && activeTask.state === "paused" && (
                 <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
                   <p className="font-medium">已暂停后续 VPS，避免继续影响服务</p>
                   <p>{activeTask.targets.some(verificationFailed)
@@ -1716,8 +1708,9 @@ export function Fleet() {
                   <p>等待执行：{activeTask.targets.filter(t => t.state === "pending").map(t => remotes.find(r => r.id === t.id)?.name || t.id).join("、") || "无"}</p>
                 </div>
               )}
+              {activeTask.archived && <p className="rounded-lg border bg-muted/30 p-3 text-sm">此任务已忽略并归档，保留原始结果，不再继续后续 VPS。归档不代表线路问题已修复。</p>}
               <div className="flex flex-wrap gap-2">
-              {activeTask.state === "paused" &&
+              {!activeTask.archived && activeTask.state === "paused" &&
                 activeTask.targets.some((t) => t.state === "failed" && !verificationFailed(t)) && (
                   <Button
                     type="button"
@@ -1748,7 +1741,7 @@ export function Fleet() {
                     选择失败及未执行对象
                   </Button>
                 )}
-              {activeTask.state === "paused" && (
+              {!activeTask.archived && activeTask.state === "paused" && (
                 <Button
                   type="button"
                   variant="outline"
@@ -1767,6 +1760,13 @@ export function Fleet() {
                   {activeTask.targets.some(verificationFailed) ? "重新验证并继续" : "重新核对原任务结果"}
                 </Button>
               )}
+              {!activeTask.archived && activeTask.state !== "running" && <Button type="button" variant="ghost" disabled={busy} onClick={() => {
+                if (!window.confirm("忽略并归档此任务？这不会修复线路，也不会继续后续 VPS；原始结果将保留在维护任务中，不再显示顶部提醒。")) return;
+                void run(async () => {
+                  await api(`/fleet/batch/${activeTask.id}/archive`, "POST", {});
+                  await refresh();
+                });
+              }}>忽略并归档</Button>}
               </div>
             </>
           ) : (

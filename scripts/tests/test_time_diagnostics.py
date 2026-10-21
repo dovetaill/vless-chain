@@ -68,6 +68,9 @@ class TimeDiagnostics(unittest.TestCase):
             chain_time.synchronize()
         calls = [call.args[0] for call in run.call_args_list]
         self.assertIn(['apt-get', 'install', '-y', 'chrony'], calls)
+        for call in run.call_args_list:
+            if call.args[0][0] == 'apt-get':
+                self.assertEqual(call.kwargs['env']['DEBIAN_FRONTEND'], 'noninteractive')
         self.assertLess(calls.index(['chronyc', 'waitsync', '30', '0', '0', '2']), calls.index(['chronyc', 'makestep']))
 
     @unittest.skipUnless(chain_time.shutil.which('systemctl'), 'systemctl unavailable')

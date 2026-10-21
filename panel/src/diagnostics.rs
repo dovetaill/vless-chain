@@ -14,6 +14,17 @@ static WRITE: Mutex<()> = Mutex::new(());
 pub fn redact(text: &str) -> String {
     text.lines().map(|line| {
         let lower = line.to_ascii_lowercase();
+        // Keep only a fixed error category: authentication errors can include credentials anywhere in the line.
+        for (patterns, category) in [
+            (&["invalid password", "incorrect password", "wrong password"][..], "密码认证失败 (invalid password)"),
+            (&["password is not set", "missing password", "empty password"][..], "缺少密码 (missing password)"),
+            (&["invalid user", "unknown user", "user not found"][..], "用户认证失败 (invalid user)"),
+            (&["invalid shortid", "invalid short-id", "invalid short id"][..], "REALITY shortId 无效 (invalid shortid)"),
+        ] {
+            if patterns.iter().any(|pattern| lower.contains(pattern)) {
+                return format!("[认证错误类别：{category}；其余字段已隐藏]");
+            }
+        }
         if (line.contains("://") && line.contains('@')) || ["privatekey", "private_key", "password", "authorization", "bearer ", "token=", "token:", "token\"", "secret", "private-key", "shortid", "short-id", "\"id\":", "\"uuid\"", "vless://", "vmess://", "trojan://", "ss://"].iter().any(|key| lower.contains(key)) {
             return "[已隐藏含认证信息的日志行]".to_string();
         }
@@ -188,6 +199,26 @@ mod tests {
         writer.write_all(format!("authenticated test-user-credential\n{}\n", "x".repeat(20_000)).as_bytes()).await.unwrap(); drop(writer); task.await.unwrap();
         let text = std::fs::read_to_string(path).unwrap(); assert!(!text.contains("test-user-credential"));
         assert!(text.contains("[已隐藏]")); assert!(text.contains("日志行已截断")); assert!(text.len()<9000);
+    }
+    #[test]
+    fn authentication_errors_keep_only_safe_categories() {
+        for (message, category) in [
+            ("proxy/trojan: invalid password: hunter2", "密码认证失败"),
+            ("PASSWORD is not set: token=hidden-token", "缺少密码"),
+            ("proxy/vless: invalid user: f43628ed-1183-4f0a-b960-a33b774275df", "用户认证失败"),
+            ("REALITY: invalid shortId: deadbeef password=hunter2", "REALITY shortId 无效"),
+        ] {
+            let result = redact(message);
+            assert!(result.contains(category), "{result}");
+            for secret in ["hunter2", "hidden-token", "f43628ed", "deadbeef"] {
+                assert!(!result.contains(secret), "{result}");
+            }
+            assert_eq!(redact(&result), result, "Stored logs are redacted again on read");
+        }
+        assert_eq!(redact("password: hunter2"), "[已隐藏含认证信息的日志行]");
+        assert_eq!(redact("Bearer hidden-token"), "[已隐藏含认证信息的日志行]");
+        assert_eq!(redact("connection refused"), "connection refused");
+        assert_eq!(redact("invalid password: hunter2\nconnection refused").lines().count(), 2);
     }
     #[test]
     fn archives_are_readable_and_private() {

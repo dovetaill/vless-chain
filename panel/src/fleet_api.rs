@@ -10,6 +10,7 @@ pub fn routes(router: Router<App>) -> Router<App> {
         .route("/api/fleet/unbind", post(revoke))
         .route("/api/fleet/batch", post(batch))
         .route("/api/fleet/batch/{id}/resume", post(resume_batch))
+        .route("/api/fleet/batch/{id}/archive", post(archive_batch))
         .route("/api/fleet/release/{version}", get(release_info))
         .route("/api/fleet/{id}", delete(disconnect))
         .route("/api/fleet/{id}/forward", post(forward))
@@ -485,6 +486,15 @@ struct Batch {
     #[serde(default)]
     lines: BTreeMap<String, Vec<String>>,
 }
+async fn archive_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    edit(&app, |d| {
+        let job = d.fleet.receipts.get_mut(&id).context("任务不存在")?;
+        ensure!(job["state"] != "running", "正在执行的任务不能忽略，请等待任务结束或暂停");
+        job["archived"] = json!(true);
+        Ok(())
+    })?;
+    Ok(Json(json!({"ok":true})))
+}
 async fn resume_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     edit(&app, |d| {
         ensure!(
@@ -492,6 +502,7 @@ async fn resume_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResu
             "已有批量任务在执行"
         );
         let job = d.fleet.receipts.get_mut(&id).context("任务不存在")?;
+        ensure!(job["archived"] != true, "已忽略的任务不能重新查询，请创建新任务");
         ensure!(job["state"] == "paused", "只可重新查询暂停的任务");
         for target in job["targets"].as_array_mut().context("任务无效")? {
             target.as_object_mut().unwrap().remove("unreachable_since");
@@ -789,6 +800,34 @@ mod tests {
             local_url: "http://127.0.0.1:1".into(),
         }
     }
+    #[tokio::test]
+    async fn archive_preserves_failure_and_never_dispatches_or_resumes() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let job_id = id();
+        let mut receipt = json!({
+            "id":job_id,"state":"running","action":"upgrade",
+            "targets":[{"id":"no-remote","state":"failed","result":{
+                "state":"failed","maintenance_state":"succeeded",
+                "verification":{"state":"failed","detail":"fixture probe failed"}
+            }}]
+        });
+        app.store.lock().unwrap().doc.fleet.receipts.insert(job_id.clone(), receipt.clone());
+        assert!(archive_batch(State(app.clone()), Path(job_id.clone())).await.is_err());
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id], receipt);
+        receipt["state"] = json!("paused");
+        app.store.lock().unwrap().doc.fleet.receipts.insert(job_id.clone(), receipt.clone());
+        let _ = archive_batch(State(app.clone()), Path(job_id.clone())).await.unwrap();
+        receipt["archived"] = json!(true);
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id], receipt);
+        let _ = archive_batch(State(app.clone()), Path(job_id.clone())).await.unwrap();
+        assert!(resume_batch(State(app.clone()), Path(job_id.clone())).await.is_err());
+        // There is no remote: dispatching anything would fail instead of completing here.
+        work_batch(&app).await.unwrap();
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id], receipt);
+        assert!(archive_batch(State(app), Path(id())).await.is_err());
+    }
+
     #[tokio::test]
     async fn maintenance_success_verification_failure_pauses_and_resume_rechecks_same_task() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
