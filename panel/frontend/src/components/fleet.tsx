@@ -1,3 +1,5 @@
+import { LayoutDashboard, Server, Network, Globe, Wrench, Settings2, RefreshCw, Activity, ArrowDownUp, Database, ShieldCheck } from "lucide-react";
+import "./fleet.css";
 import { publishChecked } from "../api";
 import { Diagnostics } from "./diagnostics";
 import {
@@ -67,6 +69,7 @@ type Point = {
   tx: number | null;
   hosts: number;
 };
+const tabIcons = { overview: LayoutDashboard, vps: Server, lines: Network, externals: Globe, tasks: Wrench, settings: Settings2 };
 const key = (r: Remote, line: Line) => `${r.id}:${line.id}`;
 const rate = (value: number, valid: boolean) =>
   valid ? `${bytes(value)}/s` : "—";
@@ -81,7 +84,7 @@ function Pager({
 }) {
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 border-t p-4">
+    <div className="fleet-pagination">
       <span className="muted">
         共 {total} 条 · 每页 {PAGE_SIZE} 条 · 第 {page} / {pages} 页
       </span>
@@ -120,7 +123,7 @@ function Trend({ points, now }: { points: Point[]; now: number }) {
   const active = points.find((p) => p.at === selected) || points.at(-1);
   const largest = Math.max(1, ...points.flatMap((p) => [p.rx || 0, p.tx || 0]));
   return (
-    <Card>
+    <Card className="fleet-trend">
       <CardHeader>
         <CardTitle>网卡速率 · 最近 10 分钟</CardTitle>
       </CardHeader>
@@ -134,7 +137,7 @@ function Trend({ points, now }: { points: Point[]; now: number }) {
           <span>点击采样点查看数值</span>
         </div>
         <div
-          className="relative my-2 h-32 border-y"
+          className="fleet-chart relative my-2 border-y"
           aria-label={`网卡速率趋势，共 ${points.length} 个采样点`}
         >
           <div className="absolute inset-x-0 top-1/2 border-t border-dashed">
@@ -686,10 +689,10 @@ export function Fleet() {
     </div>
   );
   return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className="fleet-workspace">
+      <header className="fleet-heading">
         <div>
-          <h2 className="text-lg font-semibold">运行与维护</h2>
+          <h1>多机总控</h1>
           <p className="muted">
             远端约 30 秒同步，页面每 5 秒刷新；超过 90 秒的采样不作为当前速率。
           </p>
@@ -699,9 +702,9 @@ export function Fleet() {
           disabled={busy}
           onClick={() => void run(() => refresh())}
         >
-          刷新总控
+          <RefreshCw aria-hidden="true" />刷新总控
         </Button>
-      </div>
+      </header>
       {connectionError && (
         <p
           role="alert"
@@ -745,20 +748,20 @@ export function Fleet() {
           {message}
         </p>
       )}
-      <nav aria-label="总控功能" className="flex flex-wrap gap-2">
-        {tabs.map(([id, label]) => (
+      <nav aria-label="总控功能" className="fleet-navigation">
+        {tabs.map(([id, label]) => { const Icon = tabIcons[id]; return (
           <Button
             key={id}
-            variant={tab === id ? "primary" : "outline"}
+            variant="ghost"
             aria-current={tab === id ? "page" : undefined}
             onClick={() => navigate(id)}
           >
-            {label}
+            <Icon aria-hidden="true" />{label}
           </Button>
-        ))}
+        ); })}
       </nav>
       {running.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2 rounded border border-blue-200 p-3 text-sm">
+        <div className="fleet-running-strip">
           <span>{running.length} 个运行中或暂停的任务</span>
           {running.slice(0, 3).map((t) => (
             <Button
@@ -773,8 +776,8 @@ export function Fleet() {
       )}
       {!data && <p>正在加载总控…</p>}
       {tab === "overview" && (
-        <>
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="fleet-overview">
+          <div className="fleet-metrics">
             {[
               [
                 "VPS 状态",
@@ -796,23 +799,24 @@ export function Fleet() {
                 stats.usage ? bytes(stats.used) : "尚未采集",
                 `包含 ${stats.usage}/${stats.lines} 条代理最近已知用量`,
               ],
-            ].map(([label, value, detail]) => (
-              <Card key={label}>
-                <CardContent className="p-4">
-                  <p className="muted">{label}</p>
+            ].map(([label, value, detail], index) => {
+              const Icon = [Server, ArrowDownUp, Activity, Database][index];
+              return <Card key={label} className="fleet-metric">
+                <CardContent>
+                  <div className="fleet-metric-label"><p>{label}</p><Icon aria-hidden="true" /></div>
                   <p className="my-2 text-xl font-semibold tabular-nums">
                     {value}
                   </p>
                   <p className="text-xs text-slate-500">{detail}</p>
                 </CardContent>
-              </Card>
-            ))}
+              </Card>;
+            })}
           </div>
-          <p className="muted">
+          <p className="fleet-accounting-note">
             网卡包含全部业务；代理用量为各自当前周期合计，周期可能不同，跨机器代理链不去重，不代表运营商账单。失联
             VPS 的历史用量仍保留。
           </p>
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-4">
+          <div className="fleet-proxy-summary">
             <p className="text-sm">
               代理状态：
               {
@@ -834,8 +838,9 @@ export function Fleet() {
               查看代理状态
             </Button>
           </div>
+          <div className="fleet-overview-panels">
           <Trend points={points.filter((p) => now - p.at <= 600)} now={now} />
-          <Card>
+          <Card className="fleet-attention">
             <CardHeader>
               <CardTitle>需要关注的 VPS</CardTitle>
               <Button
@@ -854,7 +859,7 @@ export function Fleet() {
                 ）
               </Button>
             </CardHeader>
-            <CardContent className="space-y-3">
+            <CardContent className="fleet-attention-scroll space-y-3" tabIndex={0} aria-label="待处理 VPS 列表">
               {remotes
                 .filter((r) => health(r, now) !== "在线" || mismatch(r))
                 .sort((a, b) => priority(a, now) - priority(b, now))
@@ -862,7 +867,7 @@ export function Fleet() {
                 .map((r) => (
                   <div
                     key={r.id}
-                    className="flex flex-wrap items-center justify-between gap-2 border-b pb-3"
+                    className="fleet-attention-item"
                   >
                     <div>
                       <p className="font-medium">
@@ -912,10 +917,11 @@ export function Fleet() {
               )}
             </CardContent>
           </Card>
-        </>
+          </div>
+        </div>
       )}
       {["vps", "lines", "externals"].includes(tab) && (
-        <Card>
+        <Card className="fleet-list-card">
           <CardHeader>
             <CardTitle>
               {tab === "vps"
@@ -924,8 +930,9 @@ export function Fleet() {
                   ? "所有代理"
                   : "外部代理"}
             </CardTitle>
+            <span className="fleet-record-count">{total} 条记录</span>
           </CardHeader>
-          <div className={tab === "vps" ? "grid grid-cols-1 gap-3 border-b bg-muted/10 p-4 sm:grid-cols-[minmax(12rem,1fr)_auto_auto_auto] sm:items-center" : "flex flex-wrap gap-3 border-b p-4"} aria-label={tab === "vps" ? "搜索与筛选 VPS" : undefined}>
+          <div className={tab === "vps" ? "fleet-filterbar fleet-filterbar-vps" : "fleet-filterbar"} aria-label={tab === "vps" ? "搜索与筛选 VPS" : undefined}>
             <Input
               className={tab === "vps" ? "w-full" : "sm:max-w-72"}
               aria-label="搜索总控列表"
@@ -1037,7 +1044,7 @@ export function Fleet() {
           </div>
           {tab === "vps" && (
             <>
-              <div className="space-y-3 border-b p-4" aria-label="VPS 批量操作">
+              <div className="fleet-selection" aria-label="VPS 批量操作">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="text-sm"><strong>已选 {chosen.length} 台 VPS</strong><span className="ml-2 text-xs text-muted-foreground">含其他页与隐藏项</span></p>
                   <div className="flex flex-wrap gap-1">
@@ -1352,12 +1359,12 @@ export function Fleet() {
               )}
             </>
           )}
-          {!total && <p className="p-5 muted">没有符合条件的记录。</p>}
+          {!total && <div className="fleet-empty"><Network aria-hidden="true" /><p>没有符合条件的记录。</p><span>调整筛选条件后查看。</span></div>}
           <Pager total={total} page={currentPage} change={setPage} />
         </Card>
       )}
       {tab === "tasks" && (
-        <Card>
+        <Card className="fleet-tasks">
           <CardHeader>
             <CardTitle>维护任务</CardTitle>
           </CardHeader>
@@ -1365,13 +1372,10 @@ export function Fleet() {
             {slice(tasks).map((t) => (
               <div
                 key={t.id}
-                className="flex flex-wrap items-center justify-between gap-3 border-b py-3"
+                className="fleet-task-row"
               >
                 <div>
-                  <p>
-                    {actions[t.action] || t.action} ·{" "}
-                    {statuses[t.state] || t.state}
-                  </p>
+                  <div className="fleet-task-title"><span className="fleet-task-icon"><Wrench aria-hidden="true" /></span><strong>{actions[t.action] || t.action}</strong><Status tone={t.state === "succeeded" ? "good" : t.state === "paused" || t.state === "failed" ? "warn" : "muted"}>{statuses[t.state] || t.state}</Status></div>
                   <p className="muted">
                     {stamp(t.at || 0)} · {t.targets.length} 台 VPS · 成功{" "}
                     {t.targets.filter((v) => v.state === "succeeded").length} 台
@@ -1382,14 +1386,14 @@ export function Fleet() {
                 </Button>
               </div>
             ))}
-            {!tasks.length && <p className="muted">暂无维护任务。</p>}
+            {!tasks.length && <div className="fleet-empty"><ShieldCheck aria-hidden="true" /><p>暂无维护任务。</p><span>从 VPS 列表发起维护后，在这里查看结果。</span></div>}
           </CardContent>
           <Pager total={tasks.length} page={currentPage} change={setPage} />
         </Card>
       )}
       {tab === "settings" && (
-        <>
-          <Card>
+        <div className="fleet-settings">
+          <Card className="fleet-access-settings">
             <CardHeader>
               <CardTitle>接入与授权</CardTitle>
             </CardHeader>
@@ -1398,7 +1402,8 @@ export function Fleet() {
                 每台 VPS
                 保留独立面板；接入后总控可管理代理、执行维护及免密登录。
               </p>
-              <h4 className="font-medium">允许另一台总控管理本机</h4>
+              <section className="fleet-setting-section">
+              <h4><ShieldCheck aria-hidden="true" />允许另一台总控管理本机</h4>
               {data?.controller ? (
                 <div>
                   已授权：{data.controller}{" "}
@@ -1440,7 +1445,9 @@ export function Fleet() {
                   <CopyButton value={invite} />
                 </div>
               )}
-              <h4 className="font-medium">接入远端 VPS</h4>
+              </section>
+              <section className="fleet-setting-section">
+              <h4><Server aria-hidden="true" />接入远端 VPS</h4>
               <p className="muted">
                 先到目标 VPS
                 的“总控设置”生成本机接入码，再回到这里填写。不要填写本页生成的接入码。
@@ -1484,9 +1491,10 @@ export function Fleet() {
                 </Field>
                 <Button disabled={busy}>接入面板</Button>
               </form>
+              </section>
             </CardContent>
           </Card>
-          <Card>
+          <Card className="fleet-policy-settings">
             <CardHeader>
               <CardTitle>统一监控策略</CardTitle>
             </CardHeader>
@@ -1499,7 +1507,7 @@ export function Fleet() {
                 />
                 覆盖所有已接入 VPS 的本地策略
               </label>
-              {override && <PolicyFields value={policy} change={setPolicy} />}
+              {override && <div className="fleet-policy-fields"><PolicyFields value={policy} change={setPolicy} /></div>}
               <p className="muted">
                 整套覆盖并保留各 VPS
                 本地设置；取消后恢复本地策略。通知渠道在本机“监控告警”配置。
@@ -1522,7 +1530,7 @@ export function Fleet() {
               </Button>
             </CardContent>
           </Card>
-        </>
+        </div>
       )}
       {activeDetail && (
         <Modal

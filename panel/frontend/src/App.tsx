@@ -575,7 +575,7 @@ export function App() {
           </div>
         </header>
         <main className="app-content">
-          <div className="mb-7 flex flex-wrap items-end justify-between gap-4">
+          {page !== "fleet" && <div className="mb-7 flex flex-wrap items-end justify-between gap-4">
             <div>
               <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
                 {current.label}
@@ -587,7 +587,7 @@ export function App() {
                 新建代理
               </Button>
             )}
-          </div>
+          </div>}
           {!connected && (
             <div
               role="alert"

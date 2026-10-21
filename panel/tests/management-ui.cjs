@@ -275,6 +275,37 @@ const root = process.env.CHAIN_TEST_ROOT;
     await closeDialog();
 
 
+    // Every fleet tab must remain usable at desktop and phone widths after restyling.
+    for(const viewport of [{width:1280,height:900},{width:390,height:844}]) {
+      await page.setViewportSize(viewport);
+      if(viewport.width===390) await page.waitForFunction(()=>getComputedStyle(document.querySelector('.app-main')).marginLeft==='0px');
+      for(const [tab,slug,names] of [
+        ['总览','overview',['查看代理状态']],
+        ['VPS','vps',['选择本页','查看 VPS']],
+        ['所有代理','lines',['选择本页','编辑']],
+        ['外部代理','externals',['编辑']],
+        ['维护任务','tasks',['查看任务']],
+        ['总控设置','settings',['生成本机接入码（10 分钟有效）','接入面板','保存总控策略']],
+      ]) {
+        await go(tab);
+        const clear=page.getByRole('button',{name:'清除筛选',exact:true});
+        if(await clear.count()) await clear.click();
+        if(tab==='VPS' && viewport.width===1280) assert.ok(await page.getByRole('region',{name:'VPS 列表',exact:true}).evaluate(el=>el.scrollWidth<=el.clientWidth),'Desktop VPS table actions need no horizontal scroll');
+        assert.equal(await nav.getByRole('button',{name:tab,exact:true}).getAttribute('aria-current'),'page');
+        for(const name of names) {
+          const control=page.getByRole('button',{name,exact:true}).first();
+          await control.scrollIntoViewIfNeeded();
+          assert.ok(await control.isVisible(),`${tab}: ${name} visible`);
+          const box=await control.boundingBox();
+          assert.ok(box.x>=0&&box.x+box.width<=viewport.width+1&&box.y>=0&&box.y+box.height<=viewport.height+1,`${tab}: ${name} reachable at ${viewport.width}px`);
+        }
+        assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),`${tab} must not overflow at ${viewport.width}px`);
+        await page.evaluate(()=>scrollTo(0,0));
+        await page.screenshot({path:path.join(root,`fleet-tab-${slug}-${viewport.width}.png`),fullPage:true,animations:'disabled'});
+      }
+    }
+
+
     await page.goto('about:blank');
     await page.goto('http://chain.test/admin#fleet-ticket=one-time-ticket');
     await page.locator('aside').waitFor();
