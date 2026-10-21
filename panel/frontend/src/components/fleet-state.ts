@@ -10,8 +10,9 @@ export type Remote = {
   snapshot:
     | (PanelState & {
         monitoring?: {
-          conditions: Record<string, { active: boolean; message: string }>;
+          conditions: Record<string, { active: boolean; message: string; good?: number }>;
           checks?: Record<string, Check>;
+          effective?: { interval: number; recoveries: number };
         };
       })
     | null;
@@ -98,11 +99,11 @@ export function latestCheck(r: Remote, line: Line) {
 export function remoteNow(r: Remote, now: number) {
   return r.snapshot?.time ? r.snapshot.time + (now - r.seen) : now;
 }
-export function issues(r: Remote, now: number): { title: string; detail: string }[] {
+export function issues(r: Remote, now: number): { title: string; detail: string; evidence?: string }[] {
   if (r.error) return [{ title: "同步失败", detail: `${r.error}。请检查远端面板连接与日志；这不代表代理已停止。` }];
   if (!r.snapshot) return [{ title: "等待首次同步", detail: "接入后约 30 秒同步一次；尚无运行数据。" }];
   if (!recent(r.seen, now)) return [{ title: "同步数据过期", detail: "总控未取得近期快照，当前运行状态未知。请刷新总控并检查同步日志；历史用量仍保留。" }];
-  const result: { title: string; detail: string }[] = [];
+  const result: { title: string; detail: string; evidence?: string }[] = [];
   const offset = r.snapshot.time ? Math.round(r.snapshot.time - r.seen) : 0;
   if (Math.abs(offset) > 60) result.push({ title: "机器时钟不一致", detail: `远端快照时间比总控${offset > 0 ? "快" : "慢"}约 ${Math.abs(offset)} 秒；不能据此确定哪台不准。请在两台机器的“日志与诊断”查看时间同步状态。` });
   if (r.policy_error) result.push({ title: "监控策略同步失败", detail: `${r.policy_error}。状态数据已同步，请稍后重试或检查远端版本与日志。` });
@@ -115,6 +116,18 @@ export function issues(r: Remote, now: number): { title: string; detail: string 
     else if (!node.report.applied) result.push({ title: "配置尚未应用", detail: "请在 VPS 详情选择“预览并应用配置”。" });
   }
   for (const [key, condition] of Object.entries(r.snapshot.monitoring?.conditions || {})) {
+    if (condition.active && key.startsWith("probe:")) {
+      const check = r.snapshot.monitoring?.checks?.[key];
+      const policy = r.snapshot.monitoring?.effective;
+      const recovering = check?.ok === true;
+      const progress = recovering ? `最近一次已通过，正在自动确认恢复${policy ? `（${condition.good || 0}/${policy.recoveries}）` : ""}。` : "系统会自动复查，达到恢复条件后自动解除。";
+      result.push({
+        title: recovering ? "入口恢复确认中" : check?.outbound?.ok ? "入口检测异常，出口正常" : "代理入口检测异常",
+        detail: `${condition.message}。${check?.checked_at ? `最近检测 ${new Date(check.checked_at * 1000).toLocaleString("zh-CN", { hour12: false })}。` : ""}${progress}${policy ? `检测间隔 ${policy.interval} 秒。` : ""}`,
+        evidence: check?.detail,
+      });
+      continue;
+    }
     if (condition.active) result.push({
       title: key.startsWith("ntp:") ? "自动校时未启用" : key.startsWith("clock:") ? "系统时钟偏差" : "监控告警",
       detail: condition.message + (/^(ntp|clock):/.test(key) ? "。请打开“日志与诊断”查看校时状态与操作结果。" : ""),

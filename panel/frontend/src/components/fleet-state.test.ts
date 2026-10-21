@@ -49,6 +49,23 @@ assert.ok(issues(warning, now).some((issue) => issue.title === "配置尚未应�
 warning.snapshot!.nodes[0].online = false;
 assert.ok(issues(warning, now).some((issue) => issue.title === "Agent 上报中断"));
 assert.equal(issues({ ...remote, snapshot: { ...remote.snapshot!, time: 0 } }, now).length, 0);
+const probeWarning = structuredClone(remote);
+probeWarning.snapshot!.monitoring = {
+  effective: { interval: 300, recoveries: 2 },
+  conditions: { "probe:local:line": { active: true, message: "REALITY：本机入口 127.0.0.1:20000 · SNI example.com 未通过", good: 0 } },
+  checks: { "probe:local:line": { ok: false, checked_at: now, detail: "Connection reset by peer\n自动分段检查：出口通过", outbound: { ok: true, detail: "HTTP 200" } } },
+};
+assert.equal(health(probeWarning, now), "入口检测异常，出口正常");
+assert.equal(connected(probeWarning, now), true);
+assert.match(issues(probeWarning, now)[0].detail, /20000.*SNI example.com/);
+assert.match(issues(probeWarning, now)[0].detail, /自动复查.*300 秒/);
+assert.match(issues(probeWarning, now)[0].evidence!, /Connection reset by peer/);
+probeWarning.snapshot!.monitoring.checks!["probe:local:line"] = { ok: true, checked_at: now + 300, detail: "HTTP 200" };
+probeWarning.snapshot!.monitoring.conditions["probe:local:line"].good = 1;
+assert.equal(health(probeWarning, now), "入口恢复确认中");
+assert.match(issues(probeWarning, now)[0].detail, /1\/2/);
+probeWarning.snapshot!.monitoring.conditions["probe:local:line"].active = false;
+assert.equal(health(probeWarning, now), "在线");
 console.log("fleet-state assertions passed");
 
 assert.equal(verificationFailed({id:"vps", state:"failed", result:{maintenance_state:"succeeded", verification:{state:"failed", detail:"probe failed"}}}), true);

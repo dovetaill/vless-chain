@@ -196,6 +196,35 @@ fn local_conditions(doc: &mut Document, policy: &Policy) {
     }
 }
 
+fn prune_probe_conditions(doc: &mut Document) {
+    let obsolete: Vec<_> = doc.monitoring.conditions.keys().filter(|key| {
+        let Some((source, id)) = key.strip_prefix("probe:").and_then(|key| key.split_once(':')) else { return false; };
+        if source == "local" {
+            !doc.applied_lines.iter().any(|line| line.id == id
+                && matches!(chain_panel::rental::status(doc, line, now()), "active" | "offline"))
+        } else {
+            match doc.fleet.remotes.iter().find(|r| r.id == source) {
+                None => true,
+                Some(remote) if remote.error.is_empty() => remote.snapshot["lines"].as_array().is_some_and(|lines|
+                    !lines.iter().any(|line| line["id"] == id && matches!(line["rental_status"].as_str(), Some("active" | "offline")))),
+                _ => false,
+            }
+        }
+    }).cloned().collect();
+    for key in obsolete {
+        doc.monitoring.conditions.remove(&key);
+        doc.monitoring.checks.remove(&key);
+    }
+}
+
+fn record_probe(doc: &mut Document, key: String, name: &str, line: &Line, p: &Policy, local: bool, result: Value) {
+    let failed = result["ok"] == false;
+    let summary: String = result["detail"].as_str().unwrap_or("").lines().take(2).collect::<Vec<_>>().join("；").chars().take(600).collect();
+    doc.monitoring.checks.insert(key.clone(), result);
+    observe(doc, key, failed, format!("{name} / {}：{}检测{}。{summary}", line.name,
+        if local { "本机发起的连接" } else { "总控发起的连接" }, if failed { "未通过" } else { "通过" }), p, false);
+}
+
 async fn notify(app: &App) -> Result<()> {
     let pending = {
         let s = app.store.lock().unwrap();
@@ -363,43 +392,60 @@ async fn check(
         mode: "http".into(),
         url: p.url.clone(),
     };
-    let result = match tokio::time::timeout(
+    let mut result = match tokio::time::timeout(
         Duration::from_secs(40),
         probe(&app.xray, &line, &doc, &request, local_id.as_deref()),
     )
     .await
     {
         Ok(Ok(value)) => value,
-        Ok(Err(_)) => {
-            json!({"ok":false,"detail":"整链 HTTPS 检测失败；可使用手动检查定位鉴权、路径或目标问题","checked_at":now()})
+        Ok(Err(e)) => {
+            json!({"ok":false,"detail":chain_panel::diagnostics::redact(&format!("{e:#}")),"checked_at":now()})
         }
         Err(_) => json!({"ok":false,"detail":"整链检测超时","checked_at":now()}),
     };
-    let mut s = app.store.lock().unwrap();
     let key = format!("probe:{source}:{}", line.id);
+    // Diagnose sustained local failures using the applied outbound, without restarting the live proxy.
+    let diagnose = local && line.kind == Kind::Vless && result["ok"] == false && {
+        let s = app.store.lock().unwrap();
+        s.doc.monitoring.conditions.get(&key).is_some_and(|c| c.active || c.bad.saturating_add(1) >= p.failures)
+            || p.failures == 1
+    };
+    if diagnose {
+        if let Some(entry) = line.hops.first() {
+            let diagnosis = tokio::time::timeout(Duration::from_secs(40), diagnostics_api::dispatch(&app, &entry.node_id,
+                json!({"operation":"path","request":{"line_id":line.id,"url":p.url}}), 35)).await;
+            let detail = match diagnosis {
+                Ok(Ok(value)) => {
+                    result["outbound"] = value["result"].clone();
+                    format!("自动分段检查：{}\n{}", if value["result"]["ok"] == true {
+                        "出口及后续链路通过；入口检测仍未通过，需结合上述错误区分握手、本机转发或检测程序问题；其他入口未受本次验证。"
+                    } else { "出口及后续链路也未通过；不能仅归因于入口或 SNI。" }, value["result"]["detail"].as_str().unwrap_or(""))
+                }
+                Ok(Err(e)) => format!("自动分段检查暂未完成：{e:#}；下轮自动重查。"),
+                Err(_) => "自动分段检查超时；下轮自动重查。".into(),
+            };
+            result["detail"] = json!(format!("{}\n{}", result["detail"].as_str().unwrap_or(""), chain_panel::diagnostics::redact(&detail)));
+        }
+    }
+    let mut s = app.store.lock().unwrap();
+    if local && (s.doc.busy() || !s.doc.applied_lines.iter().any(|current| current.id == line.id
+        && chain_panel::rental::status(&s.doc, current, now()) == "active"
+        && serde_json::to_value(current).ok() == serde_json::to_value(&line).ok())) {
+        return;
+    }
     if !local
         && s.doc
             .fleet
             .remotes
             .iter()
             .find(|r| r.id == source)
-            .is_none_or(|r| !r.error.is_empty())
+            .is_none_or(|r| !r.error.is_empty() || r.snapshot["lines"].as_array().is_some_and(|lines|
+                !lines.iter().any(|current| current["id"] == line.id && current["rental_status"] == "active")))
     {
         return;
     }
-    s.doc.monitoring.checks.insert(key.clone(), result.clone());
-    observe(
-        &mut s.doc,
-        key,
-        result["ok"] == false,
-        format!(
-            "{name} / {}：{}整链检测",
-            line.name,
-            if local { "本机" } else { "公网入口" }
-        ),
-        &p,
-        false,
-    );
+    record_probe(&mut s.doc, key, &name, &line, &p, local, result);
     if let Err(e) = s.save() {
         eprintln!("保存监控结果失败：{e}");
     }
@@ -407,6 +453,7 @@ async fn check(
 
 pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
     let mut jobs = tokio::task::JoinSet::new();
+    let mut running_checks = HashMap::new();
     let mut poll_at = BTreeMap::<String, u64>::new();
     let mut due = BTreeMap::<String, u64>::new();
     let documents = Arc::new(Mutex::new(BTreeMap::<String, (Document, u64)>::new()));
@@ -418,7 +465,9 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
-        while let Some(result) = jobs.try_join_next() {
+        while let Some(result) = jobs.try_join_next_with_id() {
+            let id = match &result { Ok((id, _)) => *id, Err(e) => e.id() };
+            running_checks.retain(|_, task| *task != id);
             if let Err(e) = result {
                 eprintln!("监控任务失败：{e}");
             }
@@ -429,6 +478,7 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
         };
         if now() >= next_state && p.enabled {
             let mut s = app.store.lock().unwrap();
+            prune_probe_conditions(&mut s.doc);
             local_conditions(&mut s.doc, &p);
             let _ = s.save();
             next_state = now() + 15;
@@ -498,12 +548,12 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                 if jobs.len() >= 8 {
                     break;
                 }
-                if now() < *due.get(&key).unwrap_or(&0) {
+                if running_checks.contains_key(&key) || now() < *due.get(&key).unwrap_or(&0) {
                     continue;
                 }
-                due.insert(key, now() + p.interval);
+                due.insert(key.clone(), now() + p.interval);
                 let (a, d, l, p) = (app.clone(), local.clone(), line.clone(), p.clone());
-                jobs.spawn(check(a, "local".into(), "本机".into(), d, l, p, true));
+                running_checks.insert(key, jobs.spawn(check(a, "local".into(), "本机".into(), d, l, p, true)).id());
             }
         }
         // Remote policies apply to remote self-checks and the controller's external checks alike.
@@ -538,11 +588,11 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                     break;
                 }
                 let key = format!("{}:{}", remote.id, line.id);
-                if now() < *due.get(&key).unwrap_or(&0) {
+                if running_checks.contains_key(&key) || now() < *due.get(&key).unwrap_or(&0) {
                     continue;
                 }
-                due.insert(key, now() + rp.interval);
-                jobs.spawn(check(
+                due.insert(key.clone(), now() + rp.interval);
+                running_checks.insert(key, jobs.spawn(check(
                     app.clone(),
                     remote.id.clone(),
                     remote.name.clone(),
@@ -550,7 +600,7 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                     line.clone(),
                     rp.clone(),
                     false,
-                ));
+                )).id());
             }
         }
     }
@@ -567,6 +617,119 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn line() -> Line {
+        serde_json::from_value(json!({"id":"line", "name":"REALITY", "kind":"vless",
+            "hops":[{"node_id":"node", "port":20000, "uuid":id()}]})).unwrap()
+    }
+    #[test]
+    fn automatic_probe_keeps_evidence_and_recovers_without_manual_action() {
+        let mut doc = Document::default();
+        let p = Policy::default();
+        let line = line();
+        let key = "probe:local:line";
+        let failed = json!({"ok":false,"checked_at":now(),"detail":"入口 127.0.0.1:20000 · SNI example.com：Connection reset by peer",
+            "outbound":{"ok":true,"detail":"HTTP 200"}});
+        for _ in 0..p.failures {
+            record_probe(&mut doc, key.into(), "本机", &line, &p, true, failed.clone());
+        }
+        assert!(doc.monitoring.conditions[key].active);
+        assert_eq!(doc.monitoring.checks[key], failed);
+        assert!(doc.monitoring.conditions[key].message.contains("Connection reset by peer"));
+        assert_eq!(doc.monitoring.notices.len(), 1);
+        for sample in 1..=p.recoveries {
+            record_probe(&mut doc, key.into(), "本机", &line, &p, true,
+                json!({"ok":true,"checked_at":now(),"detail":"入口 HTTP 200"}));
+            assert_eq!(doc.monitoring.conditions[key].active, sample < p.recoveries);
+        }
+        assert_eq!(doc.monitoring.notices.len(), 2);
+        assert!(doc.monitoring.notices[1].message.starts_with("恢复："));
+        assert!(!doc.monitoring.checks[key]["outbound"].is_object(), "成功后不能沿用旧失败诊断");
+    }
+    #[test]
+    fn obsolete_probes_clear_but_offline_nodes_keep_their_evidence() {
+        let mut doc = Document::default();
+        let mut line = line();
+        let key = "probe:local:line";
+        doc.applied_lines.push(line.clone());
+        doc.monitoring.conditions.insert(key.into(), chain_panel::management::Condition { active: true, ..Default::default() });
+        doc.monitoring.checks.insert(key.into(), json!({"ok":false}));
+        doc.monitoring.notice("historical failure".into(), now());
+        prune_probe_conditions(&mut doc);
+        assert!(doc.monitoring.conditions[key].active, "节点离线不是检测恢复");
+        line.enabled = false;
+        doc.applied_lines[0] = line;
+        prune_probe_conditions(&mut doc);
+        assert!(!doc.monitoring.conditions.contains_key(key));
+        assert!(!doc.monitoring.checks.contains_key(key));
+        assert_eq!(doc.monitoring.notices.len(), 1, "保留历史通知，不能伪造恢复");
+        doc.monitoring.conditions.insert("probe:removed:line".into(), Default::default());
+        doc.monitoring.conditions.insert("ntp:node".into(), Default::default());
+        prune_probe_conditions(&mut doc);
+        assert!(!doc.monitoring.conditions.contains_key("probe:removed:line"));
+        assert!(doc.monitoring.conditions.contains_key("ntp:node"));
+        doc.monitoring.conditions.insert(key.into(), Default::default());
+        doc.applied_lines.clear();
+        prune_probe_conditions(&mut doc);
+        assert!(!doc.monitoring.conditions.contains_key(key));
+    }
+    #[tokio::test]
+    async fn sustained_failure_automatically_requests_outbound_diagnosis() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut line = line();
+        line.id = id();
+        let node: Node = serde_json::from_value(json!({"id":"node", "name":"node", "host":"192.0.2.1",
+            "token_hash":digest("test-agent"), "seen":now(), "reality":Reality::new("example.com:443".into(), "example.com".into()),
+            "report":{"running":true,"system":{"diagnostics_version":1}}})).unwrap();
+        std::fs::write(dir.path().join("local-agent.json"), br#"{"id":"node","token":"test-agent"}"#).unwrap();
+        let doc = Document { nodes: vec![node.clone()], applied_nodes: vec![node], applied_lines: vec![line.clone()], ..Default::default() };
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)").unwrap();
+        let app = App {
+            diagnostics: Arc::new(diagnostics_api::Broker::default()),
+            store: Arc::new(Mutex::new(Store { conn, doc: doc.clone() })),
+            sessions: Default::default(), tickets: Default::default(), delegated_sessions: Default::default(),
+            admin_hash: Default::default(), token_file: dir.path().join("token"),
+            auth: Arc::new(chain_panel::security::AuthState::default()), secure_cookie: true,
+            xray: dir.path().join("deliberately-missing-core"), probe_lock: Arc::new(tokio::sync::Mutex::new(())),
+            apply_timeout: 10, local_agent: Arc::new(tokio::sync::Mutex::new(chain_panel::local_agent::LocalAgent::default())),
+            local_url: String::new(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = diagnostics_api::routes(Router::new()).with_state(app.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let key = format!("probe:local:{}", line.id);
+        let policy = Policy { failures: 1, ..Default::default() };
+        let checking = check(app.clone(), "local".into(), "本机".into(), doc, line.clone(), policy, true);
+        let answering = async {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let endpoint = format!("http://{address}/api/agent/node/diagnostics");
+            loop {
+                let task: Value = client.post(&endpoint).bearer_auth("test-agent").json(&json!({})).send().await.unwrap().json().await.unwrap();
+                if !task.is_null() {
+                    assert_eq!(task["request"]["operation"], "path");
+                    assert_eq!(task["request"]["request"]["line_id"], line.id);
+                    assert_eq!(task["request"]["request"]["url"], "https://example.com/");
+                    client.post(&endpoint).bearer_auth("test-agent").json(&json!({"id":task["id"],
+                        "result":{"result":{"ok":true,"detail":"HTTP 200"}}})).send().await.unwrap().error_for_status().unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let completed = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(checking, answering); }).await;
+        server.abort();
+        let _ = server.await;
+        let _released = std::net::TcpListener::bind(address).unwrap();
+        completed.unwrap();
+        assert!(app.diagnostics.0.lock().unwrap().is_empty());
+        let store = app.store.lock().unwrap();
+        let result = &store.doc.monitoring.checks[&key];
+        assert_eq!(result["ok"], false, "出口通过不能伪造入口恢复");
+        assert_eq!(result["outbound"]["ok"], true);
+        assert!(result["detail"].as_str().unwrap().contains("出口及后续链路通过"));
+        assert!(store.doc.monitoring.conditions[&key].active);
+    }
     #[test]
     fn diagnostics_clock_requires_distinct_samples_and_reports_recovery() {
         let mut doc = Document::default(); let at = now();

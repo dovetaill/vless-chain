@@ -142,6 +142,7 @@ export interface Check {
   latency_ms?: number;
   detail: string;
   checked_at: number;
+  outbound?: { ok: boolean; detail: string };
 }
 export interface Job {
   id: string;

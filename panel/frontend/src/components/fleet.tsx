@@ -868,7 +868,7 @@ export function Fleet() {
                       <Versions remote={r} />
                       <ul className="mt-2 max-w-3xl space-y-2 text-sm">
                         {issues(r, now).map((issue, i) => (
-                          <li key={i} className="break-words">{issue.detail}</li>
+                          <li key={i} className="break-words">{issue.detail}{issue.evidence && <details className="mt-1"><summary className="cursor-pointer">自动检测详情</summary><p className="mt-1 whitespace-pre-wrap text-xs">{issue.evidence}</p></details>}</li>
                         ))}
                       </ul>
                       <p className="muted">
@@ -1543,6 +1543,7 @@ export function Fleet() {
                 <div key={i}>
                   <p className="font-medium">{issue.title}</p>
                   <p className="mt-1 text-sm break-words">{issue.detail}</p>
+                  {issue.evidence && <details className="mt-2"><summary className="cursor-pointer text-sm">自动检测详情</summary><p className="mt-1 whitespace-pre-wrap break-words text-xs">{issue.evidence}</p></details>}
                 </div>
               ))}
             </div>

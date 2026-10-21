@@ -789,6 +789,43 @@ pub async fn probe(
     request: &ProbeRequest,
     local_node: Option<&str>,
 ) -> Result<Value> {
+    let label = probe_label(line, doc, request, local_node)?;
+    let mut result = probe_inner(binary, line, doc, request, local_node)
+        .await
+        .map_err(|e| anyhow::anyhow!("{label}\n{}", crate::diagnostics::redact(&format!("{e:#}"))))?;
+    result["detail"] = json!(format!("{label}\n{}", result["detail"].as_str().unwrap_or("")));
+    Ok(result)
+}
+
+fn probe_label(line: &Line, doc: &Document, request: &ProbeRequest, local_node: Option<&str>) -> Result<String> {
+    let entry = line.hops.first().context("无入口")?;
+    let node = doc.nodes.iter().find(|n| n.id == entry.node_id).context("入口节点不存在")?;
+    let local = local_node == Some(node.id.as_str());
+    let (endpoint, sni) = if line.kind == Kind::Vless && request.mode == "http" {
+        let proxy = crate::external::mihomo(&probe_share(line, doc, local)?, "probe")?;
+        (compiler::address(proxy["server"].as_str().context("入口地址为空")?, proxy["port"].as_u64().context("入口端口为空")? as u16),
+         proxy["servername"].as_str().or_else(|| proxy["sni"].as_str()).unwrap_or("").to_string())
+    } else if line.kind == Kind::Website && request.mode == "http" {
+        (compiler::address(&line.access.tls.domain, entry.port), line.access.tls.domain.clone())
+    } else {
+        (compiler::address(if local { "127.0.0.1" } else { &node.host }, entry.port), String::new())
+    };
+    let target = if request.mode == "http" && line.kind == Kind::Website {
+        format!("{}://{}/", if matches!(line.access.tls.mode.as_str(), "auto" | "manual") { "https" } else { "http" }, compiler::address(&line.access.tls.domain, entry.port))
+    } else { request.url.clone() };
+    Ok(format!("{}：{} {endpoint}{}{}", line.name,
+        if local && line.kind != Kind::Website { "本机入口" } else { "公网入口" },
+        if sni.is_empty() { String::new() } else { format!(" · SNI {sni}") },
+        if target.is_empty() { String::new() } else { format!(" → {target}") }))
+}
+
+async fn probe_inner(
+    binary: &Path,
+    line: &Line,
+    doc: &Document,
+    request: &ProbeRequest,
+    local_node: Option<&str>,
+) -> Result<Value> {
     let start = std::time::Instant::now();
     ensure!(line.enabled, "线路已停用");
     let entry = line.hops.first().context("无入口")?;
@@ -1117,6 +1154,15 @@ mod tests {
             let local = probe_share(&line, &doc, true).unwrap();
             assert_eq!(crate::external::mihomo(&local, "probe").unwrap(), expected);
             assert_eq!(compiler::share(&line, &doc).unwrap(), public);
+            let request = ProbeRequest { mode: "http".into(), url: "https://check.example/".into() };
+            let label = probe_label(&line, &doc, &request, Some("local")).unwrap();
+            assert!(label.contains("本机入口 127.0.0.1:443"), "{label}");
+            assert!(label.contains("SNI example.com"), "{label}");
+            assert!(label.contains("https://check.example/"));
+            assert!(!label.contains(&line.hops[0].uuid));
+            assert!(!label.contains("test-password"));
+            assert!(!label.contains(&doc.nodes[0].reality.short_id));
+            assert!(probe_label(&line, &doc, &request, None).unwrap().contains("公网入口 public.example.com:24443"));
         }
     }
 

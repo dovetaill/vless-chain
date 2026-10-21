@@ -77,6 +77,7 @@ def main():
             env['CHAIN_TEST_BROWSER'] = str(directory / 'node_modules' / 'playwright')
             run(['node', 'tests/resource-flow.cjs', str(root / 'frontend' / 'dist')])
             run(['node', 'tests/management-ui.cjs', str(root / 'frontend' / 'dist')])
+            run(['node', 'tests/monitoring-ui.cjs', str(root / 'frontend' / 'dist')])
             run(['node', 'tests/diagnostics-flow-ui.cjs', str(root / 'frontend' / 'dist')])
             run(['python3', '-B', 'tests/diagnostics_browser.py'])
         run(['python3', 'tests/smoke.py'])
