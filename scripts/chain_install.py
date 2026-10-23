@@ -1189,8 +1189,8 @@ def menu(root):
             print(f'  {ROLE_NAMES[role]}  v{value["version"]}  {running}')
         choice = choose('请选择操作', {
             '1': '安装 / 修复控制台与本机节点', '2': '接入 / 重新接入节点', '3': '更新本机全部组件与 chainctl',
-            '4': '查看状态', '5': '查看日志', '6': '重启服务', '7': '备份数据',
-            '8': '回滚上一版本', '9': '查看登录信息', '10': '启动服务', '11': '停止服务',
+            '4': '查看本机全部组件状态', '5': '查看日志', '6': '重启本机全部组件', '7': '备份数据',
+            '8': '回滚上一版本', '9': '查看登录信息', '10': '启动本机全部组件', '11': '停止本机全部组件',
             '12': '查看命令帮助', '13': '重置登录安全（TOTP / Passkey）', '14': '启用统一 443（保留已有网站）', '15': '关闭统一 443',
             '16': '卸载本机全部组件', '0': '退出'}, '4' if installed else '1')
         if choice == '0':
@@ -1198,6 +1198,20 @@ def menu(root):
         try:
             if choice == '12':
                 make_parser().print_help()
+                continue
+            if choice in ('4', '6', '10', '11'):
+                require(installed, '请先从菜单安装控制台或接入节点。')
+                action = {'4': 'status', '6': 'restart', '10': 'start', '11': 'stop'}[choice]
+                errors = []
+                for role in ROLES:
+                    if role not in installed:
+                        continue
+                    try:
+                        manager.operate(make_parser().parse_args(
+                            [action, '--component', role, '--root', str(root)]))
+                    except (ValueError, OSError, subprocess.SubprocessError) as error:
+                        errors.append(f'{ROLE_NAMES[role]}：{error}')
+                require(not errors, '\n'.join(errors))
                 continue
             if choice == '16':
                 mode = choose('卸载方式（两种均保留面板 HTTPS 证书）',

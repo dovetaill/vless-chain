@@ -19,6 +19,31 @@ import chain_install as installer
 
 
 class Menu(unittest.TestCase):
+    def test_service_menu_operates_all_installed_roles_without_submenu(self):
+        for choice, action in [('4', 'status'), ('6', 'restart'), ('10', 'start'), ('11', 'stop')]:
+            for roles in [('panel', 'agent'), ('agent',), ('panel',), ()]:
+                with self.subTest(action=action, roles=roles), \
+                        patch.object(installer, 'Manager') as manager, \
+                        patch.object(installer, 'choose', side_effect=[choice, '0']) as choose, \
+                        patch.object(installer, 'select_role', side_effect=AssertionError('no component submenu')), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    manager.return_value.state.return_value = {'roles': {r: {'version': '0.2.50'} for r in roles}}
+                    installer.menu(Path('/fixture'))
+                    calls = [c.args[0] for c in manager.return_value.operate.call_args_list]
+                    self.assertEqual([(a.action, a.component, a.root) for a in calls],
+                                     [(action, r, Path('/fixture')) for r in installer.ROLES if r in roles])
+                    self.assertEqual(choose.call_count, 2)
+
+    def test_service_menu_attempts_agent_when_panel_fails(self):
+        with patch.object(installer, 'Manager') as manager, \
+                patch.object(installer, 'choose', side_effect=['6', '0']), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            manager.return_value.state.return_value = {'roles': {r: {'version': '0.2.50'} for r in installer.ROLES}}
+            manager.return_value.operate.side_effect = [ValueError('fixture start failure'), None]
+            installer.menu(Path('/fixture'))
+            self.assertEqual([c.args[0].component for c in manager.return_value.operate.call_args_list], list(installer.ROLES))
+            self.assertIn('fixture start failure', errors.getvalue())
+
     def terminal(self, code, steps):
         pid, fd = pty.fork()
         if pid == 0:
@@ -129,7 +154,7 @@ class Menu(unittest.TestCase):
                 "manager.state.return_value={'roles':{'panel':{'version':'1'},'agent':{'version':'1'}}}; "
                 "m.Manager=lambda _:manager; m.menu(Path('/fixture')); "
                 "manager.operate.assert_not_called(); print('CANCELLED')")
-        output = self.terminal(code, [(b'[4]: ', b'6\n'), (b'[1]: ', b'\x03'), (b'[4]: ', b'0\n')])
+        output = self.terminal(code, [(b'[4]: ', b'5\n'), (b'[1]: ', b'\x03'), (b'[4]: ', b'0\n')])
         self.assertIn('返回主菜单'.encode(), output)
         self.assertIn(b'CANCELLED', output)
 
@@ -147,7 +172,7 @@ class Menu(unittest.TestCase):
         return manager, install, ingress, output.getvalue()
 
     def test_cancel_component_reinstall_logs_and_ingress(self):
-        for answers in (['6', '0', '0'], ['1', '', '0'], ['2', '0', '0'],
+        for answers in (['5', '0', '0'], ['1', '', '0'], ['2', '0', '0'],
                         ['5', '1', '0', '0'], ['14', '', '0'], ['15', '0', '0']):
             with self.subTest(answers=answers):
                 manager, install, ingress, _ = self.run_menu(answers)
@@ -162,7 +187,7 @@ class Menu(unittest.TestCase):
         self.assertIn('请输入上面的选项编号', output)
 
     def test_submenu_interrupt_and_database_error_return(self):
-        manager, _, _, output = self.run_menu(['6', KeyboardInterrupt(), '13', '0'],
+        manager, _, _, output = self.run_menu(['5', KeyboardInterrupt(), '13', '0'],
                                               error=sqlite3.DatabaseError('fixture damaged database'))
         manager.operate.assert_called_once()
         self.assertIn('返回主菜单', output)
