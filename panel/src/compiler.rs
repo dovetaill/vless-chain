@@ -206,6 +206,30 @@ fn vless_in(node: &Node, hop: &Hop, tag: &str) -> Value {
         "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"show":false,"target":node.reality.target,
             "serverNames":[node.reality.server_name],"privateKey":node.reality.private_key,"shortIds":[node.reality.short_id]}}})
 }
+pub fn guard_reality(config: &mut Value, inbound: &mut Value, port: u16) -> Result<()> {
+    let reality = &mut inbound["streamSettings"]["realitySettings"];
+    let destination = reality["target"].as_str().context("缺少 REALITY target")?.to_string();
+    target(&destination)?;
+    let names = reality["serverNames"].as_array().context("缺少 REALITY SNI")?;
+    let domains: Vec<_> = names.iter().filter_map(Value::as_str).map(|name| format!("full:{name}")).collect();
+    ensure!(!domains.is_empty(), "缺少 REALITY SNI");
+    reality["target"] = json!(format!("127.0.0.1:{port}"));
+    let tag = format!("{}-reality-target", inbound["tag"].as_str().context("缺少入站 tag")?);
+    // A domain destination would match the allow rule even when sniffing finds no SNI.
+    config["inbounds"].as_array_mut().unwrap().push(json!({
+        "tag":tag,"listen":"127.0.0.1","port":port,"protocol":"dokodemo-door",
+        "settings":{"address":"127.0.0.1","port":9,"network":"tcp"},
+        "sniffing":{"enabled":true,"destOverride":["tls"],"routeOnly":true}
+    }));
+    config["outbounds"].as_array_mut().unwrap().push(json!({
+        "tag":tag,"protocol":"freedom","settings":{"redirect":destination}
+    }));
+    config["routing"]["rules"].as_array_mut().unwrap().extend([
+        json!({"type":"field","inboundTag":[tag],"domain":domains,"outboundTag":tag}),
+        json!({"type":"field","inboundTag":[tag],"outboundTag":"blocked"}),
+    ]);
+    Ok(())
+}
 fn vless_out(node: &Node, hop: &Hop, tag: &str) -> Value {
     json!({"tag":tag,"protocol":"vless","settings":{"vnext":[{"address":node.host,"port":hop.port,
         "users":[{"id":hop.uuid,"encryption":"none","flow":"xtls-rprx-vision"}]}]},
@@ -621,13 +645,22 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     continue;
                 }
             }
-            config["inbounds"].as_array_mut().unwrap().push(inbound);
+            let guard = if inbound["streamSettings"]["security"] == "reality" {
+                Some(backend_port(&mut reserved, node)?)
+            } else { None };
+            // Keep the public inbound first for existing consumers of compiled configs.
+            let index = config["inbounds"].as_array().unwrap().len();
+            config["inbounds"].as_array_mut().unwrap().push(inbound.clone());
             config["outbounds"].as_array_mut().unwrap().push(outbound);
             if i + 1 == line.hops.len() && external.len() > 1 && !sidecar_chain {
                 config["outbounds"]
                     .as_array_mut()
                     .unwrap()
                     .extend_from_slice(&external[..external.len() - 1]);
+            }
+            if let Some(port) = guard {
+                guard_reality(config, &mut inbound, port)?;
+                config["inbounds"][index] = inbound;
             }
             if let Some(meter) = meter {
                 let bridge_in = format!("line-{}-meter-in", line.id);
@@ -693,6 +726,22 @@ mod tests {
             limits: Limits::default(),
         });
         d
+    }
+    #[test]
+    fn reality_guard_covers_each_hop_without_changing_client_sni() {
+        let d = fixture();
+        let configs = compile(&d).unwrap();
+        for config in configs.values() {
+            let inbound = &config["inbounds"][0];
+            let guard = &config["inbounds"][1];
+            assert_eq!(inbound["streamSettings"]["realitySettings"]["serverNames"], json!(["example.com"]));
+            assert_eq!(guard["listen"], "127.0.0.1");
+            assert_eq!(guard["settings"]["address"], "127.0.0.1");
+            assert_eq!(guard["sniffing"]["routeOnly"], true);
+            assert_eq!(config["routing"]["rules"][0]["domain"], json!(["full:example.com"]));
+            assert_eq!(config["routing"]["rules"][1]["outboundTag"], "blocked");
+            assert_eq!(config["outbounds"][2]["settings"]["redirect"], "example.com:443");
+        }
     }
     #[test]
     fn backend_ports_cannot_collide_with_kernel_ephemeral_connections() {
@@ -905,8 +954,9 @@ mod tests {
         assert_eq!(inbound["streamSettings"]["network"], "xhttp");
         assert_eq!(
             inbound["streamSettings"]["realitySettings"]["target"],
-            "cover.example.com:8443"
+            format!("127.0.0.1:{}", c["a"]["inbounds"][1]["port"])
         );
+        assert!(c["a"]["outbounds"].as_array().unwrap().iter().any(|out| out["settings"]["redirect"] == "cover.example.com:8443"));
         assert!(inbound["settings"]["clients"][0].get("flow").is_none());
         let node = crate::access::mihomo_node(&d.lines[0], &d).unwrap();
         assert_eq!(node["servername"], "cover.example.com");

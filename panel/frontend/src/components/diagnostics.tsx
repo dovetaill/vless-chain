@@ -4,7 +4,7 @@ import { Modal, errorText, stamp } from './shared';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 
-type Logs = { clock?: { detail?:string; ntp_enabled?:boolean; timezone?:string }; text: string; sampled_at: number; sources: string[]; detail: string };
+type Logs = { logging_enabled?: boolean; retention_hours?: number; max_mib?: number; clock?: { detail?:string; ntp_enabled?:boolean; timezone?:string }; text: string; sampled_at: number; sources: string[]; detail: string };
 export function Diagnostics({ nodes, lineId = '', close, request = api }: { nodes: {id:string;name:string}[]; lineId?:string; close:()=>void; request?:typeof api }) {
   const [node, setNode] = useState(nodes[0]?.id || '00000000-0000-0000-0000-000000000000');
   const [source, setSource] = useState(lineId && nodes.length ? 'xray' : 'panel');
@@ -23,6 +23,11 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
   const [taskFailed, setTaskFailed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [savingLogs, setSavingLogs] = useState(false);
+  const [retentionValue, setRetentionValue] = useState<string>();
+  const [retentionUnit, setRetentionUnit] = useState(1);
+  const [sizeValue, setSizeValue] = useState<string>();
+  useEffect(() => { setRetentionValue(undefined); setRetentionUnit(1); setSizeValue(undefined); }, [node, source]);
   const requester = useRef(request);
   requester.current = request;
   const inFlight = useRef<Promise<unknown>>(Promise.resolve());
@@ -31,7 +36,7 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
   following.current = follow;
   useEffect(() => { setCleared(null); }, [node, source, filter, archive]);
   useEffect(() => {
-    if (!node || diagnosing) return;
+    if (!node || diagnosing || savingLogs) return;
     let stopped = false; let timer: ReturnType<typeof setTimeout>;
     setData(undefined); setError('');
     async function refresh() {
@@ -60,7 +65,7 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
     }
     void refresh();
     return () => { stopped = true; clearTimeout(timer); setLoading(false); };
-  }, [node, source, filter, archive, tick, diagnosing]);
+  }, [node, source, filter, archive, tick, diagnosing, savingLogs]);
   useEffect(() => {
     if (!task) return;
     let stopped = false; let timer: ReturnType<typeof setTimeout>;
@@ -95,6 +100,21 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
       setDiagnostic(text);
     } catch(e) { setDiagnostic(errorText(e)); } finally { setDiagnosing(false); }
   }
+  async function saveLogging(enabled?: boolean) {
+    if (data?.logging_enabled === undefined) return;
+    const retention_hours = Number(retentionValue ?? String((data.retention_hours || 1) / retentionUnit)) * retentionUnit;
+    const max_mib = Number(sizeValue ?? String(data.max_mib || 50));
+    if (enabled === undefined && (!Number.isInteger(retention_hours) || retention_hours < 1 || retention_hours > 720 || !Number.isInteger(max_mib) || max_mib < 1 || max_mib > 1024)) {
+      setError('保留时长须为 1 小时至 30 天，大小上限须为 1 至 1024 MiB 的整数'); return;
+    }
+    setSavingLogs(true);
+    try {
+      await inFlight.current;
+      const value = await requester.current<Logs>(`/diagnostics/${node}/logs`, 'POST', {source,line_id:filter,archive,...(enabled === undefined ? {retention_hours,max_mib} : {enabled})});
+      setData(value); setCleared(null); setRetentionValue(undefined); setSizeValue(undefined); setError(''); setTick(v=>v+1);
+    } catch (e) { setError(errorText(e)); }
+    finally { setSavingLogs(false); }
+  }
   function download() {
     if (!data) return;
     const url = URL.createObjectURL(new Blob([data.text], {type:'text/plain;charset=utf-8'}));
@@ -112,12 +132,12 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
       <section className="space-y-3 rounded-xl border bg-muted/20 p-4" aria-label="日志筛选">
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="space-y-1.5 text-sm font-medium">日志来源
-            <select className="block h-10 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm" aria-label="日志来源" value={source} disabled={diagnosing} onChange={e=>setSource(e.target.value)}>
+            <select className="block h-10 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm" aria-label="日志来源" value={source} disabled={diagnosing || savingLogs} onChange={e=>setSource(e.target.value)}>
               {Array.from(new Set(['panel',...(nodes.length ? ['agent','xray','mihomo'] : []),...(data?.sources || [])])).map(s=><option key={s} value={s}>{sourceNames[s] || `旧版内核 · ${s.replace('legacy-', '')}`}</option>)}
             </select>
           </label>
           <label className="space-y-1.5 text-sm font-medium">节点
-            <select className="block h-10 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm" aria-label="日志节点" value={node} disabled={source === 'panel' || diagnosing} onChange={e=>setNode(e.target.value)}>
+            <select className="block h-10 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm" aria-label="日志节点" value={node} disabled={source === 'panel' || diagnosing || savingLogs} onChange={e=>setNode(e.target.value)}>
               {!nodes.length && <option value={node}>当前 VPS 控制台</option>}{nodes.map(n=><option key={n.id} value={n.id}>{n.name}</option>)}
             </select>
           </label>
@@ -134,6 +154,19 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
           <Button type="button" variant="outline" disabled={!data} onClick={download}>下载脱敏日志</Button>
           <span className="text-xs text-muted-foreground">{follow ? '每 3 秒自动读取，关闭窗口停止' : '已暂停自动读取'}</span>
         </div>
+      </section>
+      <section className="space-y-2 rounded-xl border p-4" aria-label="日志存储设置">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="space-y-1 text-sm">日志总大小上限（MiB）<Input type="number" min={1} max={1024} step={1} value={sizeValue ?? data?.max_mib ?? 50} disabled={savingLogs || data?.max_mib === undefined} onChange={e=>setSizeValue(e.target.value)} /></label>
+          <div className="space-y-1 text-sm"><label htmlFor="log-retention">保留时长</label><div className="flex gap-2">
+            <Input id="log-retention" type="number" min={1} max={720/retentionUnit} step={1} value={retentionValue ?? (data?.retention_hours || 1)/retentionUnit} disabled={savingLogs || data?.retention_hours === undefined} onChange={e=>setRetentionValue(e.target.value)} />
+            <select className="select" aria-label="日志保留时长单位" value={retentionUnit} disabled={savingLogs || data?.retention_hours === undefined} onChange={e=>{setRetentionUnit(Number(e.target.value));setRetentionValue('1');}}><option value={1}>小时</option><option value={24}>天</option></select>
+          </div></div>
+        </div>
+        <Button type="button" variant="outline" disabled={savingLogs || loading || diagnosing || data?.retention_hours === undefined} onClick={()=>void saveLogging()}>保存限制并清理过期日志</Button>
+        <p className="muted">默认保留 1 小时、最多 50 MiB；按 UTC 日期轮转，单段达到 1 MiB 也会归档为 gzip。大小上限包含当前文件和压缩归档，超过任一限制先清理最旧整段，可能少于完整保留时长。</p>
+        <Button type="button" variant="outline" disabled={savingLogs || loading || diagnosing || data?.logging_enabled === undefined} onClick={()=>void saveLogging(!data?.logging_enabled)}>{savingLogs ? '保存中…' : data?.logging_enabled === false ? '开启日志记录' : '关闭并清理日志'}</Button>
+        <p className="muted">{source === 'panel' ? '当前控制台应用日志' : '所选节点的 Agent、Xray、Mihomo 及受管历史内核日志'}：{data?.logging_enabled === undefined ? '状态尚未取得（旧版 Agent 需升级）' : data.logging_enabled ? '开启' : '关闭'}。关闭立即删除这些日志及归档，重启后仍生效；不清理系统 journal 或自定义配置直接写入的日志。</p>
       </section>
       <section className="min-w-0 space-y-2" aria-label="日志内容">
         {error && <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><p className="font-medium">日志读取失败</p><p className="mt-1 break-words">{error}</p>{data && <p className="mt-1">下方保留上次成功读取的记录。</p>}</div>}
@@ -169,7 +202,7 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
       </details>}
       <details className="rounded-xl border p-4 text-sm text-muted-foreground">
         <summary className="cursor-pointer font-medium text-foreground">日志保留与排障说明</summary>
-        <div className="mt-3 space-y-2"><p>控制台应用日志来自当前查看的 VPS；节点及内核日志来自所选节点。</p><p>日志保留 3 天，控制台和 Agent 各最多 50 MiB。达到限制先清理最旧记录，系统 journal 单独管理。</p><p>各跳 SNI 必须匹配该跳的 REALITY 目标或 TLS 证书。accepted 只表示已接收连接，不代表成功出网。</p></div>
+        <div className="mt-3 space-y-2"><p>控制台应用日志来自当前查看的 VPS；节点及内核日志来自所选节点。</p><p>控制台和每个节点分别保存日志限制。写入时及后台定期检查并清理；历史归档使用 gzip，当天活动日志用于持续写入。系统 journal 单独管理。</p><p>各跳 SNI 必须匹配该跳的 REALITY 目标或 TLS 证书。accepted 只表示已接收连接，不代表成功出网。</p></div>
       </details>
     </div>
   </Modal>;

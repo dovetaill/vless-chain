@@ -129,6 +129,10 @@ pub fn targets(config: &Value) -> BTreeSet<(String, String)> {
             if inbound["streamSettings"]["security"] != "reality" { continue; }
             let reality = &inbound["streamSettings"]["realitySettings"];
             if let Some(target) = reality["target"].as_str().or_else(|| reality["dest"].as_str()) {
+                let guard_tag = format!("{}-reality-target", inbound["tag"].as_str().unwrap_or(""));
+                let target = config["outbounds"].as_array().and_then(|items| items.iter()
+                    .find(|item| item["tag"] == guard_tag && item["protocol"] == "freedom"))
+                    .and_then(|item| item["settings"]["redirect"].as_str()).unwrap_or(target);
                 if let Some(names) = reality["serverNames"].as_array() {
                     for name in names.iter().filter_map(Value::as_str) { result.insert((target.into(),name.into())); }
                 }
@@ -249,5 +253,13 @@ mod tests {
         assert_eq!(targets.len(),2);
         assert!(targets.contains(&("two.example:443".into(),"two.example".into())));
         assert!(!chain_panel::management::machine_route("POST","/api/diagnostics/../../logs"));
+    }
+    #[test]
+    fn diagnostics_targets_unwrap_guard_destination() {
+        let mut config = chain_panel::compiler::empty_config();
+        let mut inbound = json!({"tag":"line-test-in","streamSettings":{"security":"reality","realitySettings":{"target":"cover.example:8443","serverNames":["cover.example"]}}});
+        chain_panel::compiler::guard_reality(&mut config, &mut inbound, 61000).unwrap();
+        config["inbounds"].as_array_mut().unwrap().push(inbound);
+        assert_eq!(targets(&config), BTreeSet::from([("cover.example:8443".into(), "cover.example".into())]));
     }
 }

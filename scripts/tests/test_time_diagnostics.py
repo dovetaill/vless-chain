@@ -14,6 +14,21 @@ from chain_install import make_parser
 
 
 class TimeDiagnostics(unittest.TestCase):
+    def test_missing_optional_time_module_does_not_block_upgrade_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = Mock(live=True, root=Path(temporary))
+            args = make_parser().parse_args(['update', '--non-interactive'])
+            output = io.StringIO()
+            with patch.dict(sys.modules, {'chain_time': None}), \
+                    patch.object(installer, 'service_kind', return_value='systemd'), \
+                    patch.object(installer, 'download_release', side_effect=ValueError('download reached')) as download, \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaisesRegex(ValueError, 'download reached'):
+                    installer.install_package(manager, args)
+            download.assert_called_once()
+            self.assertIn('时间同步未完成', output.getvalue())
+            self.assertEqual(list((Path(temporary) / 'var/tmp').iterdir()), [])
+
     def test_install_and_update_enable_time_sync_without_prompting(self):
         for action in ('install', 'update'):
             for role in ('panel', 'agent'):

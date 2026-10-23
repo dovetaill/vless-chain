@@ -815,7 +815,7 @@ mod tests {
         let inbound = &configs[&doc.nodes[0].id]["inbounds"][0];
         assert_eq!(inbound["settings"]["clients"][0]["id"], uuid);
         let settings = &inbound["streamSettings"]["realitySettings"];
-        assert_eq!(settings["target"], reality.target);
+        assert!(configs[&doc.nodes[0].id]["outbounds"].as_array().unwrap().iter().any(|out| out["settings"]["redirect"] == reality.target));
         assert_eq!(settings["privateKey"], reality.private_key);
         assert_eq!(settings["shortIds"], json!([reality.short_id]));
         assert_eq!(settings["limitFallbackUpload"], upload);
@@ -945,6 +945,10 @@ mod tests {
             );
             let mut expected_reality = original["streamSettings"]["realitySettings"].clone();
             expected_reality.as_object_mut().unwrap().remove("xver");
+            let guard_tag = format!("{tag}-reality-target");
+            let guard = config["outbounds"].as_array().unwrap().iter().find(|v| v["tag"] == guard_tag).unwrap();
+            assert_eq!(guard["settings"]["redirect"], expected_reality["target"]);
+            expected_reality["target"] = inbound["streamSettings"]["realitySettings"]["target"].clone();
             assert_eq!(
                 inbound["streamSettings"]["realitySettings"],
                 expected_reality

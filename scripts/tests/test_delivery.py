@@ -755,7 +755,7 @@ class Delivery(unittest.TestCase):
         self.assertEqual(env['CHAIN_PANEL_URL'], 'http://127.0.0.1:8088')
         self.assertEqual((self.manager.role_paths('agent')[0] / 'token').read_text().strip(), node['token'])
 
-    def test_install_upgrade_backup_and_rollback_preserve_state(self):
+    def test_update_prunes_history_without_backup_and_preserves_data(self):
         source, manifest = self.package()
         self.manager.install(source, manifest, self.args(listen='127.0.0.1:8099', secure_cookie='1'))
         initial = self.manager.state()['roles']['panel']['current']
@@ -763,27 +763,68 @@ class Delivery(unittest.TestCase):
         (data / 'admin-token').write_text('private-fixture')
         (data / 'panel.db').write_bytes(b'database-fixture')
         source2, manifest2 = self.package('0.2.0')
-        self.manager.install(source2, manifest2, self.args(action='update'))
+        with patch.object(self.manager, 'release_in_use', return_value=False), \
+                patch.object(self.manager, 'backup_files', side_effect=AssertionError('no automatic backup')):
+            self.manager.install(source2, manifest2, self.args(action='update'))
         state = self.manager.state()['roles']['panel']
-        self.assertEqual(state['previous'], initial)
+        self.assertIsNone(state['previous'])
+        self.assertFalse((self.manager.base / 'releases' / initial).exists())
         self.assertEqual(installer.parse_env(etc / 'panel.env')['CHAIN_LISTEN'], '127.0.0.1:8099')
         self.assertEqual((data / 'panel.db').read_bytes(), b'database-fixture')
         self.assertEqual((etc / 'panel.env').stat().st_mode & 0o777, 0o600)
-        backups = list(self.manager.path('/var/backups/chain-panel').glob('*.tar.gz'))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
-        with tarfile.open(backups[0]) as bundle:
-            self.assertEqual(bundle.extractfile('data/panel.db').read(), b'database-fixture')
-        state = self.manager.state()
-        metadata = {'setup_complete': True, 'panel_only': True, 'https_port': 8443,
-                    'manual_https': {'port': 8443, 'cert': '/fixture/cert', 'key': '/fixture/key'}}
-        state['roles']['panel'].update(metadata)
-        common.json_write(self.manager.state_file, state)
-        self.manager.rollback('panel')
-        for key, value in metadata.items():
-            self.assertEqual(self.manager.state()['roles']['panel'][key], value)
-        self.assertEqual(self.manager.state()['roles']['panel']['current'], initial)
+        self.assertFalse(list(self.manager.path('/var/backups/chain-panel').glob('*.tar.gz')))
+        with self.assertRaisesRegex(ValueError, '没有可回滚'):
+            self.manager.rollback('panel')
         self.assertEqual((data / 'admin-token').read_text(), 'private-fixture')
+
+    def test_release_in_use_checks_open_files_maps_and_scripts(self):
+        directory = self.root / 'release'
+        directory.mkdir()
+        proc = self.root / 'proc'
+        process = proc / '123'
+        (process / 'fd').mkdir(parents=True)
+        (process / 'maps').write_text('')
+        (process / 'cmdline').write_bytes(b'python3\0')
+        path_type = installer.Path
+        def paths(value):
+            return proc if value == '/proc' else path_type(value)
+        with patch.object(installer, 'Path', side_effect=paths), \
+                patch.object(installer, 'operating_system', return_value='linux'):
+            self.assertFalse(self.manager.release_in_use(directory))
+            (process / 'fd/4').symlink_to(directory / 'log')
+            self.assertTrue(self.manager.release_in_use(directory))
+            (process / 'fd/4').unlink()
+            (process / 'maps').write_text(f'001-002 r-xp 000 00:00 1 {directory}/binary\n')
+            self.assertTrue(self.manager.release_in_use(directory))
+            (process / 'maps').write_text('')
+            (process / 'cmdline').write_bytes(os.fsencode(directory / 'script.py') + b'\0')
+            self.assertTrue(self.manager.release_in_use(directory))
+
+    def test_update_keeps_other_role_busy_and_foreign_releases(self):
+        source, manifest = self.package()
+        self.manager.install(source, manifest, self.args())
+        initial = self.manager.state()['roles']['panel']['current']
+        state = self.manager.state()
+        state['roles']['agent'] = {'current': initial, 'previous': None, 'version': '0.1.0'}
+        common.json_write(self.manager.state_file, state)
+        self.manager.link('agent', initial)
+        foreign = self.manager.base / 'releases' / 'foreign'
+        foreign.mkdir(); (foreign / 'keep').write_text('foreign')
+        source2, manifest2 = self.package('0.2.0')
+        with patch.object(self.manager, 'release_in_use', return_value=False):
+            self.manager.install(source2, manifest2, self.args(action='update'))
+        second = self.manager.state()['roles']['panel']['current']
+        source3, manifest3 = self.package('0.3.0')
+        with patch.object(self.manager, 'release_in_use', return_value=True):
+            self.manager.install(source3, manifest3, self.args(action='update'))
+        releases = self.manager.base / 'releases'
+        self.assertTrue((releases / initial).exists())
+        self.assertTrue((releases / second).exists())
+        with patch.object(self.manager, 'release_in_use', return_value=False):
+            self.manager.install(source3, manifest3, self.args(action='update'))
+        self.assertTrue((releases / initial).exists())
+        self.assertFalse((releases / second).exists())
+        self.assertEqual((foreign / 'keep').read_text(), 'foreign')
 
     def test_failed_upgrade_restores_links_config_and_state(self):
         source, manifest = self.package()

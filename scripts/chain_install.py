@@ -388,6 +388,64 @@ class Manager:
         print(f'私有备份：{destination}（权限 600，含连接凭据，请私下保存）')
         return destination
 
+    def release_in_use(self, directory):
+        prefix = str(directory.resolve()) + '/'
+        def inside(value):
+            return value == prefix[:-1] or value.startswith(prefix)
+        if operating_system() != 'linux':
+            if not shutil.which('lsof'):
+                return True
+            result = subprocess.run(['lsof', '-t', '+D', str(directory)], capture_output=True, text=True)
+            return bool(result.stdout.strip()) or result.returncode not in (0, 1)
+        for process in Path('/proc').iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                links = [process / 'exe', process / 'cwd', *list((process / 'fd').iterdir())]
+                for link in links:
+                    try:
+                        if inside(os.readlink(link)):
+                            return True
+                    except FileNotFoundError:
+                        pass
+                if any(inside(line.split(None, 5)[-1].removesuffix(' (deleted)'))
+                       for line in (process / 'maps').read_text().splitlines()):
+                    return True
+                for arg in (process / 'cmdline').read_bytes().split(b'\0'):
+                    if arg.startswith(b'/') and inside(str(Path(os.fsdecode(arg)).resolve())):
+                        return True
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                return True  # Cannot establish that the release is unused.
+        return False
+
+    def prune_releases(self, state):
+        releases = self.base / 'releases'
+        require(not releases.is_symlink(), '发行目录不能是符号链接，未清理历史版本。')
+        keep = {item['current'] for item in state['roles'].values()}
+        for role in ROLES:
+            link = self.base / ('current-' + role)
+            if link.is_symlink():
+                keep.add(link.resolve().name)
+        for directory in releases.iterdir():
+            if directory.name in keep:
+                continue
+            try:
+                require(directory.is_dir() and not directory.is_symlink(), '不是普通发行目录')
+                info = directory.stat()
+                require(info.st_uid == self.base.stat().st_uid, '目录属主与安装目录不一致')
+                manifest = verify_tree(directory)
+                expected = f'{manifest["version"]}-{manifest.get("os", "linux")}-{manifest["arch"]}-{sha256(directory / "release.json")[:12]}'
+                require(directory.name == expected, '发行目录名称与清单不匹配')
+                require(not self.release_in_use(directory), '仍被进程占用，或无法确认占用状态')
+                print(f'清理前：{directory.resolve()} dev/inode={info.st_dev}/{info.st_ino} '
+                      f'uid/gid={info.st_uid}/{info.st_gid} mode={info.st_mode & 0o7777:o} ctime_ns={info.st_ctime_ns}')
+                shutil.rmtree(directory)
+                print(f'已清理历史版本：{directory}')
+            except (OSError, ValueError) as error:
+                print(f'保留 {directory}：{error}', file=sys.stderr)
+
     def recoverable_openrc_data(self, role):
         data = self.role_paths(role)[1]
         if service_kind() != 'openrc' or not self.state_file.is_file() or not data.is_dir():
@@ -467,10 +525,8 @@ class Manager:
             previous = {p: p.read_bytes() if p.exists() else None for p in configs}
             was_active, was_enabled = self.system.active(role), self.system.autostart(role)
             try:
-                if old or retained is not None:
-                    if old:
-                        self.system.call('stop', 'chain-' + role + '.service')
-                    self.backup_files(role)
+                if old:
+                    self.system.call('stop', 'chain-' + role + '.service')
                 if check_after_stop:
                     self.check_panel_port(env)
                 for directory in (etc, data):
@@ -496,7 +552,7 @@ class Manager:
                 self.system.call('enable', 'chain-' + role + '.service')
                 self.system.call('restart', 'chain-' + role + '.service')
                 self.healthy(role, env)
-                state['roles'][role] = {'current': release_id, 'previous': old['current'] if old and old['current'] != release_id else (old or {}).get('previous'),
+                state['roles'][role] = {'current': release_id, 'previous': None,
                                         'version': manifest['version']}
                 if role == 'panel':
                     state['roles'][role]['setup_complete'] = (False if args.action == 'install'
@@ -539,8 +595,13 @@ class Manager:
                     self.system.call('disable', 'chain-' + role + '.service', check=False)
                 if was_active:
                     self.system.call('start', 'chain-' + role + '.service')
-                print('安装未完成，已恢复此前程序链接与配置；数据与备份保留。', file=sys.stderr)
+                print('安装未完成，已恢复此前程序链接与配置；业务数据保留。', file=sys.stderr)
                 raise
+            if args.action == 'update':
+                for item in state['roles'].values():
+                    item['previous'] = None
+                json_write(self.state_file, state)
+                self.prune_releases(state)
         if self.live:
             print(f'chain-{role} 已安装并启动；日常运维：chainctl menu')
             if role == 'panel':
@@ -902,13 +963,13 @@ def install_package(manager, args):
         manager.require_role(args.component)
     # Fix the clock before HTTPS downloads and enrollment can fail on certificate dates.
     if manager.live and service_kind() == 'systemd' and args.action in ('install', 'update'):
-        from chain_time import status, synchronize
         try:
+            from chain_time import status, synchronize
             clock = status()
             if clock.get('NTPSynchronized') != 'yes' or clock.get('NTP') != 'yes':
                 print('自动检查并启用时间同步，必要时安装时间服务；保持现有时区。')
                 synchronize()
-        except (ValueError, OSError, subprocess.SubprocessError) as error:
+        except (ImportError, ValueError, OSError, subprocess.SubprocessError) as error:
             print(f'时间同步未完成：{error}；继续组件操作，连接可能因时钟偏差失败。')
 
     def install_source(source, manifest):

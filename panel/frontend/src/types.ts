@@ -23,6 +23,7 @@ export interface NodeInfo {
   server_name: string;
   seen: number;
   online: boolean;
+  desired_revision?: string | null;
   report: {
     running: boolean;
     applied: boolean;

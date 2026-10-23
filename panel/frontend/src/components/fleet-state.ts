@@ -123,7 +123,11 @@ export function issues(r: Remote, now: number): { title: string; detail: string;
   else {
     if (!node.online || !recent(node.seen, remoteNow(r, now))) result.push({ title: "Agent 上报中断", detail: "面板可同步，但 Agent 没有近期上报。请查看 Agent 服务日志；代理实际连通性尚未确认。" });
     else if (node.report.error) result.push({ title: "Agent 执行失败", detail: node.report.error });
-    else if (!node.report.running) result.push({ title: "代理内核未运行", detail: "请查看 Agent 与内核日志，确认配置已应用且启动成功。" });
+    else if (!node.report.running && !(node.report.applied
+      && (node.desired_revision === null || node.desired_revision === "") && node.report.revision === ""
+      && r.snapshot.lines.length === 0 && (r.snapshot.legacy_configs?.length ?? 0) === 0)) {
+      result.push({ title: "代理内核未运行", detail: "请查看 Agent 与内核日志，确认配置已应用且启动成功。" });
+    }
     else if (!node.report.applied) result.push({ title: "配置尚未应用", detail: "请在 VPS 详情选择“预览并应用配置”。" });
   }
   for (const [key, condition] of Object.entries(r.snapshot.monitoring?.conditions || {})) {

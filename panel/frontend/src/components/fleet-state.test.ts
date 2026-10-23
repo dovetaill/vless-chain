@@ -14,6 +14,25 @@ const remote: Remote = {
   } as unknown as PanelState,
 };
 assert.equal(health(remote, now), "在线");
+const idle = structuredClone(remote);
+idle.snapshot!.nodes[0].desired_revision = null;
+idle.snapshot!.nodes[0].report.revision = "";
+idle.snapshot!.nodes[0].report.running = false;
+assert.equal(health(idle, now), "在线", "未创建代理且未下发配置的在线 Agent 正常空闲");
+const stopped = structuredClone(idle);
+stopped.snapshot!.nodes[0].desired_revision = "published";
+assert.equal(health(stopped, now), "代理内核未运行", "已下发配置仍须检查内核");
+stopped.snapshot!.nodes[0].desired_revision = "";
+stopped.snapshot!.lines.push({ enabled: true } as Line);
+assert.equal(health(stopped, now), "代理内核未运行", "已有代理不能按空节点处理");
+stopped.snapshot!.lines = [];
+stopped.snapshot!.legacy_configs = [{ id: "legacy", node_id: "agent", name: "旧配置", enabled: true, published: true, ports: [443] }];
+assert.equal(health(stopped, now), "代理内核未运行", "迁移配置也需要内核运行");
+stopped.snapshot!.legacy_configs = [];
+stopped.snapshot!.nodes[0].desired_revision = undefined;
+assert.equal(health(stopped, now), "代理内核未运行", "缺少期望状态的旧快照不能推定空闲");
+idle.snapshot!.nodes[0].report.error = "启动失败";
+assert.equal(health(idle, now), "Agent 执行失败");
 assert.equal(health({ ...remote, seen: now - 100 }, now), "同步数据过期");
 assert.equal(health({ ...remote, error: "HTTP 401" }, now), "同步失败");
 assert.match(issues({ ...remote, error: "HTTP 401" }, now)[0].detail, /HTTP 401/);
