@@ -302,13 +302,19 @@ async fn grant(
     {
         return Err(error(StatusCode::UNAUTHORIZED, "节点身份无效"));
     }
-    let before = s.doc.resources.clone();
-    let grant = resources::allocate(&mut s.doc, &node, &input, now())?;
-    if let Err(e) = s.save() {
-        s.doc.resources = before;
-        return Err(e.into());
+    Ok(Json(allocate_grant(&mut s, &node, &input, now())?))
+}
+
+fn allocate_grant(store: &mut Store, node: &str, input: &resources::Request, at: u64) -> Result<resources::Grant> {
+    let before = (store.doc.resources.clone(), store.doc.customer_ledgers.clone(), store.doc.monitoring.clone());
+    let result = resources::allocate(&mut store.doc, node, input, at).and_then(|grant| {
+        store.save()?;
+        Ok(grant)
+    });
+    if result.is_err() {
+        (store.doc.resources, store.doc.customer_ledgers, store.doc.monitoring) = before;
     }
-    Ok(Json(grant))
+    result
 }
 
 fn source_summary(s: &rules::Source) -> Value {
@@ -510,5 +516,52 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
             tokio::select! {_=stop.cancelled()=>return,_=update(&app,&key)=>{}}
         }
         tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(60))=>{}}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_grant_save_restores_customer_resource_ledgers_and_notices() {
+        let at = 1_800_000_000;
+        let amount = 1024 * 1024;
+        let plan = chain_panel::plans::Plan { id: id(), name: "客户套餐".into(), customer_id: "customer".into(), monthly_gib: 1.0 / 1024.0,
+            members: vec![chain_panel::plans::Member { id: id(), name: "成员".into(), line_ids: vec!["line".into()], monthly_gib: Some(1.0 / 1024.0) }] };
+        let keys = vec![plan.key(), chain_panel::plans::member_key(&plan, &plan.members[0]), "infrastructure".into()];
+        let mut doc = Document::default();
+        doc.rentals.insert(plan.key(), Rental { customer_id: plan.customer_id.clone(), started_at: at - 1, expires_at: at + 100, ..Default::default() });
+        doc.customer_plans.push(plan);
+        doc.resources.resources.push(resources::Resource { id: keys[2].clone(), name: "供应资源".into(), monthly_gib: Some(1.0 / 1024.0), ..Default::default() });
+        doc.nodes.push(serde_json::from_value(json!({"id":"node","name":"入口","host":"192.0.2.1","token_hash":"test",
+            "reality":{"target":"","server_name":"","private_key":"","public_key":"","short_id":""},
+            "desired":{"revision":"r","config":{"_chain":[{"resource_ids":keys}]}}})).unwrap());
+        doc.monitoring.notice("已有告警".into(), at - 1);
+
+        for resource in keys {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)").unwrap();
+            let mut store = Store { conn, doc: doc.clone() };
+            store.save().unwrap();
+            let before = serde_json::to_value(&store.doc).unwrap();
+            let request: resources::Request = serde_json::from_value(json!({"resource":resource,"epoch":id(),"cycle":0,"used":0,"want":amount,"customer_plan_version":1})).unwrap();
+            store.conn.execute_batch("PRAGMA query_only=ON").unwrap();
+            let error = allocate_grant(&mut store, "node", &request, at).err().expect("SQLite write must fail");
+            assert!(matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::ReadOnly), "{error:#}");
+            assert_eq!(serde_json::to_value(&store.doc).unwrap(), before, "{resource}: failed grants must leave no reservation or alert");
+            let saved: String = store.conn.query_row("SELECT body FROM state WHERE id=1", [], |row| row.get(0)).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), before);
+
+            store.conn.execute_batch("PRAGMA query_only=OFF").unwrap();
+            store.save().unwrap();
+            let saved: String = store.conn.query_row("SELECT body FROM state WHERE id=1", [], |row| row.get(0)).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), before, "later saves must not persist a failed grant");
+            let grant = allocate_grant(&mut store, "node", &request, at).unwrap();
+            assert_eq!(grant.cap, amount);
+            assert_eq!(store.doc.monitoring.notices.len(), doc.monitoring.notices.len() + 3);
+            let ledgers = if chain_panel::plans::is_budget(&resource) { &store.doc.customer_ledgers } else { &store.doc.resources.ledgers };
+            assert_eq!(ledgers[&resource].allocations.values().map(|a| a.granted).sum::<u64>(), amount);
+        }
     }
 }

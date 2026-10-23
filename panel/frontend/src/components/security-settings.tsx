@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   KeyRound,
   Fingerprint,
@@ -9,11 +9,13 @@ import {
 import { Button } from "./ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { Input } from "./ui/input";
-import { Field, Modal, CopyButton, field, stamp, Status } from "./shared";
+import { Field, Modal, CopyButton, field, stamp, Status, errorText, roleNames } from "./shared";
 import { QR } from "./access-dialog";
 import { api } from "../api";
 import { registerPasskey } from "../passkey";
 import type { PanelState } from "../types";
+
+type Member = { id: string; name: string; role: "ops" | "finance" | "viewer"; created_at: number; revoked_at: number };
 
 function Proof({ otp }: { otp: boolean }) {
   return (
@@ -102,6 +104,44 @@ function TotpSetup({
     </Modal>
   );
 }
+function Members({ otp }: { otp: boolean }) {
+  const [members, setMembers] = useState<Member[] | null>(null);
+  const [error, setError] = useState("");
+  const [modal, setModal] = useState<ReactNode>(null);
+  const close = () => setModal(null);
+  const load = useCallback(async () => {
+    try {
+      const value = await api<{ members: Member[] }>("/security/members");
+      setMembers(value.members);
+      setError("");
+    } catch (e) { setError(errorText(e)); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+  return <Card><CardHeader><CardTitle>运营成员</CardTitle></CardHeader><CardContent className="space-y-4">
+    <p className="muted">每人使用独立密钥；成员不使用管理员的二步验证码。撤销成员会停用其密钥与会话，保留已有业务记录。</p>
+    {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+    <Button variant="outline" onClick={() => setModal(<Modal title="新建运营成员" submit="生成成员密钥" close={close} action={async data => {
+      const result = await api<{ member: Member; token: string }>("/security/members", "POST", { name: field(data, "name"), role: field(data, "role"), token: field(data, "token"), code: field(data, "code") });
+      setModal(<Modal title="成员密钥（仅本次显示）" description={`${result.member.name} · ${roleNames[result.member.role]}`} close={close}>
+        <p className="muted">请私下交给该成员并妥善保存。关闭后不能再次查看；丢失时撤销此成员并重新创建。</p>
+        <pre className="secret">{result.token}</pre><CopyButton value={result.token} label="复制成员密钥" />
+      </Modal>);
+      await load();
+    }}>
+      <Field label="成员名称"><Input name="name" required maxLength={80} autoComplete="off" /></Field>
+      <Field label="成员角色"><select name="role" className="select" defaultValue="viewer"><option value="viewer">只读</option><option value="ops">运维</option><option value="finance">财务</option></select></Field>
+      <p className="muted">只读：查看脱敏状态。运维：监控、诊断、应用配置与维护。财务：客户、开通续费、收款退款及纠错。成员均不能读取代理凭据、修改网络配置或管理成员。</p>
+      <Proof otp={otp} />
+    </Modal>)}>新建成员</Button>
+    {members === null ? <p className="muted">正在读取成员…</p> : !members.length ? <p className="muted">尚无运营成员，原管理员权限保持不变。</p> : members.map(member => <div key={member.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border p-3">
+      <div className="min-w-0"><p className="break-all text-sm font-medium">{member.name} · {roleNames[member.role]}</p><p className="muted">创建于 {stamp(member.created_at)} · {member.revoked_at ? `已撤销 ${stamp(member.revoked_at)}` : "可登录"}</p></div>
+      {!member.revoked_at && <Button variant="outline" size="sm" onClick={() => setModal(<Modal title="撤销成员" description={`停用「${member.name}」的独立密钥和会话，不删除其经手的业务记录。`} submit="确认撤销成员" close={close} action={async data => {
+        await api(`/security/members/${member.id}/revoke`, "POST", { token: field(data, "token"), code: field(data, "code") });
+        await load(); close();
+      }}><Proof otp={otp} /></Modal>)}>撤销成员</Button>}
+    </div>)}
+  </CardContent>{modal}</Card>;
+}
 export function SecuritySettings({
   state,
   saved,
@@ -131,7 +171,7 @@ export function SecuritySettings({
           </CardHeader>
           <CardContent className="space-y-5">
             <p className="muted">
-              更新登录密钥，并撤销旧会话。保留单管理员模式。
+              更新管理员登录密钥，并撤销旧会话。成员使用各自的独立密钥。
             </p>
             <Button
               variant="outline"
@@ -331,6 +371,7 @@ export function SecuritySettings({
           </CardContent>
         </Card>
       )}
+      <Members otp={security.totp_enabled} />
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -379,7 +420,7 @@ export function SecuritySettings({
             ))
           ) : (
             <p className="text-sm text-slate-400">
-              尚未创建订阅。在代理的「接入」窗口中创建。
+              尚未创建订阅。在代理的「分享配置 → 订阅链接」中创建。
             </p>
           )}
           <div className="rounded-lg bg-slate-50 p-4 text-sm leading-7 text-slate-600">

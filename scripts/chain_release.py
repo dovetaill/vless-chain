@@ -278,7 +278,7 @@ def build(args):
         work.run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=project / 'frontend')
         work.run(['npm', 'run', 'build'], cwd=project / 'frontend')
         work.run(['cargo', 'test', '--locked', '--lib', '--quiet'], cwd=project)
-        work.run(['cargo', 'test', '--locked', '--bin', 'chain-panel', 'latest_xray', '--quiet'], cwd=project)
+        work.run(['cargo', 'test', '--locked', '--bin', 'chain-panel', '--quiet'], cwd=project)
         work.run(['cargo', 'build', '--locked', '--release', '--bins', '--target', target], cwd=project)
         stage = work.root / 'stage'
         (stage / 'bin').mkdir(parents=True)

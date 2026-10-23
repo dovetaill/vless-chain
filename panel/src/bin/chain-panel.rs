@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
@@ -8,6 +8,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use chain_panel::{compiler::*, model::*, runtime::*};
+use chain_panel::security::{Actor, Role, Session};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,6 +24,8 @@ use subtle::ConstantTimeEq;
 mod delivery_api;
 #[path = "../rental_api.rs"]
 mod rental_api;
+#[path = "../plans_api.rs"]
+mod plans_api;
 #[path = "../rental_public.rs"]
 mod rental_public;
 #[path = "../security_api.rs"]
@@ -46,11 +49,32 @@ impl Store {
         Ok(())
     }
 }
+const PROTECTED_STATE_FIELDS: [&str; 7] = [
+    "rental_orders", "payment_adjustments", "customer_plans", "customer_ledgers",
+    "customer_query_tokens", "operator_members", "operator_audit",
+];
+fn install_state_write_guard(conn: &Connection) -> Result<()> {
+    let keys = PROTECTED_STATE_FIELDS.map(|key| format!("'{key}'")).join(",");
+    // Persist the boundary in SQLite so a previous binary cannot silently discard new fields.
+    for (name, event, previous) in [
+        ("insert", "INSERT", "(SELECT body FROM state WHERE id=NEW.id)"),
+        ("update", "UPDATE OF body", "OLD.body"),
+    ] {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS state_preserve_operations_{name}
+             BEFORE {event} ON state
+             WHEN EXISTS (SELECT 1 FROM json_each({previous}) WHERE key IN ({keys}))
+              AND (SELECT count(DISTINCT key) FROM json_each(NEW.body) WHERE key IN ({keys})) != 7
+             BEGIN SELECT RAISE(ABORT, '数据库含新版业务字段，拒绝旧程序覆盖；请恢复兼容版本，勿回退数据库'); END;"
+        ))?;
+    }
+    Ok(())
+}
 #[derive(Clone)]
 struct App {
     diagnostics: Arc<diagnostics_api::Broker>,
     store: Arc<Mutex<Store>>,
-    sessions: Arc<Mutex<HashMap<String, u64>>>,
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
     tickets: Arc<Mutex<HashMap<String, (u64, String)>>>,
     delegated_sessions: Arc<Mutex<BTreeSet<String>>>,
     admin_hash: Arc<Mutex<String>>,
@@ -93,9 +117,16 @@ fn error(status: StatusCode, s: &str) -> ApiError {
     ApiError(status, s.into())
 }
 
-async fn guard(State(app): State<App>, request: Request, next: Next) -> Response {
-    let path = request.uri().path();
+async fn guard(State(app): State<App>, mut request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut audit = None;
     let agent = path.starts_with("/api/agent/");
+    if path == "/api/federation/login" {
+        let session = app.sessions.lock().unwrap().get(&digest(&cookie(request.headers()))).cloned();
+        if session.and_then(|s| s.actor(&app.store.lock().unwrap().doc.operator_members, now())).is_some_and(|a| a.role != Role::Admin) {
+            return error(StatusCode::FORBIDDEN, "运营成员不能兑换管理员免密登录票据").into_response();
+        }
+    }
     if path.starts_with("/api/") && !agent {
         if request.method() != axum::http::Method::GET {
             if request
@@ -124,7 +155,7 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
             }
         }
         if !matches!(
-            path,
+            path.as_str(),
             "/api/login"
                 | "/api/auth/options"
                 | "/api/auth/passkey/start"
@@ -139,23 +170,35 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
                 let s = app.store.lock().unwrap();
                 !s.doc.fleet.controller_hash.is_empty()
                     && equal(&digest(token), &s.doc.fleet.controller_hash)
-                    && chain_panel::management::machine_route(request.method().as_str(), path)
+                    && chain_panel::management::machine_route(request.method().as_str(), &path)
             });
             let token = cookie(request.headers());
             let hash = digest(&token);
-            let expiry = app
-                .sessions
-                .lock()
-                .unwrap()
-                .get(&hash)
-                .copied()
-                .unwrap_or(0);
-            if expiry <= now() && !machine_ok {
+            let session = app.sessions.lock().unwrap().get(&hash).cloned();
+            let session_actor = session.and_then(|session| session.actor(&app.store.lock().unwrap().doc.operator_members, now()));
+            let interactive = session_actor.is_some();
+            let actor = session_actor.or_else(|| machine_ok.then(|| Actor { id: "controller".into(), name: "已授权总控".into(), role: Role::Admin }));
+            let Some(actor) = actor else {
                 return error(StatusCode::UNAUTHORIZED, "请先登录").into_response();
+            };
+            if !actor.role.allows(request.method().as_str(), &path) {
+                return error(StatusCode::FORBIDDEN, "当前成员无权执行此操作").into_response();
             }
+            if request.method() != axum::http::Method::GET && interactive {
+                match begin_operator_audit(&app, &actor, request.method().as_str(), &path) {
+                    Ok(id) => { request.extensions_mut().insert(AuditContext(id.clone())); audit = Some(id); }
+                    Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "无法保存操作审计，尚未执行操作").into_response(),
+                }
+            }
+            request.extensions_mut().insert(actor);
         }
     }
     let mut response = next.run(request).await;
+    if let Some(id) = audit {
+        if finish_operator_audit(&app, &id, response.status().as_u16()).is_err() {
+            response = error(StatusCode::SERVICE_UNAVAILABLE, "操作结果未能写入审计，业务可能已完成；请先查询原任务或订单，不要重复提交").into_response();
+        }
+    }
     response.headers_mut().insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
@@ -168,6 +211,28 @@ async fn guard(State(app): State<App>, request: Request, next: Next) -> Response
         .headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-store"));
     response
+}
+
+#[derive(Clone)]
+struct AuditContext(String);
+
+fn begin_operator_audit(app: &App, actor: &Actor, method: &str, path: &str) -> Result<String> {
+    let mut store = app.store.lock().unwrap();
+    let id = id();
+    store.doc.operator_audit.push(OperatorAudit { id: id.clone(), at: now(), actor: actor.clone(), method: method.into(), path: path.into(), target: None, response_status: None });
+    if let Err(e) = store.save() { store.doc.operator_audit.pop(); return Err(e); }
+    Ok(id)
+}
+
+fn finish_operator_audit(app: &App, id: &str, status: u16) -> Result<()> {
+    let mut store = app.store.lock().unwrap();
+    let event = store.doc.operator_audit.iter_mut().find(|e| e.id == id).context("操作审计不存在")?;
+    event.response_status = Some(status);
+    if let Err(e) = store.save() {
+        store.doc.operator_audit.iter_mut().find(|e| e.id == id).unwrap().response_status = None;
+        return Err(e);
+    }
+    Ok(())
 }
 fn cookie(headers: &HeaderMap) -> String {
     headers
@@ -187,7 +252,12 @@ struct Login {
 }
 async fn login(State(app): State<App>, Json(input): Json<Login>) -> ApiResult<Response> {
     app.auth.rate_limit()?;
-    if !equal(&digest(&input.token), &app.admin_hash.lock().unwrap()) {
+    let hash = digest(&input.token);
+    if !equal(&hash, &app.admin_hash.lock().unwrap()) {
+        let member = app.store.lock().unwrap().doc.operator_members.iter()
+            .find(|m| m.revoked_at == 0 && m.role != Role::Admin && equal(&hash, &m.token_hash))
+            .map(|m| Actor { id: m.id.clone(), name: m.name.clone(), role: m.role });
+        if let Some(actor) = member { return Ok(member_session_response(&app, actor, false)); }
         tokio::time::sleep(Duration::from_millis(400)).await;
         return Err(error(StatusCode::UNAUTHORIZED, "管理令牌不正确"));
     }
@@ -203,15 +273,19 @@ fn session_response(app: &App) -> Response {
     session_response_as(app, false)
 }
 fn session_response_as(app: &App, delegated: bool) -> Response {
+    let actor = if delegated { Actor { id: "controller".into(), name: "总控委托管理员".into(), role: Role::Admin } } else { Actor::admin() };
+    member_session_response(app, actor, delegated)
+}
+fn member_session_response(app: &App, actor: Actor, delegated: bool) -> Response {
     let token = secret();
     {
         let mut sessions = app.sessions.lock().unwrap();
-        sessions.retain(|_, t| *t > now());
+        sessions.retain(|_, session| session.expires > now());
         if sessions.len() > 100 {
             sessions.clear();
             app.delegated_sessions.lock().unwrap().clear();
         }
-        sessions.insert(digest(&token), now() + 28800);
+        sessions.insert(digest(&token), Session { expires: now() + 28800, actor });
         if delegated { app.delegated_sessions.lock().unwrap().insert(digest(&token)); }
     }
     let mut response = Json(json!({"ok":true})).into_response();
@@ -267,6 +341,7 @@ fn snapshot(doc: &Document) -> Value {
         .map(|l| {
             let mut v = serde_json::to_value(l).unwrap();
             v["share"] = json!(share(l, doc).ok());
+            v["plan_eligible"] = json!(!doc.rentals.contains_key(&l.id) && !doc.applied_lines.iter().any(|old| old.id == l.id) && chain_panel::plans::for_line(doc, &l.id).is_none());
             let rental = chain_panel::rental::view(doc, l, now());
             for (key, value) in rental.as_object().unwrap() {
                 v[key] = value.clone();
@@ -295,7 +370,7 @@ fn snapshot(doc: &Document) -> Value {
         .iter()
         .rev()
         .take(20)
-        .map(|j| json!({"id":j.id,"state":j.state,"started":j.started,"events":j.events}))
+        .map(|j| json!({"id":j.id,"state":j.state,"started":j.started,"events":j.events,"actor":j.actor}))
         .collect();
     let subscriptions: Vec<_> = doc
         .subscriptions
@@ -308,7 +383,7 @@ fn snapshot(doc: &Document) -> Value {
         "published":doc.applied_legacy_configs.contains(p) && doc.nodes.iter().find(|n| n.id == p.node_id).is_some_and(|n|
             n.report.applied && n.desired.as_ref().is_some_and(|d| d.revision == n.report.revision
                 && configs.as_ref().and_then(|c| c.get(&p.node_id)) == Some(&d.config)))})).collect();
-    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"legacy_configs":legacy,"pending_imports":doc.pending_imports,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"payments":doc.payments,"renewal_contact":doc.renewal_contact,"resources":doc.resources.resources})
+    json!({"nodes":nodes,"externals":doc.externals,"lines":lines,"legacy_configs":legacy,"pending_imports":doc.pending_imports,"jobs":jobs,"checks":doc.checks,"busy":doc.busy(),"time":now(),"subscriptions":subscriptions,"security":security_api::summary(&doc.security),"alerts":delivery_api::alerts(doc),"customers":doc.customers,"customer_plans":chain_panel::plans::view(doc,now()),"payments":doc.payments,"rental_orders":doc.rental_orders,"payment_adjustments":doc.payment_adjustments,"renewal_contact":doc.renewal_contact,"resources":doc.resources.resources})
 }
 async fn state(State(app): State<App>) -> Json<Value> {
     let mut value = snapshot(&app.store.lock().unwrap().doc);
@@ -341,6 +416,10 @@ async fn state(State(app): State<App>) -> Json<Value> {
         json!(["upgrade", "upgrade-xray-latest", "restart-all", "restart-panel", "restart-agent"])
     } else { json!([]) };
     Json(value)
+}
+async fn state_view(State(app): State<App>, Extension(actor): Extension<Actor>) -> Json<Value> {
+    let Json(value) = state(State(app)).await;
+    Json(chain_panel::security::state_for(value, &actor))
 }
 #[derive(Deserialize)]
 struct LocalInput {
@@ -741,6 +820,7 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         .cloned();
     ensure!(input.id.is_none() || existing.is_some(), "线路不存在");
     let line_id = existing.as_ref().map(|l| l.id.clone()).unwrap_or_else(id);
+    ensure!(chain_panel::plans::for_line(d, &line_id).is_none() || input.kind == Kind::Vless, "客户套餐线路须保留代理类型");
     let mut used: BTreeSet<(String, u16)> = d
         .lines
         .iter()
@@ -1012,13 +1092,25 @@ fn publication_preview(doc: &Document) -> Result<Value> {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublishOptions { #[serde(default)] allow_unverified_reality: bool }
-async fn publish(State(app): State<App>, input: Option<Json<PublishOptions>>) -> ApiResult<Json<Value>> {
+fn authorize_publication(doc: &Document, role: Role) -> Result<()> {
+    if role == Role::Ops {
+        let leased: BTreeSet<_> = doc.lines.iter().chain(&doc.applied_lines).filter(|l| chain_panel::plans::lease(doc, &l.id).is_some()).map(|l| &l.id).collect();
+        for id in leased {
+            let old = doc.applied_lines.iter().find(|l| &l.id == id);
+            let draft = doc.lines.iter().find(|l| &l.id == id);
+            ensure!(matches!((old, draft), (Some(old), Some(draft)) if old.limits == draft.limits && old.enabled == draft.enabled), "运维不能通过发布改变已出租代理的额度、启停或删除状态，请由管理员确认");
+        }
+    }
+    Ok(())
+}
+async fn publish(State(app): State<App>, Extension(actor): Extension<Actor>, input: Option<Json<PublishOptions>>) -> ApiResult<Json<Value>> {
     let _probe_guard = app
         .probe_lock
         .try_lock()
         .map_err(|_| error(StatusCode::CONFLICT, "正在执行整链探测，请完成后发布"))?;
     let checked = diagnostics_api::preflight(&app, input.map(|v| v.0.allow_unverified_reality).unwrap_or(false)).await?;
     let job = edit(&app, |d| {
+        authorize_publication(d, actor.role)?;
         let configs = compile(d)?;
         ensure!(configs == checked, "检测期间配置已改变，请重新预览并下发");
         let affected = changed(d, &configs);
@@ -1037,6 +1129,9 @@ async fn publish(State(app): State<App>, input: Option<Json<PublishOptions>>) ->
                 .as_array()
                 .is_some_and(|s| !s.is_empty())
             {
+                if configs[&node.id]["_chain"].as_array().unwrap().iter().any(|s| s["resource_ids"].as_array().is_some_and(|ids| ids.iter().any(|id| id.as_str().is_some_and(chain_panel::plans::is_budget)))) {
+                    ensure!(node.report.system["customer_plan_version"] == 1, "{} 的 Agent 不支持客户共享套餐，请先升级并等待心跳", node.name);
+                }
                 if configs[&node.id]["_chain"].as_array().unwrap().iter().any(|s|s["multiplier"].as_u64().unwrap_or(1)>1 || s["resource_ids"].as_array().is_some_and(|p|!p.is_empty()) || chain_panel::rules::requires_capability(&s["access_policy"]["policy"])) {
                     ensure!(node.report.system["sharing_version"]==1,"请先升级 Agent 以支持倍率和访问控制");
                 }
@@ -1086,6 +1181,7 @@ async fn publish(State(app): State<App>, input: Option<Json<PublishOptions>>) ->
             n.report = Report::default();
         }
         let job = Job {
+            actor: Some(actor.clone()),
             legacy_configs: d.legacy_configs.clone(),
             id: job_id,
             state: "publishing".into(),
@@ -1387,6 +1483,76 @@ mod web_tests {
     use super::*;
 
     #[test]
+    fn state_write_guard_preserves_new_data_against_previous_writers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)").unwrap();
+        let mut legacy = serde_json::to_value(Document::default()).unwrap();
+        for key in PROTECTED_STATE_FIELDS { legacy.as_object_mut().unwrap().remove(key); }
+        let legacy_body = legacy.to_string();
+        conn.execute("INSERT INTO state VALUES(1,?1)", [&legacy_body]).unwrap();
+        install_state_write_guard(&conn).unwrap();
+        install_state_write_guard(&conn).unwrap();
+        let read_body = |conn: &Connection| conn.query_row("SELECT body FROM state WHERE id=1", [], |row| row.get::<_, String>(0)).unwrap();
+        assert_eq!(read_body(&conn), legacy_body, "打开旧库不得改写业务记录");
+        let old_writes = [
+            "INSERT INTO state(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
+            "UPDATE state SET body=?1 WHERE id=1",
+        ];
+        legacy["renewal_contact"] = json!("旧程序仍可写入尚未迁移的文档");
+        for sql in old_writes { conn.execute(sql, [legacy.to_string()]).unwrap(); }
+        let mut store = Store { doc: serde_json::from_str(&read_body(&conn)).unwrap(), conn };
+        store.doc.operator_members.push(OperatorMember { id:"member".into(), name:"财务".into(), role:Role::Finance,
+            token_hash:digest("fixture-member"), created_at:1, revoked_at:0 });
+        store.doc.rental_orders.push(RentalOrder { id:"order".into(), request_id:"request".into(), request_hash:"hash".into(),
+            created:1, confirmed_at:0, cancelled_at:0, term:"monthly".into(), amounts:BTreeMap::new(), note:"新订单".into(), items:vec![],
+            created_session:String::new(), confirmed_session:String::new(), cancelled_session:String::new(),
+            created_by:Some(Actor::admin()), confirmed_by:None, cancelled_by:None });
+        store.save().unwrap();
+        let saved = read_body(&store.conn);
+        for sql in old_writes {
+            let error = store.conn.execute(sql, [legacy.to_string()]).unwrap_err();
+            assert!(error.to_string().contains("拒绝旧程序覆盖"));
+            assert_eq!(read_body(&store.conn), saved, "旧程序写入失败后数据库须逐字不变");
+            for field in PROTECTED_STATE_FIELDS {
+                let mut incomplete: Value = serde_json::from_str(&saved).unwrap();
+                incomplete.as_object_mut().unwrap().remove(field);
+                assert!(store.conn.execute(sql, [incomplete.to_string()]).is_err(), "{field}");
+                assert_eq!(read_body(&store.conn), saved, "{field}");
+            }
+        }
+        store.doc.rental_orders[0].note = "新版继续保存".into();
+        store.save().unwrap();
+        let loaded: Document = serde_json::from_str(&read_body(&store.conn)).unwrap();
+        assert_eq!(loaded.rental_orders[0].note, "新版继续保存");
+        assert_eq!(loaded.operator_members[0].id, "member");
+    }
+
+    #[test]
+    fn ops_publication_preserves_independent_and_shared_entitlements() {
+        let line: Line = serde_json::from_value(json!({"id":"line","name":"line","kind":"vless","enabled":true,"hops":[]})).unwrap();
+        for shared in [false, true] {
+            let mut doc = Document { lines: vec![line.clone()], applied_lines: vec![line.clone()], ..Default::default() };
+            if shared {
+                doc.customer_plans.push(chain_panel::plans::Plan { id:"plan".into(), name:"plan".into(), customer_id:"customer".into(), monthly_gib:10.0,
+                    members: vec![chain_panel::plans::Member { id:"member".into(), name:"member".into(), line_ids:vec![line.id.clone()], monthly_gib:None }] });
+            }
+            doc.rentals.insert(if shared { "plan:plan" } else { "line" }.into(), Rental::default());
+            assert!(authorize_publication(&doc, Role::Ops).is_ok());
+            doc.lines[0].limits.monthly_gib = Some(1.0);
+            assert!(authorize_publication(&doc, Role::Ops).is_err());
+            assert!(authorize_publication(&doc, Role::Admin).is_ok());
+            doc.lines[0] = line.clone();
+            doc.lines[0].enabled = false;
+            assert!(authorize_publication(&doc, Role::Ops).is_err());
+            doc.lines.clear();
+            assert!(authorize_publication(&doc, Role::Ops).is_err());
+            doc.lines.push(line.clone());
+            doc.applied_lines.clear();
+            assert!(authorize_publication(&doc, Role::Ops).is_err(), "首次发布已出租线路需管理员确认");
+        }
+    }
+
+    #[test]
     fn legacy_profile_publication_and_snapshot_keep_secrets_out_of_summary() {
         let node = Node {
             id: id(),
@@ -1493,6 +1659,7 @@ async fn run() -> Result<()> {
     ensure!(token.trim().len() >= 32, "管理令牌至少需要 32 个字符");
     let conn = Connection::open(dir.join("panel.db"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY,body TEXT NOT NULL);")?;
+    install_state_write_guard(&conn)?;
     let mut doc: Document = match conn.query_row("SELECT body FROM state WHERE id=1", [], |r| {
         r.get::<_, String>(0)
     }) {
@@ -1544,7 +1711,7 @@ async fn run() -> Result<()> {
         WEB.get_file("index.html").is_some(),
         "缺少前端构建：请先在 frontend/ 执行 npm ci && npm run build，再重新编译 chain-panel"
     );
-    let router = sharing_api::routes(diagnostics_api::routes(monitor_api::routes(fleet_api::routes(Router::new()))))
+    let router = plans_api::routes(sharing_api::routes(diagnostics_api::routes(monitor_api::routes(fleet_api::routes(Router::new())))))
         .fallback(get(web_asset))
         .route("/api/login", post(login))
         .route("/api/auth/options", get(security_api::options))
@@ -1570,10 +1737,20 @@ async fn run() -> Result<()> {
             post(security_api::remove_passkey),
         )
         .route("/api/logout", post(logout))
-        .route("/api/state", get(state))
+        .route("/api/state", get(state_view))
+        .route("/api/security/members", get(security_api::members).post(security_api::create_member))
+        .route("/api/security/members/{id}/revoke", post(security_api::revoke_member))
+        .route("/api/security/audit", get(security_api::audit))
         .route("/api/customers", post(rental_api::save_customer))
         .route("/api/customers/{id}", delete(rental_api::delete_customer))
         .route("/api/rentals/renew", post(rental_api::renew))
+        .route("/api/rentals/context", get(rental_api::context))
+        .route("/api/rentals/orders", post(rental_api::create_order))
+        .route("/api/rentals/orders/by-request/{id}", get(rental_api::order_by_request))
+        .route("/api/rentals/orders/{id}/confirm", post(rental_api::confirm_order))
+        .route("/api/rentals/orders/{id}/cancel", post(rental_api::cancel_order))
+        .route("/api/rentals/adjustments", post(rental_api::adjust))
+        .route("/api/rentals/adjustments/by-request/{id}", get(rental_api::adjustment_by_request))
         .route("/api/rentals/contact", post(rental_api::save_contact))
         .route("/api/rentals/{id}", post(rental_api::save_rental))
         .route(

@@ -330,6 +330,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 "链式代理不能重复选择同一个代理"
             );
             if let Some(id) = reference.strip_prefix("line:") {
+                ensure!(crate::plans::for_line(doc, id).is_none(), "客户套餐线路不能作为链式出口，以免重复记账");
                 let next = doc
                     .lines
                     .iter()
@@ -636,7 +637,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     "fallback_port":fallback_port,"fallback_target":line.access.fallback,
                     "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
                     "limits":line.limits,"tls":line.access.tls,"target":line.target,
-                    "enabled":line.enabled,"lease":doc.rentals.get(&line.id).map(Rental::policy),"meter":meter,
+                    "enabled":line.enabled,"lease":crate::plans::lease(doc,&line.id).map(Rental::policy),"meter":meter,
                     "multiplier":crate::resources::multiplier(doc,line)?,
                     "resource_ids":crate::resources::pools(doc,line),
                     "access_policy":crate::rules::compile(doc,&line.id)?,

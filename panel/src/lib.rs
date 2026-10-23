@@ -9,6 +9,7 @@ pub mod model;
 pub mod management;
 pub mod notifications;
 pub mod rental;
+pub mod plans;
 pub mod meter;
 pub mod runtime;
 pub mod security;

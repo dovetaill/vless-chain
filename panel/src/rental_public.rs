@@ -137,7 +137,7 @@ fn matched<'a>(doc: &'a Document, supplied: &[Option<String>]) -> (Vec<&'a Line>
             .filter(|(_, candidate)| supplied.as_ref().is_some_and(|s| equal(s, candidate)))
             .map(|(line, _)| *line)
             .collect();
-        if matches.len() == 1 && doc.rentals.contains_key(&matches[0].id) {
+        if matches.len() == 1 && chain_panel::plans::lease(doc, &matches[0].id).is_some() {
             if !lines.iter().any(|line: &&Line| line.id == matches[0].id) {
                 lines.push(matches[0]);
             }
@@ -163,17 +163,20 @@ fn lookup_result(doc: &Document, input: Lookup, at: u64) -> ApiResult<Value> {
             if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) =>
         {
             let hash = digest(&token);
+            let scope = doc.customer_query_tokens.iter().find(|(_, saved)| equal(saved, &hash)).map(|(key,_)| key.as_str());
             let lines: Vec<_> = doc
                 .applied_lines
                 .iter()
                 .filter(|line| line.kind == Kind::Vless)
                 .filter(|line| {
-                    doc.rentals
+                    let customer_scope = scope.is_some_and(|scope| doc.customer_plans.iter().any(|p|
+                        p.lines().any(|id| id == &line.id) && (p.key() == scope || p.members.iter().any(|m| chain_panel::plans::member_key(p,m)==scope && m.line_ids.contains(&line.id)))));
+                    customer_scope || doc.rentals
                         .get(&line.id)
                         .is_some_and(|r| equal(&r.query_token_hash, &hash))
                 })
                 .collect();
-            if lines.len() != 1 {
+            if lines.is_empty() || scope.is_none() && lines.len() != 1 {
                 return Err(missing());
             }
             (lines, Vec::new())
@@ -189,18 +192,28 @@ fn lookup_result(doc: &Document, input: Lookup, at: u64) -> ApiResult<Value> {
     if lines.is_empty() {
         return Err(missing());
     }
+    let authorized: BTreeSet<_> = lines.iter().map(|l| l.id.as_str()).collect();
+    let customer_plans: Vec<_> = chain_panel::plans::view(doc, at).into_iter().filter_map(|mut plan| {
+        let members = plan["members"].as_array_mut()?;
+        members.retain(|m| m["line_ids"].as_array().is_some_and(|ids| ids.iter().any(|id| id.as_str().is_some_and(|id| authorized.contains(id)))));
+        if members.is_empty() { return None; }
+        for member in members { member.as_object_mut().unwrap().remove("line_ids"); }
+        plan.as_object_mut().unwrap().remove("customer_id");
+        if let Some(rental) = plan["rental"].as_object_mut() { rental.remove("customer_id"); }
+        Some(plan)
+    }).collect();
     let lines: Vec<_> = lines
         .into_iter()
         .map(|line| {
             let view = chain_panel::rental::view(doc, line, at);
             let rental = &view["rental"];
-            json!({"id":line.id,"name":line.name,"status":view["rental_status"],
+            json!({"id":line.id,"name":line.name,"status":view["rental_status"],"customer_plan_id":view["customer_plan_id"],
             "multiplier":view["multiplier"],"traffic":view["traffic"],"limits":line.limits,"sync_status":view["sync_status"],
             "rental":{"prices":rental["prices"],"started_at":rental["started_at"],
                 "expires_at":rental["expires_at"],"next_reset_at":rental["next_reset_at"],"permanent":rental["permanent"]}})
         })
         .collect();
-    Ok(json!({"lines":lines,"unmatched":unmatched,"renewal_contact":doc.renewal_contact,"time":at}))
+    Ok(json!({"lines":lines,"customer_plans":customer_plans,"unmatched":unmatched,"renewal_contact":doc.renewal_contact,"time":at}))
 }
 
 pub async fn lookup(State(app): State<App>, request: Request) -> ApiResult<Json<Value>> {
@@ -266,6 +279,28 @@ pub async fn query_link(State(app): State<App>, Path(id): Path<String>) -> ApiRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn customer_member_link_cannot_read_another_member_or_backend_identity() {
+        let mut doc=document();
+        doc.rentals.clear();
+        let plan=chain_panel::plans::Plan { id:id(),name:"Team".into(),customer_id:"private-customer".into(),monthly_gib:10.0,
+            members:["one","two"].into_iter().map(|line| chain_panel::plans::Member {id:id(),name:line.into(),line_ids:vec![line.into()],monthly_gib:None}).collect() };
+        let owner="b".repeat(64); let member="c".repeat(64);
+        doc.customer_query_tokens.insert(plan.key(),digest(&owner));
+        doc.customer_query_tokens.insert(chain_panel::plans::member_key(&plan,&plan.members[0]),digest(&member));
+        doc.rentals.insert(plan.key(),Rental {customer_id:plan.customer_id.clone(),started_at:1,..Default::default()});
+        doc.customer_plans.push(plan.clone());
+        let owner_view=lookup_result(&doc,Lookup {config:None,token:Some(owner)},2).unwrap();
+        assert_eq!(owner_view["lines"].as_array().unwrap().len(),2);
+        let member_view=lookup_result(&doc,Lookup {config:None,token:Some(member.clone())},2).unwrap();
+        assert_eq!(member_view["lines"].as_array().unwrap().len(),1);
+        assert_eq!(member_view["customer_plans"][0]["members"].as_array().unwrap().len(),1);
+        let serialized=member_view.to_string();
+        for forbidden in ["private-customer","private-contact","private-agent-token","password","token_hash","two"] { assert!(!serialized.contains(forbidden),"{forbidden}"); }
+        doc.customer_query_tokens.insert(chain_panel::plans::member_key(&plan,&plan.members[0]),digest(&"d".repeat(64)));
+        assert!(lookup_result(&doc,Lookup {config:None,token:Some(member)},2).is_err());
+        assert!(doc.operator_members.is_empty());
+    }
 
     fn node(protocol: &str) -> Value {
         json!({"name":"label", "type":protocol, "server":"proxy.example", "port":443,

@@ -5,7 +5,7 @@ import { Button } from './ui/button';
 import { Input } from './ui/input';
 
 type Logs = { logging_enabled?: boolean; retention_hours?: number; max_mib?: number; clock?: { detail?:string; ntp_enabled?:boolean; timezone?:string }; text: string; sampled_at: number; sources: string[]; detail: string };
-export function Diagnostics({ nodes, lineId = '', close, request = api }: { nodes: {id:string;name:string}[]; lineId?:string; close:()=>void; request?:typeof api }) {
+export function Diagnostics({ nodes, lineId = '', canSyncTime = true, close, request = api }: { nodes: {id:string;name:string}[]; lineId?:string; canSyncTime?:boolean; close:()=>void; request?:typeof api }) {
   const [node, setNode] = useState(nodes[0]?.id || '00000000-0000-0000-0000-000000000000');
   const [source, setSource] = useState(lineId && nodes.length ? 'xray' : 'panel');
   const [filter, setFilter] = useState(lineId);
@@ -180,14 +180,14 @@ export function Diagnostics({ nodes, lineId = '', close, request = api }: { node
       <section className="space-y-3 rounded-xl border p-4" aria-label="VPS 时间同步">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="space-y-1"><h3 className="text-sm font-semibold">VPS 时间同步</h3><p className="text-xs text-muted-foreground">作用于当前查看的控制台所在 VPS，保留系统时区；不会修改其他远程节点。</p></div>
-          <Button type="button" variant="outline" disabled={!!task || submitting} onClick={async()=>{
+          {canSyncTime && <Button type="button" variant="outline" disabled={!!task || submitting} onClick={async()=>{
             if (!window.confirm('在当前查看的控制台所在 VPS 启用并校准系统时间？必要时安装系统时间服务，可能改变整机时间；保持现有时区。此操作不修改其他远程 Agent。')) return;
             setSubmitting(true); setTaskFailed(false); setTaskMessage('正在提交校时任务…');
             const id = crypto.randomUUID();
             try { await requester.current('/federation/task','POST',{id,action:'sync-time'}); setTask(id); setTaskMessage('校时任务已提交，正在等待结果…'); }
             catch(e) { setTaskFailed(true); setTaskMessage(errorText(e)); }
             finally { setSubmitting(false); }
-          }}>{task || submitting ? '正在校时…' : '启用本 VPS 自动校时'}</Button>
+          }}>{task || submitting ? '正在校时…' : '启用本 VPS 自动校时'}</Button>}
         </div>
         <p className="text-sm">{data?.clock ? `所选节点上报：${data.clock.detail || '时间状态未知'}` : '校时任务会检查此 VPS 的时间服务并返回结果。'}{data?.clock?.timezone && ` · 系统时区：${data.clock.timezone}`}{data?.clock?.ntp_enabled === false && ' · 自动时间同步未启用'}</p>
         {taskMessage && <div role={taskFailed ? 'alert' : 'status'} className={`rounded-lg border p-3 text-sm ${taskFailed ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'bg-muted/30'}`}><p className="mb-1 font-medium">{taskFailed ? '自动校时未完成' : task || submitting ? '自动校时进行中' : '自动校时结果'}</p><pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words font-sans">{taskMessage}</pre></div>}

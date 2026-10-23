@@ -6,6 +6,112 @@ use subtle::ConstantTimeEq;
 use totp_rs::{Algorithm, Secret, TOTP};
 use webauthn_rs::prelude::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role { Admin, Ops, Finance, Viewer }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Actor {
+    pub id: String,
+    pub name: String,
+    pub role: Role,
+}
+impl Actor {
+    pub fn admin() -> Self {
+        Self { id: "administrator".into(), name: "内置管理员".into(), role: Role::Admin }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub expires: u64,
+    pub actor: Actor,
+}
+impl Session {
+    pub fn actor(&self, members: &[crate::model::OperatorMember], at: u64) -> Option<Actor> {
+        if self.expires <= at { return None; }
+        if self.actor.role == Role::Admin { return Some(self.actor.clone()); }
+        members.iter().find(|m| m.id == self.actor.id && m.revoked_at == 0 && m.role != Role::Admin)
+            .map(|m| Actor { id: m.id.clone(), name: m.name.clone(), role: m.role })
+    }
+}
+
+impl Role {
+    pub fn allows(self, method: &str, path: &str) -> bool {
+        if self == Self::Admin { return true; }
+        if path.contains('%') || path.contains("..") { return false; }
+        let parts: Vec<_> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
+        match (method, parts.as_slice()) {
+            ("GET", ["api", "state"]) | ("POST", ["api", "logout"]) => true,
+            ("GET" | "POST", ["api", "monitoring"]) => self == Self::Ops,
+            ("POST", ["api", "monitoring", "test"] | ["api", "preview" | "publish"]) => self == Self::Ops,
+            ("GET", ["api", "fleet", "release", _]) => self == Self::Ops,
+            ("GET" | "POST", ["api", "federation", "task"]) => self == Self::Ops,
+            ("POST", ["api", "diagnostics", id, "logs"]) => self == Self::Ops && (*id == "panel" || uuid::Uuid::parse_str(id).is_ok()),
+            ("POST", ["api", "diagnostics", id, "reality" | "path"] | ["api", "lines", id, "probe"]) => self == Self::Ops && uuid::Uuid::parse_str(id).is_ok(),
+            ("GET" | "POST", ["api", "customer-plans"]) => self == Self::Finance,
+            ("POST", ["api", "customer-plans", id, "query-link"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok(),
+            ("POST", ["api", "customer-plans", id, "members", member, "query-link"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok() && uuid::Uuid::parse_str(member).is_ok(),
+            ("POST", ["api", "customers"] | ["api", "rentals", "renew" | "contact" | "orders" | "adjustments"]) => self == Self::Finance,
+            ("GET", ["api", "rentals", "context"]) => self == Self::Finance,
+            ("GET", ["api", "rentals", "orders" | "adjustments", "by-request", id]) => self == Self::Finance && !id.is_empty(),
+            ("DELETE", ["api", "customers", id]) | ("POST", ["api", "rentals", id] | ["api", "rentals", id, "query-link"] | ["api", "rentals", "orders", id, "confirm" | "cancel"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok(),
+            _ => false,
+        }
+    }
+}
+
+fn fields(value: &serde_json::Value, names: &[&str]) -> serde_json::Value {
+    serde_json::Value::Object(names.iter().filter_map(|key| value.get(*key).map(|v| ((*key).into(), v.clone()))).collect())
+}
+
+pub fn state_for(value: serde_json::Value, actor: &Actor) -> serde_json::Value {
+    use serde_json::{Value, json};
+    if actor.role == Role::Admin {
+        let mut value = value;
+        value["viewer"] = json!(actor);
+        return value;
+    }
+    let mut out = fields(&value, &["busy", "time", "version", "agent_version", "agent_seen", "cores", "local_node_id"]);
+    out["viewer"] = json!(actor);
+    out["maintenance"] = json!(actor.role == Role::Ops && value["maintenance"] == true);
+    out["maintenance_actions"] = if actor.role == Role::Ops { value["maintenance_actions"].clone() } else { json!([]) };
+    out["nodes"] = json!(value["nodes"].as_array().into_iter().flatten().map(|node| {
+        let mut n = fields(node, &["id", "name", "seen", "online", "desired_revision"]);
+        n["host"] = if actor.role == Role::Ops { node["host"].clone() } else { json!("") };
+        n["target"] = json!(""); n["server_name"] = json!("");
+        n["report"] = fields(&node["report"], &["running", "applied", "revision", "traffic"]);
+        n["report"]["error"] = json!(if node["report"]["error"].as_str().is_some_and(|s| !s.is_empty()) { "节点运行异常，请联系管理员" } else { "" });
+        n["report"]["system"] = fields(&node["report"]["system"], &["memory_total", "memory_used", "load_1m", "network_rx", "network_tx", "sampled_at", "cpu_percent", "disk_total", "disk_used", "network_rx_bps", "network_tx_bps", "agent_version"]);
+        n
+    }).collect::<Vec<_>>());
+    out["lines"] = json!(value["lines"].as_array().into_iter().flatten().map(|line| {
+        let mut l = fields(line, &["id", "name", "kind", "enabled", "published", "limits", "traffic", "rental_status", "sync_status", "multiplier", "network"]);
+        l["hops"] = json!(line["hops"].as_array().into_iter().flatten().map(|h| fields(h, &["node_id", "port"])).collect::<Vec<_>>());
+        l["access"] = json!(crate::model::Access::default());
+        l["access"]["protocol"] = line["access"]["protocol"].clone();
+        l["share"] = Value::Null; l["external_id"] = Value::Null; l["target"] = json!(""); l["chain"] = json!([]);
+        l["rental"] = if actor.role == Role::Finance { fields(&line["rental"], &["customer_id", "prices", "started_at", "expires_at", "paid_months", "next_reset_at", "query_link_exists", "permanent"]) } else { Value::Null };
+        if line["rental"].is_null() { l["rental"] = Value::Null; }
+        if actor.role == Role::Finance {
+            l["customer_plan_id"] = line["customer_plan_id"].clone();
+            l["plan_eligible"] = line["plan_eligible"].clone();
+        }
+        l
+    }).collect::<Vec<_>>());
+    for key in ["externals", "legacy_configs", "pending_imports", "subscriptions", "resources", "alerts"] { out[key] = json!([]); }
+    out["checks"] = json!({});
+    out["jobs"] = json!(value["jobs"].as_array().into_iter().flatten().map(|job| {
+        let mut j = fields(job, &["id", "state", "started", "actor"]); j["events"] = json!([]); j
+    }).collect::<Vec<_>>());
+    out["security"] = json!({"totp_enabled":false,"recovery_remaining":0,"origin":"","passkeys":[]});
+    for key in ["customers", "payments", "rental_orders", "payment_adjustments", "customer_plans"] {
+        out[key] = if actor.role == Role::Finance { value.get(key).cloned().unwrap_or(json!([])) } else { json!([]) };
+    }
+    out["renewal_contact"] = if actor.role == Role::Finance { value["renewal_contact"].clone() } else { json!("") };
+    out
+}
+
 pub fn digest(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
@@ -131,6 +237,92 @@ impl AuthState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn member_roles_default_deny_and_cannot_use_admin_tunnels() {
+        let id = uuid::Uuid::new_v4();
+        for role in [Role::Ops, Role::Finance, Role::Viewer] {
+            assert!(role.allows("GET", "/api/state"));
+            assert!(role.allows("POST", "/api/logout"));
+            for (method, path) in [
+                ("GET", "/api/new-sensitive-feature".into()),
+                ("GET", "/api/security/members".into()),
+                ("GET", "/api/federation/document".into()),
+                ("POST", "/api/security/token".into()),
+                ("POST", "/api/federation/ticket".into()),
+                ("POST", format!("/api/fleet/{id}/forward")),
+                ("POST", format!("/api/fleet/{id}/login")),
+                ("POST", "/api/lines/operate".into()),
+                ("POST", "/api/lines".into()),
+                ("GET", "/api/%73tate".into()),
+                ("GET", "/api/../state".into()),
+            ] { assert!(!role.allows(method, &path), "{role:?} {method} {path}"); }
+        }
+        assert!(Role::Ops.allows("POST", "/api/publish"));
+        assert!(Role::Ops.allows("POST", "/api/federation/task"));
+        assert!(!Role::Ops.allows("POST", "/api/rentals/renew"));
+        assert!(Role::Finance.allows("POST", &format!("/api/rentals/orders/{id}/confirm")));
+        assert!(Role::Finance.allows("POST", "/api/rentals/adjustments"));
+        assert!(Role::Finance.allows("GET", "/api/customer-plans"));
+        for path in [format!("/api/customer-plans/{id}/query-link"), format!("/api/customer-plans/{id}/members/{id}/query-link")] {
+            assert!(Role::Finance.allows("POST", &path));
+            assert!(!Role::Ops.allows("POST", &path));
+            assert!(!Role::Viewer.allows("POST", &path));
+        }
+        assert!(!Role::Finance.allows("POST", "/api/publish"));
+        assert!(!Role::Viewer.allows("POST", "/api/monitoring"));
+    }
+
+    #[test]
+    fn member_revocation_and_removal_invalidate_existing_sessions() {
+        let actor = Actor { id: "member".into(), name: "财务".into(), role: Role::Finance };
+        let session = Session { actor: actor.clone(), expires: 1000 };
+        let mut members = vec![crate::model::OperatorMember { id: actor.id.clone(), name: actor.name.clone(), role: actor.role,
+            token_hash: digest("fixture-token"), created_at: 1, revoked_at: 0 }];
+        assert_eq!(session.actor(&members, 100), Some(actor));
+        assert!(session.actor(&members, 1000).is_none());
+        members[0].revoked_at = 100;
+        assert!(session.actor(&members, 100).is_none());
+        assert!(session.actor(&[], 100).is_none());
+        let admin = Session { actor: Actor::admin(), expires: 1000 };
+        assert_eq!(admin.actor(&members, 100), Some(Actor::admin()));
+    }
+
+    #[test]
+    fn finance_state_excludes_credentials_and_other_members_cannot_read_billing() {
+        use serde_json::json;
+        let raw = json!({"nodes":[{"id":"node","host":"192.0.2.1","target":"secret-marker","report":{
+            "error":"secret-marker","running":true,"traffic":{},"system":{"private_key":"secret-marker","cpu_percent":10}}}],
+            "lines":[{"id":"line","name":"线路","hops":[{"node_id":"node","port":443,"uuid":"secret-marker"}],
+                "share":"secret-marker","access":{"protocol":"vless","password":"secret-marker","tls":{"key":"secret-marker"}},
+                "chain":["secret-marker"],"target":"secret-marker","rental":{"customer_id":"customer","prices":{"monthly":2000},"query_token_hash":"secret-marker"},
+                "customer_plan_id":"plan","plan_eligible":false}],
+            "customers":[{"id":"customer","name":"客户","contact":"private-contact"}],"payments":[{"amount_fen":2000}],
+            "externals":[{"url":"secret-marker"}],"subscriptions":[{"token":"secret-marker"}],"legacy_configs":[{"config":"secret-marker"}],
+            "security":{"totp_secret":"secret-marker"},"jobs":[{"id":"job","state":"failed","events":[{"message":"secret-marker"}]}],
+            "checks":{"line":{"detail":"secret-marker"}},"unknown_future_secret":"secret-marker","customer_query_tokens":{"plan":"secret-marker"},"customer_plans":[{"id":"plan"}]});
+        for role in [Role::Ops, Role::Finance, Role::Viewer] {
+            let actor = Actor { id: "member".into(), name: "成员".into(), role };
+            let view = state_for(raw.clone(), &actor);
+            assert!(!view.to_string().contains("secret-marker"), "{role:?}");
+            assert_eq!(view["viewer"]["role"], json!(role));
+            if role == Role::Finance {
+                assert_eq!(view["customers"][0]["contact"], "private-contact");
+                assert_eq!(view["payments"][0]["amount_fen"], 2000);
+                assert_eq!(view["lines"][0]["customer_plan_id"], "plan");
+                assert_eq!(view["lines"][0]["plan_eligible"], false);
+            } else {
+                assert_eq!(view["customers"], json!([]));
+                assert_eq!(view["payments"], json!([]));
+                assert_eq!(view["customer_plans"], json!([]));
+                assert!(view["lines"][0]["rental"].is_null());
+            }
+        }
+        assert!(state_for(raw, &Actor::admin()).to_string().contains("secret-marker"), "管理员保留原视图");
+        let doc: crate::model::Document = serde_json::from_value(json!({"nodes":[],"externals":[],"lines":[],"applied_lines":[],"applied_nodes":[],"applied_externals":[],"checks":{},"jobs":[]})).unwrap();
+        assert!(doc.operator_members.is_empty());
+        assert!(doc.operator_audit.is_empty());
+    }
+
     #[test]
     fn totp_and_recovery_codes_cannot_be_replayed() {
         let (secret, _) = new_totp().unwrap();

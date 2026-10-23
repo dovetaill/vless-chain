@@ -118,6 +118,7 @@ pub async fn subscription(
 }
 pub fn alerts(doc: &Document) -> Vec<Value> {
     let mut alerts = vec![];
+    let at = now();
     for node in &doc.nodes {
         if node.report.system["certificate"]["ok"] == false {
             alerts.push(json!({"id":format!("cert-{}",node.id),"level":"error","message":format!("{}：证书续期失败，请检查域名、80 端口和 Agent 日志",node.name)}));
@@ -129,15 +130,12 @@ pub fn alerts(doc: &Document) -> Vec<Value> {
         }
     }
     for line in &doc.lines {
-        let traffic = line
-            .hops
-            .first()
-            .and_then(|h| doc.nodes.iter().find(|n| n.id == h.node_id))
-            .and_then(|n| n.report.traffic.get(&line.id));
+        let traffic = chain_panel::rental::safe_traffic(
+            chain_panel::plans::lease(doc, &line.id), chain_panel::rental::traffic(doc, line), at);
         if let (Some(t), Some(q)) = (traffic, line.limits.monthly_gib) {
-            let ratio = (t.upload + t.download) as f64 / (q * 1073741824.0);
-            if ratio >= 0.8 || t.blocked {
-                alerts.push(json!({"id":format!("quota-{}",line.id),"level":if t.blocked {"error"} else {"warning"},"message":format!("{}：{}，本月额度已使用 {:.1}%",line.name,if t.blocked {"额度用尽，已停止传输"} else if ratio>=0.95 {"接近流量上限"} else {"流量提醒"},ratio*100.0)}));
+            let ratio = t.used() as f64 / (q * 1073741824.0);
+            if ratio >= 0.8 {
+                alerts.push(json!({"id":format!("quota-{}",line.id),"level":if ratio>=1.0 {"error"} else {"warning"},"message":format!("{}：{}，本周期额度已使用 {:.1}%",line.name,if ratio>=1.0 {"额度用尽"} else if ratio>=0.95 {"接近流量上限"} else {"流量提醒"},ratio*100.0)}));
             }
         }
         if let Some(check) = doc.checks.get(&line.id) {
@@ -147,4 +145,39 @@ pub fn alerts(doc: &Document) -> Vec<Value> {
         }
     }
     alerts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_alerts_use_charged_current_cycle_and_applied_entry() {
+        let at = now();
+        let gib = 1_u64 << 30;
+        let applied: Line = serde_json::from_value(json!({"id":"line","name":"proxy","kind":"vless",
+            "hops":[{"node_id":"node","port":443,"uuid":"fixture"}],"limits":{"monthly_gib":1.0}})).unwrap();
+        let mut node: Node = serde_json::from_value(json!({"id":"node","name":"node","host":"192.0.2.1",
+            "token_hash":"","seen":at,"reality":{"target":"","server_name":"","private_key":"","public_key":"","short_id":""}})).unwrap();
+        node.report.traffic.insert("line".into(), Traffic { upload: 1, charged: Some(gib), ..Default::default() });
+        let mut draft = applied.clone();
+        draft.hops[0].node_id = "unsaved-entry".into();
+        let mut doc = Document { nodes: vec![node], lines: vec![draft], applied_lines: vec![applied], ..Default::default() };
+        let quota = |doc: &Document| alerts(doc).into_iter().filter(|a| a["id"] == "quota-line").collect::<Vec<_>>();
+        let messages = quota(&doc);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["level"], "error");
+        assert!(messages[0]["message"].as_str().unwrap().contains("100.0%"));
+
+        let traffic = doc.nodes[0].report.traffic.get_mut("line").unwrap();
+        traffic.charged = Some(0);
+        traffic.upload = gib;
+        traffic.blocked = true;
+        assert!(quota(&doc).is_empty(), "停用或到期不能当作额度耗尽，也不能覆盖权威扣量");
+        doc.nodes[0].report.traffic.get_mut("line").unwrap().charged = None;
+        assert_eq!(quota(&doc).len(), 1, "旧 Agent 没有扣量字段时仍使用上下行合计");
+
+        doc.rentals.insert("line".into(), Rental { started_at: at - 86400, expires_at: at + 86400, ..Default::default() });
+        assert!(quota(&doc).is_empty(), "旧周期上报不能产生本周期额度告警");
+    }
 }

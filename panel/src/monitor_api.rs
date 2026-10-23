@@ -473,10 +473,27 @@ async fn check(
     }
 }
 
+enum MonitorTask<'a> {
+    Poll(&'a chain_panel::management::Remote),
+    Probe {
+        remote: &'a str,
+        name: &'a str,
+        document: &'a Document,
+        line: &'a Line,
+        policy: Policy,
+        local: bool,
+    },
+}
+
+fn due_tasks<T>(mut pending: Vec<(u64, T)>, at: u64, capacity: usize) -> Vec<T> {
+    pending.retain(|(due, _)| *due <= at);
+    pending.sort_by_key(|(due, _)| *due);
+    pending.into_iter().take(capacity).map(|(_, task)| task).collect()
+}
+
 pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
     let mut jobs = tokio::task::JoinSet::new();
-    let mut running_checks = HashMap::new();
-    let mut poll_at = BTreeMap::<String, u64>::new();
+    let mut running_tasks = HashMap::new();
     let mut due = BTreeMap::<String, u64>::new();
     let documents = Arc::new(Mutex::new(BTreeMap::<String, (Document, u64)>::new()));
     let mut next_state = 0;
@@ -491,7 +508,7 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
         tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
         while let Some(result) = jobs.try_join_next_with_id() {
             let id = match &result { Ok((id, _)) => *id, Err(e) => e.id() };
-            running_checks.retain(|_, task| *task != id);
+            running_tasks.retain(|_, task| *task != id);
             if let Err(e) = result {
                 eprintln!("监控任务失败：{e}");
             }
@@ -546,97 +563,77 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
             }));
             next_verification = now() + 10;
         }
-        for remote in &doc.fleet.remotes {
-            if now() >= *poll_at.get(&remote.id).unwrap_or(&0) && jobs.len() < 8 {
-                poll_at.insert(remote.id.clone(), now() + 30);
-                let fetch = documents
-                    .lock()
-                    .unwrap()
-                    .get(&remote.id)
-                    .is_none_or(|(_, at)| now().saturating_sub(*at) >= 60);
-                let app = app.clone();
-                let remote = remote.clone();
-                let documents = documents.clone();
-                jobs.spawn(async move {
-                    match poll_remote(&app, remote.clone(), fetch).await {
-                        Ok(Some(d)) => {
-                            documents.lock().unwrap().insert(remote.id, (d, now()));
-                        }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("远端同步：{e}"),
-                    }
-                });
-            }
+        if jobs.len() >= 8 {
+            continue;
         }
-        if p.enabled && !doc.busy() {
+        {
+            let at = now();
+            let mut pending = vec![];
+            for remote in &doc.fleet.remotes {
+                let key = format!("panel:{}", remote.id);
+                if !running_tasks.contains_key(&key) {
+                    pending.push((*due.get(&key).unwrap_or(&0), (key, MonitorTask::Poll(remote))));
+                }
+            }
             let local = Document {
-                nodes: doc.applied_nodes.clone(),
-                lines: doc.applied_lines.clone(),
-                externals: doc.applied_externals.clone(),
-                ..Default::default()
+                nodes: doc.applied_nodes.clone(), lines: doc.applied_lines.clone(),
+                externals: doc.applied_externals.clone(), ..Default::default()
             };
-            for line in local
-                .lines
-                .iter()
-                .filter(|l| chain_panel::rental::status(&doc, l, now()) == "active")
-            {
-                let key = format!("local:{}", line.id);
-                if jobs.len() >= 8 {
-                    break;
+            if p.enabled && !doc.busy() {
+                for line in local.lines.iter().filter(|l| chain_panel::rental::status(&doc, l, at) == "active") {
+                    let key = format!("local:{}", line.id);
+                    if !running_tasks.contains_key(&key) {
+                        pending.push((*due.get(&key).unwrap_or(&0), (key, MonitorTask::Probe {
+                            remote: "local", name: "本机", document: &local, line, policy: p.clone(), local: true,
+                        })));
+                    }
                 }
-                if running_checks.contains_key(&key) || now() < *due.get(&key).unwrap_or(&0) {
+            }
+            let cached_documents = documents.lock().unwrap();
+            // Remote policies apply to remote self-checks and the controller's external checks alike.
+            for remote in &doc.fleet.remotes {
+                if !remote.error.is_empty() || at.saturating_sub(remote.seen) >= p.offline {
                     continue;
                 }
-                due.insert(key.clone(), now() + p.interval);
-                let (a, d, l, p) = (app.clone(), local.clone(), line.clone(), p.clone());
-                running_checks.insert(key, jobs.spawn(check(a, "local".into(), "本机".into(), d, l, p, true)).id());
-            }
-        }
-        // Remote policies apply to remote self-checks and the controller's external checks alike.
-        for remote in &doc.fleet.remotes {
-            if jobs.len() >= 8 {
-                break;
-            }
-            if !remote.error.is_empty() || now().saturating_sub(remote.seen) >= p.offline {
-                continue;
-            }
-            let rp: Policy =
-                serde_json::from_value(remote.snapshot["monitoring"]["effective"].clone())
-                    .unwrap_or_default();
-            if !rp.enabled || remote.snapshot["busy"] == true {
-                continue;
-            }
-            let cached = documents.lock().unwrap().get(&remote.id).cloned();
-            let Some((d, at)) = cached else {
-                continue;
-            };
-            if now().saturating_sub(at) > 120 {
-                continue;
-            }
-            for line in d.lines.iter().filter(|l| {
-                remote.snapshot["lines"].as_array().is_some_and(|lines| {
-                    lines
-                        .iter()
-                        .any(|v| v["id"] == l.id && v["rental_status"] == "active")
-                })
-            }) {
-                if jobs.len() >= 8 {
-                    break;
-                }
-                let key = format!("{}:{}", remote.id, line.id);
-                if running_checks.contains_key(&key) || now() < *due.get(&key).unwrap_or(&0) {
+                let rp: Policy = serde_json::from_value(remote.snapshot["monitoring"]["effective"].clone()).unwrap_or_default();
+                if !rp.enabled || remote.snapshot["busy"] == true {
                     continue;
                 }
-                due.insert(key.clone(), now() + rp.interval);
-                running_checks.insert(key, jobs.spawn(check(
-                    app.clone(),
-                    remote.id.clone(),
-                    remote.name.clone(),
-                    d.clone(),
-                    line.clone(),
-                    rp.clone(),
-                    false,
-                )).id());
+                let Some((document, fetched)) = cached_documents.get(&remote.id) else { continue; };
+                if at.saturating_sub(*fetched) > 120 {
+                    continue;
+                }
+                for line in document.lines.iter().filter(|l| remote.snapshot["lines"].as_array().is_some_and(|lines|
+                    lines.iter().any(|v| v["id"] == l.id && v["rental_status"] == "active"))) {
+                    let key = format!("{}:{}", remote.id, line.id);
+                    if !running_tasks.contains_key(&key) {
+                        pending.push((*due.get(&key).unwrap_or(&0), (key, MonitorTask::Probe {
+                            remote: &remote.id, name: &remote.name, document, line, policy: rp.clone(), local: false,
+                        })));
+                    }
+                }
+            }
+            // Oldest due work wins across polling and probes, so slow early remotes cannot starve the rest.
+            for (key, task) in due_tasks(pending, at, 8_usize.saturating_sub(jobs.len())) {
+                let handle = match task {
+                    MonitorTask::Poll(remote) => {
+                        due.insert(key.clone(), at + 30);
+                        let fetch = cached_documents.get(&remote.id).is_none_or(|(_, fetched)| at.saturating_sub(*fetched) >= 60);
+                        let (app, remote, documents) = (app.clone(), remote.clone(), documents.clone());
+                        jobs.spawn(async move {
+                            match poll_remote(&app, remote.clone(), fetch).await {
+                                Ok(Some(d)) => { documents.lock().unwrap().insert(remote.id, (d, now())); }
+                                Ok(None) => {}
+                                Err(e) => eprintln!("远端同步：{e}"),
+                            }
+                        })
+                    }
+                    MonitorTask::Probe { remote, name, document, line, policy, local } => {
+                        due.insert(key.clone(), at + policy.interval);
+                        jobs.spawn(check(app.clone(), remote.into(), name.into(), document.clone(), line.clone(), policy, local))
+                    }
+                };
+                running_tasks.insert(key, handle.id());
             }
         }
     }
@@ -656,6 +653,30 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overdue_polling_and_probes_run_before_slow_remotes_repeat() {
+        let tasks: Vec<_> = (0..17).map(|n| format!("panel:{n}"))
+            .chain(["local:line".into(), "remote:line".into()]).collect();
+        let mut due = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        // The first sixteen polls each time out after fifteen seconds.
+        for at in [1000, 1016, 1032] {
+            let selected = due_tasks(tasks.iter().map(|key| (*due.get(key).unwrap_or(&0), key)).collect(), at, 8);
+            assert!(selected.len() <= 8);
+            if at == 1032 {
+                assert_eq!(&selected[..3], &[&tasks[16], &tasks[17], &tasks[18]], "后排轮询与检测必须先于前排重试");
+            }
+            for key in selected {
+                seen.insert(key);
+                due.insert(key.clone(), at + if key.starts_with("panel:") { 30 } else { 300 });
+            }
+        }
+        assert_eq!(seen.len(), tasks.len());
+        assert!(due_tasks(vec![(1100, "future")], 1099, 8).is_empty());
+        assert!(due_tasks(vec![(0, "ready")], 1000, 0).is_empty(), "在途任务占满时不能超出并发上限");
+    }
+
     #[test]
     fn empty_online_node_clears_runtime_alarm_without_hiding_failures() {
         let mut empty = Document::default();

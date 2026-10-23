@@ -36,7 +36,7 @@ export function LineEditor({
   close: () => void;
   ensureLocalServer: (host: string) => Promise<NodeInfo>;
   importExternal?: (done: (external?: External) => void) => void;
-  saved: (lines: Line[]) => Promise<void>;
+  saved: (lines: Line[], apply?: boolean) => Promise<void>;
   request?: typeof api;
   remoteName?: string;
 }) {
@@ -65,6 +65,7 @@ export function LineEditor({
   const [shared, setShared] = useState(line?.access.shared_port || false);
   const [checking, setChecking] = useState(false);
   const [check, setCheck] = useState("");
+  const [buttonChanges, setButtonChanges] = useState(false);
   const usesReality = protocol === "vless" && (batch ? combinations.some(c => c.endsWith("reality")) : tls === "off");
   const usesTls = protocol === "vless" && (batch ? combinations.some(c => c.endsWith("tls")) : tls !== "off");
   const usesXhttp = protocol === "vless" && (batch ? combinations.some(c => c.startsWith("xhttp")) : transport === "xhttp");
@@ -73,9 +74,11 @@ export function LineEditor({
     <Modal
       wide
       drawer={!!remoteName}
+      dirty={buttonChanges}
       title={`${line ? "编辑代理" : "新建代理"}${remoteName ? ` · ${remoteName}` : ''}`}
       description={remoteName ? `操作目标：${remoteName}。保存后预览并应用到该 VPS。` : "在本机运行，创建后自动生成客户端链接。"}
       submit={remoteName ? "保存并预览" : line ? "保存并应用" : batch ? "创建所选组合" : "创建代理"}
+      secondarySubmit={!line && !remoteName ? { name: "draft", label: "仅保存草稿" } : undefined}
       close={close}
       action={async (data) => {
         if (["trojan", "hysteria2", "tuic"].includes(protocol) && !domain) throw new Error(`${protocolNames[protocol]} 需要 TLS，请填写解析到本机的域名。`);
@@ -129,9 +132,9 @@ export function LineEditor({
               fallback: security === "tls" && network === "tcp" ? field(data, "fallback") : "",
             } };
           });
-          await saved(await request<Line[]>("/lines/batch", "POST", rows));
+          await saved(await request<Line[]>("/lines/batch", "POST", rows), !data.has("draft"));
         } else {
-          await saved([await request<Line>("/lines", "POST", payload)]);
+          await saved([await request<Line>("/lines", "POST", payload)], !data.has("draft"));
         }
       }}
     >
@@ -192,7 +195,7 @@ export function LineEditor({
             ["戴尔", "www.dell.com"],
             ["惠普", "www.hp.com"],
             ["Cloudflare", "www.cloudflare.com"],
-          ].map(([name, host]) => <Button key={host} type="button" variant="outline" size="sm" disabled={checking} onClick={() => { setRealityTarget(`${host}:443`); setSni(host); setCheck(""); }}>{name}</Button>)}
+          ].map(([name, host]) => <Button key={host} type="button" variant="outline" size="sm" disabled={checking} onClick={() => { setRealityTarget(`${host}:443`); setSni(host); setCheck(""); setButtonChanges(true); }}>{name}</Button>)}
         </div>
         <Field label="REALITY 目标地址" hint="目标网站的域名或 IP 加端口，需支持 TLS 1.3 与 H2；无需解析到本机。"><Input value={realityTarget} readOnly={checking} onChange={e => { setRealityTarget(e.target.value); setCheck(""); }} required /></Field>
         <Field label="REALITY SNI" hint="必须是目标网站证书覆盖的域名。无需申请自己的证书。"><Input value={sni} readOnly={checking} onChange={e => { setSni(e.target.value); setCheck(""); }} required /></Field>
@@ -279,11 +282,11 @@ export function LineEditor({
             {reference && !choices.some(c => c.id === reference) && <option value={reference}>当前代理不可用，请重新选择</option>}
             {choices.map(c => <option key={c.id} value={c.id} disabled={chain.some((id, i) => i !== index && id === c.id)}>{c.name}</option>)}
           </select></Field></div>
-          <Button type="button" variant="ghost" size="icon" aria-label={`移除落地 ${index + 1}`} onClick={() => setChain(chain.filter((_, i) => i !== index))}><X /></Button>
+          <Button type="button" variant="ghost" size="icon" aria-label={`移除落地 ${index + 1}`} onClick={() => { setChain(chain.filter((_, i) => i !== index)); setButtonChanges(true); }}><X /></Button>
         </div>)}
         {chain.length > 0 && <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="outline" disabled={!available || chain.length >= 8} onClick={() => available && setChain([...chain, available.id])}><Plus />添加下一跳</Button>
-          {importExternal && <Button type="button" variant="outline" disabled={chain.filter(Boolean).length >= 8} onClick={() => importExternal(e => { if (e) setChain(old => [...old.filter(Boolean), `external:${e.id}`]); })}>导入落地代理</Button>}
+          <Button type="button" variant="outline" disabled={!available || chain.length >= 8} onClick={() => { if (available) { setChain([...chain, available.id]); setButtonChanges(true); } }}><Plus />添加下一跳</Button>
+          {importExternal && <Button type="button" variant="outline" disabled={chain.filter(Boolean).length >= 8} onClick={() => importExternal(e => { if (e) { setChain(old => [...old.filter(Boolean), `external:${e.id}`]); setButtonChanges(true); } })}>导入落地代理</Button>}
         </div>}
         <p className="muted" aria-label="代理路径">客户端 → 本机{chain.map(id => ` → ${choices.find(c => c.id === id)?.name || "待选择落地"}`).join("")} → 互联网</p>
         {chain.length > 0 && <p className="muted">HTTP/HTTPS 出口仅支持 TCP；经它连接 Shadowsocks 或 SOCKS5 时也不支持 UDP。Hysteria 2、TUIC 的前置路径必须支持 UDP。</p>}

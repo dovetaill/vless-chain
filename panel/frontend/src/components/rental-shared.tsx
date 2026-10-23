@@ -18,12 +18,13 @@ export function SyncLabel({ status }: { status: SyncStatus }) {
 export function RentalUsage({ line }: { line: Line | PublicLine }) {
   const quota = line.limits.monthly_gib == null ? null : line.limits.monthly_gib * 1024 ** 3;
   const used = line.traffic ? (line.traffic.charged ?? line.traffic.upload + line.traffic.download) : null;
+  const unlimited = line.customer_plan_id ? "按共享套餐约束" : "不限量";
   return <div className="space-y-1.5 text-xs tabular-nums">
     <p>已扣 {used == null ? "尚未采集" : bytes(used)}</p>
-    <p className="text-slate-500">剩余 {quota == null ? "不限量" : used == null ? "尚未采集" : bytes(Math.max(0, quota - used))}</p>
+    <p className="text-slate-500">本线路剩余 {quota == null ? unlimited : used == null ? "尚未采集" : bytes(Math.max(0, quota - used))}</p>
     {quota != null && used != null && <progress className="h-1.5 w-full max-w-40 accent-blue-500" value={Math.min(used, quota)} max={quota} aria-label={`已用 ${bytes(used)}，额度 ${bytes(quota)}`} />}
     <p className="text-slate-400">当前倍率 ×{line.multiplier || 1} · 实际 ↑{bytes(line.traffic?.upload || 0)} ↓{bytes(line.traffic?.download || 0)}</p>
-    <p className="text-slate-400">周期额度 {quota == null ? "不限量" : bytes(quota)}</p>
+    <p className="text-slate-400">本线路周期额度 {quota == null ? unlimited : bytes(quota)}</p>
   </div>;
 }
 export function RentalSpeed({ line, now }: { line: Line | PublicLine; now: number }) {

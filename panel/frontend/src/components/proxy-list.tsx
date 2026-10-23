@@ -48,12 +48,18 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const close = () => setModal(null);
+  const role = state.viewer?.role || "admin";
+  const admin = role === "admin";
+  const billing = (admin || role === "finance") && !remote;
+  const operations = admin || role === "ops";
+  const selectable = admin || billing;
   const completed = async () => { await saved(); setSelected([]); };
   const all = state.lines.filter(line => line.kind === "vless");
   const lines = all.filter(line => matchesLine(line, state, search)
     && (!protocol || line.access.protocol === protocol) && (!status || line.rental_status === status)
     && (!attention || (attention === "expiring" ? expiringSoon(line, state.time) : lowQuota(line))));
   const chosen = all.filter(line => selected.includes(line.id));
+  const sharedPlanSelected = chosen.some(line => line.customer_plan_id);
   const disabled = state.busy || pending;
   async function operate(action: "enable" | "disable", targets: Line[]) {
     setPending(true);
@@ -80,8 +86,8 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
   return <Card>
     <CardHeader><CardTitle>我的代理 <span className="ml-2 text-sm font-normal text-slate-400">{lines.length} / {all.length}</span></CardTitle>
     </CardHeader>
-    <LegacyConfigs state={state} saved={saved} apply={() => apply()} />
-    {(state.pending_imports || []).map(item => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
+    {admin && <LegacyConfigs state={state} saved={saved} apply={() => apply()} />}
+    {admin && (state.pending_imports || []).map(item => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
       <div><p className="text-sm font-medium">{item.name} · 待手动配置</p><p className="mt-1 text-xs text-amber-700">{item.reason}；当前未运行。</p></div>
       <div className="flex gap-2"><Button variant="outline" size="sm" disabled={disabled} onClick={() => configureImport(item)}>配置代理</Button>
         <Button variant="ghost" size="sm" disabled={disabled} onClick={async () => {
@@ -98,42 +104,45 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
       {(search || protocol || status || attention) && <Button variant="ghost" size="sm" onClick={() => { setSearch(""); setProtocol(""); setStatus(""); setAttention(""); setSelected([]); }}>清除筛选</Button>}
     </div>
     {chosen.length > 0 && <div className="flex flex-wrap items-center gap-2 border-b border-blue-100 bg-blue-50 px-5 py-3" aria-label="批量操作"><span className="mr-2 text-sm font-medium">已选 {chosen.length} 条</span>
-      <Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("enable", chosen)}>启用</Button><Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("disable", chosen)}>停用</Button>
-      {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RenewalDialog lines={chosen} close={close} saved={completed} />)}>收款 / 续费</Button>}
-      {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => unlimited(chosen)}>设为无限期（自用）</Button>}
-      {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<LimitsDialog lines={chosen} close={close} saved={completed} />)}>额度 / 限速</Button>}
-      <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<ExportDialog lines={chosen} close={close} />)}>导出</Button>
-      <Button variant="outline" size="sm" disabled={disabled} onClick={() => remove(chosen)}>删除</Button><Button variant="ghost" size="sm" onClick={() => setSelected([])}>取消选择</Button>
+      {admin && <><Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("enable", chosen)}>启用</Button><Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("disable", chosen)}>停用</Button></>}
+      {billing && !sharedPlanSelected && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RenewalDialog lines={chosen} close={close} saved={completed} />)}>收款 / 续费</Button>}
+      {billing && sharedPlanSelected && <span className="text-xs">包含共享套餐线路，请到客户与收款按套餐收款。</span>}
+      {admin && sharedPlanSelected && <span className="text-xs">套餐线路不可删除；可停用并保留历史。</span>}
+      {admin && !remote && !sharedPlanSelected && <Button variant="outline" size="sm" disabled={disabled} onClick={() => unlimited(chosen)}>设为无限期（自用）</Button>}
+      {admin && !remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<LimitsDialog lines={chosen} close={close} saved={completed} />)}>额度 / 限速</Button>}
+      {admin && <><Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<ExportDialog lines={chosen} close={close} />)}>导出</Button>{!sharedPlanSelected && <Button variant="outline" size="sm" disabled={disabled} onClick={() => remove(chosen)}>删除</Button>}</>}<Button variant="ghost" size="sm" onClick={() => setSelected([])}>取消选择</Button>
     </div>}
     {error && <p role="alert" className="m-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-    {lines.length ? <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="代理列表"><table className="data-table"><thead><tr>
+    {lines.length ? <div className={`overflow-x-auto fleet-responsive proxy-responsive ${selectable ? "" : "proxy-readonly"}`} tabIndex={0} role="region" aria-label="代理列表"><table className="data-table"><thead><tr>
       <th><input type="checkbox" aria-label="选择全部筛选结果" disabled={disabled} checked={lines.every(line => selected.includes(line.id))} ref={element => { if (element) element.indeterminate = lines.some(line => selected.includes(line.id)) && !lines.every(line => selected.includes(line.id)); }} onChange={event => setSelected(event.target.checked ? lines.map(line => line.id) : [])} /></th>
       <th>名称 / 客户 / 路径</th><th>协议 / 入口</th><th>状态 / 同步</th><th>周期用量 / 余量</th><th>实时网速</th><th>到期 / 重置</th><th>报价</th><th className="text-right">操作</th>
     </tr></thead><tbody>{lines.map(line => <tr key={line.id}>
-      <td><input type="checkbox" aria-label={`选择 ${line.name}`} disabled={disabled} checked={selected.includes(line.id)} onChange={event => setSelected(old => event.target.checked ? [...old, line.id] : old.filter(id => id !== line.id))} /></td>
-      <td><p className="mb-1 text-sm font-semibold">{line.name}</p><p className="mb-2 text-xs text-slate-500">{state.customers.find(customer => customer.id === line.rental?.customer_id)?.name || "自用"}</p><PathView line={line} state={state} /></td>
-      <td><p className="text-xs font-medium">{protocolNames[line.access.protocol]}</p><p className="mono mt-2 text-xs text-slate-400">{line.access.public_host || line.access.host || state.nodes.find(node => node.id === line.hops[0]?.node_id)?.host}<br />端口 {line.access.public_port || line.hops[0]?.port}</p></td>
-      <td><RentalStatusBadge status={line.rental_status} /><p className="mt-2"><SyncLabel status={line.sync_status} /></p>{!line.published && <p className="mt-1 text-xs text-amber-600">有待应用的配置</p>}{state.checks[line.id]?.ok === false && <p className="mt-1 text-xs text-amber-600">最近连接检查未通过</p>}</td>
-      <td><RentalUsage line={line} /></td><td><RentalSpeed line={line} now={state.time} /></td><td><RentalDates line={line} /></td><td><RentalPrices line={line} /></td>
-      <td><div className="flex items-center justify-end gap-1">
-        {!remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RentalEditor line={line} state={state} close={close} saved={saved} />)}>出租信息</Button>}
-        {!remote && <Button variant="ghost" size="sm" disabled={disabled || !line.rental} onClick={() => setModal(<RenewalDialog lines={[line]} close={close} saved={saved} />)}>收款 / 续费</Button>}
-        <DropdownMenu.Root><DropdownMenu.Trigger className="row-menu-trigger" aria-label={`${line.name} 更多操作`} disabled={disabled}><MoreHorizontal className="size-4" /></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="row-menu-content" align="end" sideOffset={4} collisionPadding={8}>
-          <DropdownMenu.Item onSelect={() => void operate(line.enabled ? "disable" : "enable", [line])}>{line.enabled ? "手动停用" : "解除手动停用"}</DropdownMenu.Item>
+      <td data-label="选择代理"><input type="checkbox" aria-label={`选择 ${line.name}`} disabled={disabled} checked={selected.includes(line.id)} onChange={event => setSelected(old => event.target.checked ? [...old, line.id] : old.filter(id => id !== line.id))} /></td>
+      <td data-label="名称 / 客户 / 路径"><p className="mb-1 text-sm font-semibold">{line.name}</p><p className="mb-2 text-xs text-slate-500">{billing ? state.customers.find(customer => customer.id === line.rental?.customer_id)?.name || "自用" : admin ? "远端代理" : "客户信息未授权"}</p>{admin && <PathView line={line} state={state} />}</td>
+      <td data-label="协议 / 入口"><p className="text-xs font-medium">{protocolNames[line.access.protocol]}</p><p className="mono mt-2 text-xs text-slate-400">{line.access.public_host || line.access.host || state.nodes.find(node => node.id === line.hops[0]?.node_id)?.host}<br />端口 {line.access.public_port || line.hops[0]?.port}</p></td>
+      <td data-label="状态 / 同步"><RentalStatusBadge status={line.rental_status} /><p className="mt-2"><SyncLabel status={line.sync_status} /></p>{!line.published && <p className="mt-1 text-xs text-amber-600">有待应用的配置</p>}{state.checks[line.id]?.ok === false && <p className="mt-1 text-xs text-amber-600">最近连接检查未通过</p>}</td>
+      <td data-label="周期用量 / 余量"><RentalUsage line={line} /></td><td data-label="实时网速"><RentalSpeed line={line} now={state.time} /></td><td data-label="到期 / 重置">{billing || admin ? <RentalDates line={line} /> : "未授权"}</td><td data-label="报价">{billing || admin ? <RentalPrices line={line} /> : "未授权"}</td>
+      <td data-label="操作"><div className="flex flex-wrap items-center justify-start gap-1 sm:justify-end">
+        {billing && line.customer_plan_id && <Button variant="outline" size="sm" onClick={() => { location.hash = "customers"; }}>前往客户套餐</Button>}
+        {admin && line.customer_plan_id && <span className="text-xs text-slate-500">套餐线路不可删除；可停用并保留历史。</span>}
+        {billing && !line.customer_plan_id && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RentalEditor line={line} state={state} close={close} saved={saved} />)}>出租信息</Button>}
+        {billing && !line.customer_plan_id && <Button variant="ghost" size="sm" disabled={disabled || !line.rental} onClick={() => setModal(<RenewalDialog lines={[line]} close={close} saved={saved} />)}>收款 / 续费</Button>}
+        {role !== "viewer" && <DropdownMenu.Root><DropdownMenu.Trigger className="row-menu-trigger" aria-label={`${line.name} 更多操作`} disabled={disabled}><MoreHorizontal className="size-4" /></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="row-menu-content" align="end" sideOffset={4} collisionPadding={8}>
+          {admin && <><DropdownMenu.Item onSelect={() => void operate(line.enabled ? "disable" : "enable", [line])}>{line.enabled ? "手动停用" : "解除手动停用"}</DropdownMenu.Item>
           <DropdownMenu.Item onSelect={() => setModal(<LimitsDialog lines={[line]} close={close} saved={saved} />)}>调整额度 / 限速</DropdownMenu.Item>
-          {!remote && <DropdownMenu.Item onSelect={() => unlimited([line])}>设为无限期（自用）</DropdownMenu.Item>}
-          <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => share(line)}>分享配置</DropdownMenu.Item>
-          {!remote && <DropdownMenu.Item disabled={!line.rental || !line.published} onSelect={() => setModal(<QueryLinkDialog line={line} close={close} saved={saved} />)}>客户私密查询链接</DropdownMenu.Item>}
-          <DropdownMenu.Item onSelect={()=>setModal(<AccessPolicyEditor line={line} close={close} saved={saved}/>)}>网站 / 端口 / 连接限制</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => edit(line)}>编辑代理配置</DropdownMenu.Item>
-          <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => probe(line)}>检查连接</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => setModal(<Diagnostics nodes={state.nodes.filter(n => line.hops.some(h => h.node_id === n.id))} lineId={line.id} close={close} />)}>日志与诊断</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => apply(line)}>应用配置修改</DropdownMenu.Item>
-          <DropdownMenu.Item className="text-red-600" onSelect={() => remove([line])}>删除代理</DropdownMenu.Item>
-        </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
+          {!remote && !line.customer_plan_id && <DropdownMenu.Item onSelect={() => unlimited([line])}>设为无限期（自用）</DropdownMenu.Item>}
+          <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => share(line)}>分享配置</DropdownMenu.Item></>}
+          {billing && !line.customer_plan_id && <DropdownMenu.Item disabled={!line.rental || !line.published} onSelect={() => setModal(<QueryLinkDialog line={line} close={close} saved={saved} />)}>客户私密查询链接</DropdownMenu.Item>}
+          {admin && <><DropdownMenu.Item onSelect={()=>setModal(<AccessPolicyEditor line={line} close={close} saved={saved}/>)}>网站 / 端口 / 连接限制</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => edit(line)}>编辑代理配置</DropdownMenu.Item></>}
+          {operations && <><DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => probe(line)}>检查连接</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => setModal(<Diagnostics nodes={state.nodes.filter(n => line.hops.some(h => h.node_id === n.id))} lineId={line.id} canSyncTime={admin} close={close} />)}>日志与诊断</DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={() => apply(line)}>应用配置修改</DropdownMenu.Item></>}
+          {admin && !line.customer_plan_id && <DropdownMenu.Item className="text-red-600" onSelect={() => remove([line])}>删除代理</DropdownMenu.Item>}
+        </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>}
       </div></td>
-    </tr>)}</tbody></table></div> : <Empty title={all.length ? "没有匹配结果" : "暂无代理"} action={!all.length && <Button onClick={create}><Plus />新建代理</Button>}>新建代理后，在「出租信息」分配客户并设置报价。</Empty>}
-    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-4 text-xs text-slate-400"><span>{lines.length} 条 · 切换筛选会清除选择</span>{state.lines.some(line => !line.published) && <Button variant="outline" size="sm" disabled={disabled} onClick={() => apply()}>应用待处理配置修改</Button>}</div>
+    </tr>)}</tbody></table></div> : <Empty title={all.length ? "没有匹配结果" : "暂无代理"} action={admin && !all.length && <Button onClick={create}><Plus />新建代理</Button>}>{admin ? "新建代理后，在「出租信息」分配客户并设置报价。" : "当前没有可查看的代理。"}</Empty>}
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-4 text-xs text-slate-400"><span>{lines.length} 条{selectable && " · 切换筛选会清除选择"}</span>{operations && state.lines.some(line => !line.published) && <Button variant="outline" size="sm" disabled={disabled} onClick={() => apply()}>应用待处理配置修改</Button>}</div>
     {modal}
   </Card>;
 }

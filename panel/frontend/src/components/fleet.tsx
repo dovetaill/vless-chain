@@ -490,8 +490,8 @@ export function Fleet() {
         const state = await freshState(r);
         const condition = state.monitoring?.conditions[`probe:local:${lineId}`];
         setProbeFeedback({ key, text: result.ok
-          ? `本次连接检测通过。${condition?.active ? `恢复确认 ${condition.good || 0}/${state.monitoring?.effective?.recoveries || 2}，系统会继续自动复查。` : ""}`
-          : "本次连接检测未通过，已更新检测详情；系统会继续自动复查。" });
+          ? `本次连接检测通过。${condition?.active ? state.monitoring?.effective?.enabled ? `恢复确认 ${condition.good || 0}/${state.monitoring.effective.recoveries}，系统会继续自动复查。` : "自动检测未启用，不会自动复查。" : ""}`
+          : `本次连接检测未通过，已更新检测详情；${state.monitoring?.effective?.enabled ? "系统会继续自动复查。" : "自动检测未启用，不会自动复查。"}` });
       } catch (e) {
         setProbeFeedback({ key, text: errorText(e) });
         throw e;

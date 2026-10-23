@@ -21,6 +21,7 @@ import {
 import type { Line, PanelState } from "../types";
 export const errorText = (e: unknown) =>
   e instanceof Error ? e.message : "操作失败，请重试";
+export const roleNames = { admin: "管理员", ops: "运维", finance: "财务", viewer: "只读" };
 export const field = (data: FormData, key: string) =>
   String(data.get(key) || "").trim();
 export const number = (data: FormData, key: string) =>
@@ -115,36 +116,41 @@ export function Modal({
   description,
   children,
   submit,
+  secondarySubmit,
   action,
   close,
   wide,
   drawer,
-  protectChanges,
+  protectChanges = true,
+  dirty: changed = false,
 }: {
   title: string;
   description?: string;
   children?: ReactNode;
   submit?: string;
+  secondarySubmit?: { name: string; label: string };
   action?: (data: FormData) => Promise<void>;
   close: () => void;
   wide?: boolean;
   drawer?: boolean;
   protectChanges?: boolean;
+  dirty?: boolean;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [dirty, setDirty] = useState(false);
   const dismiss = () => {
-    if (!pending && (!(drawer || protectChanges) || !action || !dirty || window.confirm('放弃尚未保存的修改？'))) close();
+    if (!pending && (!(drawer || protectChanges) || !action || (!dirty && !changed) || window.confirm('放弃尚未保存的修改？'))) close();
   };
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!action || pending) return;
-    const data = new FormData(event.currentTarget);
+    const data = new FormData(event.currentTarget, (event.nativeEvent as SubmitEvent).submitter);
     setPending(true);
     setError("");
     try {
       await action(data);
+      setDirty(false);
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -192,6 +198,7 @@ export function Modal({
                 {pending ? "正在处理…" : submit}
               </Button>
             )}
+            {secondarySubmit && <Button type="submit" name={secondarySubmit.name} value="true" variant="outline" disabled={pending}>{secondarySubmit.label}</Button>}
           </DialogFooter>
         </form>
       </DialogContent>

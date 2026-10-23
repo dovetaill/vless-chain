@@ -7,6 +7,44 @@ pub fn summary(s: &Security) -> Value {
     json!({"totp_enabled":!s.totp_secret.is_empty(),"recovery_remaining":s.recovery_hashes.len(),"origin":s.origin,
         "passkeys":s.passkeys.iter().map(|v|json!({"id":v["id"],"name":v["name"],"created":v["created"]})).collect::<Vec<_>>()})
 }
+
+fn member_view(member: &OperatorMember) -> Value {
+    json!({"id":member.id,"name":member.name,"role":member.role,"created_at":member.created_at,"revoked_at":member.revoked_at})
+}
+pub async fn members(State(app): State<App>) -> Json<Value> {
+    Json(json!({"members":app.store.lock().unwrap().doc.operator_members.iter().map(member_view).collect::<Vec<_>>()}))
+}
+#[derive(Deserialize)]
+pub struct MemberInput {
+    #[serde(flatten)]
+    proof: Proof,
+    name: String,
+    role: Role,
+}
+pub async fn create_member(State(app): State<App>, Json(input): Json<MemberInput>) -> ApiResult<Json<Value>> {
+    reauthenticate(&app, &input.proof)?;
+    let name = input.name.trim();
+    ensure!(!name.is_empty() && name.len() <= 120 && !name.chars().any(char::is_control), "成员名称须为 1–120 字节且不能含控制字符");
+    ensure!(input.role != Role::Admin, "不能创建第二个内置管理员，请选择运维、财务或只读成员");
+    let token = secret();
+    let member = OperatorMember { id: id(), name: name.into(), role: input.role, token_hash: digest(&token), created_at: now(), revoked_at: 0 };
+    edit(&app, |doc| { doc.operator_members.push(member.clone()); Ok(()) })?;
+    Ok(Json(json!({"member":member_view(&member),"token":token})))
+}
+pub async fn revoke_member(State(app): State<App>, Path(id): Path<String>, Json(proof): Json<Proof>) -> ApiResult<Json<Value>> {
+    reauthenticate(&app, &proof)?;
+    edit(&app, |doc| {
+        let member = doc.operator_members.iter_mut().find(|m| m.id == id).context("成员不存在")?;
+        if member.revoked_at == 0 { member.revoked_at = now(); }
+        member.token_hash.clear();
+        Ok(())
+    })?;
+    app.sessions.lock().unwrap().retain(|_, session| session.actor.id != id);
+    Ok(Json(json!({"ok":true})))
+}
+pub async fn audit(State(app): State<App>) -> Json<Value> {
+    Json(json!({"events":app.store.lock().unwrap().doc.operator_audit.iter().rev().take(100).collect::<Vec<_>>()}))
+}
 pub async fn options(State(app): State<App>) -> Json<Value> {
     let s = &app.store.lock().unwrap().doc.security;
     Json(json!({"totp":!s.totp_secret.is_empty(),"passkey":!s.passkeys.is_empty()}))

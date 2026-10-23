@@ -310,6 +310,7 @@ pub struct Lane {
     pub book: Arc<Book>,
     policy: RwLock<Policy>,
     directions: [tokio::sync::Mutex<()>; 2],
+    customer_charge: tokio::sync::Mutex<()>,
     rates: tokio::sync::watch::Sender<[Option<f64>; 2]>,
     stopped: Mutex<CancellationToken>,
     changed: tokio::sync::Notify,
@@ -340,6 +341,7 @@ impl Lane {
                 limits: spec.limits.clone(),
             }),
             directions: [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())],
+            customer_charge: tokio::sync::Mutex::new(()),
             rates: tokio::sync::watch::channel([
                 spec.limits.upload_mbps,
                 spec.limits.download_mbps,
@@ -523,28 +525,38 @@ impl Lane {
                 _ = tokio::time::sleep(Duration::from_secs_f64(amount as f64 / (rate * 125000.0))) => break,
             }
         }
-        let (resource_ids, quota_left) = {
+        let customer_budget = self.policy.read().unwrap().resource_ids.iter().any(|id| crate::plans::is_budget(id));
+        // Both directions must agree on the local remainder before charging the shared customer ledger.
+        let customer_permit = if customer_budget { Some(tokio::select! {
+            _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
+            permit = self.customer_charge.lock() => permit,
+        }) } else { None };
+        let (resource_ids, multiplier, quota_left) = {
             let p = self.policy.read().unwrap();
-            let items = self.book.items.lock().unwrap();
-            let t = &items[&self.id];
-            (p.resource_ids.clone(), p.limits.monthly_gib.map(|q| ((q * 1073741824.0) as u64).saturating_sub(t.used()) / p.multiplier as u64).unwrap_or(u64::MAX))
+            let mut items = self.book.items.lock().unwrap();
+            let t = items.get_mut(&self.id).unwrap();
+            if customer_budget { rollover(t, p.lease.as_ref(), now()); }
+            (p.resource_ids.clone(), p.multiplier, p.limits.monthly_gib.map(|q| ((q * 1073741824.0) as u64).saturating_sub(t.used()) / p.multiplier as u64).unwrap_or(u64::MAX))
         };
         if datagram && amount as u64 > quota_left {
+            drop(customer_permit);
             drop(_direction);
             self.drain_transfers().await;
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         let amount = amount.min(quota_left.min(usize::MAX as u64) as usize);
         if amount == 0 {
+            drop(customer_permit);
             drop(_direction);
             self.drain_transfers().await;
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         if !resource_ids.is_empty() {
+            // shortcut: admission debits precede local durability; use reservation/settlement before promising delivered-byte billing.
             let client = self.book.resources.read().unwrap().clone().ok_or_else(|| io::Error::other("Agent 尚未连接资源额度服务"))?;
             tokio::select! {
                 _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
-                result = client.charge(&resource_ids, amount, upload) => result.map_err(io::Error::other)?,
+                result = client.charge_weighted(&resource_ids, amount, multiplier) => result.map_err(io::Error::other)?,
             }
         }
         let permit = tokio::select! {
@@ -555,6 +567,7 @@ impl Lane {
         };
         let reserved: io::Result<_> = (|| {
             let policy = self.policy.read().unwrap();
+            let billing_multiplier = if customer_budget { multiplier } else { policy.multiplier };
             let at = now();
             if stopped.is_cancelled() || !policy.open(at) {
                 return Err(io::ErrorKind::PermissionDenied.into());
@@ -569,7 +582,7 @@ impl Lane {
                     ((q * 1073741824.0) as u64).saturating_sub(t.used())
                 })
                 .unwrap_or(u64::MAX);
-            let allowed = amount.min((left / policy.multiplier as u64).min(usize::MAX as u64) as usize);
+            let allowed = amount.min((left / billing_multiplier as u64).min(usize::MAX as u64) as usize);
             if allowed == 0 || datagram && allowed < amount {
                 t.blocked = left < policy.multiplier as u64;
                 if t.blocked {
@@ -580,7 +593,7 @@ impl Lane {
                     "本月线路额度不足",
                 ));
             }
-            t.charged = Some(t.used().saturating_add((allowed as u64).saturating_mul(policy.multiplier as u64)));
+            t.charged = Some(t.used().saturating_add((allowed as u64).saturating_mul(billing_multiplier as u64)));
             let day = t
                 .days
                 .entry(
@@ -621,6 +634,7 @@ impl Lane {
         })();
         // Rate reservations stay ordered; durability waits must allow the next
         // same-direction payload to join a shared transaction.
+        drop(customer_permit);
         drop(_direction);
         let committed = match reserved {
             Ok(committed) => committed,
@@ -1237,7 +1251,7 @@ pub fn system_metrics() -> serde_json::Value {
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"customer_plan_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(target_os = "macos")]
@@ -1387,12 +1401,39 @@ pub fn system_metrics() -> serde_json::Value {
     let ephemeral = sysctl::<u32>(c"net.inet.ip.portrange.first")
         .zip(sysctl::<u32>(c"net.inet.ip.portrange.last"))
         .map(|(first, last)| [first, last]);
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"customer_plan_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn concurrent_customer_directions_do_not_charge_past_local_quota() {
+        use axum::{Json, Router, routing::post};
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        eprintln!("owned customer direction listener={address}");
+        let router=Router::new().route("/grant",post(|| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Json(crate::resources::Grant {cycle:1,end:now()+100,cap:1000,rate:None,valid_for:10})
+        }));
+        let stop=CancellationToken::new(); let stopped=stop.clone();
+        let server=tokio::spawn(async move { axum::serve(listener,router).with_graceful_shutdown(stopped.cancelled_owned()).await.unwrap(); });
+        let dir=tempfile::tempdir().unwrap();
+        let book=Book::open(dir.path()).unwrap();
+        *book.resources.write().unwrap()=Some(crate::resources::Client::open(dir.path(),format!("http://{address}/grant"),"test".into()).unwrap());
+        let mut spec=spec(Limits {monthly_gib:Some(20.0/1073741824.0),..Default::default()});
+        spec.multiplier=2; spec.resource_ids=vec!["plan:customer".into()];
+        let lane=Lane::new(&spec,book.clone());
+        let (a,b)=tokio::join!(lane.charge(10,true,false),lane.charge(10,false,false));
+        assert_eq!(a.unwrap_or(0)+b.unwrap_or(0),10);
+        assert_eq!(book.snapshot()[&spec.id].used(),20);
+        let db=Database::open_with_flags(dir.path().join("resources.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(db.query_row("SELECT used FROM consumption WHERE resource='plan:customer'",[],|row| row.get::<_,u64>(0)).unwrap(),20);
+        drop(db); drop(lane); drop(book);
+        stop.cancel(); server.await.unwrap();
+        let _released=std::net::TcpListener::bind(address).unwrap();
+    }
     #[tokio::test]
     async fn multiplier_is_charged_at_transfer_time_and_persisted() {
         let dir=tempfile::tempdir().unwrap();

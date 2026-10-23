@@ -26,6 +26,7 @@ assert.equal(matchesLine(line, state, "proxy.example"), true);
 assert.equal(matchesLine(line, state, "192.0.2.1"), true);
 assert.equal(matchesLine(line, state, "secret"), false);
 assert.equal(matchesLine(line, state, "不存在"), false);
+assert.equal(matchesLine({ ...line, access: { protocol: "vless" } } as Line, state, "Tokyo 443"), true, "成员脱敏代理不需要 TLS 或凭据字段即可搜索");
 assert.equal(expiringSoon(line, 100), true);
 assert.equal(expiringSoon(line, line.rental!.expires_at), false);
 assert.equal(lowQuota(line), true);

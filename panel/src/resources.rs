@@ -159,16 +159,20 @@ pub fn pools(doc: &Document, line: &Line) -> Vec<String> {
                 .filter(|r| r.starts_with("external:")),
         )
         .collect();
-    doc.resources
+    let mut pools: Vec<_> = doc.resources
         .resources
         .iter()
         .filter(|r| r.members.iter().any(|m| members.contains(m)))
         .map(|r| r.id.clone())
-        .collect()
+        .collect();
+    pools.extend(crate::plans::budgets(doc, &line.id));
+    pools
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default)]
+    pub customer_plan_version: u32,
     pub resource: String,
     pub epoch: String,
     pub cycle: u64,
@@ -187,13 +191,21 @@ pub struct Grant {
 pub fn allocate(doc: &mut Document, node: &str, input: &Request, at: u64) -> Result<Grant> {
     uuid::Uuid::parse_str(&input.epoch).context("账本标识无效")?;
     ensure!(input.want <= 16 * 1024 * 1024, "额度申请过大");
-    let resource = doc
+    let customer_budget = crate::plans::is_budget(&input.resource);
+    let (resource, cycle, end) = if customer_budget {
+        ensure!(input.customer_plan_version == 1, "客户套餐需要计费协议版本 1，请升级 Agent 后重试");
+        crate::plans::budget(doc, &input.resource, at)?
+    } else {
+        let resource = doc
         .resources
         .resources
         .iter()
         .find(|r| r.id == input.resource)
         .context("资源不存在")?
         .clone();
+        let (cycle, end) = resource.cycle(at)?;
+        (resource, cycle, end)
+    };
     let eligible: BTreeSet<_> = doc
         .nodes
         .iter()
@@ -211,10 +223,8 @@ pub fn allocate(doc: &mut Document, node: &str, input: &Request, at: u64) -> Res
         .map(|n| n.id.clone())
         .collect();
     ensure!(eligible.contains(node), "入口未关联此资源");
-    let (cycle, end) = resource.cycle(at)?;
-    let ledger = doc
-        .resources
-        .ledgers
+    let ledgers = if customer_budget { &mut doc.customer_ledgers } else { &mut doc.resources.ledgers };
+    let ledger = ledgers
         .entry(resource.id.clone())
         .or_default();
     if ledger.cycle != cycle {
@@ -350,6 +360,7 @@ impl Client {
             .post(&self.endpoint)
             .bearer_auth(&self.token)
             .json(&Request {
+                customer_plan_version: if crate::plans::is_budget(resource) { 1 } else { 0 },
                 resource: resource.into(),
                 epoch: self.epoch.clone(),
                 cycle,
@@ -380,6 +391,9 @@ impl Client {
         Ok(grant)
     }
     pub async fn charge(&self, resources: &[String], amount: usize, _upload: bool) -> Result<()> {
+        self.charge_weighted(resources, amount, 1).await
+    }
+    pub async fn charge_weighted(&self, resources: &[String], amount: usize, multiplier: u32) -> Result<()> {
         if resources.is_empty() {
             return Ok(());
         }
@@ -404,24 +418,29 @@ impl Client {
             permits.push(lock.lock_owned().await);
         }
 
+        let debits: BTreeMap<_, _> = resources.iter().map(|resource| {
+            let weight = if crate::plans::is_budget(resource) { multiplier.max(1) as u64 } else { 1 };
+            (resource, (amount as u64).saturating_mul(weight))
+        }).collect();
+        ensure!(debits.values().all(|amount| *amount <= 16 * 1024 * 1024), "单次计费块过大");
         let mut grants = vec![];
         let mut remaining = amount as f64;
         while remaining > 0.0 {
             grants.clear();
             let mut rate = f64::INFINITY;
             let mut window = 4.0f64;
-            for resource in resources {
-                let grant = self.grant(resource, amount as u64).await?;
+            for (resource, debit) in &debits {
+                let grant = self.grant(resource, *debit).await?;
                 if let Some(r) = grant.rate {
                     rate = rate.min(r * 125000.0);
-                    let expiry = self.grants.lock().unwrap()[resource].1;
+                    let expiry = self.grants.lock().unwrap()[*resource].1;
                     window = window.min(
                         expiry
                             .saturating_duration_since(Instant::now())
                             .as_secs_f64(),
                     );
                 }
-                grants.push((resource, grant));
+                grants.push((*resource, *debit, grant));
             }
             if rate.is_infinite() {
                 break;
@@ -439,7 +458,7 @@ impl Client {
         }
         let mut database = self.database.lock().unwrap();
         let transaction = database.transaction()?;
-        for (resource, grant) in grants {
+        for (resource, debit, grant) in grants {
             ensure!(
                 grant.end > now()
                     && self
@@ -456,12 +475,12 @@ impl Client {
                 |r| r.get(0),
             )?;
             ensure!(
-                grant.cap.saturating_sub(used) >= amount as u64,
+                grant.cap.saturating_sub(used) >= debit,
                 "共享资源额度不足"
             );
             transaction.execute(
                 "UPDATE consumption SET used=used+?1 WHERE resource=?2",
-                (amount as u64, resource),
+                (debit, resource),
             )?;
         }
         transaction.commit()?;
@@ -472,6 +491,37 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn customer_debits_use_current_multiplier_and_commit_all_budgets_together() {
+        use axum::{Json, Router, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        eprintln!("owned weighted budget listener={address}");
+        let router = Router::new().route("/grant",post(|Json(request):Json<Request>| async move {
+            assert_eq!(request.customer_plan_version, if crate::plans::is_budget(&request.resource) { 1 } else { 0 });
+            Json(Grant { cycle:1,end:now()+100,cap:if request.resource=="plan:small" { 5 } else { 100_000 },rate:None,valid_for:10 })
+        }));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let stopped = stop.clone();
+        let server = tokio::spawn(async move { axum::serve(listener,router).with_graceful_shutdown(stopped.cancelled_owned()).await.unwrap(); });
+        let dir=tempfile::tempdir().unwrap();
+        let url=format!("http://{address}/grant");
+        let client=Client::open(dir.path(),url.clone(),"test".into()).unwrap();
+        let budgets=vec!["physical".into(),"plan:team".into(),"member:team:one".into()];
+        client.charge_weighted(&budgets,10,3).await.unwrap();
+        client.charge_weighted(&budgets,10,2).await.unwrap();
+        assert_eq!(client.used("physical").unwrap().1,20);
+        assert_eq!(client.used("plan:team").unwrap().1,50);
+        assert_eq!(client.used("member:team:one").unwrap().1,50);
+        assert!(client.charge_weighted(&["physical".into(),"plan:small".into()],10,1).await.is_err());
+        assert_eq!(client.used("physical").unwrap().1,20,"另一预算不足时不得只写入一半扣费");
+        drop(client);
+        let reopened=Client::open(dir.path(),url,"test".into()).unwrap();
+        assert_eq!(reopened.used("plan:team").unwrap().1,50,"重启不能按新倍率重算历史");
+        drop(reopened);
+        stop.cancel(); server.await.unwrap();
+        let _released=std::net::TcpListener::bind(address).unwrap();
+    }
     #[tokio::test]
     async fn shared_bandwidth_counts_both_directions_and_usage_survives_reopen() {
         use axum::{Json, Router, routing::post};
@@ -532,11 +582,22 @@ mod tests {
         d
     }
     #[test]
+    fn legacy_supply_requests_remain_compatible() {
+        let mut doc = fixture();
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "resource":"pool", "epoch":id(), "cycle":0, "used":0, "want":80
+        })).unwrap();
+        assert_eq!(request.customer_plan_version, 0);
+        assert_eq!(allocate(&mut doc, "a", &request, 1_800_000_000).unwrap().cap, 80);
+        assert!(doc.customer_ledgers.is_empty());
+    }
+    #[test]
     fn grants_are_idempotent_and_never_overallocate() {
         let mut d = fixture();
         let epoch = id();
         let at = 1_800_000_000;
         let mut request = Request {
+            customer_plan_version: 0,
             resource: "pool".into(),
             epoch,
             cycle: 0,

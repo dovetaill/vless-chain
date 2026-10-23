@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import QRCode from "qrcode";
 import { Download } from "lucide-react";
 import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 import {
   Modal,
   CopyButton,
@@ -9,6 +10,8 @@ import {
   download,
   errorText,
   endpoint,
+  Field,
+  field,
 } from "./shared";
 import { api } from "../api";
 import type { Line, PanelState, External } from "../types";
@@ -56,7 +59,9 @@ export function AccessDialog({
   state: PanelState;
   close: () => void;
 }) {
-  const [tab, setTab] = useState("node");
+  const [tab, setTab] = useState("qr");
+  const [subscription, setSubscription] = useState("");
+  const localLine = line && !new URLSearchParams(location.search).has("remote");
   const [value, setValue] = useState<{
     share: string;
     node: string;
@@ -79,12 +84,19 @@ export function AccessDialog({
     };
   }, [line?.id, external?.id]);
   return (
-    <Modal title={external ? "外部代理配置" : "分享代理"} description={external?.name || line?.name} close={close}>
+    <Modal title={external ? "外部代理配置" : "分享代理"} description={external?.name || line?.name} close={close}
+      submit={tab === "subscription" && !subscription ? "创建订阅链接" : undefined}
+      action={tab === "subscription" && !subscription && localLine ? async data => {
+        const result = await api<{ path: string }>("/subscriptions", "POST", { name: field(data, "subscription_name"), line_ids: [line.id] });
+        setSubscription(new URL(result.path, location.origin).href);
+      } : undefined}
+    >
       {line && <PathView line={line} state={state} />}
           <div className="flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1">
             {[
-              ["node", "Mihomo 节点"],
               ["qr", "链接 / 二维码"],
+              ["node", "Mihomo 节点"],
+              ...(localLine ? [["subscription", "订阅链接"]] : []),
             ].map(([id, label]) => (
               <button
                 type="button"
@@ -117,6 +129,7 @@ export function AccessDialog({
           )}
           {value && tab === "node" && (
             <>
+              <p className="muted">这是单节点片段，不是完整客户端配置。请合并到现有配置的 proxies 列表，并加入需要的策略组；直接导入请使用链接 / 二维码。</p>
               <textarea
                 className="textarea mono"
                 readOnly
@@ -132,6 +145,13 @@ export function AccessDialog({
               </div>
             </>
           )}
+          {tab === "subscription" && localLine && <>
+            <p className="muted">此订阅仅包含当前代理，供支持 Mihomo 订阅的客户端更新完整配置。链接包含私密凭据，只交给使用者；可在设置中撤销。</p>
+            {subscription ? <>
+              <Field label="订阅地址"><textarea className="textarea mono" readOnly rows={3} value={subscription} /></Field>
+              <CopyButton value={subscription} label="复制订阅链接" />
+            </> : <Field label="订阅名称"><Input name="subscription_name" defaultValue={line.name} required maxLength={120} /></Field>}
+          </>}
     </Modal>
   );
 }

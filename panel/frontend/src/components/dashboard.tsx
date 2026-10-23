@@ -5,7 +5,8 @@ import { TrafficChart } from "./traffic-chart";
 import { RentalDates, RentalPrices, RentalSpeed, RentalStatusBadge, RentalUsage, SyncLabel } from "./rental-shared";
 import { beijingTime, expiringSoon, lowQuota } from "../lib/business";
 
-export function Dashboard({ state, manage }: { state: PanelState; manage: (line: Line) => void }) {
+export function Dashboard({ state, manage }: { state: PanelState; manage?: (line: Line) => void }) {
+  const billing = !state.viewer || ["admin", "finance"].includes(state.viewer.role);
   const lines = state.lines.filter(line => line.kind === "vless");
   const days: Record<string, [number, number]> = {};
   for (const line of lines) for (const [day, traffic] of Object.entries(line.traffic?.days || {})) {
@@ -20,10 +21,11 @@ export function Dashboard({ state, manage }: { state: PanelState; manage: (line:
   return <div className="space-y-4">
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       {[
-        { label: "代理 / 客户", value: `${lines.length} / ${state.customers.length}`, detail: `${lines.filter(line => line.rental_status === "active").length} 条运行中` },
+        { label: billing ? "代理 / 客户" : "代理", value: billing ? `${lines.length} / ${state.customers.length}` : `${lines.length}`, detail: `${lines.filter(line => line.rental_status === "active").length} 条运行中` },
         { label: "当前周期代理流量", value: lines.some(line => line.traffic) ? bytes(used) : "尚未采集", detail: "各代理当前计量周期合计" },
         { label: "代理实时网速", value: `↓ ${fresh.length ? `${bytes(download)}/s` : "—"}`, detail: `↑ ${fresh.length ? `${bytes(upload)}/s` : "暂无实时采样"}` },
-        { label: "需要关注", value: `${lines.filter(line => expiringSoon(line, state.time)).length} 条即将到期`, detail: `${lines.filter(lowQuota).length} 条剩余 ≤10% · ${lines.filter(line => line.rental_status === "expired").length} 条已到期` },
+        billing ? { label: "需要关注", value: `${lines.filter(line => expiringSoon(line, state.time)).length} 条即将到期`, detail: `${lines.filter(lowQuota).length} 条剩余 ≤10% · ${lines.filter(line => line.rental_status === "expired").length} 条已到期` }
+          : { label: "需要关注", value: `${lines.filter(line => line.rental_status === "offline").length} 条离线`, detail: `${lines.filter(line => line.sync_status === "pending").length} 条等待同步 · ${lines.filter(line => line.sync_status === "error").length} 条同步异常` },
       ].map(item => <Card key={item.label}><CardContent className="p-3 sm:p-4"><p className="text-xs text-slate-500">{item.label}</p><p className="mt-2 text-base font-semibold tabular-nums sm:text-lg">{item.value}</p><p className="mt-1 text-xs text-slate-400">{item.detail}</p></CardContent></Card>)}
     </div>
     <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
@@ -48,12 +50,12 @@ export function Dashboard({ state, manage }: { state: PanelState; manage: (line:
     </CardContent></Card>
     <TrafficChart days={days} now={state.time} />
     </div>
-    <Card><CardHeader className="px-4 py-4"><div><CardTitle className="leading-5">代理经营总览</CardTitle><p className="muted mt-1">到期与额度重置时间均为北京时间；点击名称管理出租信息。</p></div></CardHeader>
-      {lines.length ? <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="代理经营总览表"><table className="data-table [&_td]:px-4 [&_td]:py-3 [&_th]:px-4 [&_th]:py-3"><thead><tr><th>代理 / 客户</th><th>运行 / 同步</th><th>周期用量 / 余量</th><th>实时网速</th><th>到期 / 重置</th><th>续费报价</th></tr></thead><tbody>{lines.map(line => <tr key={line.id}>
-        <td><button className="text-left text-sm font-semibold text-blue-700 underline-offset-4 hover:underline" onClick={() => manage(line)}>{line.name}</button><p className="mt-2 text-xs text-slate-500">{state.customers.find(customer => customer.id === line.rental?.customer_id)?.name || "自用"}</p></td>
+    <Card><CardHeader className="px-4 py-4"><div><CardTitle className="leading-5">{billing ? "代理经营总览" : "代理运行总览"}</CardTitle>{billing && <p className="muted mt-1">到期与额度重置时间均为北京时间；点击名称管理出租信息或客户套餐。</p>}</div></CardHeader>
+      {lines.length ? <div className="overflow-x-auto" tabIndex={0} role="region" aria-label={billing ? "代理经营总览表" : "代理运行总览表"}><table className="data-table [&_td]:px-4 [&_td]:py-3 [&_th]:px-4 [&_th]:py-3"><thead><tr><th>{billing ? "代理 / 客户" : "代理"}</th><th>运行 / 同步</th><th>周期用量 / 余量</th><th>实时网速</th>{billing && <><th>到期 / 重置</th><th>续费报价</th></>}</tr></thead><tbody>{lines.map(line => <tr key={line.id}>
+        <td>{manage ? <button className="text-left text-sm font-semibold text-blue-700 underline-offset-4 hover:underline" onClick={() => manage(line)}>{line.name}</button> : <span className="text-sm font-semibold">{line.name}</span>}{billing && <p className="mt-2 text-xs text-slate-500">{state.customers.find(customer => customer.id === line.rental?.customer_id)?.name || "自用"}</p>}</td>
         <td><RentalStatusBadge status={line.rental_status} /><p className="mt-2"><SyncLabel status={line.sync_status} /></p></td>
-        <td><RentalUsage line={line} /></td><td><RentalSpeed line={line} now={state.time} /></td><td><RentalDates line={line} /></td><td><RentalPrices line={line} /></td>
-      </tr>)}</tbody></table></div> : <Empty title="尚无代理">先新建代理，再分配客户、设置报价并登记首次收款。</Empty>}
+        <td><RentalUsage line={line} /></td><td><RentalSpeed line={line} now={state.time} /></td>{billing && <><td><RentalDates line={line} /></td><td><RentalPrices line={line} /></td></>}
+      </tr>)}</tbody></table></div> : <Empty title="尚无代理">{!state.viewer || state.viewer.role === "admin" ? "先新建代理，再分配客户、设置报价并登记首次收款。" : "当前没有可查看的代理。"}</Empty>}
     </Card>
   </div>;
 }

@@ -12,7 +12,7 @@ export type Remote = {
         monitoring?: {
           conditions: Record<string, { active: boolean; message: string; good?: number }>;
           checks?: Record<string, Check>;
-          effective?: { interval: number; recoveries: number; url?: string };
+          effective?: { enabled: boolean; interval: number; recoveries: number; url?: string };
         };
       })
     | null;
@@ -135,10 +135,10 @@ export function issues(r: Remote, now: number): { title: string; detail: string;
       const check = r.snapshot.monitoring?.checks?.[key];
       const policy = r.snapshot.monitoring?.effective;
       const recovering = check?.ok === true;
-      const progress = recovering ? `最近一次已通过，正在自动确认恢复${policy ? `（${condition.good || 0}/${policy.recoveries}）` : ""}。` : condition.active ? "系统会自动复查，达到恢复条件后自动解除。" : "最近一次未通过，尚未达到连续失败告警阈值；系统会自动复查。";
+      const progress = !policy?.enabled ? "自动检测未启用，以下为历史结果，不会自动复查。" : recovering ? `最近一次已通过，正在自动确认恢复（${condition.good || 0}/${policy.recoveries}）。` : condition.active ? "系统会自动复查，达到恢复条件后自动解除。" : "最近一次未通过，尚未达到连续失败告警阈值；系统会自动复查。";
       result.push({
-        title: !condition.active ? "连接检测待确认" : recovering ? "入口恢复确认中" : check?.outbound?.ok ? "入口检测异常，出口正常" : "代理入口检测异常",
-        detail: `${condition.message}。${check?.checked_at ? `最近检测 ${new Date(check.checked_at * 1000).toLocaleString("zh-CN", { hour12: false })}。` : ""}${progress}${policy ? `检测间隔 ${policy.interval} 秒。` : ""}`,
+        title: !policy?.enabled ? "历史连接检测结果" : !condition.active ? "连接检测待确认" : recovering ? "入口恢复确认中" : check?.outbound?.ok ? "入口检测异常，出口正常" : "代理入口检测异常",
+        detail: `${condition.message}。${check?.checked_at ? `最近检测 ${new Date(check.checked_at * 1000).toLocaleString("zh-CN", { hour12: false })}。` : ""}${progress}${policy?.enabled ? `检测间隔 ${policy.interval} 秒。` : ""}`,
         evidence: check?.detail,
         probeLineId: key.startsWith("probe:local:") ? key.slice("probe:local:".length) : undefined,
       });
@@ -162,9 +162,10 @@ export function lineStatus(r: Remote, line: Line, now: number) {
     return line.enabled ? "待应用" : "停用待生效";
   if (!line.enabled) return "已停用";
   if (line.rental_status === "expired") return "已到期";
-  if (line.rental_status === "quota_exhausted" || line.traffic?.blocked)
+  if (line.rental_status === "quota_exhausted")
     return "额度耗尽";
   if (line.rental_status === "offline") return "Agent 离线";
+  if (line.traffic?.blocked) return "传输已阻断";
   const check = latestCheck(r, line);
   if (check && !check.ok) return "最近探测失败";
   return "已启用";

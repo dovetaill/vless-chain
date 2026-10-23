@@ -93,7 +93,7 @@ export function Maintenance({ state }: { state: PanelState }) {
         <p className="muted">默认使用发行包验证过的内核。选择官方最新版仅作用于本次主动升级，不会后台自动更换；可重新选择推荐稳定版并升级，恢复推荐内核。</p>
         {!supported && (
           <p role="status" className="text-sm text-amber-700">
-            当前部署未提供网页维护。仅支持 Linux systemd；该平台请先手工升级以安装维护组件。OpenRC、macOS 和纯 Agent 安装暂不支持。
+            当前部署未提供网页维护。Linux systemd / OpenRC（含 Alpine）请先手工升级以安装维护组件；macOS 和纯 Agent 安装暂不支持。
           </p>
         )}
         <div className="flex flex-wrap gap-2">

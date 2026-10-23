@@ -118,7 +118,43 @@ export interface Payment {
   expires_at: number;
   note: string;
 }
+export interface Operator {
+  id: string;
+  name: string;
+  role: "admin" | "ops" | "finance" | "viewer";
+}
+export interface RentalOrder {
+  id: string;
+  request_id: string;
+  created: number;
+  confirmed_at: number;
+  cancelled_at: number;
+  term: Term;
+  note: string;
+  created_session: string;
+  confirmed_session: string;
+  cancelled_session: string;
+  created_by?: Operator | null;
+  confirmed_by?: Operator | null;
+  cancelled_by?: Operator | null;
+  items: { line_id: string; customer_id: string; line_name: string; customer_name: string; quoted_fen: number; amount_fen: number; started_at: number; expires_at: number }[];
+}
+export interface PaymentAdjustment {
+  id: string;
+  payment_id: string;
+  request_id: string;
+  kind: "refund" | "correction";
+  delta_fen: number;
+  created: number;
+  note: string;
+  disable_line: boolean;
+  affected_line_ids?: string[];
+  session: string;
+  operator?: Operator | null;
+}
 export interface Line {
+  plan_eligible?: boolean;
+  customer_plan_id?: string | null;
   multiplier?: number;
   id: string;
   name: string;
@@ -137,6 +173,15 @@ export interface Line {
   rental: Rental | null;
   rental_status: RentalStatus;
   sync_status: SyncStatus;
+}
+export interface CustomerPlan {
+  id: string;
+  name: string;
+  customer_id: string;
+  monthly_gib: number;
+  members: { id: string; name: string; line_ids: string[]; monthly_gib: number | null; usage: { used: number; reserved: number } }[];
+  usage: { used: number; reserved: number };
+  rental: Rental | null;
 }
 export interface Check {
   ok: boolean;
@@ -185,9 +230,14 @@ export interface PanelState {
   alerts: { id: string; level: string; message: string }[];
   customers: Customer[];
   payments: Payment[];
+  viewer?: Operator;
+  rental_orders: RentalOrder[];
+  payment_adjustments: PaymentAdjustment[];
+  customer_plans?: CustomerPlan[];
   renewal_contact: string;
 }
 export interface PublicLine {
+  customer_plan_id?: string | null;
   multiplier?: number;
   id: string;
   name: string;
@@ -198,6 +248,7 @@ export interface PublicLine {
   rental: Pick<Rental, "prices" | "started_at" | "expires_at" | "next_reset_at" | "permanent">;
 }
 export interface PublicLookup {
+  customer_plans?: { id: string; name: string; monthly_gib: number; usage: { used: number; reserved: number }; members: { id: string; name: string; monthly_gib: number | null; usage: { used: number; reserved: number } }[] }[];
   lines: PublicLine[];
   unmatched: string[];
   renewal_contact: string;

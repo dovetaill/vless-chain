@@ -55,6 +55,11 @@ assert.equal(metrics([skewed], now + 100).sampled, 0);
 assert.equal(metrics([skewed], now + 100).used, 150);
 assert.equal(lineStatus(skewed, line, now + 100), "状态未知");
 assert.equal(lineStatus(skewed, line, now), "已启用");
+const blocked = { ...line, traffic: { ...line.traffic!, blocked: true } };
+assert.equal(lineStatus(skewed, { ...blocked, enabled: false, rental_status: "disabled" }, now), "已停用");
+assert.equal(lineStatus(skewed, { ...blocked, rental_status: "expired" }, now), "已到期");
+assert.equal(lineStatus(skewed, { ...blocked, rental_status: "quota_exhausted" }, now), "额度耗尽");
+assert.equal(lineStatus(skewed, blocked, now), "传输已阻断", "账本等其他阻断不能推定为额度耗尽或显示已启用");
 const warning = structuredClone(remote);
 warning.snapshot!.monitoring = { conditions: { "ntp:agent": { active: true, message: "自动时间同步未启用" } } };
 assert.equal(health(warning, now), "自动校时未启用");
@@ -70,7 +75,7 @@ assert.ok(issues(warning, now).some((issue) => issue.title === "Agent 上报中�
 assert.equal(issues({ ...remote, snapshot: { ...remote.snapshot!, time: 0 } }, now).length, 0);
 const probeWarning = structuredClone(remote);
 probeWarning.snapshot!.monitoring = {
-  effective: { interval: 300, recoveries: 2 },
+  effective: { enabled: true, interval: 300, recoveries: 2 },
   conditions: { "probe:local:line": { active: true, message: "REALITY：本机入口 127.0.0.1:20000 · SNI example.com 未通过", good: 0 } },
   checks: { "probe:local:line": { ok: false, checked_at: now, detail: "Connection reset by peer\n自动分段检查：出口通过", outbound: { ok: true, detail: "HTTP 200" } } },
 };
@@ -88,6 +93,11 @@ probeWarning.snapshot!.monitoring.checks!["probe:local:line"] = { ok: true, chec
 probeWarning.snapshot!.monitoring.conditions["probe:local:line"].good = 1;
 assert.equal(health(probeWarning, now), "入口恢复确认中");
 assert.match(issues(probeWarning, now)[0].detail, /1\/2/);
+probeWarning.snapshot!.monitoring.effective!.enabled = false;
+assert.equal(health(probeWarning, now), "历史连接检测结果");
+assert.match(issues(probeWarning, now)[0].detail, /不会自动复查/);
+assert.doesNotMatch(issues(probeWarning, now)[0].detail, /正在自动确认恢复|系统会自动复查|检测间隔/);
+probeWarning.snapshot!.monitoring.effective!.enabled = true;
 probeWarning.snapshot!.monitoring.conditions["probe:local:line"].active = false;
 assert.equal(health(probeWarning, now), "在线");
 console.log("fleet-state assertions passed");

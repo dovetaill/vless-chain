@@ -16,6 +16,7 @@ import {
   Fingerprint,
   LogOut,
   Menu,
+  MoreHorizontal,
   Network,
   Plus,
   Server,
@@ -29,6 +30,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { api, ApiError, publishChecked } from "./api";
 import { LineEditor } from "./components/line-editor";
 import { AccessDialog } from "./components/access-dialog";
@@ -50,6 +52,7 @@ import {
   endpoint,
   splitAddress,
   errorText,
+  roleNames,
 } from "./components/shared";
 import { loginPasskey } from "./passkey";
 import type {
@@ -73,6 +76,12 @@ const pages = [
   { id: "settings", label: "设置", icon: Settings },
 ] as const;
 type Page = (typeof pages)[number]["id"];
+const workspaceModes = [
+  { id: "personal", label: "自用", pages: ["lines", "nodes", "dashboard", "settings"], guide: "先创建代理并检查连接，再通过分享链接或二维码导入客户端。需要指定落地时，再配置外部代理与链式出网。", tasks: [["lines", "创建与分享代理"], ["nodes", "配置落地"], ["settings", "检查登录安全"]] },
+  { id: "small", label: "小型运营", pages: ["dashboard", "lines", "customers", "nodes", "fleet", "monitoring", "resources", "rules", "settings"], guide: "先建客户档案，再为代理设置归属与报价。确认线下收款后开通，交付订阅和私密查询链接，并检查到期与用量告警。", tasks: [["customers", "建立客户档案"], ["lines", "开通与交付代理"], ["monitoring", "设置告警"]] },
+  { id: "business", label: "商业运营", pages: ["dashboard", "customers", "lines", "fleet", "monitoring", "nodes", "resources", "rules", "settings"], guide: "集中处理客户与收款、代理交付和多机异常。收款与开通仍由管理员确认；先核对经营记录，再安排维护和售后。", tasks: [["customers", "客户与收款记录"], ["fleet", "集中管理 VPS"], ["monitoring", "处理运行告警"]] },
+] as const;
+type WorkspaceMode = (typeof workspaceModes)[number]["id"];
 const remotePanel = new URLSearchParams(location.search).get('remote');
 const visiblePages = remotePanel ? pages.filter(p => ['lines', 'nodes', 'resources', 'rules'].includes(p.id)) : pages;
 const pageFromHash = (): Page =>
@@ -163,6 +172,7 @@ export function App() {
   const [connected, setConnected] = useState(true);
   const [page, setPage] = useState<Page>(pageFromHash);
   const [mobile, setMobile] = useState(false);
+  const [mode, setMode] = useState<WorkspaceMode>(() => workspaceModes.find(item => item.id === localStorage.getItem("chain-workspace-mode"))?.id || "small");
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem("chain-sidebar") === "collapsed",
   );
@@ -222,7 +232,14 @@ export function App() {
     }
   }, [toast]);
   useEffect(() => {
+    const desktop = window.matchMedia("(min-width: 1024px)");
+    const resized = () => { if (desktop.matches) setMobile(false); };
+    desktop.addEventListener("change", resized);
+    return () => desktop.removeEventListener("change", resized);
+  }, []);
+  useEffect(() => {
     if (!pendingShare || !state || state.busy) return;
+    if (state.viewer && state.viewer.role !== "admin") { setPendingShare(null); return; }
     const line = state.lines.find((item) => item.id === pendingShare);
     if (state.jobs[0]?.state === "applied" && line?.published && line.enabled) {
       setPendingShare(null);
@@ -372,7 +389,7 @@ export function App() {
               登录控制台
             </h2>
             <p className="mt-3 text-sm leading-6 text-slate-500">
-              使用安装时生成的管理员密钥。
+              使用安装时生成的管理员密钥，或管理员发放的成员密钥。
             </p>
             {loginNotice && (
               <div className="my-5 space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-4">
@@ -386,7 +403,7 @@ export function App() {
               </div>
             )}
             <form onSubmit={login} className="mt-8 space-y-5">
-              <Field label="管理员密钥">
+              <Field label="管理员密钥" hint="成员可在此输入自己的独立密钥。">
                 <Input
                   name="token"
                   type="password"
@@ -396,12 +413,11 @@ export function App() {
                 />
               </Field>
               {options.totp && (
-                <Field label="动态验证码或恢复码">
+                <Field label="动态验证码或恢复码" hint="管理员启用二步验证时必填；成员密钥无需填写。">
                   <Input
                     name="code"
                     autoComplete="one-time-code"
                     placeholder="6 位验证码或一次性恢复码"
-                    required
                   />
                 </Field>
               )}
@@ -457,16 +473,25 @@ export function App() {
   const current = pages.find((p) => p.id === page)!;
   const kind: Line["kind"] = "vless";
   const latest = state.jobs[0];
-  return (
-    <div className={collapsed ? "app-shell is-collapsed" : "app-shell"}>
-      {mobile && (
-        <button
-          aria-label="关闭导航遮罩"
-          className="fixed inset-0 z-40 bg-slate-950/40 lg:hidden"
-          onClick={() => setMobile(false)}
-        />
-      )}
-      <aside className={`app-sidebar ${mobile ? "mobile-open" : ""}`}>
+  const role = state.viewer?.role || "admin";
+  const admin = role === "admin";
+  const billing = admin || role === "finance";
+  const allowedPages = visiblePages.filter(p => admin || (role === "ops"
+    ? ["dashboard", "lines", "monitoring", "settings"]
+    : role === "finance" ? ["dashboard", "lines", "customers"] : ["dashboard", "lines"]).includes(p.id));
+  const pageAllowed = allowedPages.some(p => p.id === page);
+  const workspace = workspaceModes.find(item => item.id === mode)!;
+  const primaryPages = remotePanel ? allowedPages : workspace.pages.map(id => allowedPages.find(p => p.id === id)).filter(p => p !== undefined);
+  const secondaryPages = allowedPages.filter(p => !primaryPages.some(primary => primary.id === p.id));
+  const navigationButton = (p: (typeof pages)[number]) => <button
+    key={p.id}
+    aria-label={p.label}
+    aria-current={page === p.id ? "page" : undefined}
+    title={collapsed ? p.label : undefined}
+    className={`nav-item ${page === p.id ? "active" : ""}`}
+    onClick={() => navigate(p.id)}
+  ><p.icon className="size-[18px] shrink-0" /><span className="sidebar-label">{p.label}</span></button>;
+  const sidebar = <>
         <div className="sidebar-brand">
           <span className="brand-symbol">
             <Network />
@@ -482,19 +507,19 @@ export function App() {
             <X className="size-5" />
           </button>
         </div>
+        {!remotePanel && <div className="sidebar-label px-4 pb-3">
+          <Field label="使用模式"><select className="select" value={mode} onChange={event => {
+            const next = event.target.value as WorkspaceMode;
+            localStorage.setItem("chain-workspace-mode", next);
+            setMode(next);
+          }}>{workspaceModes.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></Field>
+        </div>}
         <nav className="flex-1 space-y-1 px-3 py-2">
-          {visiblePages.map((p) => (
-            <button
-              key={p.id}
-                aria-label={p.label}
-              title={collapsed ? p.label : undefined}
-              className={`nav-item ${page === p.id ? "active" : ""} `}
-              onClick={() => navigate(p.id)}
-            >
-              <p.icon className="size-[18px] shrink-0" />
-              <span className="sidebar-label">{p.label}</span>
-            </button>
-          ))}
+          {primaryPages.map(navigationButton)}
+          {secondaryPages.length > 0 && <details key={mode} open={secondaryPages.some(p => p.id === page) || undefined}>
+            <summary className="nav-item" aria-label="更多功能"><MoreHorizontal className="size-[18px] shrink-0" /><span className="sidebar-label">更多功能</span></summary>
+            {secondaryPages.map(navigationButton)}
+          </details>}
         </nav>
         <div className="sidebar-footer">
           {remotePanel && <a className="nav-item" href="/admin#fleet">返回总控</a>}
@@ -530,19 +555,22 @@ export function App() {
             <ChevronLeft className="size-3.5" />
           )}
         </button>
-      </aside>
+      </>;
+  return (
+    <Dialog open={mobile} onOpenChange={setMobile}>
+    <div className={collapsed ? "app-shell is-collapsed" : "app-shell"}>
+      <aside className="app-sidebar">{sidebar}</aside>
       <div className="app-main">
         <header className="app-header">
           <div className="flex items-center gap-3">
-            <Button
+            <DialogTrigger asChild><Button
               size="icon"
               variant="ghost"
               className="lg:hidden"
               aria-label="打开导航"
-              onClick={() => setMobile(true)}
             >
               <Menu />
-            </Button>
+            </Button></DialogTrigger>
             <span className="text-xs font-medium">{current.label}</span>
           </div>
           <div className="flex items-center gap-4">
@@ -569,8 +597,8 @@ export function App() {
                 <span className="absolute -right-1 -top-1 size-1.5 rounded-full bg-amber-500" />
               )}
             </button>
-            <span className="flex size-8 items-center justify-center rounded-full border border-blue-100 bg-blue-50 text-[11px] font-semibold text-blue-700">
-              管理
+            <span aria-label="当前身份" title={`${state.viewer?.name || "管理员"} · ${roleNames[role]}`} className="max-w-48 truncate rounded-full border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700">
+              {state.viewer?.name || "管理员"} · {roleNames[role]}
             </span>
           </div>
         </header>
@@ -581,13 +609,19 @@ export function App() {
                 {current.label}
               </h1>
             </div>
-            {page === "lines" && (
+            {page === "lines" && admin && (
               <Button disabled={state.busy} onClick={() => editLine(kind)}>
                 <Plus />
                 新建代理
               </Button>
             )}
           </div>}
+          {!remotePanel && admin && ["dashboard", "lines", "customers"].includes(page) && <details className="mb-5 rounded-lg border border-border bg-white p-4" open={!state.lines.length || undefined}>
+            <summary className="cursor-pointer text-sm font-medium">{workspace.label} · 开始使用</summary>
+            <p className="muted mt-3">{workspace.guide}</p>
+            <p className="muted mt-2">模式仅调整本浏览器的导航与引导；已有代理、客户、收款和设置仍可访问。</p>
+            <div className="mt-3 flex flex-wrap gap-2">{workspace.tasks.map(([target, label]) => <Button key={target} size="sm" variant="outline" onClick={() => navigate(target)}>{label}</Button>)}</div>
+          </details>}
           {!connected && (
             <div
               role="alert"
@@ -607,10 +641,12 @@ export function App() {
               </p>
             </div>
           )}
-          {page === "dashboard" && <Dashboard state={state} manage={line => setModal(<RentalEditor line={line} state={state} close={close} saved={refresh} />)} />}
+          {!pageAllowed && <div role="alert" className="rounded-lg border border-border bg-white p-5 text-sm">当前身份无权访问此页面。<Button className="ml-3" variant="outline" onClick={() => navigate("dashboard")}>返回总览</Button></div>}
+          {pageAllowed && <>
+          {page === "dashboard" && <Dashboard state={state} manage={billing ? line => line.customer_plan_id ? navigate("customers") : setModal(<RentalEditor line={line} state={state} close={close} saved={refresh} />) : undefined} />}
           {remotePanel && <p role="status" className="mb-4 rounded border p-3">正在管理远端 VPS；此页面操作作用于该 VPS。<a className="ml-2 underline" href="/admin#fleet">返回总控</a></p>}
           {page === "fleet" && <Fleet />}
-          {page === "monitoring" && <><Button className="mb-4" variant="outline" onClick={() => setModal(<Diagnostics nodes={state.nodes} close={close} />)}>日志与诊断</Button><Monitoring /></>}
+          {page === "monitoring" && <><Button className="mb-4" variant="outline" onClick={() => setModal(<Diagnostics nodes={state.nodes} canSyncTime={admin} close={close} />)}>日志与诊断</Button><Monitoring /></>}
           {page === "customers" && <Customers state={state} saved={refresh} />}
           {page === "lines" && <ProxyList state={state} saved={refresh} remote={!!remotePanel}
             configureImport={pendingImport => setEditor({ kind: "vless", pendingImport })}
@@ -686,13 +722,14 @@ export function App() {
           {page === "settings" && (
             <div className="space-y-6">
             <Maintenance state={state} />
-            <SecuritySettings
+            {admin && <SecuritySettings
               state={state}
               saved={refresh}
               sessionEnded={sessionEnded}
-            />
+            />}
             </div>
           )}
+          </>}
           <footer className="mt-10 flex items-center justify-between border-t border-border pt-5 text-[11px] text-slate-400">
             <span>Chain Panel {state.version ? `v${state.version}` : "版本未知"} · 节点租赁运营控制台</span>
           </footer>
@@ -704,13 +741,25 @@ export function App() {
         ensureLocalServer={ensureLocalServer}
         importExternal={importExternal}
         close={() => setEditor(null)}
-        saved={async (value) => {
-          await refresh();
-          await apply(value[0].id, value.length === 1 && value[0].kind === "vless", value.map(line => line.id));
+        saved={async (value, publish = true) => {
           setEditor(null);
+          await refresh();
+          if (!publish) {
+            setToast("草稿已保存，可在客户与收款中绑定共享套餐，或在代理列表继续应用。");
+            return;
+          }
+          try {
+            await apply(value[0].id, value.length === 1 && value[0].kind === "vless", value.map(line => line.id));
+          } catch (e) {
+            setToast(`配置已保存，尚未应用：${errorText(e)}。请在代理列表继续应用，无需重新创建。`);
+          }
         }}
       />}
       {modal}
+      <DialogContent showCloseButton={false} aria-describedby={undefined} className="inset-y-0 left-0 top-0 h-dvh max-h-dvh w-64 max-w-[85vw] translate-x-0 translate-y-0 overflow-y-auto rounded-none border-l-0 p-0 sm:rounded-none">
+        <DialogTitle className="sr-only">管理导航</DialogTitle>
+        {sidebar}
+      </DialogContent>
       {toast && (
         <div
           role="status"
@@ -720,5 +769,6 @@ export function App() {
         </div>
       )}
     </div>
+    </Dialog>
   );
 }

@@ -329,6 +329,28 @@ pub struct Security {
     pub passkeys: Vec<Value>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OperatorMember {
+    pub id: String,
+    pub name: String,
+    pub role: crate::security::Role,
+    pub token_hash: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub revoked_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OperatorAudit {
+    pub id: String,
+    pub at: u64,
+    pub actor: crate::security::Actor,
+    pub method: String,
+    pub path: String,
+    pub target: Option<String>,
+    pub response_status: Option<u16>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: String,
@@ -352,6 +374,8 @@ pub struct Event {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    pub actor: Option<crate::security::Actor>,
     #[serde(default)]
     pub legacy_configs: Vec<LegacyConfig>,
     pub id: String,
@@ -390,6 +414,10 @@ pub struct LegacyConfig {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Document {
     #[serde(default)]
+    pub operator_members: Vec<OperatorMember>,
+    #[serde(default)]
+    pub operator_audit: Vec<OperatorAudit>,
+    #[serde(default)]
     pub resources: crate::resources::State,
     #[serde(default)]
     pub rule_sources: Vec<crate::rules::Source>,
@@ -408,9 +436,19 @@ pub struct Document {
     #[serde(default)]
     pub customers: Vec<Customer>,
     #[serde(default)]
+    pub customer_plans: Vec<crate::plans::Plan>,
+    #[serde(default)]
+    pub customer_ledgers: BTreeMap<String, crate::resources::Ledger>,
+    #[serde(default)]
+    pub customer_query_tokens: BTreeMap<String, String>,
+    #[serde(default)]
     pub rentals: BTreeMap<String, Rental>,
     #[serde(default)]
     pub payments: Vec<Payment>,
+    #[serde(default)]
+    pub rental_orders: Vec<RentalOrder>,
+    #[serde(default)]
+    pub payment_adjustments: Vec<PaymentAdjustment>,
     #[serde(default)]
     pub renewal_contact: String,
     pub nodes: Vec<Node>,
@@ -482,6 +520,59 @@ pub struct Payment {
     pub previous_expires_at: u64,
     pub expires_at: u64,
     pub note: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct RentalOrderItem {
+    pub line_id: String,
+    pub customer_id: String,
+    pub line_name: String,
+    pub customer_name: String,
+    pub quoted_fen: u64,
+    pub amount_fen: u64,
+    pub started_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct RentalOrder {
+    pub id: String,
+    pub request_id: String,
+    pub request_hash: String,
+    pub created: u64,
+    pub confirmed_at: u64,
+    pub cancelled_at: u64,
+    pub term: String,
+    pub amounts: BTreeMap<String, u64>,
+    pub note: String,
+    pub items: Vec<RentalOrderItem>,
+    pub created_session: String,
+    pub confirmed_session: String,
+    pub cancelled_session: String,
+    #[serde(default)]
+    pub created_by: Option<crate::security::Actor>,
+    #[serde(default)]
+    pub confirmed_by: Option<crate::security::Actor>,
+    #[serde(default)]
+    pub cancelled_by: Option<crate::security::Actor>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PaymentAdjustment {
+    pub id: String,
+    pub payment_id: String,
+    pub request_id: String,
+    pub request_hash: String,
+    pub kind: String,
+    pub delta_fen: i64,
+    pub created: u64,
+    pub note: String,
+    pub disable_line: bool,
+    #[serde(default)]
+    pub affected_line_ids: Vec<String>,
+    pub session: String,
+    #[serde(default)]
+    pub operator: Option<crate::security::Actor>,
 }
 impl Document {
     pub fn busy(&self) -> bool {

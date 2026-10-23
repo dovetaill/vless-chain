@@ -5,7 +5,7 @@ import type { PublicLookup } from "../types";
 import { beijingTime, money, terms } from "../lib/business";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
-import { CopyButton, Field, errorText } from "./shared";
+import { CopyButton, Field, bytes, errorText } from "./shared";
 import { RentalDates, RentalPrices, RentalSpeed, RentalStatusBadge, RentalUsage, SyncLabel } from "./rental-shared";
 
 export function PublicQuery() {
@@ -94,10 +94,11 @@ export function PublicQuery() {
       {result && <>
         <div className="flex flex-wrap justify-between gap-2 text-xs text-slate-500" role="status"><span>已匹配 {result.lines.length} 条代理 · 页面可见时每 10 秒刷新</span><span>查询时间 {beijingTime(result.time)} · 北京时间</span></div>
         {result.unmatched.length > 0 && <p className="rounded-lg bg-amber-50 p-4 text-sm text-amber-800">以下配置未匹配本平台出租服务：{result.unmatched.join("、")}。已匹配的服务显示如下。</p>}
+        {(result.customer_plans || []).map(plan => <Card key={plan.id}><CardHeader><CardTitle>共享套餐 · {plan.name}</CardTitle></CardHeader><CardContent className="space-y-3 text-sm"><p>团队总额 {bytes(plan.monthly_gib * 1024 ** 3)} · 已上报扣量 {bytes(plan.usage.used)} · 已授权 {bytes(plan.usage.reserved)}</p><p className="muted">额度在传输准入时预扣，转发失败也可能占用该块。已授权包含入口预留，离线扣量可能延后上报。所有成员共同受套餐总额限制。</p>{plan.members.map(member => <div key={member.id} className="rounded-lg border p-3"><p>{member.name} · 已上报 {bytes(member.usage.used)}</p><p className="muted mt-1">{member.monthly_gib == null ? "未另设成员上限" : `成员周期上限 ${bytes(member.monthly_gib * 1024 ** 3)}`}</p></div>)}</CardContent></Card>)}
         {result.lines.map(line => {
-          const renewal = [`代理：${line.name}`, `服务编号：${line.id}`, `到期：${beijingTime(line.rental.expires_at)}（北京时间）`, ...terms.filter(term => line.rental.prices[term.id] != null).map(term => `${term.name}报价：${money(line.rental.prices[term.id])}`), "希望续费周期：", "请运营方确认收款后开通或续期。"].join("\n");
+          const renewal = [`代理：${line.name}`, line.customer_plan_id ? `共享套餐编号：${line.customer_plan_id}（本线路共用）` : `服务编号：${line.id}`, `到期：${beijingTime(line.rental.expires_at)}（北京时间）`, ...terms.filter(term => line.rental.prices[term.id] != null).map(term => `${term.name}报价：${money(line.rental.prices[term.id])}`), "希望续费周期：", "请运营方确认收款后开通或续期。"].join("\n");
           return <Card key={line.id}><CardHeader className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 max-w-full"><CardTitle>{line.name}</CardTitle><p className="mt-2 break-all text-xs text-slate-400">服务编号 {line.id}</p></div><div className="flex items-center gap-3"><RentalStatusBadge status={line.status} /><SyncLabel status={line.sync_status} /></div></CardHeader><CardContent>
-            <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-4"><section><h3 className="mb-3 text-xs font-semibold text-slate-400">当前周期用量</h3><RentalUsage line={line} /></section><section><h3 className="mb-3 text-xs font-semibold text-slate-400">查询时网速</h3><RentalSpeed line={line} now={result.time} /></section><section><h3 className="mb-3 text-xs font-semibold text-slate-400">到期 / 额度重置（北京时间）</h3><RentalDates line={line} /></section><section><h3 className="mb-3 text-xs font-semibold text-slate-400">续费报价 · 人民币</h3><RentalPrices line={line} /></section></div>
+            <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-4"><section><h3 className="mb-3 text-xs font-semibold text-slate-400">当前周期用量</h3><RentalUsage line={line} /></section><section><h3 className="mb-3 text-xs font-semibold text-slate-400">查询时网速</h3><RentalSpeed line={line} now={result.time} /></section><section><h3 className="mb-3 text-xs font-semibold text-slate-400">到期 / 额度重置（北京时间）</h3><RentalDates line={line} /></section><section><h3 className="mb-3 text-xs font-semibold text-slate-400">{line.customer_plan_id ? "共享套餐续费报价" : "续费报价"} · 人民币</h3><RentalPrices line={line} /></section></div>
             {!line.rental.permanent && <div className="mt-6 border-t border-border pt-4"><CopyButton value={renewal} label="复制续费信息" /><p className="mt-2 text-xs text-slate-500">将续费信息发给运营方，确认付款后由运营方续期。</p></div>}
           </CardContent></Card>;
         })}

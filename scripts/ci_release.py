@@ -102,6 +102,7 @@ def smoke(directory):
         work.run([sys.executable, '-B', root / 'panel/tests/local_install.py', stage], cwd=root)
         work.env.update(CHAIN_TEST_BIN_DIR=str(stage / 'bin'), CHAIN_TEST_XRAY=str(stage / 'bin/xray'))
         work.run([sys.executable, '-B', root / 'panel/tests/legacy_migration.py'], cwd=root)
+        work.run([sys.executable, '-B', root / 'panel/tests/customer-plans.py'], cwd=root)
         if shutil.which('nginx') and shutil.which('openssl'):
             work.run([sys.executable, '-B', root / 'panel/tests/https_install.py', stage], cwd=root)
         if manifest['os'] == 'linux' and manifest['arch'] == 'x86_64':

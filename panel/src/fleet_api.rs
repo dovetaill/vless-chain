@@ -280,7 +280,7 @@ async fn receive_policy(
 }
 async fn remote_state(State(app): State<App>) -> Json<Value> {
     let Json(mut value) = state(State(app.clone())).await;
-    for key in ["customers", "payments", "subscriptions", "pending_imports"] {
+    for key in ["customers", "customer_plans", "payments", "rental_orders", "payment_adjustments", "subscriptions", "pending_imports"] {
         value[key] = json!([]);
     }
     value["renewal_contact"] = json!("");
@@ -448,7 +448,7 @@ pub async fn maintenance(value: Value) -> Result<Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let stream = tokio::net::UnixStream::connect("/run/chain-maintenance/control.sock")
         .await
-        .context("尚未安装 systemd 远程维护组件，请先在该 VPS 手工更新")?;
+        .context("尚未安装 Linux systemd / OpenRC 远程维护组件，请先在该 VPS 手工更新")?;
     let (read, mut write) = stream.into_split();
     write
         .write_all(format!("{}\n", serde_json::to_string(&value)?).as_bytes())
@@ -469,14 +469,32 @@ pub async fn maintenance(value: Value) -> Result<Value> {
     Ok(result)
 }
 async fn task_status(
+    State(app): State<App>,
     axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
-    Ok(Json(
-        maintenance(json!({"action":"status","id":query.get("id")})).await?,
-    ))
+    let mut value = maintenance(json!({"action":"status","id":query.get("id")})).await?;
+    value["last_requested_by"] = json!(app.store.lock().unwrap().doc.operator_audit.iter().rev()
+        .find(|a| a.path == "/api/federation/task" && a.target.as_ref() == query.get("id")).map(|a| &a.actor));
+    Ok(Json(value))
 }
-async fn task_submit(Json(value): Json<Value>) -> ApiResult<Json<Value>> {
-    Ok(Json(maintenance(value).await?))
+async fn task_submit(State(app): State<App>, Extension(actor): Extension<Actor>, audit: Option<Extension<AuditContext>>, Json(value): Json<Value>) -> ApiResult<Json<Value>> {
+    if actor.role == Role::Ops && !matches!(value["action"].as_str(), Some("upgrade" | "restart-all" | "restart-panel" | "restart-agent")) {
+        return Err(error(StatusCode::FORBIDDEN, "运维成员仅能执行升级或重启"));
+    }
+    if let Some(Extension(audit)) = audit {
+        let target = value["id"].as_str().context("维护任务标识无效")?;
+        uuid::Uuid::parse_str(target).context("维护任务标识无效")?;
+        let mut store = app.store.lock().unwrap();
+        let event = store.doc.operator_audit.iter_mut().find(|a| a.id == audit.0).context("操作审计不存在")?;
+        event.target = Some(target.into());
+        if let Err(e) = store.save() {
+            store.doc.operator_audit.iter_mut().find(|a| a.id == audit.0).unwrap().target = None;
+            return Err(e.into());
+        }
+    }
+    let mut result = maintenance(value).await?;
+    result["last_requested_by"] = json!(actor);
+    Ok(Json(result))
 }
 #[derive(Deserialize)]
 struct Batch {
@@ -809,17 +827,24 @@ pub async fn verify_batches(app: &App) -> Result<()> {
     Ok(())
 }
 
+fn agents_ready(state: &Value) -> bool {
+    let empty = ["lines", "legacy_configs"].into_iter().all(|key| {
+        state[key].as_array().is_some_and(Vec::is_empty)
+    });
+    state["nodes"].as_array().is_some_and(|nodes| nodes.iter().all(|n| {
+        let idle = empty
+            && n["report"]["revision"] == ""
+            && (n["desired_revision"].is_null() || n["desired_revision"] == "");
+        n["online"] == true
+            && (n["report"]["running"] == true || idle)
+            && n["report"]["applied"] == true
+            && n["report"]["error"] == ""
+    }))
+}
+
 async fn verify_remote(app: &App, remote: &Remote) -> Result<String> {
     let state = request(remote, "GET", "/api/federation/state", None).await?;
-    ensure!(
-        state["nodes"]
-            .as_array()
-            .is_some_and(|nodes| nodes.iter().all(|n| n["online"] == true
-                && n["report"]["running"] == true
-                && n["report"]["applied"] == true
-                && n["report"]["error"] == "")),
-        "存在未上线或未运行的 Agent"
-    );
+    ensure!(agents_ready(&state), "存在未上线或未运行的 Agent");
     let doc: Document =
         serde_json::from_value(request(remote, "GET", "/api/federation/document", None).await?)?;
     let policy: Policy = serde_json::from_value(state["monitoring"]["effective"].clone())?;
@@ -841,6 +866,9 @@ async fn verify_remote(app: &App, remote: &Remote) -> Result<String> {
         result.with_context(|| format!("{}：公网入口整链检测超时（40 秒）", line.name))?
             .with_context(|| format!("{}：公网入口整链检测未通过", line.name))?;
     }
+    if doc.lines.is_empty() {
+        return Ok("组件及 Agent 心跳通过；当前无可用代理，未进行公网整链检测".into());
+    }
     Ok(format!(
         "组件及 Agent 心跳通过；{} 条可用代理公网整链检测通过（不含 UDP）",
         doc.lines.len()
@@ -850,6 +878,36 @@ async fn verify_remote(app: &App, remote: &Remote) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn maintenance_accepts_idle_agents_without_hiding_configuration_failures() {
+        let idle = json!({"lines":[],"legacy_configs":[],"nodes":[{
+            "online":true,"desired_revision":null,
+            "report":{"running":false,"applied":true,"error":"","revision":""}
+        }]});
+        assert!(agents_ready(&idle));
+        for (pointer, value) in [
+            ("/nodes/0/online", json!(false)),
+            ("/nodes/0/report/applied", json!(false)),
+            ("/nodes/0/report/error", json!("failed")),
+            ("/nodes/0/report/revision", json!("previous")),
+            ("/nodes/0/desired_revision", json!("pending")),
+            ("/lines", json!([{"id":"draft"}])),
+            ("/legacy_configs", json!([{"id":"legacy"}])),
+            ("/lines", Value::Null),
+            ("/legacy_configs", Value::Null),
+        ] {
+            let mut state = idle.clone();
+            *state.pointer_mut(pointer).unwrap() = value;
+            assert!(!agents_ready(&state), "{pointer}");
+        }
+        let mut configured = idle;
+        configured["lines"] = json!([{"id":"active"}]);
+        configured["nodes"][0]["report"]["revision"] = json!("active");
+        configured["nodes"][0]["desired_revision"] = json!("active");
+        assert!(!agents_ready(&configured));
+        configured["nodes"][0]["report"]["running"] = json!(true);
+        assert!(agents_ready(&configured));
+    }
     #[test]
     fn formal_release_tag_is_validated() {
         let mut release = json!({"tag_name":"v0.2.30","draft":false,"prerelease":false});
@@ -1197,6 +1255,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn member_guard_blocks_tunnels_and_revocation_keeps_admin_session() {
+        use axum::body::{Body, to_bytes};
+        use hyper::service::Service;
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let member_id = id();
+        let actor = Actor { id: member_id.clone(), name: "财务成员".into(), role: Role::Finance };
+        app.store.lock().unwrap().doc.operator_members.push(OperatorMember { id: member_id.clone(), name: actor.name.clone(),
+            role: actor.role, token_hash: digest("member-key"), created_at: now(), revoked_at: 0 });
+        app.sessions.lock().unwrap().insert(digest("member-session"), Session { expires: now() + 600, actor: actor.clone() });
+        app.sessions.lock().unwrap().insert(digest("admin-session"), Session { expires: now() + 600, actor: Actor::admin() });
+        let router = Router::new()
+            .route("/api/state", get(state_view))
+            .route("/api/customers", post(|Extension(actor): Extension<Actor>| async move { Json(json!(actor)) }))
+            .route("/api/future-sensitive", get(|| async { "must not reach" }))
+            .route("/api/fleet/{id}/forward", post(|| async { "must not reach" }))
+            .route("/api/fleet/{id}/login", post(|| async { "must not reach" }))
+            .route("/api/federation/ticket", post(|| async { "must not reach" }))
+            .route("/api/federation/login", post(|| async { "must not reach" }))
+            .route("/api/security/members/{id}/revoke", post(security_api::revoke_member))
+            .layer(middleware::from_fn_with_state(app.clone(), guard))
+            .with_state(app.clone());
+        let service = hyper_util::service::TowerToHyperService::new(router);
+        let request = |method: &str, path: &str, session: &str, body: Value| Request::builder().method(method).uri(path)
+            .header("host", "panel.test").header("origin", "https://panel.test")
+            .header("content-type", "application/json").header("x-chain-request", "1")
+            .header("cookie", format!("chain_session={session}")).header("x-chain-actor", "administrator")
+            .body(Body::from(body.to_string())).unwrap();
+        for (method, path) in [
+            ("GET", "/api/future-sensitive".into()),
+            ("POST", format!("/api/fleet/{member_id}/forward")),
+            ("POST", format!("/api/fleet/{member_id}/login")),
+            ("POST", "/api/federation/ticket".into()),
+            ("POST", "/api/federation/login".into()),
+        ] {
+            let response = service.call(request(method, &path, "member-session", json!({}))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let response = service.call(request("POST", "/api/customers", "member-session", json!({"actor":"administrator"}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["id"], member_id);
+        assert_eq!(body["role"], "finance");
+        let audit = app.store.lock().unwrap().doc.operator_audit.last().unwrap().clone();
+        assert_eq!(audit.actor, actor);
+        assert_eq!(audit.response_status, Some(200));
+
+        let response = service.call(request("POST", &format!("/api/security/members/{member_id}/revoke"), "admin-session", json!({"token":"test"}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!app.sessions.lock().unwrap().contains_key(&digest("member-session")));
+        assert!(app.sessions.lock().unwrap().contains_key(&digest("admin-session")));
+        assert_eq!(service.call(request("GET", "/api/state", "member-session", json!({}))).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(service.call(request("GET", "/api/state", "admin-session", json!({}))).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn customer_query_tokens_do_not_authenticate_backend() {
+        use axum::body::Body;
+        use hyper::service::Service;
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        app.store.lock().unwrap().doc.customer_query_tokens.insert("plan:fixture".into(), digest("customer-query-token"));
+        let response = login(State(app.clone()), Json(Login { token: "customer-query-token".into(), code: String::new() })).await.unwrap_err();
+        assert_eq!(response.0, StatusCode::UNAUTHORIZED);
+        assert!(app.sessions.lock().unwrap().is_empty());
+        let router = Router::new().route("/api/state", get(state_view))
+            .layer(middleware::from_fn_with_state(app.clone(), guard)).with_state(app);
+        let service = hyper_util::service::TowerToHyperService::new(router);
+        let request = Request::builder().uri("/api/state")
+            .header("cookie", "chain_session=customer-query-token")
+            .header("authorization", "Bearer customer-query-token")
+            .body(Body::empty()).unwrap();
+        assert_eq!(service.call(request).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn machine_auth_is_scoped_and_keeps_origin_checks() {
         use axum::body::Body;
         use hyper::service::Service;
@@ -1322,7 +1456,7 @@ mod tests {
         app.sessions
             .lock()
             .unwrap()
-            .insert("independent-session".into(), now() + 600);
+            .insert("independent-session".into(), Session { expires: now() + 600, actor: Actor::admin() });
         let _ = revoke(State(app.clone())).await.unwrap();
         assert_eq!(app.sessions.lock().unwrap().len(), 1);
         assert!(

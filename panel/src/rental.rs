@@ -146,7 +146,7 @@ pub fn status(doc: &Document, line: &Line, at: u64) -> &'static str {
     if !line.enabled {
         return "disabled";
     }
-    if let Some(rental) = doc.rentals.get(&line.id) {
+    if let Some(rental) = crate::plans::lease(doc, &line.id) {
         if rental.started_at == 0 {
             return "not_started";
         }
@@ -157,7 +157,8 @@ pub fn status(doc: &Document, line: &Line, at: u64) -> &'static str {
     if !doc.applied_lines.iter().any(|l| l.id == line.id) {
         return "draft";
     }
-    let traffic = safe_traffic(doc.rentals.get(&line.id), traffic(doc, line), at);
+    if crate::plans::exhausted(doc, &line.id, at) { return "quota_exhausted"; }
+    let traffic = safe_traffic(crate::plans::lease(doc, &line.id), traffic(doc, line), at);
     if let (Some(t), Some(limit)) = (&traffic, line.limits.monthly_gib) {
         if t.used() >= (limit * 1073741824.0) as u64 {
             return "quota_exhausted";
@@ -175,7 +176,7 @@ pub fn status(doc: &Document, line: &Line, at: u64) -> &'static str {
 }
 
 pub fn view(doc: &Document, line: &Line, at: u64) -> Value {
-    let rental = doc.rentals.get(&line.id);
+    let rental = crate::plans::lease(doc, &line.id);
     let value = rental.map(|r| {
         json!({
             "customer_id":r.customer_id,"prices":r.prices,"started_at":r.started_at,
@@ -190,7 +191,7 @@ pub fn view(doc: &Document, line: &Line, at: u64) -> Value {
         .and_then(|n|n.desired.as_ref()).and_then(|d|d.config["_chain"].as_array())
         .and_then(|specs|specs.iter().find(|s|s["id"]==line.id)).and_then(|s|s["multiplier"].as_u64())
         .unwrap_or_else(||crate::resources::multiplier(doc,line).unwrap_or(1) as u64);
-    json!({"multiplier":multiplier,"rental":value,"rental_status":status(doc,line,at),"sync_status":sync_status(doc,line),
+    json!({"multiplier":multiplier,"rental":value,"customer_plan_id":crate::plans::for_line(doc,&line.id).map(|p|&p.id),"rental_status":status(doc,line,at),"sync_status":sync_status(doc,line),
         "traffic":safe_traffic(rental,traffic(doc,line),at)})
 }
 

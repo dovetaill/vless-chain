@@ -41,7 +41,7 @@ export function matchesLine(line: Line, state: PanelState, search: string) {
     return `${node?.name || ""} ${node?.host || ""} ${hop.port}`;
   });
   const fields = [line.name, customer?.name, ...nodes, line.access.host, line.access.public_host,
-    line.access.public_port, line.access.tls.domain].join(" ").toLowerCase();
+    line.access.public_port, line.access.tls?.domain].join(" ").toLowerCase();
   return search.toLowerCase().trim().split(/\s+/).every(word => fields.includes(word));
 }
 
