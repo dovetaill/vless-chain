@@ -1243,6 +1243,8 @@ pub fn system_metrics() -> serde_json::Value {
 #[cfg(target_os = "macos")]
 pub fn system_metrics() -> serde_json::Value {
     unsafe extern "C" {
+        fn mach_host_self() -> libc::mach_port_t;
+        static mach_task_self_: libc::mach_port_t;
         fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
     }
     fn sysctl<T: Default>(name: &std::ffi::CStr) -> Option<T> {
@@ -1262,7 +1264,7 @@ pub fn system_metrics() -> serde_json::Value {
     }
     let total = sysctl::<u64>(c"hw.memsize");
     let (cpu, available) = unsafe {
-        let host = libc::mach_host_self();
+        let host = mach_host_self();
         let mut cpu: libc::host_cpu_load_info = std::mem::zeroed();
         let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
         let cpu = (libc::host_statistics(
@@ -1290,7 +1292,7 @@ pub fn system_metrics() -> serde_json::Value {
                 (u64::from(vm.free_count) + u64::from(vm.inactive_count))
                     * libc::sysconf(libc::_SC_PAGESIZE) as u64
             });
-        mach_port_deallocate(libc::mach_task_self(), host);
+        mach_port_deallocate(mach_task_self_, host);
         (cpu, available)
     };
     let (mut rx, mut tx) = (0u64, 0u64);
