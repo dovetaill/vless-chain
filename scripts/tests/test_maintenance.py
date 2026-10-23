@@ -16,6 +16,9 @@ from chain_install import Manager, OWNER
 
 class MaintenanceTests(unittest.TestCase):
     def setUp(self):
+        kind = patch.object(maintenance, 'service_kind', return_value='systemd')
+        kind.start()
+        self.addCleanup(kind.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -91,6 +94,44 @@ class MaintenanceTests(unittest.TestCase):
         maintenance.HTTPS_UNIT.unlink()
         result, commands, _ = self.run_job('restart-all', {'panel': '1.2.3'})
         self.assertEqual(commands, [['/usr/bin/systemctl', 'restart', 'chain-panel.service']])
+
+    def test_openrc_restart_and_upgrade_use_platform_services(self):
+        with patch.object(maintenance, 'service_kind', return_value='openrc'):
+            maintenance.HTTPS_UNIT.write_text(maintenance.SITE_OWNER + '\n')
+            services = ['chain-panel', 'chain-agent', 'chain-panel-https']
+            result, commands, checks = self.run_job('restart-all', {'panel': '1.2.3', 'agent': '1.2.3'})
+            self.assertEqual(result['state'], 'succeeded')
+            self.assertEqual(commands, [['rc-service', name, 'restart'] for name in services])
+            self.assertEqual(checks, [['rc-service', name, 'status'] for name in services])
+            result, commands, checks = self.run_job('upgrade', {'panel': '1.2.3', 'agent': '1.2.3'},
+                                                  after={'panel': '1.2.4', 'agent': '1.2.4'})
+            self.assertEqual(result['state'], 'succeeded')
+            self.assertEqual(commands[0][:2], ['/usr/local/bin/chainctl', 'update'])
+            self.assertEqual(commands[1], ['rc-service', 'chain-panel-https', 'restart'])
+            self.assertEqual(checks, [['rc-service', name, 'status'] for name in services])
+
+    def test_openrc_installer_writes_owned_supervised_service(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch('chain_install.service_kind', return_value='openrc'), \
+                patch('chain_platform.service_kind', return_value='openrc'), \
+                patch('chain_install.service_state', return_value=(True, True)):
+            manager = Manager(Path(root))
+            script = manager.base / 'current-panel/scripts/chain_maintenance.py'
+            script.parent.mkdir(parents=True)
+            script.write_text('# fixture')
+            manager.maintenance_units()
+            unit = manager.path('/etc/init.d/chain-maintenance')
+            self.assertEqual(unit.stat().st_mode & 0o777, 0o755)
+            self.assertIn('supervisor=supervise-daemon', unit.read_text())
+            subprocess.run(['/bin/sh', '-n', str(unit)], check=True)
+            with patch.object(manager.system, 'call') as call:
+                manager.maintenance_units()
+            self.assertEqual([c.args for c in call.call_args_list],
+                             [('enable', 'chain-maintenance'), ('start', 'chain-maintenance')])
+            unit.write_text('foreign')
+            with self.assertRaises(ValueError):
+                manager.maintenance_units()
+            self.assertEqual(unit.read_text(), 'foreign')
 
     def test_foreign_https_service_is_never_restarted(self):
         maintenance.HTTPS_UNIT.write_text('foreign service')

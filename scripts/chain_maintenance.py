@@ -1,5 +1,8 @@
-"""Socket-activated, fixed-operation maintenance executor; never accepts shell text."""
+"""Fixed-operation maintenance executor for systemd/OpenRC; never accepts shell text."""
 import concurrent.futures
+import contextlib
+import fcntl
+import stat
 import json
 import os
 from pathlib import Path
@@ -18,13 +21,14 @@ import uuid
 
 from chain_common import VERSION_RE, download_release, json_write, require, safe_extract
 from chain_network import SITE_OWNER
+from chain_platform import service_kind, service_path
 
 STATE = Path('/var/lib/chain-maintenance')
 INSTALL_STATE = Path('/opt/chain/.chain-install.json')
 LOCK = threading.Lock()
 RELOAD = threading.Event()
 ACTIONS = {'upgrade', 'restart-all', 'restart-panel', 'restart-agent', 'sync-time'}
-HTTPS_UNIT = Path('/etc/systemd/system/chain-panel-https.service')
+HTTPS_UNIT = service_path('chain-panel-https')
 
 
 def validate(value):
@@ -51,8 +55,59 @@ def related_services(roles):
     if HTTPS_UNIT.exists() or HTTPS_UNIT.is_symlink():
         require(not HTTPS_UNIT.is_symlink() and HTTPS_UNIT.is_file()
                 and HTTPS_UNIT.read_text().startswith(SITE_OWNER + '\n'), '独立 HTTPS 服务归属不匹配')
-        services.append(HTTPS_UNIT.name)
+        services.append('chain-panel-https.service')
     return services
+
+
+def restart_commands(services):
+    if service_kind() == 'openrc':
+        return [['rc-service', name.removesuffix('.service'), 'restart'] for name in services]
+    return [['/usr/bin/systemctl', 'restart', *services]]
+
+
+def status_command(name):
+    if service_kind() == 'openrc':
+        return ['rc-service', name.removesuffix('.service'), 'status']
+    return ['/usr/bin/systemctl', 'is-active', '--quiet', name]
+
+
+@contextlib.contextmanager
+def control_listener(panel_gid, runtime=Path('/run/chain-maintenance')):
+    if service_kind() != 'openrc':
+        require(os.environ.get('LISTEN_PID') == str(os.getpid()) and os.environ.get('LISTEN_FDS') == '1',
+                '需要 systemd socket activation')
+        with socket.socket(fileno=3) as listener:
+            yield listener
+        return
+    try:
+        runtime.mkdir(mode=0o755)
+    except FileExistsError:
+        pass
+    else:
+        runtime.chmod(0o755)  # OpenRC's private umask must not hide the socket from the panel.
+    info = runtime.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and info.st_mode & 0o777 == 0o755,
+            '维护运行目录归属不匹配')
+    descriptor = os.open(runtime / 'listener.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'w') as lock:
+        info = os.fstat(lock.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+                and info.st_mode & 0o777 == 0o600, '维护监听锁归属不匹配')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        path = runtime / 'control.sock'
+        if path.exists() or path.is_symlink():
+            info = path.lstat()
+            require(stat.S_ISSOCK(info.st_mode) and info.st_uid == 0, '维护 socket 归属不匹配')
+            path.unlink()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(path))
+            try:
+                os.chown(path, 0, panel_gid)
+                os.chmod(path, 0o660)
+                listener.listen(16)
+                yield listener
+            finally:
+                path.unlink(missing_ok=True)
 
 
 def time_output(path):
@@ -95,16 +150,16 @@ def execute(job, directory=STATE):
                 commands = [['/usr/local/bin/chainctl', 'update', '--component', 'panel', '--package', str(archive), '--non-interactive']]
                 if job.get('xray_channel') == 'latest':
                     commands[0].extend(['--xray-channel', 'latest'])
-                if HTTPS_UNIT.name in services:
-                    commands.append(['/usr/bin/systemctl', 'restart', HTTPS_UNIT.name])
+                if 'chain-panel-https.service' in services:
+                    commands.extend(restart_commands(['chain-panel-https.service']))
             elif job['action'] == 'restart-all':
-                commands = [['/usr/bin/systemctl', 'restart', *services]]
+                commands = restart_commands(services)
             elif job['action'] == 'sync-time':
                 commands = [[sys.executable, '-B', str(Path(__file__).with_name('chain_time.py'))]]
             else:
                 role = job['action'].removeprefix('restart-')
                 require(role in before, '该组件未安装')
-                commands = [['/usr/bin/systemctl', 'restart', 'chain-' + role + '.service']]
+                commands = restart_commands(['chain-' + role + '.service'])
                 services = ['chain-' + role + '.service']
             with (temporary / 'operation.log').open('wb') as log:
                 for command in commands:
@@ -123,17 +178,13 @@ def execute(job, directory=STATE):
                             process.wait()
                         raise ValueError('维护操作超时；已停止本任务进程，请检查逐组件状态') from None
                     finally:
-                        try:
-                            os.killpg(process.pid, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
                         if job['action'] == 'sync-time':
                             log.flush()
                             job['detail'] = time_output(temporary / 'operation.log')
                     require(result == 0, '维护操作失败；请在该 VPS 检查安装状态与服务日志')
             job['after'] = installed()
             for service in services:
-                require(subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', service], timeout=30).returncode == 0,
+                require(subprocess.run(status_command(service), timeout=30).returncode == 0,
                         f'{service} 服务未运行')
             if job['action'] == 'upgrade':
                 for role in ('panel', 'agent'):
@@ -151,7 +202,9 @@ def execute(job, directory=STATE):
         except Exception:
             pass
     finally:
-        if process is not None:
+        # OpenRC supervisors launched by a completed command may retain its process group.
+        # They are the requested persistent services, not leftover task children.
+        if process is not None and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -192,10 +245,13 @@ def submit(value, pool, directory=STATE):
 
 
 def main():
-    require(os.geteuid() == 0, '维护组件须由 systemd 启动')
-    require(os.environ.get('LISTEN_PID') == str(os.getpid()) and os.environ.get('LISTEN_FDS') == '1', '需要 systemd socket activation')
-    panel_uid = pwd.getpwnam('chain-panel').pw_uid
-    listener = socket.socket(fileno=3)
+    require(os.geteuid() == 0, '维护组件须由系统服务以 root 启动')
+    panel = pwd.getpwnam('chain-panel')
+    with control_listener(panel.pw_gid) as listener:
+        serve(listener, panel.pw_uid)
+
+
+def serve(listener, panel_uid):
     listener.settimeout(1)
     # Do not replay interrupted upgrades: their externally visible result is unknown.
     for path in STATE.glob('*.json'):

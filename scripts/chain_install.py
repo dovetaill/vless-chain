@@ -19,6 +19,7 @@ import shutil
 import shlex
 import signal
 import socket
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -286,7 +287,8 @@ class Manager:
             temp.unlink(missing_ok=True)
 
     def maintenance_units(self):
-        if service_kind() != 'systemd':
+        kind = service_kind()
+        if kind not in ('systemd', 'openrc'):
             return
         script = self.base / 'current-panel/scripts/chain_maintenance.py'
         if not script.is_file():
@@ -302,13 +304,19 @@ class Manager:
                         f'ExecStart="{sys.executable}" -B "{script}"\n'
                         'PrivateTmp=true\nProtectHome=true\nKillMode=control-group\nTimeoutStopSec=45\n'),
         }
+        if kind == 'openrc':
+            definitions = {'service': service_definition('chain-maintenance', [sys.executable, '-B', script], OWNER,
+                                                       env={'PYTHONDONTWRITEBYTECODE': '1'})}
+        def unit_path(suffix):
+            return self.path('/etc/init.d/chain-maintenance' if kind == 'openrc'
+                             else '/etc/systemd/system/chain-maintenance.' + suffix)
         for suffix in definitions:
-            path = self.path('/etc/systemd/system/chain-maintenance.' + suffix)
+            path = unit_path(suffix)
             require(not path.is_symlink() and (not path.exists() or OWNER in path.read_text()),
                     f'{path} 不归本安装器管理，拒绝覆盖。')
         runtime = self.path('/run/chain-maintenance')
         if runtime.exists() or runtime.is_symlink():
-            socket_unit = self.path('/etc/systemd/system/chain-maintenance.socket')
+            socket_unit = unit_path('socket' if kind == 'systemd' else 'service')
             require(runtime.is_dir() and not runtime.is_symlink() and socket_unit.is_file()
                     and OWNER in socket_unit.read_text() and (not self.live or runtime.stat().st_uid == 0),
                     '维护运行目录归属不匹配，拒绝接管。')
@@ -324,10 +332,16 @@ class Manager:
             state.mkdir(parents=True, mode=0o700)
             atomic_write(marker, OWNER)
         for suffix, body in definitions.items():
-            path = self.path('/etc/systemd/system/chain-maintenance.' + suffix)
-            atomic_write(path, body, 0o644)
-        self.system.call('daemon-reload')
-        self.system.call('enable', '--now', 'chain-maintenance.socket')
+            path = unit_path(suffix)
+            atomic_write(path, body, 0o755 if kind == 'openrc' else 0o644)
+        if kind == 'openrc':
+            self.system.call('enable', 'chain-maintenance')
+            # An upgrade may be running inside this executor; never stop its parent.
+            if not self.live or not service_state('chain-maintenance')[0]:
+                self.system.call('start', 'chain-maintenance')
+        else:
+            self.system.call('daemon-reload')
+            self.system.call('enable', '--now', 'chain-maintenance.socket')
 
     def healthy(self, role, env):
         if not self.live:
@@ -685,6 +699,8 @@ class Manager:
                        'chain-maintenance.' + suffix, OWNER) for suffix in ('socket', 'service')]
         else:
             units.append((renew_timer, 'chain-panel-cert-renew', SITE_OWNER))
+            if service_kind() == 'openrc':
+                units.append((self.path('/etc/init.d/chain-maintenance'), 'chain-maintenance', OWNER))
         units += [(p, p.name if service_kind() == 'systemd' else 'chain-ingress', INGRESS_OWNER)
                   for p in ingress.unit_paths()]
         config_root = nginx_conf().parent if self.live else self.path('/etc/nginx')
@@ -705,6 +721,19 @@ class Manager:
         directories.append(backups)
         maintenance_state = self.path('/var/lib/chain-maintenance')
         directories.append(maintenance_state)
+        maintenance_runtime = self.path('/run/chain-maintenance')
+        if service_kind() == 'openrc' and maintenance_runtime.exists():
+            directories.append(maintenance_runtime)
+            require(not maintenance_runtime.is_symlink() and maintenance_runtime.is_dir()
+                    and (not self.live or maintenance_runtime.stat().st_uid == 0)
+                    and self.path('/etc/init.d/chain-maintenance').is_file(),
+                    '维护运行目录归属不匹配，拒绝删除。')
+            for path in maintenance_runtime.iterdir():
+                info = path.lstat()
+                require((not self.live or info.st_uid == 0) and (
+                    path.name == 'control.sock' and stat.S_ISSOCK(info.st_mode)
+                    or path.name == 'listener.lock' and stat.S_ISREG(info.st_mode) and info.st_nlink == 1),
+                    '维护运行目录包含未知文件，拒绝删除。')
         legacy_assets = self.path('/var/lib/chain-legacy-assets')
         directories.append(legacy_assets)
         if legacy_assets.exists():
@@ -723,6 +752,7 @@ class Manager:
         logs = [self.path('/var/log/chain-' + role + '.log') for role in roles] + [self.path('/var/log/chain-panel-https.log')]
         if service_kind() == 'openrc':
             logs += [self.role_paths(role)[1] / 'service.log' for role in roles]
+            logs.append(self.path('/var/log/chain-maintenance.log'))
         for p in logs:
             require(not p.is_symlink(), f'日志路径为链接，拒绝删除：{p}')
         if purge and backups.exists():
@@ -770,6 +800,8 @@ class Manager:
                 for role in roles:
                     remove_account('chain-' + role)
             remove = [ingress.directory, ingress.config, self.path('/var/lib/chain-acme'), https_temporary]
+            if service_kind() == 'openrc':
+                remove.append(maintenance_runtime)
             if purge:
                 remove += [p for role in roles for p in self.role_paths(role)[:2]] + [backups, maintenance_state, legacy_assets]
             for p in remove:

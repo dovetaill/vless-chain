@@ -78,12 +78,17 @@ jobs:
       - name: Verify failed OpenRC installation can be retried
         if: github.ref_type == 'tag' && matrix.system == 'linux' && matrix.arch == 'x86_64'
         run: |
-          trap 'docker rm -f chain-openrc-recovery >/dev/null 2>&1 || true' EXIT
+          trap 'docker rm -f chain-openrc-recovery chain-openrc-maintenance >/dev/null 2>&1 || true' EXIT
           docker run --rm --init --name chain-openrc-recovery \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
             --workdir /source --env PYTHONDONTWRITEBYTECODE=1 --env CHAIN_TEST_OPENRC=1 \
             alpine:3.23.6@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0 \
             sh -ec 'apk add --no-cache openrc python3; python3 -B scripts/tests/openrc_recovery.py'
+          docker run --rm --init --name chain-openrc-maintenance \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --workdir /source --env PYTHONDONTWRITEBYTECODE=1 --env CHAIN_TEST_OPENRC=1 \
+            alpine:3.23.6@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0 \
+            sh -ec 'apk add --no-cache openrc python3; python3 -B scripts/tests/openrc_maintenance.py'
       - name: Build native release
         env:
           RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}

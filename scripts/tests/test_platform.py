@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -283,7 +284,24 @@ class Platforms(unittest.TestCase):
                     self.assertEqual(manager.state()['roles']['panel']['current'], current)
                     self.assertEqual((data / 'keep').read_text(), 'business data')
                     args = installer.make_parser().parse_args(['uninstall', '--non-interactive'])
+                    if kind == 'openrc':
+                        maintenance_unit = manager.path('/etc/init.d/chain-maintenance')
+                        maintenance_unit.write_text('#!/sbin/openrc-run\n# ' + installer.OWNER + '\n')
+                        runtime = manager.path('/run/chain-maintenance')
+                        runtime.mkdir(parents=True)
+                        (runtime / 'listener.lock').touch(mode=0o600)
+                        with socket.socket(socket.AF_UNIX) as listener:
+                            # Keep bind below the Unix socket path limit even in deep CI workspaces.
+                            previous_cwd = Path.cwd()
+                            try:
+                                os.chdir(runtime)
+                                listener.bind('control.sock')
+                            finally:
+                                os.chdir(previous_cwd)
                     manager.operate(args)
+                    if kind == 'openrc':
+                        self.assertFalse(runtime.exists())
+                        self.assertFalse(maintenance_unit.exists())
                     self.assertFalse((data / 'service.log').exists())
                     self.assertFalse(unit.exists())
                     self.assertEqual((data / 'keep').read_text(), 'business data')
