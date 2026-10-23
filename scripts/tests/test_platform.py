@@ -239,7 +239,7 @@ class Platforms(unittest.TestCase):
         dump = '# configuration file /opt/homebrew/etc/nginx/nginx.conf:\nhttp { include servers/*; }\n'
         self.assertEqual(network.nginx_site_directory(dump), Path('/opt/homebrew/etc/nginx/servers'))
 
-    def test_non_systemd_install_upgrade_rollback_and_uninstall(self):
+    def test_non_systemd_install_upgrade_backup_and_uninstall(self):
         from test_delivery import Delivery
         for kind, system in [('openrc', 'Linux'), ('launchd', 'Darwin')]:
             fixture = Delivery()
@@ -260,13 +260,15 @@ class Platforms(unittest.TestCase):
                     (data / 'keep').write_text('business data')
                     if kind == 'openrc':
                         (data / 'service.log').write_text('service output')
-                    previous = manager.state()['roles']['panel']['current']
                     source, manifest = fixture.package('0.2.0')
                     manager.install(source, manifest, fixture.args(action='update'))
+                    self.assertFalse(list(manager.path('/var/backups/chain-panel').glob('*.tar.gz')))
+                    self.assertIsNone(manager.state()['roles']['panel']['previous'])
                     if kind == 'openrc':
-                        backup = next(manager.path('/var/backups/chain-panel').glob('*.tar.gz'))
+                        backup = manager.backup_files('panel')
                         with tarfile.open(backup) as archive:
                             self.assertNotIn('data/service.log', archive.getnames())
+                            self.assertEqual(archive.extractfile('data/keep').read(), b'business data')
                     self.assertEqual((etc / 'panel.env').read_bytes(), env)
                     if kind == 'launchd':
                         service = plistlib.loads(unit.read_bytes())
@@ -275,8 +277,10 @@ class Platforms(unittest.TestCase):
                     else:
                         self.assertEqual(unit.stat().st_mode & 0o777, 0o755)
                         subprocess.run(['/bin/sh', '-n', str(unit)], check=True)
-                    manager.rollback('panel')
-                    self.assertEqual(manager.state()['roles']['panel']['current'], previous)
+                    current = manager.state()['roles']['panel']['current']
+                    with self.assertRaisesRegex(ValueError, '没有可回滚'):
+                        manager.rollback('panel')
+                    self.assertEqual(manager.state()['roles']['panel']['current'], current)
                     self.assertEqual((data / 'keep').read_text(), 'business data')
                     args = installer.make_parser().parse_args(['uninstall', '--non-interactive'])
                     manager.operate(args)
