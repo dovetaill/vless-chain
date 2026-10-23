@@ -293,7 +293,7 @@ def build(args):
         work.run(['node', ROOT / 'panel/tests/xray-reality.cjs'], cwd=ROOT)
         fetch_mihomo(work, stage / 'bin/mihomo')
         work.run([stage / 'bin/mihomo', '-v'])
-        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_time.py']:
+        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_time.py', 'chain_tuning.py']:
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')

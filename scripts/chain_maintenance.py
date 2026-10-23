@@ -22,17 +22,18 @@ import uuid
 from chain_common import VERSION_RE, download_release, json_write, require, safe_extract
 from chain_network import SITE_OWNER
 from chain_platform import service_kind, service_path
+import chain_tuning
 
 STATE = Path('/var/lib/chain-maintenance')
 INSTALL_STATE = Path('/opt/chain/.chain-install.json')
 LOCK = threading.Lock()
 RELOAD = threading.Event()
-ACTIONS = {'upgrade', 'restart-all', 'restart-panel', 'restart-agent', 'sync-time'}
+ACTIONS = {'upgrade', 'restart-all', 'restart-panel', 'restart-agent', 'sync-time', 'network-tune', 'network-status'}
 HTTPS_UNIT = service_path('chain-panel-https')
 
 
 def validate(value):
-    require(isinstance(value, dict) and set(value) <= {'id', 'action', 'version', 'xray_channel'}, '请求字段无效')
+    require(isinstance(value, dict) and set(value) <= {'id', 'action', 'version', 'xray_channel', 'congestion_control', 'qdisc'}, '请求字段无效')
     require(isinstance(value.get('id'), str) and str(uuid.UUID(value['id'])) == value['id'], '任务 ID 无效')
     require(value.get('action') in ACTIONS | {'status'}, '不支持的维护操作')
     if value['action'] == 'upgrade':
@@ -40,6 +41,10 @@ def validate(value):
         require(value.get('xray_channel', 'recommended') in ('recommended', 'latest'), 'Xray 来源无效')
     else:
         require('xray_channel' not in value, '只有升级操作可选择内核来源')
+    if value['action'] == 'network-tune':
+        chain_tuning.validate(value.get('congestion_control'), value.get('qdisc'))
+    else:
+        require('congestion_control' not in value and 'qdisc' not in value, '只有网络设置可选择算法或队列')
     return value
 
 
@@ -154,6 +159,10 @@ def execute(job, directory=STATE):
                     commands.extend(restart_commands(['chain-panel-https.service']))
             elif job['action'] == 'restart-all':
                 commands = restart_commands(services)
+            elif job['action'] == 'network-tune':
+                job['network'] = chain_tuning.apply(job['congestion_control'], job['qdisc'])
+                job['detail'] = job['network']['detail']
+                commands = []
             elif job['action'] == 'sync-time':
                 commands = [[sys.executable, '-B', str(Path(__file__).with_name('chain_time.py'))]]
             else:
@@ -190,8 +199,8 @@ def execute(job, directory=STATE):
                 for role in ('panel', 'agent'):
                     if role in before:
                         require(job['after'].get(role) == job['version'], f'{role} 版本未达到目标')
-            job.update(state='succeeded', detail=(job.get('detail') or '时间同步已确认，时区保持不变')
-                       if job['action'] == 'sync-time' else '组件检查通过；总控还需检查整链')
+            job.update(state='succeeded', detail=job.get('detail') or ('时间同步已确认，时区保持不变'
+                       if job['action'] == 'sync-time' else '组件检查通过；总控还需检查整链'))
     except Exception as error:
         message = str(error)
         if job['action'] == 'sync-time' and job.get('detail'):
@@ -223,12 +232,16 @@ def execute(job, directory=STATE):
 
 def submit(value, pool, directory=STATE):
     value = validate(value)
+    if value['action'] == 'network-status':
+        return chain_tuning.status()
     path = directory / (value['id'] + '.json')
     with LOCK:
         if path.exists():
             job = json.loads(path.read_text())
             require(value['action'] == 'status' or (job['action'], job.get('version', ''), job.get('xray_channel', 'recommended')) ==
                     (value['action'], value.get('version', ''), value.get('xray_channel', 'recommended')), '任务 ID 已用于其他操作')
+            require(value['action'] == 'status' or all(job.get(key) == value.get(key) for key in ('congestion_control', 'qdisc')),
+                    '任务 ID 已用于其他网络设置')
             return job
         if value['action'] == 'status':
             return {'id': value['id'], 'state': 'not_found'}

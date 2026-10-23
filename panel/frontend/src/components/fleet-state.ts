@@ -33,6 +33,7 @@ export type Task = {
       detail?: string;
       error?: string;
       after?: Record<string, string>;
+      network?: { after: { congestion_control: string; qdisc: string; interfaces: { dev: string; kind: string; parent: string }[]; warning: string } };
       maintenance_state?: string;
       verification?: { state: string; detail?: string; checked_at?: number; retry_at?: number };
     };
@@ -67,6 +68,7 @@ export const actions: Record<string, string> = {
   "restart-all": "整套重启",
   "restart-panel": "重启面板",
   "restart-agent": "重启 Agent",
+  "network-tune": "设置网络算法",
   enable: "启用所选代理",
   disable: "停用所选代理",
 };

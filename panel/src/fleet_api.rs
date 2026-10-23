@@ -506,6 +506,10 @@ struct Batch {
     #[serde(default)]
     xray_channel: String,
     #[serde(default)]
+    congestion_control: String,
+    #[serde(default)]
+    qdisc: String,
+    #[serde(default)]
     lines: BTreeMap<String, Vec<String>>,
 }
 async fn archive_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -557,12 +561,26 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
     uuid::Uuid::parse_str(&input.id).map_err(|_| error(StatusCode::BAD_REQUEST, "任务 ID 无效"))?;
     if !matches!(
         input.action.as_str(),
-        "upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "enable" | "disable"
+        "upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "enable" | "disable" | "network-tune"
     ) {
         return Err(error(StatusCode::BAD_REQUEST, "不支持的批量操作"));
     }
     if input.action == "upgrade" && !version_valid(&input.version) {
         return Err(error(StatusCode::BAD_REQUEST, "请选择正式发行版本"));
+    }
+    if input.action == "network-tune" {
+        let cc = &input.congestion_control;
+        if cc.is_empty() || cc.len() > 32 || !cc.starts_with(|c: char| c.is_ascii_lowercase())
+            || !cc.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') {
+            return Err(error(StatusCode::BAD_REQUEST, "拥塞算法无效"));
+        }
+        if !matches!(input.qdisc.as_str(), "fq" | "fq_codel" | "fq_pie" | "cake" | "pfifo_fast") {
+            return Err(error(StatusCode::BAD_REQUEST, "队列无效"));
+        }
+    } else {
+        if !input.congestion_control.is_empty() || !input.qdisc.is_empty() {
+            return Err(error(StatusCode::BAD_REQUEST, "只有网络设置可选择算法或队列"));
+        }
     }
     if !matches!(input.xray_channel.as_str(), "" | "recommended" | "latest")
         || (input.xray_channel == "latest" && input.action != "upgrade") {
@@ -570,6 +588,13 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
     }
     edit(&app, |d| {
         if d.fleet.receipts.contains_key(&input.id) {
+            let job = &d.fleet.receipts[&input.id];
+            if input.action == "network-tune" || job["action"] == "network-tune" {
+                ensure!(job["action"] == input.action && job["congestion_control"] == input.congestion_control
+                    && job["qdisc"] == input.qdisc
+                    && job["targets"].as_array().is_some_and(|targets| targets.iter().map(|t| t["id"].as_str().unwrap_or("")).eq(input.targets.iter().map(String::as_str))),
+                    "任务 ID 已用于其他设置");
+            }
             return Ok(());
         }
         ensure!(
@@ -607,6 +632,12 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
                         .as_array().is_some_and(|actions| actions.iter().any(|a| a == "restart-all")))),
                     "所选 VPS 尚不支持整套重启；请先升级并等待状态同步");
             }
+            if input.action == "network-tune" {
+                ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter()
+                    .find(|r| &r.id == id).is_some_and(|r| r.snapshot["maintenance_actions"]
+                        .as_array().is_some_and(|actions| actions.iter().any(|a| a == "network-tune")))),
+                    "所选 VPS 尚不支持网络算法设置；请先升级并等待状态同步");
+            }
             if input.xray_channel == "latest" {
                 ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter()
                     .find(|r| &r.id == id).is_some_and(|r| r.snapshot["maintenance_actions"]
@@ -633,6 +664,7 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
         d.fleet.receipts.insert(
             input.id.clone(),
             json!({"id":input.id,"action":input.action,"version":input.version,"xray_channel":input.xray_channel,
+            "congestion_control":input.congestion_control,"qdisc":input.qdisc,
             "lines":input.lines,"targets":targets,"state":"running","at":now()}),
         );
         if d.fleet.receipts.len() > 100 {
@@ -737,6 +769,10 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
         // The remote executor persists request IDs before starting, including across panel restarts.
         let mut payload = json!({"id":target["task_id"],"action":action,"version":job["version"]});
         if job["xray_channel"] == "latest" { payload["xray_channel"] = json!("latest"); }
+        if action == "network-tune" {
+            payload["congestion_control"] = job["congestion_control"].clone();
+            payload["qdisc"] = job["qdisc"].clone();
+        }
         request(
             &remote,
             "POST",
@@ -1223,7 +1259,7 @@ mod tests {
             snapshot: json!({"maintenance":true}),
         });
         let input = |channel: &str| Batch { id: id(), targets: vec![remote_id.clone()],
-            action: "upgrade".into(), version: "0.2.47".into(), xray_channel: channel.into(), lines: BTreeMap::new() };
+            action: "upgrade".into(), version: "0.2.47".into(), xray_channel: channel.into(), congestion_control: String::new(), qdisc: String::new(), lines: BTreeMap::new() };
         assert!(batch(State(app.clone()), Json(input("latest"))).await.is_err());
         app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["upgrade-xray-latest"]);
         assert!(batch(State(app.clone()), Json(input("nightly"))).await.is_err());
@@ -1242,7 +1278,7 @@ mod tests {
             snapshot: json!({"maintenance":true}),
         });
         let input = || Batch { id: id(), targets: vec![remote_id.clone()],
-            action: "restart-all".into(), version: String::new(), xray_channel: String::new(), lines: BTreeMap::new() };
+            action: "restart-all".into(), version: String::new(), xray_channel: String::new(), congestion_control: String::new(), qdisc: String::new(), lines: BTreeMap::new() };
         assert!(batch(State(app.clone()), Json(input())).await.is_err());
         assert!(app.store.lock().unwrap().doc.fleet.receipts.is_empty());
         app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["restart-all"]);
@@ -1252,6 +1288,31 @@ mod tests {
         assert_eq!(job["action"], "restart-all");
         assert_eq!(job["targets"][0]["id"], remote_id);
         assert_eq!(job["targets"][0]["state"], "pending");
+    }
+
+    #[tokio::test]
+    async fn network_tuning_requires_capability_and_keeps_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let remote_id = id();
+        app.store.lock().unwrap().doc.fleet.remotes.push(Remote {
+            id: remote_id.clone(), name: "test".into(), url: "https://unused.invalid".into(),
+            token: String::new(), seen: now(), error: String::new(), policy_error: String::new(),
+            snapshot: json!({"maintenance":true}),
+        });
+        let task = id();
+        let input = |qdisc: &str| Batch { id: task.clone(), targets: vec![remote_id.clone()],
+            action: "network-tune".into(), version: String::new(), xray_channel: String::new(),
+            congestion_control: "bbr".into(), qdisc: qdisc.into(), lines: BTreeMap::new() };
+        assert!(batch(State(app.clone()), Json(input("fq"))).await.is_err());
+        app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["network-tune"]);
+        assert!(batch(State(app.clone()), Json(input("fq;id"))).await.is_err());
+        let _ = batch(State(app.clone()), Json(input("fq"))).await.unwrap();
+        let _ = batch(State(app.clone()), Json(input("fq"))).await.unwrap();
+        assert!(batch(State(app.clone()), Json(input("cake"))).await.is_err());
+        let store = app.store.lock().unwrap();
+        assert_eq!(store.doc.fleet.receipts[&task]["congestion_control"], "bbr");
+        assert_eq!(store.doc.fleet.receipts[&task]["qdisc"], "fq");
     }
 
     #[tokio::test]

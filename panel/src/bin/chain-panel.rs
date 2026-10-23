@@ -413,7 +413,7 @@ async fn state(State(app): State<App>) -> Json<Value> {
     value["maintenance"] = json!(cfg!(target_os = "linux")
         && std::path::Path::new("/run/chain-maintenance/control.sock").exists());
     value["maintenance_actions"] = if value["maintenance"] == true {
-        json!(["upgrade", "upgrade-xray-latest", "restart-all", "restart-panel", "restart-agent"])
+        json!(["upgrade", "upgrade-xray-latest", "restart-all", "restart-panel", "restart-agent", "network-tune"])
     } else { json!([]) };
     Json(value)
 }

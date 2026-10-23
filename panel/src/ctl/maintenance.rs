@@ -22,6 +22,8 @@ struct Request {
     #[serde(default)]
     version: String,
     xray_channel: Option<String>,
+    congestion_control: Option<String>,
+    qdisc: Option<String>,
 }
 impl Request {
     fn parse(value: Value) -> Result<Self> {
@@ -39,6 +41,8 @@ impl Request {
                     | "restart-panel"
                     | "restart-agent"
                     | "sync-time"
+                    | "network-status"
+                    | "network-tune"
             ),
             "不支持的维护操作"
         );
@@ -54,6 +58,14 @@ impl Request {
         } else {
             ensure!(request.xray_channel.is_none(), "只有升级操作可选择内核来源");
         }
+        if request.action == "network-tune" {
+            let cc = request.congestion_control.as_deref().unwrap_or("");
+            ensure!(!cc.is_empty() && cc.len() <= 32 && cc.starts_with(|c: char| c.is_ascii_lowercase())
+                && cc.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'), "拥塞算法无效");
+            ensure!(matches!(request.qdisc.as_deref(), Some("fq" | "fq_codel" | "fq_pie" | "cake" | "pfifo_fast")), "队列无效");
+        } else {
+            ensure!(request.congestion_control.is_none() && request.qdisc.is_none(), "只有网络设置可选择算法或队列");
+        }
         Ok(request)
     }
     fn same(&self, job: &Value) -> bool {
@@ -61,6 +73,8 @@ impl Request {
             && self.version == job["version"].as_str().unwrap_or("")
             && self.xray_channel.as_deref().unwrap_or("recommended")
                 == job["xray_channel"].as_str().unwrap_or("recommended")
+            && self.congestion_control.as_deref() == job["congestion_control"].as_str()
+            && self.qdisc.as_deref() == job["qdisc"].as_str()
     }
 }
 fn now() -> u64 {
@@ -122,6 +136,10 @@ fn receipt(directory: &Path, request: &Request) -> Result<(Value, bool)> {
     let mut job = json!({"id":request.id,"action":request.action,"version":request.version,"state":"queued","created":now()});
     if let Some(channel) = &request.xray_channel {
         job["xray_channel"] = json!(channel);
+    }
+    if request.action == "network-tune" {
+        job["congestion_control"] = json!(request.congestion_control);
+        job["qdisc"] = json!(request.qdisc);
     }
     write(&directory.join(format!("{}.json", request.id)), &job)?;
     existing.sort_by_key(|(_, job)| job["finished"].as_u64().unwrap_or(0));
@@ -210,6 +228,12 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
             ensure!(after[role] == version, "{role} 版本未达到目标");
         }
         manager.prune()?;
+    } else if action == "network-tune" {
+        job["network"] = network(manager, &[
+            job["congestion_control"].as_str().context("缺少拥塞算法")?,
+            job["qdisc"].as_str().context("缺少队列")?,
+        ]).await?;
+        job["detail"] = job["network"]["detail"].clone();
     } else if action == "sync-time" {
         job["detail"] = json!(super::time::synchronize().await?);
     } else {
@@ -284,6 +308,15 @@ fn redacted(error: &str) -> String {
         .collect()
 }
 
+async fn network(manager: &Manager, args: &[&str]) -> Result<Value> {
+    let script = manager.path("/opt/chain/current-panel/scripts/chain_tuning.py");
+    let mut command_args = vec!["-B", script.to_str().context("网络设置脚本路径无效")?];
+    command_args.extend_from_slice(args);
+    let result = output("python3", &command_args, 120).await?;
+    ensure!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    Ok(serde_json::from_slice(&result.stdout)?)
+}
+
 pub async fn serve() -> Result<()> {
     use std::os::fd::FromRawFd;
     ensure!(unsafe { libc::geteuid() } == 0, "维护服务须由 systemd 启动");
@@ -355,6 +388,9 @@ pub async fn serve() -> Result<()> {
                 "请求过大或不完整"
             );
             let request = Request::parse(serde_json::from_slice(&line)?)?;
+            if request.action == "network-status" {
+                return network(&manager, &["status"]).await;
+            }
             let _guard = lock.lock().await;
             let (job, start) = receipt(&directory, &request)?;
             if start {
@@ -399,6 +435,23 @@ pub async fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn network_tuning_validates_choices_and_receipt_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let payload = json!({"id":id,"action":"network-tune","congestion_control":"bbr","qdisc":"fq"});
+        let request = Request::parse(payload.clone()).unwrap();
+        assert!(receipt(directory.path(), &request).unwrap().1);
+        assert!(!receipt(directory.path(), &request).unwrap().1);
+        let mut other = payload.clone();
+        other["qdisc"] = json!("cake");
+        assert!(receipt(directory.path(), &Request::parse(other).unwrap()).is_err());
+        for (key, value) in [("congestion_control", "bbr;id"), ("qdisc", "../fq"), ("action", "restart-all")] {
+            let mut invalid = payload.clone();
+            invalid[key] = json!(value);
+            assert!(Request::parse(invalid).is_err());
+        }
+    }
     #[test]
     fn strict_request_boundary() {
         let id = uuid::Uuid::new_v4().to_string();

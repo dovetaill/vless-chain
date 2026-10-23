@@ -14,12 +14,12 @@ import { CopyButton, Empty, Modal, PathView, download, errorText, protocolNames 
 import { LimitsDialog, QueryLinkDialog, RentalEditor, RenewalDialog } from "./rental-editor";
 import { RentalDates, RentalPrices, RentalSpeed, RentalStatusBadge, RentalUsage, SyncLabel, rentalStatusNames } from "./rental-shared";
 
-function ExportDialog({ lines, close }: { lines: Line[]; close: () => void }) {
+export function ExportDialog({ lines, close, requestForLine = () => api }: { lines: Line[]; close: () => void; requestForLine?: (line: Line) => typeof api }) {
   const [result, setResult] = useState<{ links: string; yaml: string; errors: string[]; count: number } | null>(null);
   return <Modal title={`批量导出 · ${lines.length} 条`} submit={result ? undefined : "读取已应用配置"} close={close} action={async () => {
     const valid = lines.filter(line => line.enabled && line.published);
     const errors = lines.filter(line => !line.enabled || !line.published).map(line => `${line.name}：尚未启用或应用，已跳过。`);
-    const exports = await Promise.allSettled(valid.map(line => api<{ share: string; node: string }>(`/lines/${line.id}/export`)));
+    const exports = await Promise.allSettled(valid.map(line => requestForLine(line)<{ share: string; node: string }>(`/lines/${line.id}/export`)));
     const links: string[] = [], nodes: string[] = [];
     exports.forEach((value, i) => {
       if (value.status === "fulfilled") { links.push(value.value.share); nodes.push(value.value.node.trim()); }

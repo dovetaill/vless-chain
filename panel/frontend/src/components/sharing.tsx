@@ -67,12 +67,12 @@ export function RulesLibrary(){
   </CardContent>{modal}</Card>;
 }
 
-export function AccessPolicyEditor({line,close,saved}:{line:Line;close:()=>void;saved:()=>Promise<void>}){
+export function AccessPolicyEditor({line,close,saved,request=api}:{line:Line;close:()=>void;saved:()=>Promise<void>;request?:typeof api}){
   const [policy,setPolicy]=useState<AccessPolicy|null>(null);const [sources,setSources]=useState<Source[]>([]);const [filter,setFilter]=useState('');const [error,setError]=useState('');
-  useEffect(()=>{void Promise.all([api<AccessPolicy>(`/access/${line.id}`),api<Source[]>('/rules')]).then(([p,s])=>{setPolicy(p);setSources(s);}).catch(e=>setError(errorText(e)));},[line.id]);
+  useEffect(()=>{void Promise.all([request<AccessPolicy>(`/access/${line.id}`),request<Source[]>('/rules')]).then(([p,s])=>{setPolicy(p);setSources(s);}).catch(e=>setError(errorText(e)));},[line.id,request]);
   const ports=(text:string)=>text.split(/[\s,，]+/).filter(Boolean).map(s=>{if(!/^\d+$/.test(s)||+s<1||+s>65535)throw Error('端口须为 1–65535，使用逗号或空格分隔');return +s;});
   return <Modal title={`访问限制 · ${line.name}`} close={close} wide submit={policy?'保存并下发':undefined} action={policy?async data=>{
-    await api(`/access/${line.id}`,'POST',{...policy,domains:field(data,'domains').split(/\s+/).filter(Boolean),denied_ports:ports(field(data,'denied')),udp_ports:ports(field(data,'udp_ports')),max_connections:number(data,'connections')});await saved();close();
+    await request(`/access/${line.id}`,'POST',{...policy,domains:field(data,'domains').split(/\s+/).filter(Boolean),denied_ports:ports(field(data,'denied')),udp_ports:ports(field(data,'udp_ports')),max_connections:number(data,'connections')});await saved();close();
   }:undefined}>
     {error&&<p role="alert" className="text-red-600">{error}</p>}
     {!policy?<p>正在读取策略…</p>:<>

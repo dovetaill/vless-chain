@@ -1,7 +1,15 @@
-import { LayoutDashboard, Server, Network, Globe, Wrench, Settings2, RefreshCw, Activity, ArrowDownUp, Database, ShieldCheck } from "lucide-react";
+import { LayoutDashboard, Server, Network, Globe, Wrench, Settings2, RefreshCw, Activity, ArrowDownUp, Database, ShieldCheck, MoreHorizontal } from "lucide-react";
+import { DropdownMenu } from "radix-ui";
 import "./fleet.css";
 import { publishChecked } from "../api";
 import { Diagnostics } from "./diagnostics";
+import { NetworkTuning } from "./network-tuning";
+import { LimitsDialog } from "./rental-editor";
+import { AccessPolicyEditor } from "./sharing";
+import { AccessDialog } from "./access-dialog";
+import { ProbeEditor } from "./probe-editor";
+import { ExportDialog } from "./proxy-list";
+import { FleetLineBatch } from "./fleet-line-batch";
 import {
   useCallback,
   useEffect,
@@ -532,6 +540,25 @@ export function Fleet() {
     setEditor({ remote: r, state, line: current });
     setDetail(undefined);
   }
+  async function lineAction(r: Remote, line: Line, action: string) {
+    const state = await freshState(r);
+    const current = state.lines.find(item => item.id === line.id);
+    if (!current) throw new Error("该代理已不存在，请刷新列表。");
+    const request = remoteApi(r.id);
+    const saved = async () => { await freshState(r); };
+    if (action === "toggle") {
+      await request("/lines/operate", "POST", { line_ids: [current.id], action: current.enabled ? "disable" : "enable" });
+      await saved();
+    } else if (action === "limits") setModal(<LimitsDialog lines={[current]} request={request} close={close} saved={saved} />);
+    else if (action === "access") setModal(<AccessPolicyEditor line={current} request={request} close={close} saved={saved} />);
+    else if (action === "share") setModal(<AccessDialog line={current} state={state} request={request} remote close={close} />);
+    else if (action === "probe") setModal(<ProbeEditor line={current} state={state} request={request} close={close} saved={saved} />);
+    else if (action === "diagnostics") setModal(<Diagnostics nodes={state.nodes.filter(n => current.hops.some(h => h.node_id === n.id))} lineId={current.id} request={request} close={close} />);
+  }
+  function exportLines() {
+    const items = chosenLines.map(({ r, line }) => ({ r, line: { ...line, name: `${r.name} / ${line.name}` } }));
+    setModal(<ExportDialog lines={items.map(item => item.line)} requestForLine={line => remoteApi(items.find(item => item.line === line)!.r.id)} close={close} />);
+  }
   async function openExternal(r: Remote, external?: External) {
     const state = await freshState(r),
       current = external && state.externals.find((e) => e.id === external.id);
@@ -693,6 +720,14 @@ export function Fleet() {
         )}
       </Modal>,
     );
+  }
+  function networkTuning(targets: Remote[]) {
+    setDetail(undefined);
+    setModal(<NetworkTuning targets={targets} close={close} submitted={async id => {
+      await refresh();
+      navigate("tasks");
+      setTaskId(id);
+    }} />);
   }
   async function jump(r: Remote) {
     const target = window.open("about:blank", "_blank");
@@ -1088,6 +1123,7 @@ export function Fleet() {
                       <option value="latest">官方最新版（含预发布）</option>
                     </select>
                     <Button disabled={busy || releaseLoading || !release || running.some(t => t.state === "running")} onClick={() => batch("upgrade")}>批量升级</Button>
+                    <Button variant="outline" disabled={busy || running.some(t => t.state === "running")} onClick={() => networkTuning(chosen)}>网络算法 / BBR</Button>
                     <Button variant="outline" disabled={busy || releaseLoading} onClick={() => void fetchRelease()}>{releaseLoading ? "正在获取最新版本…" : "检查最新版本"}</Button>
                     <span className="text-xs text-muted-foreground">{release ? `最新正式版 ${release.version}` : "先检查版本，再升级所选 VPS"}</span>
                   </div>
@@ -1228,6 +1264,10 @@ export function Fleet() {
                     {actions[action]}
                   </Button>
                 ))}
+                <Button variant="outline" disabled={busy || !chosenLines.length} onClick={() => setModal(<FleetLineBatch targets={chosenLines} action="limits" close={close} saved={async () => { await refresh(); setSelectedLines([]); }} />)}>额度 / 限速</Button>
+                <Button variant="outline" disabled={busy || !chosenLines.length} onClick={exportLines}>导出</Button>
+                <Button variant="outline" disabled={busy || !chosenLines.length || chosenLines.some(t => t.line.customer_plan_id)} onClick={() => setModal(<FleetLineBatch targets={chosenLines} action="delete" close={close} saved={async () => { await refresh(); setSelectedLines([]); }} />)}>删除</Button>
+                {chosenLines.some(t => t.line.customer_plan_id) && <span className="text-xs">套餐线路不可删除，可停用并保留历史。</span>}
               </div>
               <p className="muted px-4 py-2">
                 速率表示当前业务吞吐，不是带宽测速；低吞吐不代表节点变慢。探测详情以最近一次结果和时间为准。
@@ -1325,13 +1365,16 @@ export function Fleet() {
                               >
                                 编辑
                               </Button>
-                              <Button
-                                variant="ghost"
-                                disabled={busy}
-                                onClick={() => remove(r, line)}
-                              >
-                                删除
-                              </Button>
+                              <DropdownMenu.Root><DropdownMenu.Trigger className="row-menu-trigger" aria-label={`${r.name} / ${line.name} 更多操作`} disabled={busy}><MoreHorizontal className="size-4" /></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="row-menu-content" align="end" sideOffset={4} collisionPadding={8}>
+                                <DropdownMenu.Item onSelect={() => void run(() => lineAction(r, line, "toggle"))}>{line.enabled ? "手动停用" : "解除手动停用"}</DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={() => void run(() => lineAction(r, line, "limits"))}>调整额度 / 限速</DropdownMenu.Item>
+                                <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => void run(() => lineAction(r, line, "share"))}>分享配置</DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={() => void run(() => lineAction(r, line, "access"))}>网站 / 端口 / 连接限制</DropdownMenu.Item>
+                                <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => void run(() => lineAction(r, line, "probe"))}>检查连接</DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={() => void run(() => lineAction(r, line, "diagnostics"))}>日志与诊断</DropdownMenu.Item>
+                                <DropdownMenu.Item onSelect={() => void run(() => prepareApply(r))}>应用配置修改</DropdownMenu.Item>
+                                {!line.customer_plan_id && <DropdownMenu.Item className="text-red-600" onSelect={() => remove(r, line)}>删除代理</DropdownMenu.Item>}
+                              </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
                             </div>
                           </td>
                         </tr>
@@ -1653,6 +1696,7 @@ export function Fleet() {
               setDetail(undefined);
               setModal(<Diagnostics nodes={remote.snapshot?.nodes || []} request={remoteApi(remote.id)} close={() => setModal(null)} />);
             }}>日志与诊断</Button>
+            <Button type="button" variant="outline" disabled={busy} onClick={() => networkTuning([activeDetail])}>网络算法 / BBR</Button>
             <Button
               type="button"
               variant="outline"
@@ -1736,6 +1780,7 @@ export function Fleet() {
                     <p>后续验证：{verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" ? "已通过" : "等待自动验证"}</p>
                   </div>
                   {t.result?.after && <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">{Object.entries(t.result.after).map(([key, value]) => <span key={key}>{({panel:"控制台",agent:"Agent",chainctl:"管理命令"} as Record<string,string>)[key] || key} <strong>{value}</strong></span>)}</div>}
+                  {t.result?.network && <div className="space-y-1 text-sm"><p>系统默认：{t.result.network.after.congestion_control} + {t.result.network.after.qdisc}</p><p>网卡实际队列：{t.result.network.after.interfaces.map(q => `${q.dev} / ${q.parent}: ${q.kind}`).join("；") || "未知"}</p><p>{t.result.network.after.warning || "现有连接及网卡队列未重建。"}</p></div>}
                   {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && !activeTask.archived && <p className="mt-2">系统会自动复查连接，不会重复升级，也不阻塞其他 VPS。{t.result?.verification?.retry_at ? `下次复查：${stamp(t.result.verification.retry_at)}` : ""}</p>}</div> : (t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail) && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail}</p>}
                   {remote && maintenanceDone && !["enable", "disable"].includes(activeTask.action) && !activeTask.archived && <Button type="button" variant="outline" disabled={busy || verifyPending} onClick={() => void run(async () => {
                     await api(`/fleet/batch/${activeTask.id}/verify/${t.id}`, "POST", {});

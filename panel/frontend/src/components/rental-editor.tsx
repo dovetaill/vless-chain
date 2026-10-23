@@ -176,10 +176,10 @@ export function PaymentAdjustmentDialog({ payment, adjustments, affectedLines, c
   </Modal>;
 }
 
-export function LimitsDialog({ lines, close, saved }: { lines: Line[]; close: () => void; saved: () => Promise<void> }) {
+export function LimitsDialog({ lines, close, saved, request = api }: { lines: Line[]; close: () => void; saved: () => Promise<void>; request?: typeof api }) {
   const initial = lines.length === 1 ? lines[0].limits : null;
   return <Modal title={lines.length === 1 ? "调整额度与限速" : `批量调整额度与限速 · ${lines.length} 条`} description="以下三个值将整体替换所选代理的限制；留空表示不限。修改立即下发，不清零当前已用流量；离线节点等待同步。" submit="确认调整并下发" close={close} action={async data => {
-    await api("/lines/operate", "POST", { line_ids: lines.map(line => line.id), action: "limits", limits: { monthly_gib: number(data, "quota"), upload_mbps: number(data, "upload"), download_mbps: number(data, "download") } });
+    await request("/lines/operate", "POST", { line_ids: lines.map(line => line.id), action: "limits", limits: { monthly_gib: number(data, "quota"), upload_mbps: number(data, "upload"), download_mbps: number(data, "download") } });
     await saved();
     close();
   }}>

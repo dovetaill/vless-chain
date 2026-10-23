@@ -53,15 +53,19 @@ export function AccessDialog({
   external,
   state,
   close,
+  request = api,
+  remote = false,
 }: {
   line?: Line;
   external?: External;
   state: PanelState;
   close: () => void;
+  request?: typeof api;
+  remote?: boolean;
 }) {
   const [tab, setTab] = useState("qr");
   const [subscription, setSubscription] = useState("");
-  const localLine = line && !new URLSearchParams(location.search).has("remote");
+  const localLine = line && !remote && !new URLSearchParams(location.search).has("remote");
   const [value, setValue] = useState<{
     share: string;
     node: string;
@@ -70,7 +74,7 @@ export function AccessDialog({
   useEffect(() => {
     if (!line && !external) return;
     let alive = true;
-    void api<{ share: string; node: string }>(
+    void request<{ share: string; node: string }>(
       external ? `/externals/${external.id}/export` : `/lines/${line!.id}/export`,
     )
       .then((v) => {
@@ -82,12 +86,12 @@ export function AccessDialog({
     return () => {
       alive = false;
     };
-  }, [line?.id, external?.id]);
+  }, [line?.id, external?.id, request]);
   return (
     <Modal title={external ? "外部代理配置" : "分享代理"} description={external?.name || line?.name} close={close}
       submit={tab === "subscription" && !subscription ? "创建订阅链接" : undefined}
       action={tab === "subscription" && !subscription && localLine ? async data => {
-        const result = await api<{ path: string }>("/subscriptions", "POST", { name: field(data, "subscription_name"), line_ids: [line.id] });
+        const result = await request<{ path: string }>("/subscriptions", "POST", { name: field(data, "subscription_name"), line_ids: [line.id] });
         setSubscription(new URL(result.path, location.origin).href);
       } : undefined}
     >
