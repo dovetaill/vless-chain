@@ -94,10 +94,15 @@ fn local_conditions(doc: &mut Document, policy: &Policy) {
         if offline {
             continue;
         }
+        let idle = n.report.applied
+            && n.desired.as_ref().is_none_or(|d| d.revision.is_empty())
+            && n.report.revision.is_empty()
+            && doc.lines.is_empty()
+            && doc.legacy_configs.is_empty();
         observe(
             doc,
             format!("runtime:{}", n.id),
-            !n.report.running || !n.report.error.is_empty(),
+            (!n.report.running && !idle) || !n.report.error.is_empty(),
             format!("{}：代理运行组件，请查看节点应用结果", n.name),
             policy,
             true,
@@ -651,6 +656,39 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_online_node_clears_runtime_alarm_without_hiding_failures() {
+        let mut empty = Document::default();
+        empty.nodes.push(serde_json::from_value(json!({"id":"node","name":"node","host":"192.0.2.1",
+            "token_hash":"","reality":Reality::new("example.com:443".into(),"example.com".into()),
+            "seen":now(),"report":{"running":false,"applied":true}})).unwrap());
+        let policy = Policy::default();
+        let key = "runtime:node";
+        local_conditions(&mut empty, &policy);
+        assert!(!empty.monitoring.conditions[key].active);
+        assert!(empty.monitoring.notices.is_empty());
+        empty.monitoring.conditions.get_mut(key).unwrap().active = true;
+        local_conditions(&mut empty, &policy);
+        assert!(!empty.monitoring.conditions[key].active);
+        assert!(empty.monitoring.notices.last().unwrap().message.starts_with("恢复"));
+        for case in 0..6 {
+            let mut doc = empty.clone();
+            match case {
+                0 => doc.nodes[0].report.error = "fixture failure".into(),
+                1 => doc.nodes[0].report.applied = false,
+                2 => doc.nodes[0].report.revision = "previous-config".into(),
+                3 => doc.nodes[0].desired = Some(Desired { revision: "pending-config".into(), config: json!({}) }),
+                4 => doc.lines.push(line()),
+                _ => doc.legacy_configs.push(serde_json::from_value(json!({
+                    "id":"legacy","node_id":"node","name":"legacy","config":{}})).unwrap()),
+            }
+            local_conditions(&mut doc, &policy);
+            assert!(doc.monitoring.conditions[key].active, "case {case}");
+        }
+        empty.nodes[0].seen = now() - policy.offline;
+        local_conditions(&mut empty, &policy);
+        assert!(empty.monitoring.conditions["agent:node"].active);
+    }
     fn line() -> Line {
         serde_json::from_value(json!({"id":"line", "name":"REALITY", "kind":"vless",
             "hops":[{"node_id":"node", "port":20000, "uuid":id()}]})).unwrap()
