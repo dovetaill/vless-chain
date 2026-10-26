@@ -54,6 +54,8 @@ export function LineEditor({
     line?.access.protocol || "vless",
   );
   const [certificate, setCertificate] = useState(line?.access.tls.mode || (protocol === "vless" ? "off" : "auto"));
+  const [method, setMethod] = useState(line?.access.method || "2022-blake3-aes-128-gcm");
+  const usesUuid = ["vless", "vmess", "tuic"].includes(protocol);
   const supportsTls = ["vless", "trojan", "http", "vmess", "hysteria2", "tuic"].includes(protocol);
   const tls = supportsTls && domain ? certificate : "off";
   const showTls = supportsTls && domain;
@@ -88,13 +90,15 @@ export function LineEditor({
         const changedProtocol = line && line.access.protocol !== protocol;
         if (batch && (!combinations.length || usesTls && !domain)) throw new Error("请选择组合；TLS 组合需要解析到本机的域名。");
         if (batch && shared && (combinations.filter(c => c.endsWith("tls")).length > 1 || combinations.filter(c => c.endsWith("reality")).length > 1)) throw new Error("相同 SNI 无法同时分流 TCP 和 XHTTP；请选择一种传输，或使用独立端口。");
+        const uuid = usesUuid ? field(data, "uuid") : "";
+        const credential = uuid ? { uuid } : {};
         const payload = {
           pending_import_id: pendingImport?.id,
           id: line?.id,
           kind,
           name: field(data, "name").trim() || `${protocolNames[protocol]} ${host.trim()}`.slice(0, 80),
           enabled: line ? line.enabled : data.has("enabled"),
-          hops: line ? line.hops.map((h, i) => ({ node_id: h.node_id, port: i === 0 ? shared ? 443 : number(data, "port") : h.port })) : [{ node_id: node.id, port: shared ? 443 : batch ? null : number(data, "port") }],
+          hops: line ? line.hops.map((h, i) => ({ node_id: h.node_id, port: i === 0 ? shared ? 443 : number(data, "port") : h.port, ...(i === 0 ? credential : {}) })) : [{ node_id: node.id, port: shared ? 443 : batch ? null : number(data, "port"), ...credential }],
           external_id: null, chain, target: "", network: "tcp",
           access: {
             transport: { network: protocol === "vless" ? transport : "tcp", path: field(data, "xhttp_path") || "/", host: field(data, "xhttp_host"), mode: field(data, "xhttp_mode") || "auto" },
@@ -105,9 +109,9 @@ export function LineEditor({
             protocol: kind === "vless" ? protocol : "vless",
             username: field(data, "username") || line?.access.username || "",
             password:
-              field(data, "password") ||
+              String(data.get("password") || "") ||
               (changedProtocol ? "" : line?.access.password || ""),
-            method: "",
+            method: protocol === "shadowsocks" ? method : "",
             public_host: "",
             public_port: null,
             tls: {
@@ -202,9 +206,17 @@ export function LineEditor({
         <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await request<{ ok: boolean; detail: string; latency_ms: number; cdn?: { detail: string }; fallback?: { detail: string } }>(`/diagnostics/${(existing || local)?.id || (await ensureLocalServer(host.trim())).id}/reality`, "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`握手${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）\nCDN：${result.cdn?.detail || "当前 Agent 未提供 CDN 风险检测"}\nSNI 过滤：${result.fallback?.detail || "当前 Agent 未提供过滤验证，不能判定无盗流风险"}`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测 REALITY 握手与回落风险"}</Button>
         {check && <p className="muted whitespace-pre-line" role="status">{check}</p>}
       </section>}
-      {kind === "vless" && ["http", "socks", "trojan", "hysteria2", "tuic"].includes(protocol) && <details className="details">
-        <summary>账号与密码 · 高级</summary>
+      {kind === "vless" && <section key={protocol} className="space-y-3 rounded-xl border border-border p-4">
+        <h3 className="font-medium">连接凭据</h3>
+        {protocol === "shadowsocks" && <Field label="Shadowsocks 加密方式" hint="迁入已有配置时，选择与原配置相同的加密方式。"><select className="select" value={method} onChange={e => setMethod(e.target.value)}>
+          <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm（默认）</option>
+          <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
+          <option value="aes-128-gcm">aes-128-gcm</option>
+          <option value="aes-256-gcm">aes-256-gcm</option>
+          <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305</option>
+        </select></Field>}
         <div className="grid gap-4 sm:grid-cols-2">
+          {usesUuid && <Field label="UUID" hint="新建留空自动生成；编辑留空保留原 UUID。"><Input name="uuid" defaultValue={line?.hops[0]?.uuid} autoComplete="off" spellCheck={false} /></Field>}
           {["http", "socks"].includes(protocol) && (
             <Field label="用户名" hint="留空生成默认用户名">
               <Input
@@ -215,21 +227,22 @@ export function LineEditor({
               />
             </Field>
           )}
-          <Field label="连接密码" hint="留空自动生成；编辑时留空保留原密码">
+          {!["vless", "vmess"].includes(protocol) && <Field label="连接密码" hint={protocol === "shadowsocks" && method.startsWith("2022-") ? `此加密方式需要 ${method === "2022-blake3-aes-128-gcm" ? 16 : 32} 字节的 Base64 密钥；新建留空生成，编辑留空保留。` : "新建留空自动生成；编辑留空保留原密码。"}>
             <Input
               name="password"
               type="password"
               autoComplete="new-password"
             />
-          </Field>
+          </Field>}
         </div>
+        {line && <p className="muted">修改 UUID、密码或加密方式后，客户端需同步更新；留空不会重置现有凭据。</p>}
       {["http", "socks"].includes(protocol) && (
         <p className="muted">
           HTTP / SOCKS5
           使用用户名和密码。普通连接本身不加密，适合可信网络或已有加密隧道。
         </p>
       )}
-      </details>}
+      </section>}
       {showTls && (!batch || usesTls) && (
         <details className="details"><summary>传输安全 · {tls === "off" ? protocol === "vless" ? "REALITY" : protocol === "vmess" ? "VMess AEAD" : "未启用 TLS" : "TLS 证书"}</summary>
           <Field label="HTTPS / 证书" hint={tls === "auto" ? "域名需解析到本机，并放行 TCP 80 和监听端口。" : undefined}>

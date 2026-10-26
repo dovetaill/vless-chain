@@ -48,7 +48,7 @@ export const protocolNames = {
   vless: "VLESS",
   http: "HTTP 代理",
   socks: "SOCKS5",
-  shadowsocks: "Shadowsocks 2022",
+  shadowsocks: "Shadowsocks",
   trojan: "Trojan / TLS",
   vmess: "VMess AEAD",
   hysteria2: "Hysteria 2",

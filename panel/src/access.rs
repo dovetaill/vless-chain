@@ -12,6 +12,8 @@ use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use url::Url;
 
+const SS_METHODS: &[&str] = &["2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"];
+
 fn decode(s: &str) -> Result<String> {
     Ok(percent_decode_str(s).decode_utf8()?.into_owned())
 }
@@ -225,14 +227,7 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
                 .split_once(':')
                 .context("Shadowsocks 链接缺少加密方式和密码")?;
             ensure!(
-                matches!(
-                    method,
-                    "2022-blake3-aes-128-gcm"
-                        | "2022-blake3-aes-256-gcm"
-                        | "aes-128-gcm"
-                        | "aes-256-gcm"
-                        | "chacha20-ietf-poly1305"
-                ),
+                SS_METHODS.contains(&method),
                 "不支持此 Shadowsocks 加密方式"
             );
             ensure!(!password.is_empty(), "Shadowsocks 密码不能为空");
@@ -382,13 +377,16 @@ pub fn validate_line(line: &Line) -> Result<()> {
             }
             Protocol::Shadowsocks => {
                 ensure!(
-                    line.access.method == "2022-blake3-aes-128-gcm",
-                    "新建 Shadowsocks 使用 SS2022 AES-128-GCM"
+                    SS_METHODS.contains(&line.access.method.as_str()),
+                    "不支持此 Shadowsocks 加密方式"
                 );
-                ensure!(
-                    STANDARD.decode(&line.access.password)?.len() == 16,
-                    "SS2022 密钥须为 16 字节的 Base64"
-                );
+                if line.access.method.starts_with("2022-") {
+                    let size = if line.access.method == "2022-blake3-aes-128-gcm" { 16 } else { 32 };
+                    ensure!(STANDARD.decode(&line.access.password).is_ok_and(|key| key.len() == size),
+                        "此 SS2022 加密方式的密钥须为 {size} 字节的 Base64");
+                } else {
+                    ensure!(!line.access.password.is_empty(), "Shadowsocks 密码不能为空");
+                }
             }
             Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic => {
                 ensure!(!line.access.password.is_empty(), "代理密码不能为空");
@@ -443,18 +441,20 @@ pub fn validate_line(line: &Line) -> Result<()> {
 }
 
 pub fn fill_credentials(access: &mut Access) {
+    if access.protocol == Protocol::Shadowsocks && access.method.is_empty() {
+        access.method = "2022-blake3-aes-128-gcm".into();
+    }
     if access.username.is_empty() {
         access.username = "chain".into();
     }
     if access.password.is_empty() {
-        access.password = if access.protocol == Protocol::Shadowsocks {
+        access.password = if access.protocol == Protocol::Shadowsocks && access.method == "2022-blake3-aes-128-gcm" {
             STANDARD.encode(rand::random::<[u8; 16]>())
+        } else if access.protocol == Protocol::Shadowsocks && access.method == "2022-blake3-aes-256-gcm" {
+            STANDARD.encode(rand::random::<[u8; 32]>())
         } else {
             secret()[..32].into()
         };
-    }
-    if access.protocol == Protocol::Shadowsocks {
-        access.method = "2022-blake3-aes-128-gcm".into();
     }
 }
 
@@ -697,6 +697,49 @@ pub fn mihomo(lines: &[Line], doc: &Document) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shadowsocks_custom_credentials_round_trip_and_validate() {
+        let node = Node { id: "node".into(), name: "node".into(), host: "proxy.example".into(),
+            reality: Reality::new("example.com:443".into(), "example.com".into()),
+            token_hash: String::new(), seen: 0, report: Report::default(), desired: None };
+        for method in SS_METHODS {
+            let password = match *method {
+                "2022-blake3-aes-128-gcm" => STANDARD.encode([1u8; 16]),
+                "2022-blake3-aes-256-gcm" => STANDARD.encode([2u8; 32]),
+                _ => " original :密码@/?# ".into(),
+            };
+            let mut line: Line = serde_json::from_value(json!({"id":"line", "name":"SS", "kind":"vless",
+                "hops":[{"node_id":"node", "port":8388, "uuid":id()}],
+                "access":{"protocol":"shadowsocks", "method":method, "password":password}})).unwrap();
+            fill_credentials(&mut line.access);
+            validate_line(&line).unwrap();
+            assert_eq!(line.access.password, password);
+            assert_eq!(line.access.method, *method);
+            let inbound = inbound(&line, &line.hops[0], "test");
+            assert_eq!(inbound["settings"]["password"], password);
+            assert_eq!(inbound["settings"]["method"], *method);
+            let outbound = external(&share(&line, &node, true).unwrap(), "test").unwrap();
+            assert_eq!(outbound["settings"]["servers"][0]["password"], password);
+            assert_eq!(outbound["settings"]["servers"][0]["method"], *method);
+            line.access.password.clear();
+            assert!(validate_line(&line).is_err());
+            fill_credentials(&mut line.access);
+            validate_line(&line).unwrap();
+            if method.starts_with("2022-") {
+                for invalid in ["not-base64".into(), STANDARD.encode([3u8; 24])] {
+                    line.access.password = invalid;
+                    assert!(validate_line(&line).is_err());
+                }
+            }
+            line.access.method = "unknown".into();
+            assert!(validate_line(&line).is_err());
+        }
+        let mut access = Access { protocol: Protocol::Shadowsocks, ..Default::default() };
+        fill_credentials(&mut access);
+        assert_eq!(access.method, "2022-blake3-aes-128-gcm");
+        assert_eq!(STANDARD.decode(access.password).unwrap().len(), 16);
+    }
+
     #[test]
     fn vmess_and_quic_validate_credentials_and_transport() {
         let uuid = id();

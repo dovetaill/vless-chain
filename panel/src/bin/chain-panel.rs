@@ -746,6 +746,8 @@ struct HopInput {
     node_id: String,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    uuid: Option<String>,
 }
 #[derive(Deserialize)]
 struct LineInput {
@@ -861,13 +863,18 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         hops.push(Hop {
             node_id: h.node_id,
             port,
-            uuid: old.map(|h| h.uuid.clone()).unwrap_or_else(id),
+            uuid: h.uuid.filter(|value| !value.is_empty()).or_else(|| old.map(|h| h.uuid.clone())).unwrap_or_else(id),
         });
     }
     let mut access = input
         .access
         .or_else(|| existing.as_ref().map(|l| l.access.clone()))
         .unwrap_or_default();
+    if let Some(old) = existing.as_ref().map(|l| &l.access).filter(|old| old.protocol == access.protocol) {
+        if access.password.is_empty() { access.password = old.password.clone(); }
+        if access.username.is_empty() { access.username = old.username.clone(); }
+        if access.method.is_empty() { access.method = old.method.clone(); }
+    }
     chain_panel::access::fill_credentials(&mut access);
     let line = Line {
         id: line_id.clone(),
@@ -1489,6 +1496,50 @@ async fn web_asset(uri: Uri) -> Response {
 #[cfg(test)]
 mod web_tests {
     use super::*;
+
+    #[test]
+    fn custom_proxy_credentials_survive_create_edit_compile_and_export() {
+        for protocol in ["vless", "vmess", "tuic", "shadowsocks", "http", "socks", "trojan", "hysteria2"] {
+            let node = Node { id: "node".into(), name: "node".into(), host: "proxy.example".into(),
+                reality: Reality::new("example.com:443".into(), "example.com".into()),
+                token_hash: String::new(), seen: 0, report: Report::default(), desired: None };
+            let reality = serde_json::to_value(&node.reality).unwrap();
+            let mut doc = Document { nodes: vec![node], ..Default::default() };
+            let original = "00000000-0000-4000-8000-000000000001";
+            let access = json!({"protocol":protocol,"username":"original-user","password":" original :密码@/?# ",
+                "method":if protocol == "shadowsocks" {"aes-256-gcm"} else {""},
+                "tls":{"mode":if matches!(protocol,"trojan"|"hysteria2"|"tuic") {"auto"} else {"off"},"domain":"proxy.example"}});
+            let line = put_line(&mut doc, serde_json::from_value(json!({"name":"proxy","kind":"vless",
+                "hops":[{"node_id":"node","port":24443,"uuid":original}],"access":access})).unwrap()).unwrap();
+            compile(&doc).unwrap();
+            let link = share(&line, &doc).unwrap();
+            assert_eq!(line.hops[0].uuid, original);
+            let mut edit = serde_json::to_value(&line).unwrap();
+            edit["hops"][0]["uuid"] = json!("");
+            for key in ["username", "password", "method"] { edit["access"][key] = json!(""); }
+            let saved = put_line(&mut doc, serde_json::from_value(edit).unwrap()).unwrap();
+            compile(&doc).unwrap();
+            assert_eq!(saved.access, line.access);
+            assert_eq!(saved.hops[0].uuid, original);
+            assert_eq!(share(&saved, &doc).unwrap(), link, "{protocol}");
+            let mut edit = serde_json::to_value(&saved).unwrap();
+            let replacement = "00000000-0000-4000-8000-000000000002";
+            edit["hops"][0]["uuid"] = json!(replacement);
+            edit["access"]["password"] = json!(" replacement ");
+            let changed = put_line(&mut doc, serde_json::from_value(edit.clone()).unwrap()).unwrap();
+            compile(&doc).unwrap();
+            assert_eq!(changed.hops[0].uuid, replacement);
+            assert_eq!(changed.access.password, " replacement ");
+            assert_ne!(share(&changed, &doc).unwrap(), link);
+            let exported = chain_panel::access::mihomo_node(&changed, &doc).unwrap();
+            if matches!(protocol, "vless" | "vmess" | "tuic") { assert_eq!(exported["uuid"], replacement); }
+            if !matches!(protocol, "vless" | "vmess") { assert_eq!(exported["password"], " replacement "); }
+            assert_eq!(serde_json::to_value(&doc.nodes[0].reality).unwrap(), reality);
+            edit["hops"][0]["uuid"] = json!("invalid-uuid");
+            put_line(&mut doc, serde_json::from_value(edit).unwrap()).unwrap();
+            assert!(compile(&doc).is_err());
+        }
+    }
 
     #[test]
     fn state_write_guard_preserves_new_data_against_previous_writers() {
