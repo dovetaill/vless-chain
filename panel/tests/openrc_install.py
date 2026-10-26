@@ -130,7 +130,9 @@ def main():
                     h.launch(f'exit-{index}', h.xray, {}, ['run', '-config', str(config)])
                     exits.append(access)
                 else:
-                    entry['config']['outbounds'][0] = copy.deepcopy(direct)
+                    entry['config']['outbounds'][0]['settings'] = copy.deepcopy(direct['settings'])
+                tags = {outbound.get('tag') for outbound in entry['config']['outbounds']}
+                assert all(rule['outboundTag'] in tags for rule in entry['config']['routing']['rules'])
                 name = f'xray-chain-fixture-{index}'
                 config = h.root / f'{name}.json'
                 config.write_text(json.dumps(entry['config']))
