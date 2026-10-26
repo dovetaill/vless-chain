@@ -342,7 +342,9 @@ class Platforms(unittest.TestCase):
 
         def download(request, timeout):
             if isinstance(request, str):
-                return io.BytesIO((script.parent / request.rsplit('/', 1)[-1]).read_bytes())
+                prefix = 'https://raw.githubusercontent.com/dovetaill/vless-chain/' + 'a' * 40 + '/'
+                self.assertTrue(request.startswith(prefix))
+                return io.BytesIO((script.parent.parent / request.removeprefix(prefix)).read_bytes())
             return io.BytesIO(b'{"sha": "' + b'a' * 40 + b'"}')
 
         with tempfile.TemporaryDirectory(prefix='chain-bootstrap-test-') as temporary:
@@ -351,7 +353,8 @@ class Platforms(unittest.TestCase):
                 exec(compile(bootstrap, str(script), 'exec'), {'__name__': '__main__'})
             result = subprocess.run(
                 [sys.executable, '-B', '-S', '-c',
-                 'import chain_install; from chain_ingress import refresh_panel_site'],
+                 'import chain_install, chain_cores; from chain_ingress import refresh_panel_site; '
+                 'assert set(chain_cores.RECOMMENDED) == {"xray", "mihomo"}'],
                 cwd=temporary, env={**os.environ, 'PYTHONPATH': ''},
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
