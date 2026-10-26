@@ -46,6 +46,9 @@ def validate(value):
 
 def fetch(url, path, limit):
     request = urllib.request.Request(url, headers={'User-Agent': 'chainctl', 'Accept': 'application/vnd.github+json'})
+    token = os.environ.get('GH_TOKEN')
+    if token and url.startswith('https://api.github.com/'):
+        request.add_unredirected_header('Authorization', 'Bearer ' + token)
     with urllib.request.urlopen(request, timeout=60) as response, Path(path).open('xb') as stream:
         require(response.geturl().startswith('https://'), '内核下载必须使用 HTTPS')
         total = 0

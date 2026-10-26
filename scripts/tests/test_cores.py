@@ -1,5 +1,6 @@
 """Core maintenance uses only private offline trees; no system services or real configuration."""
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -241,6 +242,27 @@ class Cores(unittest.TestCase):
             for key, value in [('browser_download_url', 'https://example.test/xray.zip'), ('digest', 'md5:bad')]:
                 with self.assertRaises(ValueError):
                     cores.asset({**release, 'assets': [{**item, key: value}]}, 'xray', '26.10.21')
+
+    def test_download_token_is_only_sent_to_api_and_never_redirected(self):
+        api = 'https://api.github.com/repos/XTLS/Xray-core/releases/tags/v26.10.21'
+        urls = [api, 'https://github.com/XTLS/Xray-core/releases/download/v26.10.21/Xray-linux-64.zip',
+                'https://raw.githubusercontent.com/MetaCubeX/mihomo/v1.19.33/LICENSE',
+                'https://api.github.com.example.test/file', 'https://api.github.com@example.test/file']
+        for token in ('fixture-token', ''):
+            for index, url in enumerate(urls):
+                with self.subTest(token=bool(token), url=url):
+                    response = io.BytesIO(b'fixture')
+                    response.geturl = lambda: url
+                    path = self.root / f'download-{bool(token)}-{index}'
+                    with patch.dict(os.environ, {'GH_TOKEN': token}), patch.object(cores.urllib.request, 'urlopen', return_value=response) as opened:
+                        cores.fetch(url, path, 64)
+                    request = opened.call_args.args[0]
+                    expected = 'Bearer fixture-token' if token and url == api else None
+                    self.assertEqual(request.get_header('Authorization'), expected)
+                    redirected = cores.urllib.request.HTTPRedirectHandler().redirect_request(
+                        request, None, 302, 'Found', {}, 'https://release-assets.githubusercontent.com/file')
+                    self.assertIsNone(redirected.get_header('Authorization'))
+                    self.assertEqual(path.read_bytes(), b'fixture')
 
     @unittest.skipUnless(sys.platform == 'linux', 'Linux sandbox')
     def test_validation_sandbox_blocks_external_writes_permissions_and_network(self):

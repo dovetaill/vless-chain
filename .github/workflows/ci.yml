@@ -76,6 +76,7 @@ jobs:
         run: python3 -B scripts/ci_release.py check
       - name: Test and build native release
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
           CHAIN_BUILD_CACHE: '1'
         run: |

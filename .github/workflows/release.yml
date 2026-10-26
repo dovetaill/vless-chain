@@ -91,6 +91,7 @@ jobs:
             sh -ec 'apk add --no-cache openrc python3; python3 -B scripts/tests/openrc_maintenance.py'
       - name: Build native release
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
           CHAIN_BUILD_CACHE: '1'
         run: |
