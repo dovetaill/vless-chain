@@ -14,6 +14,7 @@ pub fn routes(router: Router<App>) -> Router<App> {
         .route("/api/fleet/batch/{id}/archive", post(archive_batch))
         .route("/api/fleet/batch/{id}/verify/{remote_id}", post(recheck_batch))
         .route("/api/fleet/release/{version}", get(release_info))
+        .route("/api/fleet/cores/{core}", get(core_releases))
         .route("/api/fleet/{id}", delete(disconnect))
         .route("/api/fleet/{id}/forward", post(forward))
         .route("/api/fleet/{id}/login", post(remote_login))
@@ -468,6 +469,34 @@ pub async fn maintenance(value: Value) -> Result<Value> {
     );
     Ok(result)
 }
+async fn core_releases(Path(core): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(load_core_releases(&core).await?))
+}
+async fn load_core_releases(core: &str) -> Result<Value> {
+    let repo = match core {
+        "xray" => "XTLS/Xray-core",
+        "mihomo" => "MetaCubeX/mihomo",
+        _ => anyhow::bail!("内核无效"),
+    };
+    let recommended: Value = serde_json::from_str(include_str!("core-versions.json"))?;
+    let client = reqwest::Client::builder().https_only(true).user_agent("chain-panel")
+        .timeout(Duration::from_secs(15)).build()?;
+    let mut response = client.get(format!("https://api.github.com/repos/{repo}/releases?per_page=30"))
+        .send().await?.error_for_status()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(bytes.len() + chunk.len() <= 2 * 1024 * 1024, "发行信息过大");
+        bytes.extend_from_slice(&chunk);
+    }
+    let releases: Value = serde_json::from_slice(&bytes)?;
+    let versions: Vec<_> = releases.as_array().context("发行信息无效")?.iter()
+        .filter(|r| r["draft"] == false)
+        .filter_map(|r| {
+            let version = r["tag_name"].as_str()?.strip_prefix('v')?;
+            version_valid(version).then(|| json!({"version":version,"prerelease":r["prerelease"] == true}))
+        }).collect();
+    Ok(json!({"recommended":recommended[core],"versions":versions}))
+}
 async fn task_status(
     State(app): State<App>,
     axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
@@ -478,8 +507,25 @@ async fn task_status(
     Ok(Json(value))
 }
 async fn task_submit(State(app): State<App>, Extension(actor): Extension<Actor>, audit: Option<Extension<AuditContext>>, Json(value): Json<Value>) -> ApiResult<Json<Value>> {
-    if actor.role == Role::Ops && !matches!(value["action"].as_str(), Some("upgrade" | "restart-all" | "restart-panel" | "restart-agent")) {
+    if actor.role == Role::Ops && !matches!(value["action"].as_str(), Some("upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "core-upgrade" | "core-rollback" | "core-confirm" | "core-reject" | "core-status")) {
         return Err(error(StatusCode::FORBIDDEN, "运维成员仅能执行升级或重启"));
+    }
+    if value["action"] == "core-confirm"
+        && maintenance(json!({"id":value["id"],"action":"status"})).await?["state"] == "not_found" {
+        let task = maintenance(json!({"id":value["task_id"],"action":"status"})).await?;
+        if task["state"] != "awaiting_verification" || task["core"] != value["core"] {
+            return Err(error(StatusCode::CONFLICT, "没有对应的待验证内核任务"));
+        }
+        let local = chain_panel::local_agent::node_id(app.token_file.parent().unwrap()).context("本机 Agent 身份未知")?;
+        let s = app.store.lock().unwrap();
+        let node = s.doc.nodes.iter().find(|n| n.id == local).context("本机 Agent 未接入")?;
+        let core = value["core"].as_str().context("内核无效")?;
+        if !(now().saturating_sub(node.seen) <= 30 && node.seen >= task["started"].as_u64().unwrap_or(u64::MAX)
+            && node.report.applied && node.report.error.is_empty()
+            && (node.report.running || node.desired.is_none())
+            && node.report.system["cores"][core] == task["core_version"]) {
+            return Err(error(StatusCode::CONFLICT, "Agent 尚未确认目标内核正常运行，不能标记成功"));
+        }
     }
     if let Some(Extension(audit)) = audit {
         let target = value["id"].as_str().context("维护任务标识无效")?;
@@ -506,6 +552,14 @@ struct Batch {
     #[serde(default)]
     xray_channel: String,
     #[serde(default)]
+    core: String,
+    #[serde(default)]
+    security_update: bool,
+    #[serde(default)]
+    rollback_safe: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
     congestion_control: String,
     #[serde(default)]
     qdisc: String,
@@ -525,7 +579,7 @@ async fn recheck_batch(State(app): State<App>, Path((id, remote_id)): Path<(Stri
     edit(&app, |d| {
         let job = d.fleet.receipts.get_mut(&id).context("任务不存在")?;
         ensure!(job["archived"] != true, "已归档任务不再复查");
-        ensure!(!matches!(job["action"].as_str(), Some("enable" | "disable")), "此任务没有维护后连接验证");
+        ensure!(!matches!(job["action"].as_str(), Some("enable" | "disable" | "core-upgrade")), "此任务不能通过自动复查代替内核确认");
         let target = job["targets"].as_array_mut().context("任务无效")?.iter_mut()
             .find(|target| target["id"] == remote_id).context("VPS 不在此任务中")?;
         ensure!(maintenance_succeeded(target), "请等待组件维护完成");
@@ -547,9 +601,11 @@ async fn resume_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResu
         let job = d.fleet.receipts.get_mut(&id).context("任务不存在")?;
         ensure!(job["archived"] != true, "已忽略的任务不能重新查询，请创建新任务");
         ensure!(job["state"] == "paused" || job["state"] == "completed", "只可重新查询暂停或已结束的异常任务");
+        let core = job["action"] == "core-upgrade";
         for target in job["targets"].as_array_mut().context("任务无效")? {
             target.as_object_mut().unwrap().remove("unreachable_since");
-            target["state"] = json!(if maintenance_succeeded(target) { "succeeded" } else { "pending" });
+            let succeeded = if core { target["state"] == "succeeded" } else { maintenance_succeeded(target) };
+            target["state"] = json!(if succeeded { "succeeded" } else { "pending" });
         }
         job["state"] = json!("running");
         finish_batch(job);
@@ -561,12 +617,19 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
     uuid::Uuid::parse_str(&input.id).map_err(|_| error(StatusCode::BAD_REQUEST, "任务 ID 无效"))?;
     if !matches!(
         input.action.as_str(),
-        "upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "enable" | "disable" | "network-tune"
+        "upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "enable" | "disable" | "network-tune" | "core-upgrade"
     ) {
         return Err(error(StatusCode::BAD_REQUEST, "不支持的批量操作"));
     }
     if input.action == "upgrade" && !version_valid(&input.version) {
         return Err(error(StatusCode::BAD_REQUEST, "请选择正式发行版本"));
+    }
+    if input.action == "core-upgrade" {
+        if !matches!(input.core.as_str(), "xray" | "mihomo") || !version_valid(&input.version) || (input.rollback_safe && !input.security_update) {
+            return Err(error(StatusCode::BAD_REQUEST, "内核、准确版本或回退安全确认无效"));
+        }
+    } else if !input.core.is_empty() || input.security_update || input.rollback_safe || input.prerelease {
+        return Err(error(StatusCode::BAD_REQUEST, "内核参数只用于内核升级"));
     }
     if input.action == "network-tune" {
         let cc = &input.congestion_control;
@@ -589,6 +652,13 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
     edit(&app, |d| {
         if d.fleet.receipts.contains_key(&input.id) {
             let job = &d.fleet.receipts[&input.id];
+            if input.action == "core-upgrade" || job["action"] == "core-upgrade" {
+                ensure!(job["action"] == input.action && job["core"] == input.core && job["version"] == input.version
+                    && job["security_update"] == input.security_update && job["rollback_safe"] == input.rollback_safe
+                    && job["prerelease"] == input.prerelease
+                    && job["targets"].as_array().is_some_and(|targets| targets.iter().map(|t| t["id"].as_str().unwrap_or("")).eq(input.targets.iter().map(String::as_str))),
+                    "任务 ID 已用于其他内核升级");
+            }
             if input.action == "network-tune" || job["action"] == "network-tune" {
                 ensure!(job["action"] == input.action && job["congestion_control"] == input.congestion_control
                     && job["qdisc"] == input.qdisc
@@ -626,6 +696,12 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
                     .is_some_and(|r| r.snapshot["maintenance"] == true)),
                 "所选 VPS 尚未确认支持 systemd 维护；请先手工更新并等待状态同步"
             );
+            if input.action == "core-upgrade" {
+                ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter().find(|r| &r.id == id)
+                    .is_some_and(|r| r.snapshot["maintenance_actions"].as_array()
+                        .is_some_and(|actions| actions.iter().any(|a| a == "core-upgrade")))),
+                    "所选 VPS 尚不支持独立内核升级，请先更新维护组件");
+            }
             if input.action == "restart-all" {
                 ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter()
                     .find(|r| &r.id == id).is_some_and(|r| r.snapshot["maintenance_actions"]
@@ -664,6 +740,7 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
         d.fleet.receipts.insert(
             input.id.clone(),
             json!({"id":input.id,"action":input.action,"version":input.version,"xray_channel":input.xray_channel,
+            "core":input.core,"security_update":input.security_update,"rollback_safe":input.rollback_safe,"prerelease":input.prerelease,
             "congestion_control":input.congestion_control,"qdisc":input.qdisc,
             "lines":input.lines,"targets":targets,"state":"running","at":now()}),
         );
@@ -692,7 +769,11 @@ fn maintenance_succeeded(target: &Value) -> bool {
 
 fn finish_batch(job: &mut Value) {
     let targets = job["targets"].as_array().unwrap();
-    if targets.iter().any(|t| matches!(t["state"].as_str(), Some("pending" | "queued" | "running"))) {
+    if job["action"] == "core-upgrade" && targets.iter().any(|t| matches!(t["state"].as_str(), Some("failed" | "unknown"))) {
+        job["state"] = json!("paused");
+        return;
+    }
+    if targets.iter().any(|t| matches!(t["state"].as_str(), Some("pending" | "queued" | "running" | "awaiting_verification"))) {
         return;
     }
     job["state"] = json!(if targets.iter().all(maintenance_succeeded) { "succeeded" } else { "completed" });
@@ -713,6 +794,17 @@ pub async fn work_batch(app: &App) -> Result<()> {
         return Ok(());
     };
     let targets = job["targets"].as_array().unwrap();
+    if job["action"] == "core-upgrade" {
+        if let Some(index) = targets.iter().position(|t| t["state"] != "succeeded") {
+            if matches!(targets[index]["state"].as_str(), Some("pending" | "queued" | "running" | "awaiting_verification")) {
+                work_target(app, &job, index).await?;
+            }
+        }
+        let mut s = app.store.lock().unwrap();
+        if let Some(current) = s.doc.fleet.receipts.get_mut(job["id"].as_str().unwrap()) { finish_batch(current); }
+        s.save()?;
+        return Ok(());
+    }
     // Count remote operations still running, not just concurrent HTTP requests.
     let indices: Vec<_> = targets.iter().enumerate()
         .filter(|(_, t)| matches!(t["state"].as_str(), Some("running" | "queued")))
@@ -769,6 +861,9 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
         // The remote executor persists request IDs before starting, including across panel restarts.
         let mut payload = json!({"id":target["task_id"],"action":action,"version":job["version"]});
         if job["xray_channel"] == "latest" { payload["xray_channel"] = json!("latest"); }
+        if action == "core-upgrade" {
+            for key in ["core", "security_update", "rollback_safe", "prerelease"] { payload[key] = job[key].clone(); }
+        }
         if action == "network-tune" {
             payload["congestion_control"] = job["congestion_control"].clone();
             payload["qdisc"] = job["qdisc"].clone();
@@ -786,7 +881,38 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
         Ok(mut result) => {
             target.as_object_mut().unwrap().remove("error");
             target.as_object_mut().unwrap().remove("unreachable_since");
-            if !lines {
+            if action == "core-upgrade" {
+                result["verification"] = target["result"]["verification"].clone();
+                if result["state"] == "succeeded" {
+                    result["verification"] = json!({"state":"succeeded","detail":"已确认目标内核与原链接实际传输","checked_at":now()});
+                }
+                if result["state"] == "awaiting_verification" && result["verification"].is_null() {
+                    if now().saturating_sub(result["finished"].as_u64().unwrap_or(now())) >= 30 {
+                        let remote = remote(app, target["id"].as_str().unwrap())?;
+                        match verify_remote(app, &remote).await {
+                            Ok(detail) => result["verification"] = json!({"state":"unverified","detail":format!("{detail}；原链接、旧客户端和 UDP 仍需人工确认，确认后继续下一台")}),
+                            Err(e) => {
+                                let rejection = json!({"id":target["task_id"],"action":"status"});
+                                // Resolve through a separate idempotent task; never resubmit an upgrade with new IDs.
+                                let reject_id = target["reject_id"].as_str().map(str::to_owned).unwrap_or_else(crate::id);
+                                target["reject_id"] = json!(reject_id);
+                                {
+                                    let mut s = app.store.lock().unwrap();
+                                    s.doc.fleet.receipts.get_mut(job["id"].as_str().unwrap()).context("任务不存在")?["targets"][index] = target.clone();
+                                    s.save()?;
+                                }
+                                let recovery = request(&remote, "POST", "/api/federation/task", Some(json!({"id":reject_id,"action":"core-reject","task_id":target["task_id"],"core":job["core"]}))).await;
+                                result["verification"] = json!({"state":"failed","detail":chain_panel::diagnostics::redact(&format!("{e:#}"))});
+                                result["state"] = json!("unknown");
+                                result["detail"] = json!(if recovery.is_ok() { "连接检测失败，已请求恢复或停用代理；请核对远端处理结果" } else { "连接检测失败，恢复请求尚未确认；请核对远端状态" });
+                                if let Ok(receipt) = request(&remote, "POST", "/api/federation/task", Some(rejection)).await {
+                                    if receipt["state"] == "failed" { result["state"] = json!("failed"); result["detail"] = receipt["detail"].clone(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if !lines {
                 result["maintenance_state"] = result["state"].clone();
                 result["verification"] = json!({"state":"pending","detail":"组件维护完成后自动验证；验证失败不阻塞其他 VPS"});
             }
@@ -822,7 +948,7 @@ pub async fn verify_batches(app: &App) -> Result<()> {
     let pending: Vec<_> = {
         let s = app.store.lock().unwrap();
         s.doc.fleet.receipts.iter().filter(|(_, job)| job["archived"] != true
-            && !matches!(job["action"].as_str(), Some("enable" | "disable")))
+            && !matches!(job["action"].as_str(), Some("enable" | "disable" | "core-upgrade")))
             .flat_map(|(id, job)| job["targets"].as_array().into_iter().flatten().enumerate()
                 .filter(|(_, t)| maintenance_succeeded(t) && t["result"]["verification"]["state"] != "succeeded"
                     && t["result"]["verification"]["retry_at"].as_u64().unwrap_or(0) <= now())
@@ -914,6 +1040,57 @@ async fn verify_remote(app: &App, remote: &Remote) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn core_batches_wait_for_confirmation_and_stop_at_first_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let answer = Arc::new(Mutex::new("awaiting_verification".to_string()));
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let (state, observed) = (answer.clone(), calls.clone());
+        let router = Router::new().route("/api/federation/task", post(move |Json(body): Json<Value>| {
+            let (state, observed) = (state.clone(), observed.clone());
+            async move {
+                observed.lock().unwrap().push(body.clone());
+                Json(json!({"id":body["id"],"state":*state.lock().unwrap(),"finished":now()}))
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let job_id = id();
+        let targets: Vec<_> = (0..3).map(|_| json!({"id":id(),"task_id":id(),"state":"pending"})).collect();
+        {
+            let mut s = app.store.lock().unwrap();
+            for target in &targets {
+                s.doc.fleet.remotes.push(Remote {id:target["id"].as_str().unwrap().into(),name:"fixture".into(),
+                    url:format!("http://{address}"),token:"fixture".into(),seen:now(),error:String::new(),policy_error:String::new(),snapshot:Value::Null});
+            }
+            s.doc.fleet.receipts.insert(job_id.clone(), json!({"id":job_id,"action":"core-upgrade","core":"xray","version":"26.10.21",
+                "security_update":true,"rollback_safe":false,"prerelease":false,"state":"running","targets":targets}));
+        }
+        work_batch(&app).await.unwrap();
+        work_batch(&app).await.unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert!(calls.lock().unwrap().iter().all(|p| p["id"] == targets[0]["task_id"] && p["version"] == "26.10.21" && p["security_update"] == true));
+        *answer.lock().unwrap() = "succeeded".into();
+        work_batch(&app).await.unwrap();
+        *answer.lock().unwrap() = "failed".into();
+        work_batch(&app).await.unwrap();
+        work_batch(&app).await.unwrap();
+        let job = app.store.lock().unwrap().doc.fleet.receipts[&job_id].clone();
+        assert_eq!(job["state"], "paused");
+        assert_eq!(job["targets"][2]["state"], "pending");
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(calls.lock().unwrap()[3]["id"], targets[1]["task_id"]);
+        app.store.lock().unwrap().doc.fleet.receipts.get_mut(&job_id).unwrap()["targets"][1]["result"]["verification"] = json!({"state":"failed"});
+        assert!(recheck_batch(State(app.clone()), Path((job_id.clone(), targets[1]["id"].as_str().unwrap().into()))).await.is_err());
+        let _ = resume_batch(State(app.clone()), Path(job_id.clone())).await.unwrap();
+        work_batch(&app).await.unwrap();
+        assert_eq!(calls.lock().unwrap().last().unwrap()["id"], targets[1]["task_id"]);
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&job_id]["state"], "paused");
+        server.abort(); let _ = server.await;
+        let _released = std::net::TcpListener::bind(address).unwrap();
+    }
     #[test]
     fn maintenance_accepts_idle_agents_without_hiding_configuration_failures() {
         let idle = json!({"lines":[],"legacy_configs":[],"nodes":[{
@@ -1259,7 +1436,7 @@ mod tests {
             snapshot: json!({"maintenance":true}),
         });
         let input = |channel: &str| Batch { id: id(), targets: vec![remote_id.clone()],
-            action: "upgrade".into(), version: "0.2.47".into(), xray_channel: channel.into(), congestion_control: String::new(), qdisc: String::new(), lines: BTreeMap::new() };
+            action: "upgrade".into(), version: "0.2.47".into(), xray_channel: channel.into(), congestion_control: String::new(), qdisc: String::new(), lines: BTreeMap::new(), core: String::new(), security_update: false, rollback_safe: false, prerelease: false };
         assert!(batch(State(app.clone()), Json(input("latest"))).await.is_err());
         app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["upgrade-xray-latest"]);
         assert!(batch(State(app.clone()), Json(input("nightly"))).await.is_err());
@@ -1278,7 +1455,7 @@ mod tests {
             snapshot: json!({"maintenance":true}),
         });
         let input = || Batch { id: id(), targets: vec![remote_id.clone()],
-            action: "restart-all".into(), version: String::new(), xray_channel: String::new(), congestion_control: String::new(), qdisc: String::new(), lines: BTreeMap::new() };
+            action: "restart-all".into(), version: String::new(), xray_channel: String::new(), congestion_control: String::new(), qdisc: String::new(), lines: BTreeMap::new(), core: String::new(), security_update: false, rollback_safe: false, prerelease: false };
         assert!(batch(State(app.clone()), Json(input())).await.is_err());
         assert!(app.store.lock().unwrap().doc.fleet.receipts.is_empty());
         app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["restart-all"]);
@@ -1303,7 +1480,7 @@ mod tests {
         let task = id();
         let input = |qdisc: &str| Batch { id: task.clone(), targets: vec![remote_id.clone()],
             action: "network-tune".into(), version: String::new(), xray_channel: String::new(),
-            congestion_control: "bbr".into(), qdisc: qdisc.into(), lines: BTreeMap::new() };
+            congestion_control: "bbr".into(), qdisc: qdisc.into(), lines: BTreeMap::new(), core: String::new(), security_update: false, rollback_safe: false, prerelease: false };
         assert!(batch(State(app.clone()), Json(input("fq"))).await.is_err());
         app.store.lock().unwrap().doc.fleet.remotes[0].snapshot["maintenance_actions"] = json!(["network-tune"]);
         assert!(batch(State(app.clone()), Json(input("fq;id"))).await.is_err());

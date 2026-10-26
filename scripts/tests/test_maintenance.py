@@ -22,6 +22,11 @@ class MaintenanceTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        install_state = self.root / '.chain-install.json'
+        install_state.write_text(json.dumps({'owner': OWNER, 'roles': {}}))
+        install = patch.object(maintenance, 'INSTALL_STATE', install_state)
+        install.start()
+        self.addCleanup(install.stop)
         unit = patch.object(maintenance, 'HTTPS_UNIT', self.root / 'chain-panel-https.service')
         unit.start()
         self.addCleanup(unit.stop)

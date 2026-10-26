@@ -44,6 +44,7 @@ def login_as(h, token):
 
 def exercise(h):
     echo_port = h.port()
+    h.allow_loopback_target(echo_port)
     h.server(TcpServer(("127.0.0.1", echo_port), RentalEcho))
     cert, key = h.root / "cert.pem", h.root / "key.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",

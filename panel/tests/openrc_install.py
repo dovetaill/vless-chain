@@ -96,6 +96,8 @@ def main():
             tls.tls_context.set_alpn_protocols(['http/1.1'])
             h.server(tls)
             h.http_port = h.port()
+            direct = {'protocol':'freedom','settings':{'finalRules':[{'action':'allow','network':'tcp',
+                'ip':['127.0.0.1'],'port':str(h.http_port)}]}}
             h.server(http.server.ThreadingHTTPServer(('127.0.0.1', h.http_port), Response))
             panel_cert = Path('/etc/letsencrypt/live/chain-panel-panel.test')
             panel_cert.mkdir(parents=True)
@@ -124,9 +126,11 @@ def main():
                     access = h.root / f'exit-{index}-access.log'
                     config = h.root / f'exit-{index}.json'
                     config.write_text(json.dumps({'log': {'access': str(access), 'loglevel': 'warning'},
-                        'inbounds': [exit_inbound], 'outbounds': [{'protocol': 'freedom'}]}))
+                        'inbounds': [exit_inbound], 'outbounds': [direct]}))
                     h.launch(f'exit-{index}', h.xray, {}, ['run', '-config', str(config)])
                     exits.append(access)
+                else:
+                    entry['config']['outbounds'][0] = copy.deepcopy(direct)
                 name = f'xray-chain-fixture-{index}'
                 config = h.root / f'{name}.json'
                 config.write_text(json.dumps(entry['config']))

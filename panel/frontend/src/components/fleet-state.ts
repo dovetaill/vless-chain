@@ -23,10 +23,12 @@ export type Task = {
   action: string;
   state: string;
   version?: string;
+  core?: string;
   lines?: Record<string, string[]>;
   at?: number;
   targets: {
     id: string;
+    task_id?: string;
     state: string;
     error?: string;
     result?: {
@@ -62,9 +64,11 @@ export const statuses: Record<string, string> = {
   unknown: "结果待确认",
   paused: "已暂停",
   completed: "已结束，有异常",
+  awaiting_verification: "内核已切换 · 待验证",
 };
 export const actions: Record<string, string> = {
   upgrade: "批量升级",
+  "core-upgrade": "批量升级内核",
   "restart-all": "整套重启",
   "restart-panel": "重启面板",
   "restart-agent": "重启 Agent",

@@ -48,6 +48,7 @@ def main():
             tls.tls_context.load_cert_chain(cert, key)
             h.server(tls)
             h.http_port = h.port()
+            h.allow_loopback_target(h.http_port)
             h.server(http.server.ThreadingHTTPServer(('127.0.0.1', h.http_port), Response))
             panel_port = h.port()
             h.base = f'http://127.0.0.1:{panel_port}'

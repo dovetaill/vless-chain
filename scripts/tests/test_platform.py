@@ -19,31 +19,21 @@ import chain_install as installer
 import chain_network as network
 import chain_platform as platform
 import chain_release as release
+import chain_cores as cores
 
 
 class Platforms(unittest.TestCase):
-    @unittest.skipUnless(shutil.which('go'), 'Go is only required on build hosts')
-    def test_failed_xray_build_cleans_readonly_toolchain_cache(self):
+    def test_failed_core_download_cleans_partial_archive(self):
         with tempfile.TemporaryDirectory() as directory:
-            with common.Workspace(Path(directory)) as work:
-                execute = work.run
-                cache = work.root / 'go/mod'
-
-                def download_failure(command, **kwargs):
-                    if command[:3] == ['go', 'mod', 'download']:
-                        source = cache / 'golang.org/toolchain@v0.0.1-test/src'
-                        source.mkdir(parents=True)
-                        (source / 'go.env').write_text('test')
-                        source.chmod(0o555)
-                        source.parent.chmod(0o555)
-                        raise subprocess.CalledProcessError(42, command)
-                    return execute(command, **kwargs)
-
-                with patch.object(work, 'run', side_effect=download_failure):
-                    with self.assertRaises(subprocess.CalledProcessError) as error:
+            with self.assertRaisesRegex(ValueError, 'fixture download failed'):
+                with common.Workspace(Path(directory)) as work:
+                    def download_failure(core, version, root, destination):
+                        self.assertEqual((core, version), ('xray', cores.RECOMMENDED['xray']))
+                        (root / 'partial.zip').write_bytes(b'incomplete')
+                        raise ValueError('fixture download failed')
+                    with patch.object(release, 'download_core', side_effect=download_failure):
                         release.fetch_xray(work, work.root / 'stage/bin/xray')
-                self.assertEqual(error.exception.returncode, 42)
-                self.assertFalse(cache.exists())
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_startup_failure_points_to_logs_without_requiring_chainctl(self):
         manager = installer.Manager.__new__(installer.Manager)
@@ -119,7 +109,11 @@ class Platforms(unittest.TestCase):
                 with patch.object(common.platform, 'system', return_value=os_name), \
                         patch.object(common.platform, 'machine', return_value=machine):
                     self.assertEqual((common.operating_system(), common.architecture()), (system, arch))
-                    self.assertIn((system, arch), release.MIHOMO_ASSETS)
+                    name = f'mihomo-{system}-{"amd64-compatible" if arch == "x86_64" else "arm64"}-v{cores.RECOMMENDED["mihomo"]}.gz'
+                    url = f'https://github.com/MetaCubeX/mihomo/releases/download/v{cores.RECOMMENDED["mihomo"]}/{name}'
+                    info = {'tag_name':'v' + cores.RECOMMENDED['mihomo'], 'draft':False,
+                            'assets':[{'name':name,'browser_download_url':url,'digest':'sha256:' + 'a' * 64}]}
+                    self.assertEqual(cores.asset(info, 'mihomo', cores.RECOMMENDED['mihomo'])[:2], (name, url))
         with patch.object(common.platform, 'system', return_value='Windows'):
             with self.assertRaisesRegex(ValueError, 'Linux 和 macOS'):
                 common.architecture()

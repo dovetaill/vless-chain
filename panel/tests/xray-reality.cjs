@@ -41,7 +41,8 @@ async function probe(binary, target, name) {
       settings: { clients: [{ id: uuid, flow: 'xtls-rprx-vision' }], decryption: 'none' },
       streamSettings: { network: 'tcp', security: 'reality', realitySettings: {
         show: true, target, serverNames: [name], privateKey: secret, shortIds: [sid] } } }],
-      outbounds: [{ protocol: 'freedom' }] },
+      // Only the disposable loopback echo endpoint is allowed through newer cores' private-IP guard.
+      outbounds: [{ protocol: 'freedom', settings: { finalRules: [{ action: 'allow', ip: ['127.0.0.1'], port: String(echoPort) }] } }] },
     { log: { loglevel: 'debug' }, inbounds: [{ listen: '127.0.0.1', port: socksPort, protocol: 'socks', settings: { auth: 'noauth' } }],
       outbounds: [{ protocol: 'vless', settings: { vnext: [{ address: '127.0.0.1', port: serverPort,
         users: [{ id: uuid, encryption: 'none', flow: 'xtls-rprx-vision' }] }] },
@@ -65,7 +66,7 @@ async function probe(binary, target, name) {
       children.push(child); let body = ''; child.stdout.on('data', b => body += b); child.stderr.resume();
       child.once('error', reject); child.once('exit', code => resolve({ code, body }));
     });
-    return { ok: result.code === 0 && result.body === marker,
+    return { ok: result.code === 0 && result.body === marker, logs: pair.map(p => p.log.slice(-5000)),
       records: [...pair[0].log.matchAll(/Certificate:\s*(\d+)/g)].map(m => Number(m[1])) };
   } finally {
     await Promise.all(pair.map(stop));
@@ -80,9 +81,9 @@ async function probe(binary, target, name) {
   const port = await listen(tls.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(cert),
     minVersion: 'TLSv1.3', ALPNProtocols: ['h2', 'http/1.1'] }));
   const patched = await probe(process.env.CHAIN_TEST_XRAY, `127.0.0.1:${port}`, 'localhost');
-  assert(patched.ok, 'patched core must exchange authenticated data with a large target certificate');
+  assert(patched.ok, 'target core must exchange authenticated data with a large target certificate\n' + patched.logs.join('\n'));
   assert(patched.records.some(size => size > 8192), `expected certificate record > 8192: ${patched.records}`);
-  console.log('patched large-certificate handshake passed; record sizes:', patched.records);
+  console.log('target core large-certificate handshake passed; record sizes:', patched.records);
   if (process.env.CHAIN_TEST_OLD_XRAY) {
     const old = await probe(process.env.CHAIN_TEST_OLD_XRAY, `127.0.0.1:${port}`, 'localhost');
     assert(!old.ok, 'unpatched baseline must reproduce the failure');
@@ -99,6 +100,11 @@ async function probe(binary, target, name) {
   await Promise.all(children.map(stop));
   for (const socket of sockets) socket.destroy();
   await Promise.all(servers.filter(s => s.listening).map(s => new Promise(resolve => s.close(resolve))));
+  for (const port of new Set(ports)) {
+    const released = net.createServer();
+    await new Promise((resolve, reject) => released.once('error', reject).listen(port, '127.0.0.1', resolve));
+    await new Promise(resolve => released.close(resolve));
+  }
   fs.rmSync(root, { recursive: true });
   console.log('Cleaned test processes, loopback listeners and files:', root);
 });

@@ -210,6 +210,8 @@ export interface PanelState {
   maintenance?: boolean;
   maintenance_actions?: string[];
   cores?: { xray?: string; mihomo?: string; xray_channel?: string; xray_prerelease?: boolean } | null;
+  core_maintenance?: { supported: boolean; versions: Record<string, string>; recommended: Record<string, string>;
+    history: Record<string, { version: string; safe: boolean }>; blocked?: { core: string } | null; pending?: string | null };
   legacy_configs?: { id: string; node_id: string; name: string; enabled: boolean; published: boolean; pending_delete?: boolean; ports: number[] }[];
   pending_imports?: { id: string; name: string; reason: string }[];
   local_node_id: string | null;

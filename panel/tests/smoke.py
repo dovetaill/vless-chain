@@ -81,6 +81,30 @@ class Harness:
             "files": str(self.root),
         }))
 
+    def allow_loopback_target(self, port):
+        """Allow only this fixture endpoint in disposable execution configs."""
+        assert port in self.ports and self.root.resolve().is_relative_to(Path(os.environ['CHAIN_TEST_ROOT']).resolve())
+        binary, root = str(self.xray.resolve()), str(self.root.resolve())
+        wrapper = self.root / 'fixture-xray'
+        wrapper.write_text('#!/usr/bin/env python3\n' + f'''import json,os,pathlib,sys,tempfile
+args=sys.argv[1:]
+if '-config' in args:
+    index=args.index('-config')+1
+    source=pathlib.Path(args[index]).resolve()
+    assert source.is_relative_to(pathlib.Path({root!r}))
+    value=json.loads(source.read_text())
+    for outbound in value.get('outbounds',[]):
+        if outbound.get('protocol')=='freedom':
+            outbound.setdefault('settings',{{}}).setdefault('finalRules',[]).insert(0,
+                {{'action':'allow','network':'tcp','ip':['127.0.0.1'],'port':{str(port)!r}}})
+    fd,path=tempfile.mkstemp(prefix='fixture-core-',suffix='.json',dir=source.parent)
+    with os.fdopen(fd,'w') as stream: json.dump(value,stream)
+    args[index]=path
+os.execv({binary!r},[{binary!r},*args])
+''')
+        wrapper.chmod(0o755)
+        self.xray = wrapper
+
     def port(self):
         while True:
             with socket.socket() as s:

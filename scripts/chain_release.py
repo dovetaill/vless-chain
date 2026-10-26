@@ -17,20 +17,11 @@ import urllib.request
 
 from chain_common import (Workspace, architecture, operating_system, atomic_write, json_write, output, require,
                           run, sha256, verify_archive_checksum, VERSION_RE)
+from chain_cores import RECOMMENDED, download as download_core
 
 ROOT = Path(__file__).resolve().parents[1]
-XRAY_VERSION = '26.3.27-chain.1'
-XRAY_SOURCES = (
-    ('github.com/xtls/xray-core@v1.260327.0', 'h1:g4TzxMwyPrxslZh6uD+FiG3lXKTrnNO+b4ky2OhogHE='),
-    ('github.com/xtls/reality@v0.0.0-20260322125925-9234c772ba8f', 'h1:iy2JRioxmUpoJ3SzbFPyTxHZMbR/rSHP7dOOgYaq1O8='),
-)
-MIHOMO_VERSION = '1.19.32'
-MIHOMO_ASSETS = {
-    ('linux', 'x86_64'): ('amd64-compatible', 'ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20'),
-    ('linux', 'aarch64'): ('arm64', '9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0'),
-    ('darwin', 'x86_64'): ('amd64-compatible', '18b382df77bded2ad0fb3db27db5636cb15b20729d5ba995a357eeb9b46bf507'),
-    ('darwin', 'aarch64'): ('arm64', '3312a6780652c622890fd4357c6a853bbf865464fd047ac7b7f52dab8de18652'),
-}
+XRAY_VERSION = RECOMMENDED['xray']
+MIHOMO_VERSION = RECOMMENDED['mihomo']
 SHIPPED = ['panel', 'scripts', 'README.md', '.gitignore']
 
 
@@ -148,66 +139,11 @@ def release_wizard(push_only=False):
 
 
 def fetch_mihomo(work, destination):
-    arch, digest = MIHOMO_ASSETS[operating_system(), architecture()]
-    name = f'mihomo-{operating_system()}-{arch}-v{MIHOMO_VERSION}.gz'
-    archive = work.root / name
-    url = f'https://github.com/MetaCubeX/mihomo/releases/download/v{MIHOMO_VERSION}/{name}'
-    with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as stream:
-        shutil.copyfileobj(response, stream)
-    require(sha256(archive) == digest, 'Mihomo 下载校验失败。')
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(archive, 'rb') as source, destination.open('wb') as output:
-        shutil.copyfileobj(source, output)
-    destination.chmod(0o755)
-    license_path = destination.parent.parent / 'share/Mihomo-LICENSE'
-    license_path.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(f'https://raw.githubusercontent.com/MetaCubeX/mihomo/v{MIHOMO_VERSION}/LICENSE', timeout=30) as response:
-        license_path.write_bytes(response.read())
+    download_core('mihomo', MIHOMO_VERSION, work.root, destination)
 
 
 def fetch_xray(work, destination):
-    require(shutil.which('go'), '构建补丁内核需要 Go；安装后的服务器无需 Go。')
-    work.env.update(GOTOOLCHAIN='go1.26.4', GOENV='off', GOFLAGS='-modcacherw', CGO_ENABLED='0',
-                    GOPATH=str(work.root / 'go'), GOMODCACHE=str(work.root / 'go/mod'),
-                    GOCACHE=str(work.root / 'go/cache'), GOPROXY='https://proxy.golang.org', GOSUMDB='sum.golang.org')
-    try:
-        sources = []
-        for index, (module, digest) in enumerate(XRAY_SOURCES):
-            metadata = work.root / f'xray-source-{index}.json'
-            with metadata.open('wb') as stream:
-                work.run(['go', 'mod', 'download', '-json', module], cwd=work.root, stdout=stream)
-            info = json.loads(metadata.read_text())
-            require(info.get('Sum') == digest and not info.get('Error'), 'Xray 源码校验失败。')
-            source = work.root / f'xray-source-{index}'
-            shutil.copytree(info['Dir'], source, copy_function=shutil.copyfile)
-            source.chmod(0o700)
-            for directory in source.rglob('*'):
-                if directory.is_dir():
-                    directory.chmod(0o700)
-            sources.append(source)
-        core, reality = sources
-        file = reality / 'tls.go'
-        original = file.read_text()
-        require(original.count('\tsize  = 8192\n') == 1, 'REALITY 补丁基线不匹配，拒绝构建。')
-        # Backport only XTLS/REALITY#33; retain the stable baseline's client compatibility.
-        file.write_text(original.replace('\tsize  = 8192\n', '\tsize  = 17 * 1024\n'))
-        work.run(['go', 'mod', 'edit', '-replace', f'github.com/xtls/reality={reality}'], cwd=core)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        work.run(['go', 'build', '-mod=readonly', '-trimpath', '-buildvcs=false', '-ldflags',
-                  '-s -w -buildid= -X github.com/xtls/xray-core/core.build=chain.1-reality-buffer-17k',
-                  '-o', destination, './main'], cwd=core)
-        share = destination.parent.parent / 'share'
-        share.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(core / 'LICENSE', share / 'Xray-LICENSE')
-        (share / 'Xray-PATCHES.txt').write_text(
-            f'{XRAY_VERSION}: 本项目补丁构建，并非官方原版二进制。\n'
-            '基线：Xray v26.3.27；仅回移 https://github.com/XTLS/REALITY/pull/33\n'
-            'tls.go: size = 8192 -> size = 17 * 1024；保留原 REALITY 客户端兼容性。\n'
-            'Go 1.26.4；源码模块及校验：\n' + '\n'.join(f'{m} {s}' for m, s in XRAY_SOURCES) + '\n')
-    finally:
-        # Go toolchain downloads stay read-only even with -modcacherw.
-        work.env['GOTOOLCHAIN'] = 'local'
-        work.run(['go', 'clean', '-modcache'], cwd=work.root)
+    download_core('xray', XRAY_VERSION, work.root, destination)
 
 
 def default_output():
@@ -230,6 +166,7 @@ def check(args):
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_platform.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_ingress.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_maintenance.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_cores.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_time_diagnostics.py'])
     run([sys.executable, '-B', ROOT / 'scripts/tests/test_menu.py'])
     if args.full:
@@ -293,9 +230,10 @@ def build(args):
         work.run(['node', ROOT / 'panel/tests/xray-reality.cjs'], cwd=ROOT)
         fetch_mihomo(work, stage / 'bin/mihomo')
         work.run([stage / 'bin/mihomo', '-v'])
-        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_time.py', 'chain_tuning.py']:
+        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_cores.py', 'chain_time.py', 'chain_tuning.py']:
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
+        shutil.copy2(ROOT / 'panel/src/core-versions.json', stage / 'scripts/core-versions.json')
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')
         shutil.copytree(ROOT / 'panel/docs', stage / 'docs')
         (stage / 'frontend').mkdir()

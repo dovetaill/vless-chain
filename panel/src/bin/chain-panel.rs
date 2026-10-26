@@ -415,6 +415,14 @@ async fn state(State(app): State<App>) -> Json<Value> {
     value["maintenance_actions"] = if value["maintenance"] == true {
         json!(["upgrade", "upgrade-xray-latest", "restart-all", "restart-panel", "restart-agent", "network-tune"])
     } else { json!([]) };
+    if !cfg!(test) && value["maintenance"] == true {
+        if let Ok(cores) = fleet_api::maintenance(json!({"id":crate::id(),"action":"core-status"})).await {
+            if cores["supported"] == true {
+                value["core_maintenance"] = cores;
+                value["maintenance_actions"].as_array_mut().unwrap().push(json!("core-upgrade"));
+            }
+        }
+    }
     Json(value)
 }
 async fn state_view(State(app): State<App>, Extension(actor): Extension<Actor>) -> Json<Value> {

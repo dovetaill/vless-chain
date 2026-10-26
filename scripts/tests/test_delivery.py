@@ -406,8 +406,9 @@ class Delivery(unittest.TestCase):
         (root / 'scripts').mkdir()
         for name in ['chain-panel', 'chain-agent', 'xray']:
             (root / 'bin' / name).write_text('fixture-' + version)
-        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_time.py', 'install-server.sh']:
+        for name in ['chain_common.py', 'chain_install.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_time.py', 'chain_cores.py', 'install-server.sh']:
             shutil.copy2(Path(__file__).resolve().parents[1] / name, root / 'scripts' / name)
+        shutil.copyfile(Path(__file__).resolve().parents[2] / 'panel/src/core-versions.json', root / 'scripts/core-versions.json')
         files = {str(p.relative_to(root)): {'sha256': common.sha256(p), 'mode': 0o755 if p.parent.name == 'bin' or p.suffix == '.sh' else 0o644}
                  for p in root.rglob('*') if p.is_file()}
         manifest = {'format': 1, 'version': version, 'arch': common.architecture(), 'os': common.operating_system(), 'libc': 'musl', 'macos_min': '14.0', 'files': files}
@@ -672,6 +673,8 @@ class Delivery(unittest.TestCase):
         self.assertEqual(self.manager.state()['roles']['panel']['version'], '0.2.0')
         self.assertEqual(installed_script.read_bytes(), (source2 / 'scripts/chain_install.py').read_bytes())
         self.assertIn(str(installed_script), self.manager.path('/usr/local/bin/chainctl').read_text())
+        for name in ('chain_cores.py', 'core-versions.json'):
+            self.assertEqual((self.manager.base / 'manager' / name).read_bytes(), (source2 / 'scripts' / name).read_bytes())
 
     def test_existing_local_agent_is_not_registered_again(self):
         source, manifest = self.package()

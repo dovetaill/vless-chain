@@ -15,6 +15,7 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let dir =
         PathBuf::from(std::env::var("CHAIN_AGENT_DIR").unwrap_or_else(|_| "agent-data".into()));
+    ensure!(!dir.join(".core-upgrade-blocked").exists(), "安全更新失败后代理已停用，请通过维护入口安装安全内核；未启动代理");
     private_dir(&dir, "chain-agent")?;
     let _lock = lock_dir(&dir)?;
     let panel = std::env::var("CHAIN_PANEL_URL").context("缺少 CHAIN_PANEL_URL")?;
@@ -53,6 +54,7 @@ async fn run() -> Result<()> {
     let token = std::fs::read_to_string(token_path)?;
     ensure!(token.trim().len() >= 32, "Agent token 无效");
     let binary = PathBuf::from(std::env::var("CHAIN_XRAY_BIN").unwrap_or_else(|_| "xray".into()));
+    let core_versions = reported_cores(&binary);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
@@ -186,6 +188,7 @@ async fn run() -> Result<()> {
             }
             report.system["clock"] = clock.lock().unwrap().clone();
             report.system["diagnostics_version"] = serde_json::json!(1);
+            report.system["cores"] = core_versions.clone();
             report.system["certificate_expiry"] = certificate_expiry.clone();
             let ingress_status = std::env::var_os("CHAIN_INGRESS_STATUS")
                 .map(PathBuf::from)
@@ -235,6 +238,7 @@ async fn run() -> Result<()> {
                         system: chain_panel::gateway::system_metrics(),
                     };
                     report.system["diagnostics_version"] = serde_json::json!(1);
+                    report.system["cores"] = core_versions.clone();
                     report.system["clock"] = clock.lock().unwrap().clone();
                     // Acknowledge immediately; do not report a saved config as running before application.
                     client
@@ -259,4 +263,26 @@ async fn run() -> Result<()> {
     let _ = chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "Agent 已停止");
     eprintln!("Agent 已停止，所属 Xray 已退出");
     Ok(())
+}
+
+fn reported_cores(xray: &std::path::Path) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut result = serde_json::json!({});
+    let Some(root) = xray.canonicalize().ok().and_then(|p| p.parent()?.parent().map(std::path::Path::to_path_buf)) else { return result; };
+    let Some(manifest) = std::fs::read(root.join("release.json")).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return result; };
+    for core in ["xray", "mihomo"] {
+        let path = if core == "mihomo" { std::env::var_os("CHAIN_MIHOMO_BIN").map(PathBuf::from).unwrap_or_else(|| xray.with_file_name("mihomo")) } else { xray.to_path_buf() };
+        let checked = (|| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop { let n = file.read(&mut buffer)?; if n == 0 { break; } hash.update(&buffer[..n]); }
+            ensure!(hex::encode(hash.finalize()) == manifest["files"][format!("bin/{core}")]["sha256"].as_str().unwrap_or(""), "内核摘要与发行记录不一致");
+            Ok(manifest[core].as_str().context("缺少内核版本")?.into())
+        })();
+        if let Ok(version) = checked { result[core] = serde_json::json!(version); }
+    }
+    result
 }

@@ -23,17 +23,20 @@ from chain_common import VERSION_RE, download_release, json_write, require, safe
 from chain_network import SITE_OWNER
 from chain_platform import service_kind, service_path
 import chain_tuning
+import chain_cores
 
 STATE = Path('/var/lib/chain-maintenance')
 INSTALL_STATE = Path('/opt/chain/.chain-install.json')
 LOCK = threading.Lock()
 RELOAD = threading.Event()
-ACTIONS = {'upgrade', 'restart-all', 'restart-panel', 'restart-agent', 'sync-time', 'network-tune', 'network-status'}
+ACTIONS = {'upgrade', 'restart-all', 'restart-panel', 'restart-agent', 'sync-time', 'network-tune', 'network-status',
+           'core-status', 'core-upgrade', 'core-rollback', 'core-confirm', 'core-reject'}
 HTTPS_UNIT = service_path('chain-panel-https')
 
 
 def validate(value):
-    require(isinstance(value, dict) and set(value) <= {'id', 'action', 'version', 'xray_channel', 'congestion_control', 'qdisc'}, '请求字段无效')
+    require(isinstance(value, dict) and set(value) <= {'id', 'action', 'version', 'xray_channel', 'congestion_control', 'qdisc',
+            'core', 'security_update', 'rollback_safe', 'prerelease', 'task_id'}, '请求字段无效')
     require(isinstance(value.get('id'), str) and str(uuid.UUID(value['id'])) == value['id'], '任务 ID 无效')
     require(value.get('action') in ACTIONS | {'status'}, '不支持的维护操作')
     if value['action'] == 'upgrade':
@@ -45,6 +48,10 @@ def validate(value):
         chain_tuning.validate(value.get('congestion_control'), value.get('qdisc'))
     else:
         require('congestion_control' not in value and 'qdisc' not in value, '只有网络设置可选择算法或队列')
+    if value['action'].startswith('core-') and value['action'] != 'core-status':
+        chain_cores.validate(value)
+    else:
+        require(not any(key in value for key in ('core', 'security_update', 'rollback_safe', 'prerelease', 'task_id')), '只有内核操作可指定内核参数')
     return value
 
 
@@ -140,6 +147,15 @@ def execute(job, directory=STATE):
         services = related_services(before) if job['action'] in ('upgrade', 'restart-all') else []
         job.update(state='running', before=before, started=int(time.time()))
         json_write(path, job)
+        if job['action'].startswith('core-'):
+            from chain_install import Manager
+            job.update(chain_cores.operate(Manager(), job, directory))
+            job['after'] = installed()
+            return
+        if job['action'] in ('upgrade', 'restart-all', 'restart-agent'):
+            state = json.loads(INSTALL_STATE.read_text())
+            require(not state.get('core_blocked'), '安全更新失败后代理已停用，请先安装安全内核')
+            require(not INSTALL_STATE.with_name('.core-pending.json').exists(), '请先完成内核升级验证或恢复')
         with tempfile.TemporaryDirectory(prefix='work-' + job['id'] + '-', dir=directory) as temporary:
             temporary = Path(temporary)
             if job['action'] == 'upgrade':
@@ -206,6 +222,13 @@ def execute(job, directory=STATE):
         if job['action'] == 'sync-time' and job.get('detail'):
             message += '\n' + job['detail']
         job.update(state='failed', error=message)
+        if job['action'] in ('core-confirm', 'core-reject'):
+            original = directory / (job['task_id'] + '.json')
+            if original.is_file():
+                receipt = json.loads(original.read_text())
+                if receipt.get('core') == job['core'] and receipt.get('state') == 'awaiting_verification':
+                    receipt['error'] = '验证处理未完成：' + message
+                    json_write(original, receipt)
         try:
             job['after'] = installed()
         except Exception:
@@ -234,6 +257,9 @@ def submit(value, pool, directory=STATE):
     value = validate(value)
     if value['action'] == 'network-status':
         return chain_tuning.status()
+    if value['action'] == 'core-status':
+        from chain_install import Manager
+        return chain_cores.status(Manager())
     path = directory / (value['id'] + '.json')
     with LOCK:
         if path.exists():
@@ -242,11 +268,15 @@ def submit(value, pool, directory=STATE):
                     (value['action'], value.get('version', ''), value.get('xray_channel', 'recommended')), '任务 ID 已用于其他操作')
             require(value['action'] == 'status' or all(job.get(key) == value.get(key) for key in ('congestion_control', 'qdisc')),
                     '任务 ID 已用于其他网络设置')
+            require(value['action'] == 'status' or all(job.get(key) == value.get(key)
+                    for key in ('core', 'security_update', 'rollback_safe', 'prerelease', 'task_id')), '任务 ID 已用于其他内核操作')
             return job
         if value['action'] == 'status':
             return {'id': value['id'], 'state': 'not_found'}
         jobs = list(directory.glob('*.json'))
         require(not any(json.loads(p.read_text()).get('state') in ('queued', 'running') for p in jobs), '已有维护任务正在执行')
+        if value['action'] not in ('core-confirm', 'core-reject'):
+            require(not any(json.loads(p.read_text()).get('state') == 'awaiting_verification' for p in jobs), '请先确认或恢复待验证的内核升级')
         job = {**value, 'state': 'queued', 'created': int(time.time())}
         json_write(path, job)
         pool.submit(execute, job.copy(), directory)

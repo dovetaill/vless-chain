@@ -438,6 +438,11 @@ class Manager:
         releases = self.base / 'releases'
         require(not releases.is_symlink(), '发行目录不能是符号链接，未清理历史版本。')
         keep = {item['current'] for item in state['roles'].values()}
+        keep.update(item['release'] for item in state.get('core_history', {}).values())
+        journal = self.base / '.core-pending.json'
+        if journal.exists():
+            pending = json.loads(journal.read_text())
+            keep.update((pending['before']['current'], pending['target']))
         for role in ROLES:
             link = self.base / ('current-' + role)
             if link.is_symlink():
@@ -579,8 +584,8 @@ class Manager:
                 json_write(self.state_file, state)
                 manager = self.base / 'manager'
                 manager.mkdir(exist_ok=True)
-                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_time.py']:
-                    if name in ('chain_legacy.py', 'chain_time.py') and not (release / 'scripts' / name).exists():
+                for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_time.py', 'chain_cores.py', 'core-versions.json']:
+                    if name in ('chain_legacy.py', 'chain_time.py', 'chain_cores.py', 'core-versions.json') and not (release / 'scripts' / name).exists():
                         continue
                     if name == 'chain_platform.py' and 'os' not in manifest and not (release / 'scripts' / name).exists():
                         continue
@@ -824,6 +829,9 @@ class Manager:
             return self.uninstall(args)
         role, action = args.component, args.action
         state = self.require_role(role)
+        if role == 'agent' and action in ('start', 'restart', 'rollback'):
+            require(not state.get('core_blocked'), '安全更新失败后代理已停用，请先安装安全内核')
+            require(not (self.base / '.core-pending.json').exists(), '请先完成内核升级验证或恢复')
         if action == 'status':
             print(f'{ROLE_NAMES[role]} · 版本 {state["roles"][role]["version"]}')
             self.system.call('status', 'chain-' + role + '.service', '--no-pager', check=False)
@@ -1091,6 +1099,9 @@ def install_package(manager, args):
         stage = Path(temporary) / 'stage'
         manifest = safe_extract(archive, stage)
         require(expected_version is None or manifest['version'] == expected_version, '下载包版本与发行信息不一致。')
+        if args.action == 'update':
+            from chain_cores import preserve
+            preserve(manager, stage, manifest)
         if getattr(args, 'xray_channel', 'recommended') == 'latest':
             latest_xray(stage, manifest, Path(temporary))
         print(f'Xray {manifest.get("xray", "未知")} · {"官方最新版" if manifest.get("xray_channel") == "latest" else "发行包推荐版"}', flush=True)

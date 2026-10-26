@@ -46,6 +46,7 @@ impl Role {
             ("GET" | "POST", ["api", "monitoring"]) => self == Self::Ops,
             ("POST", ["api", "monitoring", "test"] | ["api", "preview" | "publish"]) => self == Self::Ops,
             ("GET", ["api", "fleet", "release", _]) => self == Self::Ops,
+            ("GET", ["api", "fleet", "cores", "xray" | "mihomo"]) => self == Self::Ops,
             ("GET" | "POST", ["api", "federation", "task"]) => self == Self::Ops,
             ("POST", ["api", "diagnostics", id, "logs"]) => self == Self::Ops && (*id == "panel" || uuid::Uuid::parse_str(id).is_ok()),
             ("POST", ["api", "diagnostics", id, "reality" | "path"] | ["api", "lines", id, "probe"]) => self == Self::Ops && uuid::Uuid::parse_str(id).is_ok(),
@@ -72,7 +73,7 @@ pub fn state_for(value: serde_json::Value, actor: &Actor) -> serde_json::Value {
         value["viewer"] = json!(actor);
         return value;
     }
-    let mut out = fields(&value, &["busy", "time", "version", "agent_version", "agent_seen", "cores", "local_node_id"]);
+    let mut out = fields(&value, &["busy", "time", "version", "agent_version", "agent_seen", "cores", "core_maintenance", "local_node_id"]);
     out["viewer"] = json!(actor);
     out["maintenance"] = json!(actor.role == Role::Ops && value["maintenance"] == true);
     out["maintenance_actions"] = if actor.role == Role::Ops { value["maintenance_actions"].clone() } else { json!([]) };

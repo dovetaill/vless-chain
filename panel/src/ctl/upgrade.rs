@@ -158,6 +158,10 @@ impl Manager {
             .collect())
     }
     pub async fn update(&self, source: &Path, component: Option<&str>) -> Result<()> {
+        ensure!(!self.base.join(".core-pending.json").exists() && self.state()?["core_blocked"].is_null(),
+            "请先完成内核升级验证或恢复安全版本");
+        ensure!(self.state()?["core_history"].as_object().is_none_or(|h| h.is_empty()),
+            "已独立选择内核，请使用已安装的管理器更新，以保留所选版本和回退记录");
         self.update_checked(source, component, |role| self.healthy(role))
             .await
     }
@@ -490,6 +494,14 @@ impl Manager {
         for item in state["roles"].as_object().unwrap().values() {
             keep.insert(item["current"].as_str().unwrap().to_string());
         }
+        if let Some(history) = state["core_history"].as_object() {
+            for item in history.values() {
+                let release = item["release"].as_str().context("内核回退记录无效")?;
+                release_name(release)?;
+                keep.insert(release.into());
+            }
+        }
+        ensure!(!self.base.join(".core-pending.json").exists(), "内核升级尚未确认，未清理历史版本");
         for role in ["panel", "agent"] {
             let link = self.base.join(format!("current-{role}"));
             if link.is_symlink() {
