@@ -3,7 +3,7 @@ import { DropdownMenu } from "radix-ui";
 import "./fleet.css";
 import { publishChecked } from "../api";
 import { Diagnostics } from "./diagnostics";
-import { NetworkTuning } from "./network-tuning";
+import { NetworkTuning, type NetworkTarget } from "./network-tuning";
 import { LimitsDialog } from "./rental-editor";
 import { AccessPolicyEditor } from "./sharing";
 import { AccessDialog } from "./access-dialog";
@@ -229,7 +229,7 @@ function Trend({ points, now }: { points: Point[]; now: number }) {
   );
 }
 
-export function Fleet() {
+export function Fleet({ state }: { state: PanelState }) {
   const [data, setData] = useState<FleetState>();
   const [error, setError] = useState(""),
     [message, setMessage] = useState("");
@@ -262,6 +262,7 @@ export function Fleet() {
   const [pendingApply, setPendingApply] = useState<string[]>([]);
   const [selected, setSelected] = useState<string[]>([]),
     [selectedLines, setSelectedLines] = useState<string[]>([]);
+  const [includeLocal, setIncludeLocal] = useState(false);
   const [modal, setModal] = useState<ReactNode>(null),
     [detail, setDetail] = useState<string>();
   const [taskId, setTaskId] = useState<string>();
@@ -722,7 +723,7 @@ export function Fleet() {
       </Modal>,
     );
   }
-  function networkTuning(targets: Remote[]) {
+  function networkTuning(targets: NetworkTarget[]) {
     setDetail(undefined);
     setModal(<NetworkTuning targets={targets} close={close} submitted={async id => {
       await refresh();
@@ -1108,6 +1109,15 @@ export function Fleet() {
           {tab === "vps" && (
             <>
               <div className="fleet-selection" aria-label="VPS 批量操作">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button variant="outline" disabled={busy || running.some(t => t.state === "running") || !state.maintenance_actions?.includes("network-tune")}
+                    onClick={() => networkTuning([{ id: "local", name: "本机（主控）", snapshot: state }])}>本机网络算法 / BBR</Button>
+                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={includeLocal}
+                    onChange={e => setIncludeLocal(e.target.checked)} />网络批量设置包含本机</label>
+                  <Button variant="outline" disabled={busy || (!chosen.length && !includeLocal) || running.some(t => t.state === "running")}
+                    onClick={() => networkTuning([...chosen, ...(includeLocal ? [{ id: "local", name: "本机（主控）", snapshot: state }] : [])])}>网络算法 / BBR</Button>
+                  <p className="text-xs text-muted-foreground">勾选下方 VPS 可批量设置，无需重启。</p>
+                </div>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="text-sm"><strong>已选 {chosen.length} 台 VPS</strong><span className="ml-2 text-xs text-muted-foreground">含其他页与隐藏项</span></p>
                   <div className="flex flex-wrap gap-1">
@@ -1119,7 +1129,6 @@ export function Fleet() {
                 {chosen.length > 0 && <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
                   <div className="flex flex-wrap items-center gap-2">
                     <Button disabled={busy || releaseLoading || !release || running.some(t => t.state === "running")} onClick={() => batch("upgrade")}>批量升级</Button>
-                    <Button variant="outline" disabled={busy || running.some(t => t.state === "running")} onClick={() => networkTuning(chosen)}>网络算法 / BBR</Button>
                     <Button variant="outline" disabled={busy || releaseLoading} onClick={() => void fetchRelease()}>{releaseLoading ? "正在获取最新版本…" : "检查最新版本"}</Button>
                     <span className="text-xs text-muted-foreground">{release ? `最新正式版 ${release.version}` : "先检查版本，再升级所选 VPS"}</span>
                   </div>
@@ -1763,22 +1772,23 @@ export function Fleet() {
               {activeTask.targets.map((t) => {
                 const remote = remotes.find(r => r.id === t.id);
                 const verifyFailed = verificationFailed(t);
-                const verifyPending = t.result?.verification?.state === "pending";
+                const verifyPending = t.id !== "local" && t.result?.verification?.state === "pending";
                 const maintenanceDone = activeTask.action === "core-upgrade" ? t.state === "succeeded" : maintenanceSucceeded(t);
                 const issue = verifyFailed
                   ? t.result?.verification?.detail || (t.error || t.result?.error || "").replace(/^组件维护已完成，但整链验证失败[：:]?\s*/, "")
                   : t.error || t.result?.error;
-                return <section key={t.id} className="min-w-0 space-y-3 rounded-xl border p-4" aria-label={`VPS 任务：${remote?.name || t.id}`}>
+                const targetName = t.id === "local" ? "本机（主控）" : remote?.name || t.id;
+                return <section key={t.id} className="min-w-0 space-y-3 rounded-xl border p-4" aria-label={`VPS 任务：${targetName}`}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h4 className="font-semibold break-all">{remote?.name || t.id}</h4>
+                    <h4 className="font-semibold break-all">{targetName}</h4>
                     <Status tone={verifyFailed || verifyPending ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? activeTask.action === "core-upgrade" ? "连接未通过 · 后续已暂停" : activeTask.archived ? "维护完成 · 验证未通过" : "维护完成 · 自动复查中" : verifyPending ? "维护完成 · 等待连接验证" : statuses[t.state] || t.state}</Status>
                   </div>
                   <div className="grid gap-2 rounded-lg bg-muted/30 p-3 text-sm sm:grid-cols-2">
                     <p>组件维护：<span className={maintenanceDone ? "text-emerald-700" : ""}>{maintenanceDone ? "已完成" : statuses[t.result?.maintenance_state || t.state] || t.state}</span></p>
-                    <p>后续验证：{verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" ? "已通过" : activeTask.action === "core-upgrade" ? "等待原链接验证" : "等待自动验证"}</p>
+                    <p>后续验证：{t.id === "local" ? "请查看本机网络设置结果" : verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" ? "已通过" : activeTask.action === "core-upgrade" ? "等待原链接验证" : "等待自动验证"}</p>
                   </div>
                   {t.result?.after && <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">{Object.entries(t.result.after).map(([key, value]) => <span key={key}>{({panel:"控制台",agent:"Agent",chainctl:"管理命令"} as Record<string,string>)[key] || key} <strong>{value}</strong></span>)}</div>}
-                  {t.result?.network && <div className="space-y-1 text-sm"><p>系统默认：{t.result.network.after.congestion_control} + {t.result.network.after.qdisc}</p><p>网卡实际队列：{t.result.network.after.interfaces.map(q => `${q.dev} / ${q.parent}: ${q.kind}`).join("；") || "未知"}</p><p>{t.result.network.after.warning || "现有连接及网卡队列未重建。"}</p></div>}
+                  {t.result?.network && <div className="space-y-1 text-sm"><p>系统默认：{t.result.network.after.congestion_control} + {t.result.network.after.qdisc}</p><p>网卡实际队列：{t.result.network.after.interfaces.map(q => `${q.dev} / ${q.parent}: ${q.kind}`).join("；") || "未知"}</p><p>{t.result.network.after.warning || "未重启服务器或服务；现有连接与监听器不会自动切换 TCP 算法。"}</p></div>}
                   {remote && activeTask.action === "core-upgrade" && t.state === "awaiting_verification" && <div className="space-y-2">
                     <p className="text-sm">{t.result?.verification?.detail || "请用原链接确认实际连接、旧客户端及需要的 UDP 功能。"}</p>
                     <div className="flex flex-wrap gap-2">
@@ -1834,7 +1844,8 @@ export function Fleet() {
                         );
                         navigate("lines");
                       } else {
-                        setSelected(ids);
+                        setSelected(ids.filter(id => id !== "local"));
+                        if (activeTask.action === "network-tune") setIncludeLocal(ids.includes("local"));
                         navigate("vps");
                       }
                       setTaskId(undefined);

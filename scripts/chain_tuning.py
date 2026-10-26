@@ -1,4 +1,4 @@
-"""Inspect and set TCP defaults; never replace live interface queues or install kernels."""
+"""Set TCP defaults and switch default interface queues without restarting services."""
 import json
 import os
 from pathlib import Path
@@ -108,6 +108,42 @@ def replace_owned(path, expected, content):
             raise
 
 
+def apply_queues(qdisc):
+    warnings = []
+    try:
+        queues = json.loads(command('tc', '-j', 'qdisc', 'show'))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return [f'默认设置已保存，网卡队列未切换：{error}']
+    for queue in queues:
+        kind, dev = queue.get('kind'), queue.get('dev')
+        if kind in ('noqueue', 'mq', 'ingress', 'clsact') or kind == qdisc:
+            continue
+        parent = queue.get('parent', 'root')
+        label = f'{dev} / {parent}'
+        # shortcut: 仅替换内核自动创建的 0: 队列；支持自定义队列前需完整保存其配置及过滤规则。
+        root = next((q for q in queues if q.get('dev') == dev and q.get('root')), None)
+        if (kind not in ('fq', 'fq_codel', 'fq_pie', 'pfifo_fast') or queue.get('handle') != '0:'
+                or (not queue.get('root') and (not root or root.get('kind') != 'mq'))):
+            warnings.append(f'{label} 保留现有 {kind} 队列，未覆盖自定义配置')
+            continue
+        try:
+            if json.loads(command('tc', '-j', 'filter', 'show', 'dev', dev)):
+                warnings.append(f'{label} 存在流量过滤规则，未切换队列')
+                continue
+            current = json.loads(command('tc', '-j', 'qdisc', 'show', 'dev', dev))
+            if queue not in current:
+                warnings.append(f'{label} 队列已被其他操作修改，未覆盖')
+                continue
+            location = ('root',) if queue.get('root') else ('parent', parent)
+            command('tc', 'qdisc', 'replace', 'dev', dev, *location, qdisc)
+            current = json.loads(command('tc', '-j', 'qdisc', 'show', 'dev', dev))
+            if not any(q.get('parent', 'root') == parent and q.get('kind') == qdisc for q in current):
+                warnings.append(f'{label} 切换后未确认 {qdisc} 生效，请核对实际队列')
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            warnings.append(f'{label} 队列切换未完成：{error}')
+    return warnings
+
+
 def apply(cc, qdisc):
     validate(cc, qdisc)
     before = status()
@@ -141,8 +177,6 @@ def apply(cc, qdisc):
         after = status()
         if (after['congestion_control'], after['qdisc']) != desired:
             raise ValueError('设置被其他程序修改，请检查系统网络配置')
-        return {'before': before, 'after': after, 'loaded_modules': loaded,
-                'detail': 'TCP 默认算法及默认队列已保存。现有连接、监听套接字和网卡队列未重建，请查看网卡实际队列。'}
     except Exception as error:
         rollback_errors = []
         for index in reversed(written):
@@ -166,6 +200,13 @@ def apply(cc, qdisc):
         if loaded:
             detail += '；本次加载的模块仍在内核中：' + ', '.join(loaded)
         raise ValueError(str(error) + detail) from error
+    # Commit defaults first; queue failures are reported per interface, never as a fictitious rollback.
+    warnings = apply_queues(qdisc)
+    after = status()
+    after['warning'] = '；'.join(filter(None, [after['warning'], *warnings]))
+    return {'before': before, 'after': after, 'loaded_modules': loaded,
+            'detail': 'TCP 默认算法及默认队列已保存，已尝试在线应用网卡队列，请核对实际队列及跳过项。'
+                      '无需重启服务器或服务；已有连接和监听器不会自动切换 TCP 算法。'}
 
 
 if __name__ == '__main__':

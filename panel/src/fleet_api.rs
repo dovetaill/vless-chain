@@ -576,6 +576,9 @@ async fn archive_batch(State(app): State<App>, Path(id): Path<String>) -> ApiRes
     Ok(Json(json!({"ok":true})))
 }
 async fn recheck_batch(State(app): State<App>, Path((id, remote_id)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    if remote_id == "local" {
+        return Err(error(StatusCode::BAD_REQUEST, "本机网络状态请从网络算法入口重新检测"));
+    }
     edit(&app, |d| {
         let job = d.fleet.receipts.get_mut(&id).context("任务不存在")?;
         ensure!(job["archived"] != true, "已归档任务不再复查");
@@ -683,12 +686,13 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
             input
                 .targets
                 .iter()
-                .all(|id| d.fleet.remotes.iter().any(|r| &r.id == id)),
+                .all(|id| (input.action == "network-tune" && id == "local")
+                    || d.fleet.remotes.iter().any(|r| &r.id == id)),
             "VPS 不存在"
         );
         if !matches!(input.action.as_str(), "enable" | "disable") {
             ensure!(
-                input.targets.iter().all(|id| d
+                input.targets.iter().filter(|id| id.as_str() != "local").all(|id| d
                     .fleet
                     .remotes
                     .iter()
@@ -709,7 +713,7 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
                     "所选 VPS 尚不支持整套重启；请先升级并等待状态同步");
             }
             if input.action == "network-tune" {
-                ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter()
+                ensure!(input.targets.iter().filter(|id| id.as_str() != "local").all(|id| d.fleet.remotes.iter()
                     .find(|r| &r.id == id).is_some_and(|r| r.snapshot["maintenance_actions"]
                         .as_array().is_some_and(|actions| actions.iter().any(|a| a == "network-tune")))),
                     "所选 VPS 尚不支持网络算法设置；请先升级并等待状态同步");
@@ -840,6 +844,11 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
         s.save()?;
     }
     let result = async {
+        if target["id"] == "local" {
+            ensure!(action == "network-tune", "本机批量任务仅支持网络设置");
+            return maintenance(json!({"id":target["task_id"],"action":action,
+                "congestion_control":job["congestion_control"],"qdisc":job["qdisc"]})).await;
+        }
         let remote = remote(app, target["id"].as_str().unwrap())?;
         if lines {
         if dispatch_lines {
@@ -914,7 +923,12 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
                 }
             } else if !lines {
                 result["maintenance_state"] = result["state"].clone();
-                result["verification"] = json!({"state":"pending","detail":"组件维护完成后自动验证；验证失败不阻塞其他 VPS"});
+                result["verification"] = if target["id"] == "local" {
+                    json!({"state":if result["state"] == "succeeded" { "succeeded" } else { "pending" },
+                        "detail":"已回读本机网络默认值与实际队列；现有连接算法未验证"})
+                } else {
+                    json!({"state":"pending","detail":"组件维护完成后自动验证；验证失败不阻塞其他 VPS"})
+                };
             }
             target["result"] = result.clone();
             let state = result["state"].as_str().unwrap_or("running");
@@ -950,7 +964,7 @@ pub async fn verify_batches(app: &App) -> Result<()> {
         s.doc.fleet.receipts.iter().filter(|(_, job)| job["archived"] != true
             && !matches!(job["action"].as_str(), Some("enable" | "disable" | "core-upgrade")))
             .flat_map(|(id, job)| job["targets"].as_array().into_iter().flatten().enumerate()
-                .filter(|(_, t)| maintenance_succeeded(t) && t["result"]["verification"]["state"] != "succeeded"
+                .filter(|(_, t)| t["id"] != "local" && maintenance_succeeded(t) && t["result"]["verification"]["state"] != "succeeded"
                     && t["result"]["verification"]["retry_at"].as_u64().unwrap_or(0) <= now())
                 .map(|(index, t)| (id.clone(), index, t["id"].as_str().unwrap().to_string())))
             .collect()
@@ -1478,7 +1492,7 @@ mod tests {
             snapshot: json!({"maintenance":true}),
         });
         let task = id();
-        let input = |qdisc: &str| Batch { id: task.clone(), targets: vec![remote_id.clone()],
+        let input = |qdisc: &str| Batch { id: task.clone(), targets: vec![remote_id.clone(), "local".into()],
             action: "network-tune".into(), version: String::new(), xray_channel: String::new(),
             congestion_control: "bbr".into(), qdisc: qdisc.into(), lines: BTreeMap::new(), core: String::new(), security_update: false, rollback_safe: false, prerelease: false };
         assert!(batch(State(app.clone()), Json(input("fq"))).await.is_err());
@@ -1490,6 +1504,23 @@ mod tests {
         let store = app.store.lock().unwrap();
         assert_eq!(store.doc.fleet.receipts[&task]["congestion_control"], "bbr");
         assert_eq!(store.doc.fleet.receipts[&task]["qdisc"], "fq");
+        assert_eq!(store.doc.fleet.receipts[&task]["targets"][1]["id"], "local");
+        drop(store);
+        app.store.lock().unwrap().doc.fleet.receipts.clear();
+        let mut local = input("fq");
+        local.targets = vec!["local".into()];
+        local.action = "restart-all".into();
+        local.congestion_control.clear();
+        local.qdisc.clear();
+        assert!(batch(State(app.clone()), Json(local)).await.is_err());
+        let mut local = input("fq");
+        local.targets = vec!["local".into()];
+        let _ = batch(State(app.clone()), Json(local)).await.unwrap();
+        assert!(recheck_batch(State(app.clone()), Path((task.clone(), "local".into()))).await.is_err());
+        app.store.lock().unwrap().doc.fleet.receipts.get_mut(&task).unwrap()["targets"][0] =
+            json!({"id":"local","state":"succeeded","result":{"verification":{"state":"succeeded"}}});
+        verify_batches(&app).await.unwrap();
+        assert_eq!(app.store.lock().unwrap().doc.fleet.receipts[&task]["targets"][0]["result"]["verification"]["state"], "succeeded");
     }
 
     #[tokio::test]

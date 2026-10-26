@@ -571,7 +571,7 @@ export function App() {
           {pageAllowed && <>
           {page === "dashboard" && <Dashboard state={state} manage={billing ? line => line.customer_plan_id ? navigate("customers") : setModal(<RentalEditor line={line} state={state} close={close} saved={refresh} />) : undefined} />}
           {remotePanel && <p role="status" className="mb-4 rounded border p-3">正在管理远端 VPS；此页面操作作用于该 VPS。<a className="ml-2 underline" href="/admin#fleet">返回总控</a></p>}
-          {page === "fleet" && <Fleet />}
+          {page === "fleet" && <Fleet state={state} />}
           {page === "monitoring" && <><Button className="mb-4" variant="outline" onClick={() => setModal(<Diagnostics nodes={state.nodes} canSyncTime={admin} close={close} />)}>日志与诊断</Button><Monitoring /></>}
           {page === "customers" && <Customers state={state} saved={refresh} />}
           {page === "lines" && <ProxyList state={state} saved={refresh} remote={!!remotePanel}

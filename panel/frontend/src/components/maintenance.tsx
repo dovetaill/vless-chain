@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { Modal, Status, errorText, stamp } from "./shared";
 import { requestId, statuses } from "./fleet-state";
 import { CoreSelector, initialCoreChoice, type CoreChoice } from "./core-selector";
+import { NetworkTuning, type NetworkRequest, type NetworkStatus } from "./network-tuning";
 
 type Release = { version: string; xray: string; mihomo: string };
 type Task = {
@@ -18,6 +19,7 @@ type Task = {
   core?: string;
   core_version?: string;
   after?: Record<string, string>;
+  network?: { after: NetworkStatus };
 };
 const storageKey = "chain-maintenance-task";
 
@@ -29,6 +31,7 @@ export function Maintenance({ state }: { state: PanelState }) {
   const [taskId, setTaskId] = useState(() => localStorage.getItem(storageKey));
   const [task, setTask] = useState<Task>();
   const [submitting, setSubmitting] = useState(false);
+  const [networkOpen, setNetworkOpen] = useState(false);
   const [core, setCore] = useState<CoreChoice>(initialCoreChoice);
   const [confirm, setConfirm] = useState<{ id: string; action: string; version?: string; xray_channel?: string; core?: string; task_id?: string } & Partial<CoreChoice>>();
   const busy = submitting || (!!taskId && (!task || ["queued", "running", "awaiting_verification"].includes(task.state)));
@@ -68,7 +71,28 @@ export function Maintenance({ state }: { state: PanelState }) {
     void poll();
     return () => { stopped = true; clearTimeout(timer); };
   }, [taskId, task?.state, submitting]);
+  async function submit(request: NonNullable<typeof confirm> | NetworkRequest) {
+    localStorage.setItem(storageKey, request.id);
+    setSubmitting(true);
+    setTask({ ...request, state: "queued" });
+    setTaskId(request.id);
+    setConfirm(undefined);
+    setNetworkOpen(false);
+    setError("");
+    try {
+      setTask(await api<Task>("/federation/task", "POST", request));
+    } catch (e) {
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
+        setTask({ ...request, state: "failed", error: errorText(e) });
+      } else {
+        setConnection("提交结果尚未确认，正在查询原任务；不会重复执行。");
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
   const supported = !!state.maintenance;
+  const networkAdmin = !state.viewer || state.viewer.role === "admin";
   return (
     <Card>
       <CardHeader><CardTitle>版本与维护</CardTitle></CardHeader>
@@ -108,6 +132,13 @@ export function Maintenance({ state }: { state: PanelState }) {
           </Button>
         </div>
         <p className="muted">自动处理已安装的面板、Agent 及其代理内核、项目独立 HTTPS 服务。重启会中断本机连接，配置和业务数据保留。</p>
+        <div className="space-y-2">
+          <Button variant="outline" disabled={!networkAdmin || busy || !state.maintenance_actions?.includes("network-tune")}
+            onClick={() => setNetworkOpen(true)}>网络算法 / BBR</Button>
+          <p className="muted">设置本机 TCP 拥塞算法与网卡队列，无需重启服务器或服务。</p>
+          {!networkAdmin ? <p className="muted">网络算法设置仅管理员可操作。</p>
+            : !state.maintenance_actions?.includes("network-tune") && <p className="muted">网络设置需要本机安装新版维护组件。</p>}
+        </div>
         <CoreSelector value={core} onChange={setCore} disabled={busy} />
         {!state.maintenance_actions?.includes("core-upgrade") && <p className="muted">独立内核升级需要本机先安装新版维护组件。</p>}
         {state.core_maintenance?.blocked && <p role="alert" className="text-red-600">安全更新未完成，本机代理已停用；管理面板仍可使用。请安装安全的 {state.core_maintenance.blocked.core} 版本恢复服务。</p>}
@@ -127,6 +158,11 @@ export function Maintenance({ state }: { state: PanelState }) {
             {["failed", "unknown"].includes(task.state) && state.core_maintenance?.pending && state.core_maintenance.pending !== task.id &&
               <Button variant="outline" onClick={() => { setTask(undefined); setTaskId(state.core_maintenance!.pending!); localStorage.setItem(storageKey, state.core_maintenance!.pending!); }}>返回待验证内核任务</Button>}
             {task.detail && <p>{task.detail}</p>}
+            {task.network && <div className="space-y-1">
+              <p>系统默认：{task.network.after.congestion_control} + {task.network.after.qdisc}</p>
+              <p>网卡实际队列：{task.network.after.interfaces.map(q => `${q.dev} / ${q.parent}: ${q.kind}`).join("；") || "未知"}</p>
+              {task.network.after.warning && <p className="text-amber-700">{task.network.after.warning}</p>}
+            </div>}
             {task.core_version && <p>{task.core} 目标版本：{task.core_version}</p>}
             {task.core && (task.state === "awaiting_verification" || state.core_maintenance?.pending === task.id) && <div className="space-y-2">
               <p>请使用升级前的原链接验证连接、实际传输及需要的 UDP 功能；未验证不能标记成功。</p>
@@ -141,29 +177,12 @@ export function Maintenance({ state }: { state: PanelState }) {
             )}
           </div>
         )}
+        {networkOpen && <NetworkTuning targets={[{ id: "local", name: "本机", snapshot: state }]}
+          close={() => setNetworkOpen(false)} submitLocal={submit} />}
         {confirm && (
           <Modal title={confirm.action.startsWith("core-") ? `${confirm.core} · ${{"core-upgrade":"升级到 " + confirm.version,"core-rollback":"恢复上一版","core-confirm":"确认原链接与实际传输正常","core-reject":"报告连接失败"}[confirm.action]}` : confirm.action === "upgrade" ? `升级到 ${confirm.version}` : "整套重启当前服务器"}
             description={confirm.action.startsWith("core-") ? "内核操作保持 UUID、密钥和链接参数。升级及恢复会重启代理；安全更新没有安全回退版本时会停用代理并保留面板。确认通过表示你已完成原链接的实际传输验证。" : `会自动重启本项目相关服务，代理连接将中断。${confirm.xray_channel === "latest" ? "本次选择官方最新 Xray，包含预发布版本，现有客户端可能需要升级。" : ""}面板恢复后可能需要重新登录，回到此处可继续查看原任务。`}
-            submit="确认执行" close={() => setConfirm(undefined)} action={async () => {
-              const request = confirm;
-              localStorage.setItem(storageKey, request.id);
-              setSubmitting(true);
-              setTask({ ...request, state: "queued" });
-              setTaskId(request.id);
-              setConfirm(undefined);
-              setError("");
-              try {
-                setTask(await api<Task>("/federation/task", "POST", request));
-              } catch (e) {
-                if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
-                  setTask({ ...request, state: "failed", error: errorText(e) });
-                } else {
-                  setConnection("提交结果尚未确认，正在查询原任务；不会重复执行。");
-                }
-              } finally {
-                setSubmitting(false);
-              }
-            }} />
+            submit="确认执行" close={() => setConfirm(undefined)} action={() => submit(confirm)} />
         )}
       </CardContent>
     </Card>

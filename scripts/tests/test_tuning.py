@@ -20,6 +20,8 @@ class TuningTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.values = dict(zip(tuning.KEYS, ('cubic', 'fq_codel')))
         self.calls = []
+        self.queues = [{'dev': 'eth0', 'kind': 'fq_codel', 'root': True, 'handle': '0:'}]
+        self.filters = []
         patches = [patch.object(tuning, 'CONFIG', self.root / 'network.conf'),
                    patch.object(tuning, 'MODULE_CONFIG', self.root / 'modules.conf'),
                    patch.object(tuning, 'modules', return_value={'sch_fq', 'sch_fq_codel'}),
@@ -36,7 +38,16 @@ class TuningTests(unittest.TestCase):
     def command(self, *args):
         self.calls.append(args)
         if args[0] == 'tc':
-            return '[{"dev":"eth0","kind":"fq_codel","root":true}]'
+            if 'filter' in args:
+                return json.dumps(self.filters)
+            if 'replace' in args:
+                dev = args[args.index('dev') + 1]
+                parent = args[args.index('parent') + 1] if 'parent' in args else 'root'
+                for queue in self.queues:
+                    if queue['dev'] == dev and queue.get('parent', 'root') == parent:
+                        queue.update(kind=args[-1], handle='8001:')
+                return ''
+            return json.dumps(self.queues if 'dev' not in args else [q for q in self.queues if q['dev'] == args[-1]])
         if args[0] == 'sysctl':
             key, value = args[2].split('=')
             self.values[key] = value
@@ -49,7 +60,7 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(self.calls, [('tc', '-j', 'qdisc', 'show')])
         self.assertEqual(list(self.root.iterdir()), [])
 
-    def test_apply_persists_only_two_defaults_and_reports_actual_queues(self):
+    def test_apply_persists_defaults_and_switches_live_default_queue(self):
         tuning.CONFIG.write_text(tuning.OWNER + '# old\n')
         before = tuning.CONFIG.stat()
         result = tuning.apply('bbr', 'fq')
@@ -58,9 +69,66 @@ class TuningTests(unittest.TestCase):
                          (after.st_ino, after.st_uid, after.st_gid, after.st_mode))
         self.assertEqual(tuning.CONFIG.read_text(), tuning.OWNER + 'net.ipv4.tcp_congestion_control = bbr\nnet.core.default_qdisc = fq\n')
         self.assertEqual(result['after']['qdisc'], 'fq')
-        self.assertEqual(result['after']['interfaces'][0]['kind'], 'fq_codel')
+        self.assertEqual(result['after']['interfaces'][0]['kind'], 'fq')
         self.assertNotIn(('sysctl', '--system'), self.calls)
-        self.assertFalse(any(c[0] == 'tc' and 'replace' in c for c in self.calls))
+        self.assertIn(('tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'fq'), self.calls)
+        self.assertEqual(result['after']['warning'], '')
+
+    def test_multiqueue_root_and_virtual_devices_are_preserved(self):
+        self.queues = [{'dev': 'eth0', 'kind': 'mq', 'root': True, 'handle': '0:'},
+                       {'dev': 'eth0', 'kind': 'fq_codel', 'parent': '0:1', 'handle': '0:'},
+                       {'dev': 'eth0', 'kind': 'fq_codel', 'parent': '0:2', 'handle': '0:'},
+                       {'dev': 'lo', 'kind': 'noqueue', 'root': True, 'handle': '0:'}]
+        tuning.apply('bbr', 'fq')
+        self.assertEqual([q['kind'] for q in self.queues], ['mq', 'fq', 'fq', 'noqueue'])
+        self.assertEqual([c for c in self.calls if 'replace' in c],
+                         [('tc', 'qdisc', 'replace', 'dev', 'eth0', 'parent', f'0:{i}', 'fq') for i in (1, 2)])
+
+    def test_custom_queues_and_filters_are_not_overwritten(self):
+        for queue, filters in [({'dev': 'eth0', 'kind': 'htb', 'root': True, 'handle': '1:'}, []),
+                               ({'dev': 'eth0', 'kind': 'fq_codel', 'root': True, 'handle': '8001:'}, []),
+                               ({'dev': 'eth0', 'kind': 'fq_codel', 'root': True, 'handle': '0:'}, [{'kind': 'bpf'}])]:
+            with self.subTest(queue=queue, filters=filters):
+                self.queues, self.filters, self.calls = [queue], filters, []
+                result = tuning.apply('bbr', 'fq')
+                self.assertTrue(result['after']['warning'])
+                self.assertFalse(any('replace' in c for c in self.calls))
+
+    def test_queue_failure_is_reported_without_claiming_defaults_were_rolled_back(self):
+        def fail(*args):
+            if 'replace' in args:
+                raise ValueError('device busy')
+            return self.command(*args)
+        with patch.object(tuning, 'command', side_effect=fail):
+            result = tuning.apply('bbr', 'fq')
+        self.assertEqual(tuple(self.values.values()), ('bbr', 'fq'))
+        self.assertEqual(result['after']['interfaces'][0]['kind'], 'fq_codel')
+        self.assertIn('device busy', result['after']['warning'])
+
+    def test_concurrent_queue_change_is_not_overwritten(self):
+        def changed(*args):
+            if 'filter' in args:
+                self.queues[0]['kind'] = 'htb'
+            return self.command(*args)
+        with patch.object(tuning, 'command', side_effect=changed):
+            result = tuning.apply('bbr', 'fq')
+        self.assertIn('其他操作', result['after']['warning'])
+        self.assertFalse(any('replace' in c for c in self.calls))
+
+    def test_failed_queue_readback_and_missing_tc_are_reported(self):
+        def unavailable(*args):
+            if args[0] == 'tc':
+                raise FileNotFoundError('tc missing')
+            return self.command(*args)
+        with patch.object(tuning, 'command', side_effect=unavailable):
+            result = tuning.apply('bbr', 'fq')
+        self.assertIn('tc missing', result['after']['warning'])
+        self.assertEqual(tuple(self.values.values()), ('bbr', 'fq'))
+        def unchanged(*args):
+            return '' if 'replace' in args else self.command(*args)
+        with patch.object(tuning, 'command', side_effect=unchanged):
+            result = tuning.apply('bbr', 'fq')
+        self.assertIn('未确认 fq 生效', result['after']['warning'])
 
     def test_bad_or_unsupported_choices_have_no_mutations(self):
         for cc, qdisc in [('bbr;id', 'fq'), ('bbr', '../fq'), ('vegas', 'cake'), ('bbr', None)]:

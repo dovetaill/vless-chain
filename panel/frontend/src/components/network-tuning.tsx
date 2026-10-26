@@ -10,8 +10,12 @@ export type NetworkStatus = {
   warning: string;
 };
 
-export function NetworkTuning({ targets, close, submitted }: {
-  targets: Remote[]; close: () => void; submitted: (id: string) => Promise<void>;
+export type NetworkTarget = Pick<Remote, "id" | "name" | "snapshot">;
+export type NetworkRequest = { id: string; action: "network-tune"; congestion_control: string; qdisc: string };
+
+export function NetworkTuning({ targets, close, submitted, submitLocal }: {
+  targets: NetworkTarget[]; close: () => void; submitted?: (id: string) => Promise<void>;
+  submitLocal?: (request: NetworkRequest) => Promise<void>;
 }) {
   const [states, setStates] = useState<Record<string, NetworkStatus>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -25,7 +29,8 @@ export function NetworkTuning({ targets, close, submitted }: {
         await Promise.all(targets.slice(offset, offset + 5).map(async remote => {
           try {
             if (!remote.snapshot?.maintenance_actions?.includes("network-tune")) throw new Error("请先升级该 VPS 的面板及维护组件");
-            const value = await remoteApi(remote.id)<NetworkStatus>("/federation/task", "POST", {
+            const request = remote.id === "local" ? api : remoteApi(remote.id);
+            const value = await request<NetworkStatus>("/federation/task", "POST", {
               id: requestId(), action: "network-status",
             }, controller.signal);
             if (!controller.signal.aborted) setStates(old => ({ ...old, [remote.id]: value }));
@@ -43,10 +48,14 @@ export function NetworkTuning({ targets, close, submitted }: {
   const algorithms = common("algorithms"), queues = common("queues");
   const valid = ready && algorithms.includes(cc) && queues.includes(queue);
   return <Modal title={`网络算法 · ${targets.length} 台 VPS`} close={close} wide
-    description="设置 TCP 默认拥塞算法和默认队列，并写入持久配置。已有连接、监听套接字和网卡队列保持现状；其实际生效需在维护窗口重建后核对。其他调优工具可能覆盖默认设置，请以重新读取的状态为准。"
-    submit={valid ? "确认保存并应用默认设置" : undefined} action={valid ? async () => {
-      await api("/fleet/batch", "POST", { id, targets: targets.map(remote => remote.id), action: "network-tune", congestion_control: cc, qdisc: queue });
-      await submitted(id);
+    description="保存并立即应用系统默认设置，无需重启服务器或服务。新版维护组件会在线切换可安全替换的网卡队列，可能短暂丢包；自定义限速或过滤规则保持不变，结果中会说明跳过项。已有 TCP 连接和监听器不会自动切换算法。"
+    submit={valid ? "确认保存并应用" : undefined} action={valid ? async () => {
+      const request: NetworkRequest = { id, action: "network-tune", congestion_control: cc, qdisc: queue };
+      if (submitLocal) await submitLocal(request);
+      else {
+        await api("/fleet/batch", "POST", { ...request, targets: targets.map(remote => remote.id) });
+        await submitted?.(id);
+      }
       close();
     } : undefined}>
     <div className="grid gap-4 sm:grid-cols-2">
