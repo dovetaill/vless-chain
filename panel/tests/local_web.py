@@ -54,7 +54,8 @@ def main():
             assert harness.request('/api/local-node', 'POST', {'host': '127.0.0.1'})['id'] == node
             assert len(harness.state()['nodes']) == 1
             assert harness.state()['local_node_id'] == node
-            assert harness.state()['nodes'][0]['target'] == 'www.microsoft.com:443'
+            assert harness.state()['nodes'][0]['target'] == ''
+            assert harness.state()['nodes'][0]['server_name'] == ''
             harness.request(f'/api/nodes/{node}', 'DELETE', status=409)
             harness.request(f'/api/nodes/{node}/token', 'POST', {}, status=409)
             harness.request('/api/lines', 'POST', {'name': 'local SS', 'kind': 'vless',

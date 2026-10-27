@@ -743,7 +743,10 @@ class Delivery(unittest.TestCase):
                 if path != 'login':
                     assert request.get_header('Cookie') == 'chain_session=fixture'
                 if path == 'nodes':
-                    assert json.loads(request.data)['host'] == '192.0.2.1'
+                    body = json.loads(request.data)
+                    assert body['host'] == '192.0.2.1'
+                    assert body['target'] == (args.local_target or '')
+                    assert body['server_name'] == ('tls.example.com' if args.local_target else '')
                 return Response(json.dumps(node if path == 'nodes' else {'ok': True}).encode())
         args = self.args(local_host='192.0.2.1', local_target='tls.example.com:443')
         with patch('urllib.request.build_opener', return_value=Opener()):
@@ -752,6 +755,7 @@ class Delivery(unittest.TestCase):
                     installer.provision_local_agent(self.manager, source, manifest, args)
             self.assertIn(('DELETE', 'nodes/' + node['id']), paths)
             self.assertEqual(paths[-1], ('POST', 'logout'))
+            args.local_target = None
             installer.provision_local_agent(self.manager, source, manifest, args)
         env = installer.parse_env(self.manager.role_paths('agent')[0] / 'agent.env')
         self.assertEqual(env['CHAIN_NODE_ID'], node['id'])

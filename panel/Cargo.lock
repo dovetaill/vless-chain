@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "chain-panel"
-version = "0.2.61"
+version = "0.2.62"
 dependencies = [
  "anyhow",
  "axum",
@@ -247,6 +247,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "include_dir",
+ "ipnet",
  "libc",
  "openssl",
  "percent-encoding",

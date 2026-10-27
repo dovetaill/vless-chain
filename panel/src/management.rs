@@ -294,7 +294,7 @@ pub fn machine_route(method: &str, path: &str) -> bool {
             uuid::Uuid::parse_str(id).is_ok() || crate::rules::presets().iter().any(|s| s.id == *id)
         }
         ("POST", ["api", "reality", "check"]) => true,
-        ("POST", ["api", "diagnostics", id, "logs" | "reality" | "path"]) => uuid::Uuid::parse_str(id).is_ok(),
+        ("POST", ["api", "diagnostics", id, "logs" | "reality" | "reality-candidates" | "path"]) => uuid::Uuid::parse_str(id).is_ok(),
         ("POST" | "DELETE", ["api", "externals", id]) => uuid::Uuid::parse_str(id).is_ok(),
         ("DELETE", ["api", "lines", id]) => uuid::Uuid::parse_str(id).is_ok(),
         ("GET" | "PUT" | "DELETE", ["api", "legacy-configs", id]) => {

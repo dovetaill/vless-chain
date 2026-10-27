@@ -480,8 +480,8 @@ async fn local_node(
                 let node = NodeInput {
                     name: "本机".into(),
                     host: input.host.clone(),
-                    target: default_target(),
-                    server_name: default_server_name(),
+                    target: String::new(),
+                    server_name: String::new(),
                 };
                 validate_node(&node)?;
                 edit(&app, |doc| {
@@ -513,8 +513,8 @@ async fn local_node(
             input.name
         },
         host: input.host,
-        target: default_target(),
-        server_name: default_server_name(),
+        target: String::new(),
+        server_name: String::new(),
     };
     validate_node(&input)?;
     chain_panel::local_agent::binary()?;
@@ -547,16 +547,10 @@ async fn local_node(
 struct NodeInput {
     name: String,
     host: String,
-    #[serde(default = "default_target")]
+    #[serde(default)]
     target: String,
-    #[serde(default = "default_server_name")]
+    #[serde(default)]
     server_name: String,
-}
-fn default_target() -> String {
-    "www.microsoft.com:443".into()
-}
-fn default_server_name() -> String {
-    "www.microsoft.com".into()
 }
 fn validate_node(n: &NodeInput) -> Result<()> {
     ensure!(
@@ -567,8 +561,10 @@ fn validate_node(n: &NodeInput) -> Result<()> {
         host_valid(&n.host),
         "节点地址应为 IP 或域名，不含协议和端口"
     );
-    target(&n.target)?;
-    ensure!(host_valid(&n.server_name), "REALITY server name 无效");
+    if !n.target.is_empty() || !n.server_name.is_empty() {
+        target(&n.target)?;
+        ensure!(host_valid(&n.server_name), "REALITY server name 无效");
+    }
     Ok(())
 }
 async fn add_node(State(app): State<App>, Json(input): Json<NodeInput>) -> ApiResult<Json<Value>> {
@@ -829,6 +825,14 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         .and_then(|id| d.lines.iter().find(|l| &l.id == id))
         .cloned();
     ensure!(input.id.is_none() || existing.is_some(), "线路不存在");
+    let mut access = input.access.or_else(|| existing.as_ref().map(|l| l.access.clone())).unwrap_or_default();
+    let reality = input.kind == Kind::Vless && access.protocol == Protocol::Vless
+        && !matches!(access.tls.mode.as_str(), "auto" | "manual");
+    if existing.is_none() && reality {
+        let cover = access.reality.as_ref().context("新建 REALITY 必须明确选择目标与 SNI")?;
+        target(&cover.target)?;
+        ensure!(host_valid(&cover.server_name), "REALITY SNI 无效");
+    }
     let line_id = existing.as_ref().map(|l| l.id.clone()).unwrap_or_else(id);
     ensure!(chain_panel::plans::for_line(d, &line_id).is_none() || input.kind == Kind::Vless, "客户套餐线路须保留代理类型");
     let mut used: BTreeSet<(String, u16)> = d
@@ -838,7 +842,7 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         .flat_map(|l| l.hops.iter().map(|h| (h.node_id.clone(), h.port)))
         .collect();
     let mut hops = vec![];
-    for h in input.hops {
+    for (index, h) in input.hops.into_iter().enumerate() {
         let occupied: BTreeSet<u16> = d
             .nodes
             .iter()
@@ -851,9 +855,15 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         let old = existing
             .as_ref()
             .and_then(|l| l.hops.iter().find(|o| o.node_id == h.node_id));
+        let default_reality_port = index == 0 && reality && h.port.is_none() && old.is_none();
+        if default_reality_port && !access.shared_port {
+            ensure!(!used.contains(&(h.node_id.clone(), 443)) && !occupied.contains(&443),
+                "REALITY 默认使用公网 TCP 443，但 443 已被占用；请配置统一 443 入口或明确填写其他端口。未自动改用高位端口");
+        }
         let port = h
             .port
             .or(old.map(|h| h.port))
+            .or(default_reality_port.then_some(443))
             .or_else(|| {
                 (20000..50000)
                     .find(|p| !used.contains(&(h.node_id.clone(), *p)) && !occupied.contains(p))
@@ -866,10 +876,6 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
             uuid: h.uuid.filter(|value| !value.is_empty()).or_else(|| old.map(|h| h.uuid.clone())).unwrap_or_else(id),
         });
     }
-    let mut access = input
-        .access
-        .or_else(|| existing.as_ref().map(|l| l.access.clone()))
-        .unwrap_or_default();
     if let Some(old) = existing.as_ref().map(|l| &l.access).filter(|old| old.protocol == access.protocol) {
         if access.password.is_empty() { access.password = old.password.clone(); }
         if access.username.is_empty() { access.username = old.username.clone(); }
@@ -1106,7 +1112,7 @@ fn publication_preview(doc: &Document) -> Result<Value> {
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PublishOptions { #[serde(default)] allow_unverified_reality: bool }
+struct PublishOptions {}
 fn authorize_publication(doc: &Document, role: Role) -> Result<()> {
     if role == Role::Ops {
         let leased: BTreeSet<_> = doc.lines.iter().chain(&doc.applied_lines).filter(|l| chain_panel::plans::lease(doc, &l.id).is_some()).map(|l| &l.id).collect();
@@ -1118,12 +1124,12 @@ fn authorize_publication(doc: &Document, role: Role) -> Result<()> {
     }
     Ok(())
 }
-async fn publish(State(app): State<App>, Extension(actor): Extension<Actor>, input: Option<Json<PublishOptions>>) -> ApiResult<Json<Value>> {
+async fn publish(State(app): State<App>, Extension(actor): Extension<Actor>, _input: Option<Json<PublishOptions>>) -> ApiResult<Json<Value>> {
     let _probe_guard = app
         .probe_lock
         .try_lock()
         .map_err(|_| error(StatusCode::CONFLICT, "正在执行整链探测，请完成后发布"))?;
-    let checked = diagnostics_api::preflight(&app, input.map(|v| v.0.allow_unverified_reality).unwrap_or(false)).await?;
+    let checked = diagnostics_api::preflight(&app).await?;
     let job = edit(&app, |d| {
         authorize_publication(d, actor.role)?;
         let configs = compile(d)?;
@@ -1498,6 +1504,40 @@ mod web_tests {
     use super::*;
 
     #[test]
+    fn reality_default_port_and_publication_cannot_silently_fall_back() {
+        let node = Node { id:"node".into(),name:"node".into(),host:"proxy.example".into(),
+            reality:Reality::new(String::new(),String::new()),token_hash:String::new(),seen:0,report:Report::default(),desired:None };
+        let mut doc = Document { nodes:vec![node],..Default::default() };
+        let input = json!({"name":"proxy","kind":"vless","hops":[{"node_id":"node"}],
+            "access":{"reality":{"target":"cover.example:443","server_name":"cover.example"}}});
+        let first = put_line(&mut doc,serde_json::from_value(input.clone()).unwrap()).unwrap();
+        assert_eq!(first.hops[0].port,443);
+        assert!(put_line(&mut doc,serde_json::from_value(input.clone()).unwrap()).err().unwrap().to_string().contains("443"));
+        let mut explicit = input.clone(); explicit["hops"][0]["port"] = json!(24443);
+        let second = put_line(&mut doc,serde_json::from_value(explicit).unwrap()).unwrap();
+        let mut edit = serde_json::to_value(&second).unwrap(); edit["hops"][0].as_object_mut().unwrap().remove("port");
+        assert_eq!(put_line(&mut doc,serde_json::from_value(edit).unwrap()).unwrap().hops[0].port,24443);
+        doc.lines.clear(); doc.nodes[0].report.system["listening_ports"] = json!([443]);
+        assert!(put_line(&mut doc,serde_json::from_value(input.clone()).unwrap()).is_err());
+        let mut missing = input; missing["access"] = json!({});
+        assert!(put_line(&mut doc,serde_json::from_value(missing).unwrap()).is_err());
+        assert!(serde_json::from_value::<PublishOptions>(json!({"allow_unverified_reality":true})).is_err());
+    }
+
+    #[test]
+    fn reality_node_defaults_require_no_cover_domain_until_a_line_is_created() {
+        let mut input: NodeInput = serde_json::from_value(json!({"name":"node","host":"proxy.example"})).unwrap();
+        assert!(input.target.is_empty() && input.server_name.is_empty());
+        validate_node(&input).unwrap();
+        input.target = "cover.example:443".into();
+        assert!(validate_node(&input).is_err());
+        input.server_name = "cover.example".into();
+        validate_node(&input).unwrap();
+        input.target.clear();
+        assert!(validate_node(&input).is_err());
+    }
+
+    #[test]
     fn custom_proxy_credentials_survive_create_edit_compile_and_export() {
         for protocol in ["vless", "vmess", "tuic", "shadowsocks", "http", "socks", "trojan", "hysteria2"] {
             let node = Node { id: "node".into(), name: "node".into(), host: "proxy.example".into(),
@@ -1507,6 +1547,7 @@ mod web_tests {
             let mut doc = Document { nodes: vec![node], ..Default::default() };
             let original = "00000000-0000-4000-8000-000000000001";
             let access = json!({"protocol":protocol,"username":"original-user","password":" original :密码@/?# ",
+                "reality":if protocol == "vless" {json!({"target":"example.com:443","server_name":"example.com"})} else {Value::Null},
                 "method":if protocol == "shadowsocks" {"aes-256-gcm"} else {""},
                 "tls":{"mode":if matches!(protocol,"trojan"|"hysteria2"|"tuic") {"auto"} else {"off"},"domain":"proxy.example"}});
             let line = put_line(&mut doc, serde_json::from_value(json!({"name":"proxy","kind":"vless",

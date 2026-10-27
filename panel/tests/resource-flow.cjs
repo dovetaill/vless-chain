@@ -14,7 +14,7 @@ const assets = path.resolve(process.argv[2]);
     page.setDefaultTimeout(10000);
     const errors = [], writes = [], reads = [], members = [];
     let acceptDialog = true, failPreview = false, unverifiedPublish = false;
-    let signedIn = true;
+    let signedIn = true, recommendationMode = 'ok';
     let authOptions = { totp: false, passkey: false };
     const dialogMessages = [];
     page.on('dialog', dialog => { dialogMessages.push(dialog.message()); return acceptDialog ? dialog.accept() : dialog.dismiss(); });
@@ -51,6 +51,13 @@ const assets = path.resolve(process.argv[2]);
           else if (url.pathname === '/api/local-node') { state.local_node_id = 'local'; state.nodes = [{ ...node, host: data.host }]; body = { id: 'local' }; }
           else if (url.pathname === '/api/lines') { body = { ...data, id: data.id || String(state.lines.length + 1), published: false, plan_eligible: true, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' }; state.lines = [...state.lines.filter(l => l.id !== body.id), body]; }
           else if (url.pathname === '/api/lines/batch') { body = data.map((line, index) => ({ ...line, id: String(state.lines.length + index + 1), published: false, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' })); state.lines.push(...body); }
+          else if (url.pathname === '/api/diagnostics/local/reality-candidates') {
+            if (recommendationMode === 'error') return route.fulfill({status:400,json:{error:'无法确认 Cloudflare 官方网段，本次停止推荐'}});
+            body = {checked:12,detail:recommendationMode === 'empty' ? '本批没有通过全部检查的目标' : '兼容性通过不保证不会被封锁',candidates:recommendationMode === 'empty' ? [] : [
+              {name:'Fixture College',target:'college.example.edu:443',server_name:'college.example.edu',detail:'TLS 1.3、H2、证书通过；Cloudflare 已排除'},
+              {name:'Fixture University',target:'university.example.edu:443',server_name:'university.example.edu',detail:'TLS 1.3、H2、证书通过；Cloudflare 已排除'},
+            ]};
+          }
           else if (url.pathname === '/api/diagnostics/local/reality') body = { ok: true, detail: 'TLS 1.3、证书/SNI 与 H2 检查通过', latency_ms: 12 };
           else if (url.pathname === '/api/preview') {
             if (failPreview) { failPreview = false; return route.fulfill({ status: 503, json: { error: '模拟预览失败' } }); }
@@ -76,7 +83,14 @@ const assets = path.resolve(process.argv[2]);
     const button = name => page.getByRole('button', { name, exact: true });
     const close = () => page.getByRole('dialog').last().getByRole('button', { name: '关闭', exact: true }).first().click();
     const create = async name => { await button('新建代理').first().click(); await page.getByLabel('名称', { exact: true }).fill(name); };
-    const save = async () => { await page.getByRole('dialog').getByRole('button', { name: '创建代理', exact: true }).click(); await page.getByRole('heading', { name: '分享代理', exact: true }).waitFor(); await close(); };
+    const fillTarget = async () => {
+      const input = page.getByLabel('REALITY 目标地址', {exact:true});
+      if (await input.count() && !(await input.inputValue())) {
+        await input.fill('college.example.edu:443');
+        await page.getByLabel('REALITY SNI', {exact:true}).fill('college.example.edu');
+      }
+    };
+    const save = async () => { await fillTarget(); await page.getByRole('dialog').getByRole('button', { name: '创建代理', exact: true }).click(); await page.getByRole('heading', { name: '分享代理', exact: true }).waitFor(); await close(); };
     await page.goto('http://chain.test/admin#lines');
     await page.locator('aside nav').getByRole('button', { name: '代理', exact: true }).waitFor();
     assert.equal(await page.locator('aside nav button').count(), 9);
@@ -93,30 +107,37 @@ const assets = path.resolve(process.argv[2]);
     assert.equal(await page.getByLabel('出网方式').inputValue(), 'direct');
     const target = page.getByLabel('REALITY 目标地址', { exact: true });
     const sni = page.getByLabel('REALITY SNI', { exact: true });
-    assert.equal(await target.inputValue(), 'www.cloudflare.com:443');
-    assert.equal(await sni.inputValue(), 'www.cloudflare.com');
-    for (const [name, host] of [
-      ['微软', 'www.microsoft.com'], ['苹果', 'www.apple.com'], ['AWS', 'aws.amazon.com'],
-      ['三星', 'www.samsung.com'], ['索尼', 'www.sony.com'], ['戴尔', 'www.dell.com'],
-      ['惠普', 'www.hp.com'], ['Cloudflare', 'www.cloudflare.com'],
-    ]) {
-      await button(name).click();
-      assert.equal(await target.inputValue(), `${host}:443`);
-      assert.equal(await sni.inputValue(), host);
-    }
+    assert.equal(await target.inputValue(), '');
+    assert.equal(await sni.inputValue(), '');
+    for (const name of ['微软','苹果','AWS','三星','索尼','戴尔','惠普','Cloudflare']) assert.equal(await button(name).count(),0);
+    await button('创建代理').click();
+    assert.equal(writes.filter(w => w.path === '/api/lines').length,0,'empty target must not save');
+    recommendationMode = 'error';
+    await button('检测并推荐目标').click();
+    await page.getByText('无法确认 Cloudflare 官方网段，本次停止推荐',{exact:true}).waitFor();
+    assert.equal(await target.inputValue(),'');
+    recommendationMode = 'empty';
+    await button('换一批推荐').click();
+    await page.getByText(/本批没有通过全部检查的目标/).waitFor();
+    assert.equal(await target.inputValue(),'');
+    recommendationMode = 'ok';
+    await button('换一批推荐').click();
+    await button('college.example.edu').click();
+    assert.equal(await target.inputValue(),'college.example.edu:443');
+    assert.equal(await sni.inputValue(),'college.example.edu');
     assert.equal(writes.filter(w => w.path === '/api/lines').length, 0);
     await button('检测 REALITY 握手与回落风险').click();
     const checked = page.getByText(/握手通过：TLS 1.3、证书\/SNI 与 H2 检查通过（12 ms）/);
     await checked.waitFor();
-    assert.deepEqual(writes.find(w => w.path === '/api/diagnostics/local/reality').body, { target: 'www.cloudflare.com:443', server_name: 'www.cloudflare.com' });
-    await button('苹果').click();
+    assert.deepEqual(writes.find(w => w.path === '/api/diagnostics/local/reality').body, { target: 'college.example.edu:443', server_name: 'college.example.edu' });
+    await button('university.example.edu').click();
     await checked.waitFor({ state: 'hidden' });
     if (root) await page.screenshot({ path: path.join(root, 'local-create.png') });
     await save();
     const first = writes.find(w => w.path === '/api/lines').body;
     assert.deepEqual(first.hops, [{ node_id: 'local', port: null, uuid: originalUuid }]);
     assert.equal(first.access.tls.mode, 'off');
-    assert.deepEqual(first.access.reality, { target: 'www.apple.com:443', server_name: 'www.apple.com' });
+    assert.deepEqual(first.access.reality, { target: 'university.example.edu:443', server_name: 'university.example.edu' });
     assert.equal(writes.filter(w => w.path === '/api/local-node').length, 0);
     await create('VLESS B');
     await page.getByLabel('出网方式').selectOption('chain');
@@ -199,13 +220,12 @@ const assets = path.resolve(process.argv[2]);
     await page.getByLabel('本机 IP 或域名').fill('batch.example.com');
     await page.getByLabel('REALITY + XHTTP', { exact: true }).check();
     await page.getByLabel('TLS + XHTTP', { exact: true }).check();
-    await button('微软').click();
     await page.getByLabel('REALITY 目标地址', { exact: true }).fill('cover.example.com:443');
     await page.getByLabel('REALITY SNI', { exact: true }).fill('cover.example.com');
     await button('检测 REALITY 握手与回落风险').click();
     await page.getByText(/握手通过：TLS 1.3、证书\/SNI 与 H2 检查通过（12 ms）/).waitFor();
     await page.getByLabel('XHTTP 路径', { exact: true }).fill('/batch-path');
-    await page.getByText('监听端口 · 自动分配', { exact: true }).click();
+    await page.getByText('监听端口 · REALITY 默认 443', { exact: true }).click();
     await page.getByLabel('使用统一 443 入口（按 SNI 分流）').check();
     await button('创建所选组合').click();
     await page.getByText('相同 SNI 无法同时分流 TCP 和 XHTTP；请选择一种传输，或使用独立端口。', { exact: true }).waitFor();
@@ -250,6 +270,7 @@ const assets = path.resolve(process.argv[2]);
 
     const beforeDraftWrites = writes.length;
     await create('套餐候选草稿');
+    await fillTarget();
     await button('仅保存草稿').click();
     await page.getByText('草稿已保存，可在客户与收款中绑定共享套餐，或在代理列表继续应用。', { exact: true }).waitFor();
     assert.deepEqual(writes.slice(beforeDraftWrites).map(write => write.path), ['/api/lines'], '仅保存草稿不预览、不发布');
@@ -261,6 +282,7 @@ const assets = path.resolve(process.argv[2]);
       const before = writes.filter(w => w.path === '/api/lines').length;
       const count = state.lines.length;
       await create(failure);
+      await fillTarget();
       acceptDialog = failure !== 'cancel-publish';
       unverifiedPublish = failure === 'cancel-publish';
       failPreview = failure === 'preview';
@@ -269,7 +291,7 @@ const assets = path.resolve(process.argv[2]);
       assert.equal(await page.getByRole('dialog').count(), 0);
       assert.equal(state.lines.length, count + 1);
       assert.equal(state.lines.at(-1).published, false);
-      if (unverifiedPublish) assert.match(dialogMessages.at(-1), /REALITY_UNVERIFIED/);
+      if (unverifiedPublish) assert.equal(writes.filter(w => w.path === '/api/publish' && w.body.allow_unverified_reality).length, 0, '未验证不得通过确认弹窗绕过');
       acceptDialog = true; unverifiedPublish = false;
       await Promise.all([page.waitForResponse(response => response.url().endsWith('/api/publish')), button('应用待处理配置修改').click()]);
       await button('应用待处理配置修改').waitFor({ state: 'hidden' });
@@ -278,11 +300,12 @@ const assets = path.resolve(process.argv[2]);
 
     // Button-only edits are unsaved changes too, even without a text-input event.
     await button('新建代理').first().click();
-    await button('苹果').click();
+    await button('检测并推荐目标').click();
+    await button('college.example.edu').click();
     acceptDialog = false;
     await page.keyboard.press('Escape');
     assert.match(dialogMessages.at(-1), /放弃尚未保存/);
-    assert.equal(await target.inputValue(), 'www.apple.com:443');
+    assert.equal(await target.inputValue(), 'college.example.edu:443');
     acceptDialog = true;
     await close();
     await page.getByRole('dialog').waitFor({ state: 'hidden' });
@@ -347,12 +370,14 @@ const assets = path.resolve(process.argv[2]);
 
     await create('手机布局');
     await page.setViewportSize({ width: 390, height: 844 });
-    const presets = page.getByRole('group', { name: 'REALITY 目标快捷选择' });
-    assert.equal(await presets.getByRole('button').count(), 8);
+    await button('检测并推荐目标').click();
+    const presets = page.getByRole('group', { name: '检测通过的 REALITY 候选' });
+    await presets.waitFor();
+    assert.equal(await presets.getByRole('button').count(), 2);
     assert.ok(await presets.evaluate(el => el.scrollWidth <= el.clientWidth));
-    await presets.getByRole('button', { name: 'Cloudflare', exact: true }).click();
-    assert.equal(await target.inputValue(), 'www.cloudflare.com:443');
-    assert.equal(await sni.inputValue(), 'www.cloudflare.com');
+    await button('college.example.edu').click();
+    assert.equal(await target.inputValue(), 'college.example.edu:443');
+    assert.equal(await sni.inputValue(), 'college.example.edu');
     await page.getByLabel('本机 IP 或域名').fill('mobile.example.com');
     await page.getByText('传输安全 · REALITY', { exact: true }).click();
     await page.getByLabel('HTTPS / 证书').selectOption('auto');

@@ -203,7 +203,7 @@ def build(args):
         project.mkdir()
         for name in ['Cargo.toml', 'Cargo.lock', 'build.rs']:
             shutil.copy2(ROOT / 'panel' / name, project / name)
-        for name in ['src', 'empty-web', 'frontend', 'tests/fixtures']:
+        for name in ['src', 'empty-web', 'frontend', 'tests/fixtures', 'reality-candidates']:
             shutil.copytree(ROOT / 'panel' / name, project / name,
                             ignore=shutil.ignore_patterns('node_modules', 'dist', '.env', '.env.*', '__pycache__'))
         work.env['CHAIN_WEB_ASSETS'] = str(project / 'frontend/dist')
@@ -234,6 +234,8 @@ def build(args):
             (stage / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/src/core-versions.json', stage / 'scripts/core-versions.json')
+        (stage / 'share').mkdir(exist_ok=True)
+        shutil.copy2(ROOT / 'panel/reality-candidates/university-domains-LICENSE.txt', stage / 'share/university-domains-LICENSE.txt')
         shutil.copy2(ROOT / 'panel/README.md', stage / 'README.md')
         shutil.copytree(ROOT / 'panel/docs', stage / 'docs')
         (stage / 'frontend').mkdir()

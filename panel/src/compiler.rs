@@ -729,6 +729,27 @@ mod tests {
         d
     }
     #[test]
+    fn reality_empty_node_requires_an_explicit_line_target() {
+        let mut d = fixture();
+        d.nodes.truncate(1);
+        d.nodes[0].reality.target.clear();
+        d.nodes[0].reality.server_name.clear();
+        d.lines[0].hops.truncate(1);
+        assert!(compile(&d).is_err());
+        d.lines[0].access.reality = Some(serde_json::from_value(json!({"target":"cover.example:443","server_name":"cover.example"})).unwrap());
+        assert!(compile(&d).is_ok());
+        d.lines[0].access.reality.as_mut().unwrap().server_name.clear();
+        assert!(compile(&d).is_err());
+        d.lines[0].access.reality = None;
+        d.lines[0].access.protocol = Protocol::Shadowsocks;
+        d.lines[0].access.method = "aes-128-gcm".into();
+        d.lines[0].access.password = "test-password".into();
+        assert!(compile(&d).is_ok());
+        d.lines.clear();
+        assert!(compile(&d).is_ok());
+    }
+
+    #[test]
     fn reality_guard_covers_each_hop_without_changing_client_sni() {
         let d = fixture();
         let configs = compile(&d).unwrap();

@@ -15,6 +15,8 @@ import {
 import { api } from "../api";
 import type { Line, PanelState, Protocol, NodeInfo, External } from "../types";
 
+type RealityCandidate = { name: string; target: string; server_name: string; detail: string };
+
 export function LineEditor({
   line,
   kind,
@@ -62,11 +64,14 @@ export function LineEditor({
   const [batch, setBatch] = useState(false);
   const [combinations, setCombinations] = useState(["tcp-reality", "tcp-tls"]);
   const [transport, setTransport] = useState(line?.access.transport?.network || "tcp");
-  const [realityTarget, setRealityTarget] = useState(line?.access.reality?.target || existing?.target || local?.target || "www.microsoft.com:443");
-  const [sni, setSni] = useState(line?.access.reality?.server_name || existing?.server_name || local?.server_name || "www.microsoft.com");
+  const [realityTarget, setRealityTarget] = useState(line ? line.access.reality?.target || existing?.target || "" : "");
+  const [sni, setSni] = useState(line ? line.access.reality?.server_name || existing?.server_name || "" : "");
   const [shared, setShared] = useState(line?.access.shared_port || false);
   const [checking, setChecking] = useState(false);
   const [check, setCheck] = useState("");
+  const [recommending, setRecommending] = useState(false);
+  const [candidates, setCandidates] = useState<RealityCandidate[]>([]);
+  const [recommendation, setRecommendation] = useState("");
   const [buttonChanges, setButtonChanges] = useState(false);
   const usesReality = protocol === "vless" && (batch ? combinations.some(c => c.endsWith("reality")) : tls === "off");
   const usesTls = protocol === "vless" && (batch ? combinations.some(c => c.endsWith("tls")) : tls !== "off");
@@ -83,6 +88,8 @@ export function LineEditor({
       secondarySubmit={!line && !remoteName ? { name: "draft", label: "仅保存草稿" } : undefined}
       close={close}
       action={async (data) => {
+        if (checking || recommending) throw new Error("目标检测尚未完成，请稍候。");
+        if (usesReality && (!realityTarget.trim() || !sni.trim())) throw new Error("请选择检测通过的推荐，或填写 REALITY 目标与 SNI。");
         if (["trojan", "hysteria2", "tuic"].includes(protocol) && !domain) throw new Error(`${protocolNames[protocol]} 需要 TLS，请填写解析到本机的域名。`);
         if (chain.some(id => !id)) throw new Error("请选择链式代理的落地。");
         const node = line ? existing : await ensureLocalServer(host.trim());
@@ -177,9 +184,9 @@ export function LineEditor({
         <Input value={host} onChange={e => setHost(e.target.value)} required placeholder="本机公网 IP 或域名" />
       </Field>
       <details className="details">
-        <summary>监听端口 · 自动分配</summary>
+        <summary>{usesReality ? "监听端口 · REALITY 默认 443" : "监听端口 · 自动分配"}</summary>
         {protocol === "vless" && <label className="my-3 flex items-center gap-2"><input type="checkbox" checked={shared} onChange={e => setShared(e.target.checked)} />使用统一 443 入口（按 SNI 分流）</label>}
-        {shared ? <p className="muted">需先在本机运行 chainctl ingress-enable；保留已有 HTTPS 网站。每个 SNI 对应一种入口。</p> : batch ? <p className="muted mt-3">为每个组合自动分配独立端口。</p> : <Field label="监听端口" hint={["hysteria2", "tuic"].includes(protocol) ? "留空自动分配；需放行此 UDP 端口。" : "留空自动选择空闲端口"}><Input name="port" type="number" min={1} max={65535} defaultValue={line?.hops[0]?.port} placeholder="自动分配" /></Field>}
+        {shared ? <p className="muted">需先在本机运行 chainctl ingress-enable；保留已有 HTTPS 网站。每个 SNI 对应一种入口。</p> : batch ? <p className="muted mt-3">REALITY 使用 443；同机多个 REALITY 组合会冲突，请分开创建并明确选择端口与 SNI。</p> : <Field label="监听端口" hint={usesReality ? "留空使用公网 TCP 443；占用时停止创建。非 443 端口存在上游提示的封锁风险。" : ["hysteria2", "tuic"].includes(protocol) ? "留空自动分配；需放行此 UDP 端口。" : "留空自动选择空闲端口"}><Input name="port" type="number" min={1} max={65535} defaultValue={line?.hops[0]?.port} placeholder={usesReality ? "443" : "自动分配"} /></Field>}
       </details>
       {protocol === "vless" && !batch && <Field label="传输方式"><select className="select" value={transport} onChange={e => setTransport(e.target.value as "tcp" | "xhttp")}><option value="tcp">TCP + Vision</option><option value="xhttp">XHTTP</option></select></Field>}
       {usesXhttp && <section className="space-y-4 rounded-xl border border-border p-4">
@@ -188,22 +195,24 @@ export function LineEditor({
         <Field label="XHTTP 模式"><select name="xhttp_mode" className="select" defaultValue={line?.access.transport?.mode || "auto"}>{["auto", "packet-up", "stream-up", "stream-one"].map(mode => <option key={mode}>{mode}</option>)}</select></Field>
       </section>}
       {usesReality && <section className="space-y-4 rounded-xl border border-border p-4">
-        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="REALITY 目标快捷选择">
-          <span className="muted">快捷选择</span>
-          {[
-            ["微软", "www.microsoft.com"],
-            ["苹果", "www.apple.com"],
-            ["AWS", "aws.amazon.com"],
-            ["三星", "www.samsung.com"],
-            ["索尼", "www.sony.com"],
-            ["戴尔", "www.dell.com"],
-            ["惠普", "www.hp.com"],
-            ["Cloudflare", "www.cloudflare.com"],
-          ].map(([name, host]) => <Button key={host} type="button" variant="outline" size="sm" disabled={checking} onClick={() => { setRealityTarget(`${host}:443`); setSni(host); setCheck(""); setButtonChanges(true); }}>{name}</Button>)}
-        </div>
-        <Field label="REALITY 目标地址" hint="目标网站的域名或 IP 加端口，需支持 TLS 1.3 与 H2；无需解析到本机。"><Input value={realityTarget} readOnly={checking} onChange={e => { setRealityTarget(e.target.value); setCheck(""); }} required /></Field>
-        <Field label="REALITY SNI" hint="必须是目标网站证书覆盖的域名。无需申请自己的证书。"><Input value={sni} readOnly={checking} onChange={e => { setSni(e.target.value); setCheck(""); }} required /></Field>
-        <Button type="button" variant="outline" disabled={checking} onClick={async () => { setChecking(true); setCheck(""); try { const result = await request<{ ok: boolean; detail: string; latency_ms: number; cdn?: { detail: string }; fallback?: { detail: string } }>(`/diagnostics/${(existing || local)?.id || (await ensureLocalServer(host.trim())).id}/reality`, "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`握手${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）\nCDN：${result.cdn?.detail || "当前 Agent 未提供 CDN 风险检测"}\nSNI 过滤：${result.fallback?.detail || "当前 Agent 未提供过滤验证，不能判定无盗流风险"}`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测 REALITY 握手与回落风险"}</Button>
+        <p className="muted">从美国院校公开目录抽取一小批官网，由本节点检测 TLS 1.3、H2、证书并排除 Cloudflare。检测通过不代表不会被封锁。</p>
+        <Button type="button" variant="outline" disabled={checking || recommending || !host.trim()} onClick={async () => {
+          setRecommending(true); setCandidates([]); setRecommendation("");
+          try {
+            const node = existing || local || await ensureLocalServer(host.trim());
+            const result = await request<{ candidates: RealityCandidate[]; checked: number; detail: string }>(`/diagnostics/${node.id}/reality-candidates`, "POST", {});
+            setCandidates(result.candidates); setRecommendation(`本批检查 ${result.checked} 个官网。${result.detail}`);
+          } catch (e) { setRecommendation(errorText(e)); }
+          finally { setRecommending(false); }
+        }}>{recommending ? "节点正在检测候选…" : recommendation ? "换一批推荐" : "检测并推荐目标"}</Button>
+        {recommendation && <p className="muted" role="status">{recommendation}</p>}
+        {candidates.length > 0 && <div className="space-y-2" role="group" aria-label="检测通过的 REALITY 候选">{candidates.map(candidate => <div key={candidate.server_name} className="space-y-1">
+          <Button type="button" variant="outline" size="sm" className="max-w-full whitespace-normal break-all text-left" disabled={checking || recommending} onClick={() => { setRealityTarget(candidate.target); setSni(candidate.server_name); setCheck(""); setButtonChanges(true); }}>{candidate.server_name}</Button>
+          <p className="muted">{candidate.name} · {candidate.detail}</p>
+        </div>)}</div>}
+        <Field label="REALITY 目标地址" hint="目标网站的域名或 IP 加端口，需支持 TLS 1.3 与 H2；无需解析到本机。"><Input value={realityTarget} readOnly={checking || recommending} onChange={e => { setRealityTarget(e.target.value); setCheck(""); }} required placeholder="选择推荐，或手动填写 host:443" /></Field>
+        <Field label="REALITY SNI" hint="必须是目标网站证书覆盖的域名。无需申请自己的证书。"><Input value={sni} readOnly={checking || recommending} onChange={e => { setSni(e.target.value); setCheck(""); }} required placeholder="选择推荐，或手动填写域名" /></Field>
+        <Button type="button" variant="outline" disabled={checking || recommending || !realityTarget.trim() || !sni.trim()} onClick={async () => { setChecking(true); setCheck(""); try { const result = await request<{ ok: boolean; detail: string; latency_ms: number; cdn?: { detail: string }; fallback?: { detail: string } }>(`/diagnostics/${(existing || local)?.id || (await ensureLocalServer(host.trim())).id}/reality`, "POST", { target: realityTarget.trim(), server_name: sni.trim() }); setCheck(`握手${result.ok ? "通过" : "未通过"}：${result.detail}（${result.latency_ms} ms）\nCDN：${result.cdn?.detail || "当前 Agent 未提供 CDN 风险检测"}\nSNI 过滤：${result.fallback?.detail || "当前 Agent 未提供过滤验证，不能判定无盗流风险"}`); } catch (e) { setCheck(errorText(e)); } finally { setChecking(false); } }}>{checking ? "正在检测…" : "检测 REALITY 握手与回落风险"}</Button>
         {check && <p className="muted whitespace-pre-line" role="status">{check}</p>}
       </section>}
       {kind === "vless" && <section key={protocol} className="space-y-3 rounded-xl border border-border p-4">

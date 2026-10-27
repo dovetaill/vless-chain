@@ -15,6 +15,7 @@ pub mod runtime;
 pub mod security;
 pub mod website;
 pub mod diagnostics;
+pub mod reality_candidates;
 
 pub mod resources;
 pub mod rules;

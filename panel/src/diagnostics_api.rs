@@ -14,6 +14,7 @@ pub struct Pending {
 pub fn routes(router: Router<App>) -> Router<App> {
     router.route("/api/diagnostics/{id}/logs", post(logs))
         .route("/api/diagnostics/{id}/reality", post(reality))
+        .route("/api/diagnostics/{id}/reality-candidates", post(reality_candidates))
         .route("/api/diagnostics/{id}/path", post(path_probe))
         .route("/api/agent/{id}/diagnostics", post(exchange))
 }
@@ -27,6 +28,16 @@ async fn logs(State(app): State<App>, Path(id): Path<String>, Json(request): Jso
 async fn reality(State(app): State<App>, Path(id): Path<String>, Json(input): Json<RealityTarget>) -> ApiResult<Json<Value>> {
     target(&input.target)?; if !host_valid(&input.server_name) { return Err(error(StatusCode::BAD_REQUEST,"SNI 无效")); }
     Ok(Json(dispatch(&app, &id, json!({"operation":"reality","request":input}), 55).await?))
+}
+async fn reality_candidates(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    {
+        let store = app.store.lock().unwrap();
+        let node = store.doc.nodes.iter().find(|n| n.id == id).context("节点不存在")?;
+        if node.report.system["reality_candidates_version"] != 1 {
+            return Err(error(StatusCode::BAD_REQUEST, "请先升级该节点 Agent，以支持 REALITY 目标推荐"));
+        }
+    }
+    Ok(Json(dispatch(&app, &id, json!({"operation":"reality-candidates"}), 55).await?))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,19 +155,22 @@ pub fn targets(config: &Value) -> BTreeSet<(String, String)> {
     }
     result
 }
-pub async fn preflight(app: &App, allow_unverified: bool) -> Result<BTreeMap<String,Value>> {
+fn require_verified(result: &Value) -> Result<()> {
+    ensure!(result["ok"] == true && result["cloudflare_checked"] == true
+        && result["fallback"]["status"] == "verified",
+        "REALITY 检查未全部通过，已保留草稿并阻止发布：{}", result["detail"].as_str().unwrap_or("缺少验证结果"));
+    Ok(())
+}
+pub async fn preflight(app: &App) -> Result<BTreeMap<String,Value>> {
     let (configs, nodes) = { let s = app.store.lock().unwrap(); (compile(&s.doc)?, s.doc.nodes.clone()) };
     for node in nodes {
         let Some(config) = configs.get(&node.id) else { continue; };
-        let old = node.desired.as_ref().map(|d| targets(&d.config)).unwrap_or_default();
-        for (target, server_name) in targets(config).difference(&old) {
-            let result = dispatch(app, &node.id, json!({"operation":"reality","request":{"target":target,"server_name":server_name}}), 55).await;
-            match result {
-                Ok(v) if v["ok"] == true => (),
-                Ok(v) if v["status"] == "failed" => anyhow::bail!("{}：{} / {} 的 REALITY 握手未通过，已阻止下发。{}",node.name,target,server_name,v["detail"].as_str().unwrap_or("")),
-                other if !allow_unverified => anyhow::bail!("REALITY_UNVERIFIED：{}：{} / {} 尚未验证：{}。可以保留草稿；确认接受连接失败风险后可显式继续下发。",node.name,target,server_name,match other {Ok(v)=>v["detail"].as_str().unwrap_or("未知结果").to_string(),Err(e)=>format!("{e:#}")}),
-                _ => (),
-            }
+        if node.desired.as_ref().is_some_and(|d| &d.config == config) { continue; }
+        for (target, server_name) in targets(config) {
+            ensure!(node.report.system["reality_preflight_version"] == 1, "{}：请升级 Agent 后再发布 REALITY；草稿已保留", node.name);
+            let result = dispatch(app, &node.id, json!({"operation":"reality-preflight","request":{"target":target,"server_name":server_name}}), 70).await
+                .with_context(|| format!("{}：REALITY 发布检查未完成，草稿已保留", node.name))?;
+            require_verified(&result).with_context(|| format!("{}：{target} / {server_name}", node.name))?;
         }
     }
     Ok(configs)
@@ -165,6 +179,16 @@ pub async fn preflight(app: &App, allow_unverified: bool) -> Result<BTreeMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reality_publication_requires_every_check() {
+        let verified = json!({"ok":true,"cloudflare_checked":true,"fallback":{"status":"verified"}});
+        require_verified(&verified).unwrap();
+        for key in ["ok", "cloudflare_checked", "fallback"] {
+            let mut missing = verified.clone(); missing.as_object_mut().unwrap().remove(key);
+            assert!(require_verified(&missing).is_err());
+        }
+        assert!(require_verified(&json!({"ok":false,"status":"unverified"})).is_err());
+    }
     fn log_request(source: &str) -> Value {
         json!({"operation":"logs","request":{"source":source}})
     }

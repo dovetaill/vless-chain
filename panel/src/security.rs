@@ -49,7 +49,7 @@ impl Role {
             ("GET", ["api", "fleet", "cores", "xray" | "mihomo"]) => self == Self::Ops,
             ("GET" | "POST", ["api", "federation", "task"]) => self == Self::Ops,
             ("POST", ["api", "diagnostics", id, "logs"]) => self == Self::Ops && (*id == "panel" || uuid::Uuid::parse_str(id).is_ok()),
-            ("POST", ["api", "diagnostics", id, "reality" | "path"] | ["api", "lines", id, "probe"]) => self == Self::Ops && uuid::Uuid::parse_str(id).is_ok(),
+            ("POST", ["api", "diagnostics", id, "reality" | "reality-candidates" | "path"] | ["api", "lines", id, "probe"]) => self == Self::Ops && uuid::Uuid::parse_str(id).is_ok(),
             ("GET" | "POST", ["api", "customer-plans"]) => self == Self::Finance,
             ("POST", ["api", "customer-plans", id, "query-link"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok(),
             ("POST", ["api", "customer-plans", id, "members", member, "query-link"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok() && uuid::Uuid::parse_str(member).is_ok(),

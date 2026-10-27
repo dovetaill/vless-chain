@@ -391,8 +391,8 @@ mod tests {
         assert_eq!(result["ok"],false); assert_eq!(result["status"],"failed");
         use tokio::io::AsyncWriteExt;
         let dir = tempfile::tempdir().unwrap(); let line = crate::model::id();
-        std::fs::write(dir.path().join("xray.json"),serde_json::to_vec(&json!({"outbounds":[{"tag":format!("line-{line}-out"),"protocol":"freedom"}]})).unwrap()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(); let address = listener.local_addr().unwrap();
+        std::fs::write(dir.path().join("xray.json"),serde_json::to_vec(&json!({"outbounds":[{"tag":format!("line-{line}-out"),"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1"],"port":address.port().to_string()}]}}]})).unwrap()).unwrap();
         let server = tokio::spawn(async move { let (mut stream,_) = listener.accept().await.unwrap(); let mut bytes=[0;4096]; let _=stream.read(&mut bytes).await; stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap(); });
         let result = crate::runtime::diagnose_path(&binary,dir.path(),&line,&format!("http://{address}/")).await.unwrap();
         server.await.unwrap(); assert_eq!(result["result"]["ok"],true,"{result}");
@@ -541,7 +541,8 @@ pub async fn reality(binary: &Path, input: &crate::model::RealityTarget) -> Resu
     let _echo_cleanup = Abort(echo_task.abort_handle());
     let identity = Reality::new(input.target.clone(), input.server_name.clone());
     let user = id();
-    let mut server = json!({"log":{"loglevel":"debug"},"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[]}});
+    // Newer cores block private destinations; allow only this disposable echo endpoint.
+    let mut server = json!({"log":{"loglevel":"debug"},"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1"],"port":echo_port.to_string()}]}},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[]}});
     let mut inbound = json!({"tag":"diagnostic","listen":"127.0.0.1","port":server_port,"protocol":"vless","settings":{"clients":[{"id":user,"flow":"xtls-rprx-vision"}],"decryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"target":input.target,"serverNames":[input.server_name],"privateKey":identity.private_key,"shortIds":[identity.short_id]}}});
     crate::compiler::guard_reality(&mut server, &mut inbound, reserve()?)?;
     server["inbounds"].as_array_mut().unwrap().push(inbound);

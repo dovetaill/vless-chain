@@ -108,6 +108,17 @@ async fn run() -> Result<()> {
                                         Err(_) => Err(anyhow::anyhow!("出口诊断超时；隔离进程已停止")),
                                     }
                                 },
+                                Some("reality-candidates") => match tokio::time::timeout(Duration::from_secs(45), chain_panel::reality_candidates::recommend()).await {
+                                    Ok(result) => result,
+                                    Err(_) => Err(anyhow::anyhow!("目标推荐超时；未填入默认域名，请稍后重试")),
+                                },
+                                Some("reality-preflight") => match serde_json::from_value::<RealityTarget>(task["request"].clone()) {
+                                    Ok(input) => match tokio::time::timeout(Duration::from_secs(60), chain_panel::reality_candidates::preflight(&diagnostic_binary, &input)).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(anyhow::anyhow!("REALITY 发布检查超时，已阻止发布；请稍后重试")),
+                                    },
+                                    Err(e) => Err(e.into()),
+                                },
                                 Some("reality") => match serde_json::from_value::<RealityTarget>(task["request"].clone()) {
                                     Ok(input) => match tokio::time::timeout(Duration::from_secs(45), chain_panel::diagnostics::reality(&diagnostic_binary, &input)).await {
                                         Ok(result) => result,
@@ -188,6 +199,8 @@ async fn run() -> Result<()> {
             }
             report.system["clock"] = clock.lock().unwrap().clone();
             report.system["diagnostics_version"] = serde_json::json!(1);
+            report.system["reality_candidates_version"] = serde_json::json!(1);
+            report.system["reality_preflight_version"] = serde_json::json!(1);
             report.system["cores"] = core_versions.clone();
             report.system["certificate_expiry"] = certificate_expiry.clone();
             let ingress_status = std::env::var_os("CHAIN_INGRESS_STATUS")
@@ -238,6 +251,8 @@ async fn run() -> Result<()> {
                         system: chain_panel::gateway::system_metrics(),
                     };
                     report.system["diagnostics_version"] = serde_json::json!(1);
+                    report.system["reality_candidates_version"] = serde_json::json!(1);
+                    report.system["reality_preflight_version"] = serde_json::json!(1);
                     report.system["cores"] = core_versions.clone();
                     report.system["clock"] = clock.lock().unwrap().clone();
                     // Acknowledge immediately; do not report a saved config as running before application.

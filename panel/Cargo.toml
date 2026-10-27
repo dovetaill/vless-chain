@@ -1,6 +1,6 @@
 [package]
 name = "chain-panel"
-version = "0.2.61"
+version = "0.2.62"
 edition = "2024"
 
 [dependencies]
@@ -17,6 +17,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 include_dir = "0.7"
+ipnet = "2"
 libc = "0.2"
 openssl = { version = "0.10", features = ["vendored"] }
 rand = "0.8"
