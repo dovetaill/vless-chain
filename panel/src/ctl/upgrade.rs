@@ -158,10 +158,6 @@ impl Manager {
             .collect())
     }
     pub async fn update(&self, source: &Path, component: Option<&str>) -> Result<()> {
-        ensure!(!self.base.join(".core-pending.json").exists() && self.state()?["core_blocked"].is_null(),
-            "请先完成内核升级验证或恢复安全版本");
-        ensure!(self.state()?["core_history"].as_object().is_none_or(|h| h.is_empty()),
-            "已独立选择内核，请使用已安装的管理器更新，以保留所选版本和回退记录");
         self.update_checked(source, component, |role| self.healthy(role))
             .await
     }
@@ -184,6 +180,10 @@ impl Manager {
             "上次升级中断，请先核对 .update-pending.json 中的原版本与当前服务；未继续覆盖"
         );
         let old = self.state()?;
+        ensure!(
+            !self.base.join(".core-pending.json").exists() && old["core_blocked"].is_null(),
+            "请先完成内核升级验证或恢复安全版本"
+        );
         let roles = self.roles(&old, component)?;
         let mut running = Vec::new();
         for role in &roles {
@@ -215,6 +215,14 @@ impl Manager {
             self.environment(role)?;
             running.push(self.active(role).await?);
         }
+        let temporary = tempfile::Builder::new()
+            .prefix(".update-core-")
+            .tempdir_in(&self.base)?;
+        let stage = temporary.path().join("stage");
+        package::copy(source, &stage, &manifest)?;
+        super::cores::preserve(self, &stage)?;
+        let source = stage.as_path();
+        let manifest = package::verify(source, true)?;
         let id = format!(
             "{}-{}-{}-{}",
             manifest.version,
@@ -345,7 +353,13 @@ impl Manager {
                 command("systemctl", &[action, &format!("{name}.service")], 70).await?;
             }
             "openrc" => {
-                command("rc-service", &[&name, action], 70).await?;
+                if matches!(action, "stop" | "restart") {
+                    command("rc-service", &[&name, "stop"], 70).await?;
+                    super::platform::stop_openrc_residue(self, &name).await?;
+                }
+                if action != "stop" {
+                    command("rc-service", &[&name, "start"], 70).await?;
+                }
             }
             _ => {
                 let target = format!("system/org.vless-chain.{name}");
@@ -483,7 +497,7 @@ impl Manager {
             "chain-{role} 启动检查未通过，请查看该组件服务日志；Agent 存活检查不代表代理整链已通过"
         )
     }
-    pub fn prune(&self) -> Result<()> {
+    pub async fn prune(&self) -> Result<()> {
         let _lock = self.lock()?;
         ensure!(
             !self.base.join(".update-pending.json").exists(),
@@ -501,7 +515,10 @@ impl Manager {
                 keep.insert(release.into());
             }
         }
-        ensure!(!self.base.join(".core-pending.json").exists(), "内核升级尚未确认，未清理历史版本");
+        ensure!(
+            !self.base.join(".core-pending.json").exists(),
+            "内核升级尚未确认，未清理历史版本"
+        );
         for role in ["panel", "agent"] {
             let link = self.base.join(format!("current-{role}"));
             if link.is_symlink() {
@@ -522,7 +539,7 @@ impl Manager {
                 continue;
             }
             let directory = entry.path();
-            let result: Result<()> = (|| {
+            let result: Result<()> = async {
                 ordinary(&directory)?;
                 let info = fs::symlink_metadata(&directory)?;
                 ensure!(
@@ -541,7 +558,10 @@ impl Manager {
                     entry.file_name() == std::ffi::OsStr::new(&expected),
                     "发行目录名称与清单不匹配"
                 );
-                ensure!(!in_use(&directory)?, "目录仍被进程使用，或不能确认占用情况");
+                ensure!(
+                    !in_use(&directory).await?,
+                    "目录仍被进程使用，或不能确认占用情况"
+                );
                 println!(
                     "清理前：{} dev/inode={}/{} uid/gid={}/{} mode={:o} ctime={}.{}",
                     directory.display(),
@@ -555,7 +575,8 @@ impl Manager {
                 );
                 fs::remove_dir_all(&directory)?;
                 Ok(())
-            })();
+            }
+            .await;
             if let Err(error) = result {
                 eprintln!("保留 {}：{error:#}", directory.display());
             }
@@ -575,19 +596,26 @@ pub async fn output(program: &str, args: &[&str], seconds: u64) -> Result<std::p
         .kill_on_drop(true)
         .process_group(0);
     let child = command.spawn()?;
-    struct Group(u32);
+    struct Group(u32, bool);
     impl Drop for Group {
         fn drop(&mut self) {
-            unsafe {
-                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            if self.1 {
+                unsafe {
+                    libc::kill(-(self.0 as i32), libc::SIGKILL);
+                }
             }
         }
     }
-    let _group = Group(child.id().context("未取得子进程 PID")?);
-    tokio::time::timeout(Duration::from_secs(seconds), child.wait_with_output())
+    let mut group = Group(child.id().context("未取得子进程 PID")?, true);
+    let result = tokio::time::timeout(Duration::from_secs(seconds), child.wait_with_output())
         .await
         .context("系统命令超时，已终止任务进程组")?
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    // Service managers may leave an intentional supervisor in the invocation group.
+    if matches!(program, "rc-service" | "launchctl") && result.status.success() {
+        group.1 = false;
+    }
+    Ok(result)
 }
 pub async fn command(program: &str, args: &[&str], seconds: u64) -> Result<()> {
     let result = output(program, args, seconds).await?;
@@ -603,10 +631,25 @@ pub async fn command(program: &str, args: &[&str], seconds: u64) -> Result<()> {
     Ok(())
 }
 
-fn in_use(directory: &Path) -> Result<bool> {
+async fn in_use(directory: &Path) -> Result<bool> {
     let directory = directory.canonicalize()?;
-    if !cfg!(target_os = "linux") {
-        return Ok(true);
+    if cfg!(target_os = "macos") {
+        let result = output(
+            "lsof",
+            &[
+                "-nP",
+                "-t",
+                "+D",
+                directory.to_str().context("发行路径无效")?,
+            ],
+            30,
+        )
+        .await?;
+        ensure!(
+            result.status.success() || result.status.code() == Some(1) && result.stderr.is_empty(),
+            "无法检查发行目录占用"
+        );
+        return Ok(!result.stdout.is_empty());
     }
     for process in fs::read_dir("/proc")? {
         let process = process?;
@@ -676,6 +719,7 @@ mod tests {
     fn installed(root: &Path) -> Manager {
         let base = root.join("opt/chain");
         fs::create_dir_all(base.join("releases/old")).unwrap();
+        fixture(&base.join("releases/old"));
         let mut roles = serde_json::Map::new();
         for role in ["panel", "agent"] {
             symlink("releases/old", base.join(format!("current-{role}"))).unwrap();

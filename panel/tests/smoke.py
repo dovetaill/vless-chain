@@ -69,8 +69,11 @@ class Harness:
         self.processes = []
         self.servers = []
         self.ports = set()
+        self.preflight_fixture = None
         self.bin_dir = Path(os.environ["CHAIN_TEST_BIN_DIR"])
         self.xray = Path(os.environ["CHAIN_TEST_XRAY"])
+        self.original_xray = self.xray
+        self.loopback_targets = set()
         self.cookie_jar = http.cookiejar.CookieJar()
         self.client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
 
@@ -84,7 +87,11 @@ class Harness:
     def allow_loopback_target(self, port):
         """Allow only this fixture endpoint in disposable execution configs."""
         assert port in self.ports and self.root.resolve().is_relative_to(Path(os.environ['CHAIN_TEST_ROOT']).resolve())
-        binary, root = str(self.xray.resolve()), str(self.root.resolve())
+        self.loopback_targets.add(port)
+        binary, root = str(self.original_xray.resolve()), str(self.root.resolve())
+        mihomo = self.original_xray.parent / 'mihomo'
+        if mihomo.is_file() and not (self.root / 'mihomo').exists():
+            (self.root / 'mihomo').symlink_to(mihomo.resolve())
         wrapper = self.root / 'fixture-xray'
         wrapper.write_text('#!/usr/bin/env python3\n' + f'''import json,os,pathlib,sys,tempfile
 args=sys.argv[1:]
@@ -93,10 +100,21 @@ if '-config' in args:
     source=pathlib.Path(args[index]).resolve()
     assert source.is_relative_to(pathlib.Path({root!r}))
     value=json.loads(source.read_text())
+    # Xray now defaults to its bundled CAs; opt into this process's fixture CA.
+    trust=os.environ.get('SSL_CERT_FILE')
+    if trust:
+        assert pathlib.Path(trust).resolve().is_relative_to(pathlib.Path({root!r}))
+        def trust_fixture(item):
+            if isinstance(item,dict):
+                if isinstance(item.get('tlsSettings'),dict): item['tlsSettings']['useSystemCA']=True
+                for child in item.values(): trust_fixture(child)
+            elif isinstance(item,list):
+                for child in item: trust_fixture(child)
+        trust_fixture(value)
     for outbound in value.get('outbounds',[]):
         if outbound.get('protocol')=='freedom':
             outbound.setdefault('settings',{{}}).setdefault('finalRules',[]).insert(0,
-                {{'action':'allow','network':'tcp','ip':['127.0.0.1'],'port':{str(port)!r}}})
+                {{'action':'allow','network':'tcp,udp','ip':['127.0.0.1'],'port':{','.join(map(str,sorted(self.loopback_targets)))!r}}})
     fd,path=tempfile.mkstemp(prefix='fixture-core-',suffix='.json',dir=source.parent)
     with os.fdopen(fd,'w') as stream: json.dump(value,stream)
     args[index]=path
@@ -115,10 +133,17 @@ os.execv({binary!r},[{binary!r},*args])
                 self.record()
                 return port
 
+    def fixture_reality_target(self, port, server_name='localhost', enabled=True):
+        from fixture_preflight import server
+        self.preflight_fixture = server(self, f'127.0.0.1:{port}', server_name, enabled)
+
     def launch(self, name, binary, env, args=None):
+        if self.preflight_fixture and env.get('CHAIN_PANEL_URL') == self.base:
+            env = {**env, 'CHAIN_PANEL_URL': f'http://127.0.0.1:{self.preflight_fixture.server_port}'}
         log = (self.root / f"{name}.log").open("wb")
         merged = os.environ.copy()
         merged.update(env)
+        merged['TMPDIR'] = str(self.root)
         p = subprocess.Popen([str(binary), *(args or [])], env=merged, stdin=subprocess.DEVNULL,
                              stdout=log, stderr=log, start_new_session=True)
         self.processes.append((name, p, log))
@@ -183,7 +208,7 @@ os.execv({binary!r},[{binary!r},*args])
             response = error
         body = response.read()
         assert response.status == status, (path, response.status, body.decode(errors="replace"))
-        return json.loads(body) if path.startswith("/api/") else body
+        return json.loads(body) if response.headers.get_content_type() == "application/json" else body
 
     def wait(self, callback, description, timeout=30):
         until = time.monotonic() + timeout
@@ -204,8 +229,8 @@ os.execv({binary!r},[{binary!r},*args])
         token = (self.root / "control" / "admin-token").read_text()
         self.request("/api/login", "POST", {"token": token})
 
-    def publish(self, expected="applied", *, allow_unverified_reality=False):
-        job = self.request("/api/publish", "POST", {"allow_unverified_reality": allow_unverified_reality})["job_id"]
+    def publish(self, expected="applied"):
+        job = self.request("/api/publish", "POST", {})["job_id"]
         def done():
             j = next(j for j in self.state()["jobs"] if j["id"] == job)
             return j if j["state"] not in ("publishing", "rolling_back") else None
@@ -245,6 +270,8 @@ os.execv({binary!r},[{binary!r},*args])
         echo_port = self.port()
         self.server(TcpServer(("127.0.0.1", echo_port), TcpEcho))
         self.server(socketserver.ThreadingUDPServer(("127.0.0.1", echo_port), UdpEcho))
+        self.allow_loopback_target(self.http_port)
+        self.allow_loopback_target(echo_port)
         control_port = self.port()
         self.base = f"http://127.0.0.1:{control_port}"
         control_env = {"CHAIN_DATA_DIR": str(self.root / "control"), "CHAIN_LISTEN": f"127.0.0.1:{control_port}",
@@ -258,6 +285,7 @@ os.execv({binary!r},[{binary!r},*args])
         self.request("/api/preview", "POST", {}, status=403, headers={"Origin": "https://untrusted.example"})
         print("PASS authentication and cross-origin rejection", flush=True)
 
+        self.fixture_reality_target(tls_port)
         nodes, agents, agent_envs = [], [], []
         for name in ["入口 A", "中转 B", "出口 C"]:
             n = self.request("/api/nodes", "POST", {"name": name, "host": "127.0.0.1",
@@ -276,7 +304,8 @@ os.execv({binary!r},[{binary!r},*args])
         print("PASS node-scoped authentication and private-key redaction", flush=True)
 
         def line_input(name, path, kind="vless", **extra):
-            return {"name": name, "kind": kind, "hops": [{"node_id": nodes[i]["id"], "port": self.port()} for i in path], **extra}
+            return {"name": name, "kind": kind, "hops": [{"node_id": nodes[i]["id"], "port": self.port()} for i in path],
+                    "access": {"reality": {"target": f"127.0.0.1:{tls_port}", "server_name": "localhost"}}, **extra}
         main = self.request("/api/lines", "POST", line_input("三跳代理", [0, 1, 2]))
         shared = self.request("/api/lines", "POST", line_input("共享入口与出口", [0, 2]))
         self.request("/api/lines", "POST", line_input("已移除的端口转发", [0], "forward",
@@ -288,7 +317,7 @@ os.execv({binary!r},[{binary!r},*args])
         preview = self.request("/api/preview", "POST", {})
         assert len(preview["nodes"]) == 3
         # The deliberately HTTP/1-only local TLS fixture cannot pass the H2 preflight.
-        self.publish(allow_unverified_reality=True)
+        self.publish()
         if os.environ.get("CHAIN_TEST_FEATURES_ONLY") == "1":
             from features import exercise
             exercise(self, nodes, echo_port, agents, agent_envs)
@@ -332,9 +361,13 @@ os.execv({binary!r},[{binary!r},*args])
         self.probe(main)
         print("PASS durable state and continued node traffic across controller restart", flush=True)
 
-        # Interrupt a publish while the downstream Agent is offline. Recovery
+        # Admit the fixture, then interrupt while the downstream Agent is offline. Recovery
         # must remain visibly incomplete until that Agent confirms restoration.
-        self.stop_process(agents[2])
+        def disconnect_after_preflight(authorization):
+            if authorization == 'Bearer ' + nodes[2]['token']:
+                self.preflight_fixture.on_preflight = None
+                self.stop_process(agents[2])
+        self.preflight_fixture.on_preflight = disconnect_after_preflight
         interrupted = self.request("/api/lines", "POST", line_input("中断发布测试", [0, 2]))
         job_id = self.request("/api/publish", "POST", {})["job_id"]
         self.wait(lambda: any(n["id"] == nodes[2]["id"] and
@@ -369,7 +402,10 @@ if __name__ == "__main__":
             harness.run()
         except BaseException:
             for log in Path(directory).rglob("*.log"):
-                print(f"LOG {log.name}:\n{log.read_text(errors='replace')[-1800:]}", flush=True)
+                content = log.read_text(errors='replace')
+                failures = '\n'.join(line for line in content.splitlines()
+                                     if any(marker in line for marker in ('Failed to start', '[Error]', 'Traceback', 'AssertionError')))
+                print(f"LOG {log.relative_to(directory)}:\n{failures}\n{content[-1800:]}", flush=True)
             raise
         finally:
             harness.close()

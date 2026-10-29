@@ -15,13 +15,12 @@ import tempfile
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from smoke import Harness, HttpHandler, UdpEcho
 from mihomo import exercise
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'scripts'))
-from chain_ingress import Ingress, OWNER
+OWNER = '# chain-ingress managed v1'
 
 
 def main():
@@ -37,14 +36,18 @@ def main():
                 '-nodes','-keyout',str(key),'-out',str(cert),'-days','1','-subj','/CN=reality.test',
                 '-addext','subjectAltName=DNS:reality.test,DNS:tls.test,DNS:existing.test'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             panel_port,tls_port,existing_port,public_port,h.http_port,udp_port=[h.port() for _ in range(6)]
+            h.allow_loopback_target(h.http_port)
+            h.allow_loopback_target(udp_port)
             h.server(http.server.ThreadingHTTPServer(('127.0.0.1',h.http_port),HttpHandler))
             h.server(socketserver.ThreadingUDPServer(('127.0.0.1',udp_port),UdpEcho))
-            ingress=Ingress(h.root/'system')
+            ingress=SimpleNamespace(config=h.root/'system/etc/chain-ingress', directory=h.root/'system/var/lib/chain-ingress')
+            ingress.state_path=ingress.directory/'state.json'
+            ingress.status_path=ingress.directory/'status.json'
             ingress.config.mkdir(parents=True)
             ingress.directory.mkdir(parents=True)
             ingress.request_path=h.root/'agent/ingress-request.json'
             ingress.state_path.write_text(json.dumps({'blocked':['existing.test']}))
-            ingress.status(ready=True,applied=True,id='',error='')
+            ingress.status_path.write_text(json.dumps({'ready':True,'applied':True,'id':'','error':''}))
             routes=ingress.config/'routes.conf'
             routes.write_text(OWNER+'\n')
             config=h.root/'nginx.conf'
@@ -86,7 +89,6 @@ stream {{
                 subprocess.run(['nginx','-t','-c',str(config),'-p',str(h.root)],check=True,capture_output=True)
                 os.kill(nginx.pid,signal.SIGHUP)
                 time.sleep(.15)
-            ingress.reload=reload
             def watch():
                 seen=''
                 while not watcher_stop.wait(.03):
@@ -94,8 +96,19 @@ stream {{
                         data=json.loads(ingress.request_path.read_text())
                         if data['id']==seen: continue
                         seen=data['id']
-                        with patch('chain_ingress.pwd.getpwnam',return_value=SimpleNamespace(pw_uid=os.getuid())):
-                            with contextlib.suppress(Exception): ingress.apply()
+                        result=subprocess.run([str(h.bin_dir/'chainctl'),'internal-render-routes'],
+                            input=json.dumps({'routes':data['routes'],'blocked':['existing.test']}),text=True,capture_output=True,timeout=15)
+                        before=routes.read_text()
+                        error=result.stderr
+                        if result.returncode==0:
+                            try:
+                                routes.write_text(result.stdout)
+                                reload()
+                            except Exception as failure:
+                                routes.write_text(before)
+                                reload()
+                                error=str(failure)
+                        ingress.status_path.write_text(json.dumps({'ready':True,'applied':not error,'id':data['id'],'error':error}))
                     except FileNotFoundError: pass
             watcher=threading.Thread(target=watch)
             watcher.start()
@@ -110,12 +123,14 @@ stream {{
             assert not negative['ok'],negative
             node=h.request('/api/nodes','POST',{'name':'fronting','host':'127.0.0.1','target':f'127.0.0.1:{tls_port}','server_name':'reality.test'})
             token=h.root/'token';token.write_text(node['token']);token.chmod(0o600)
+            h.fixture_reality_target(tls_port, 'reality.test')
             h.launch('agent',h.bin_dir/'chain-agent',{'CHAIN_AGENT_DIR':str(h.root/'agent'),'CHAIN_PANEL_URL':h.base,'CHAIN_NODE_ID':node['id'],
                 'CHAIN_NODE_TOKEN_FILE':str(token),'CHAIN_XRAY_BIN':str(h.xray),'CHAIN_INGRESS_STATUS':str(ingress.status_path),'SSL_CERT_FILE':str(cert)})
             h.wait(lambda:h.state()['nodes'][0]['online'],'agent')
             for port in h.state()['nodes'][0]['report']['system']['listening_ports']:
                 if 50000<=port<65535:
-                    h.request('/api/lines','POST',{'name':f'reserved-{port}','kind':'vless','enabled':False,'hops':[{'node_id':node['id'],'port':port}]})
+                    h.request('/api/lines','POST',{'name':f'reserved-{port}','kind':'vless','enabled':False,'hops':[{'node_id':node['id'],'port':port}],
+                        'access': {'reality': {'target': f'127.0.0.1:{tls_port}', 'server_name': 'reality.test'}}})
             tls={'mode':'manual','domain':'tls.test','cert':cert.read_text(),'key':key.read_text()}
             inputs=[]
             for network,security in [('tcp','reality'),('tcp','tls'),('xhttp','reality'),('xhttp','tls')]:
@@ -128,8 +143,8 @@ stream {{
             h.request('/api/lines/batch','POST',[inputs[0],bad],status=400)
             assert len(h.state()['lines'])==count,'partial batch was saved'
             lines=h.request('/api/lines/batch','POST',inputs)
-            # The local cover fixture implements HTTP/1, not a public H2 target.
-            h.publish(allow_unverified_reality=True)
+            # The explicit loopback fixture seam supplies only the public-target admission result.
+            h.publish()
             for line in lines:
                 h.probe(line)
                 exported=h.request('/api/lines/'+line['id']+'/export')

@@ -31,6 +31,26 @@ async fn status() -> Result<BTreeMap<String, String>> {
         .collect())
 }
 
+pub async fn prepare(manager: &super::upgrade::Manager) {
+    if !manager.live() || manager.kind() != "systemd" {
+        return;
+    }
+    let result: Result<()> = async {
+        let clock = status().await?;
+        if clock.get("NTP").map(String::as_str) != Some("yes")
+            || clock.get("NTPSynchronized").map(String::as_str) != Some("yes")
+        {
+            println!("自动检查并启用时间同步，保持现有时区。");
+            println!("{}", synchronize().await?);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        eprintln!("时间同步未完成：{error:#}；继续组件操作。");
+    }
+}
+
 fn installed(text: &str) -> Vec<&'static str> {
     UNITS
         .into_iter()

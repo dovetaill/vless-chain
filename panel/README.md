@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo sh
 ```
 
-正式发行包支持 Linux（systemd / OpenRC）的 x86_64 / ARM64，以及 macOS 14+ 的 Apple Silicon（ARM64）；不再提供 macOS Intel 包。Linux 发行包使用静态 musl，兼容 Alpine 与 glibc 系统；仍需 Python 3.10+ 及包含 Nginx/Certbot 的软件源。macOS 需先安装 Homebrew，并从普通管理员账户通过 sudo 执行。Windows 暂不支持。安装脚本下载正式 Release；本次跨平台包发布前需从源码构建对应平台包，开发中的界面与功能需使用对应源码构建，见[高级部署与开发](docs/advanced.md#构建)。
+正式发行包支持 Linux（systemd / OpenRC）的 x86_64 / ARM64，以及 macOS 14+ 的 Apple Silicon（ARM64）；不再提供 macOS Intel 包。Linux 发行包使用静态 musl，兼容 Alpine 与 glibc 系统；chainctl 不再依赖 Python；HTTPS 功能仍需包含 Nginx/Certbot 的软件源。macOS 需先安装 Homebrew，并从普通管理员账户通过 sudo 执行。Windows 暂不支持。安装脚本下载正式 Release；本次跨平台包发布前需从源码构建对应平台包，开发中的界面与功能需使用对应源码构建，见[高级部署与开发](docs/advanced.md#构建)。
 
 保存安装结束时显示的控制台地址和管理员密钥。填写面板域名可配置 Nginx、HTTPS 与证书续期；公网登录请使用 HTTPS。Passkey 需要固定 HTTPS 域名，本机开发可用 `http://localhost`。
 

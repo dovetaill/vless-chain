@@ -81,6 +81,10 @@ jobs:
           CHAIN_BUILD_CACHE: '1'
         run: |
           ./scripts/version-release.sh build --work-parent "$RUNNER_TEMP" --output "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
+      - name: Verify native installation and release smoke tests
+        env:
+          RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
+        run: python3 -B scripts/ci_release.py smoke --input "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
       - name: Remove task artifacts
         if: always()
         env:

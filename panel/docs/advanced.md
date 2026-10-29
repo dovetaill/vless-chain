@@ -24,7 +24,7 @@
 
 `npm ci` 报缺少锁文件时，先检查所在目录：前端清单与锁文件位于 `panel/frontend/`，仓库根目录没有 npm 项目。不要为了消除报错在根目录生成新锁文件。
 
-需要 Linux 或 macOS 14+、Rust 2024 edition 工具链、Node.js 20.19+ 或 22.12+、npm、C 编译器、Perl 和 make。WebAuthn 的 OpenSSL 随程序静态编译，不要求目标系统安装匹配版本的 libssl。Linux 发行构建还需要 musl-tools 和对应 Rust 目标（`rustup target add x86_64-unknown-linux-musl` 或 `aarch64-unknown-linux-musl`）；macOS 使用本机 apple-darwin 目标。运行时包括两个 Rust 二进制和 Xray；Agent 自动证书还需要 Certbot，安装器会补齐。前端静态文件编译进 `chain-panel`，不需要 Node.js 服务。
+需要 Linux 或 macOS 14+、Rust 2024 edition 工具链、Node.js 20.19+ 或 22.12+、npm、C 编译器、Perl 和 make。WebAuthn 的 OpenSSL 随程序静态编译，不要求目标系统安装匹配版本的 libssl。Linux 发行构建还需要 musl-tools 和对应 Rust 目标（`rustup target add x86_64-unknown-linux-musl` 或 `aarch64-unknown-linux-musl`）；macOS 使用本机 apple-darwin 目标。运行时包括 chain-panel、chain-agent、chainctl 三个 Rust 二进制，以及 Xray/Mihomo；Agent 自动证书还需要 Certbot，安装器会补齐。前端静态文件编译进 `chain-panel`，不需要 Node.js 服务。
 
 ```bash
 cd /home/wwwroot/vless-chain/panel/frontend
@@ -40,7 +40,7 @@ cargo build --release --bins
 
 ## 构建、安装与运维脚本
 
-在仓库根目录执行以下命令即可打开菜单，不再需要手工切换 npm/Cargo 目录。两个 `.sh` 入口及同目录 Python 实现需一起保留；支持 Python 3.10+。
+在仓库根目录执行以下命令即可打开菜单，不再需要手工切换 npm/Cargo 目录。构建、版本和发版工具仍使用 Python 3.10+；安装引导为 Shell，安装后的运维入口为 Rust `chainctl`。
 
 ```bash
 ./scripts/version-release.sh
@@ -78,7 +78,7 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 
 证书续期在 systemd 使用 `chain-panel-cert-renew.timer`，OpenRC 使用受监控的定时任务，macOS 使用 launchd 的 StartInterval；每 12 小时检查一次，Certbot 只续期该面板证书；deploy hook 也核对证书路径后才检查并重载 Nginx。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
 
-构建支持 Linux/macOS 的 x86_64 与 aarch64；Linux 使用静态 musl 目标，macOS 使用原生 apple-darwin 目标（最低 macOS 14），执行 TypeScript/Vite 构建与 Rust 单元测试后生成 release 二进制。自动下载固定的 Xray v26.3.27 并检查官方 ZIP 的 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
+构建支持 Linux/macOS 的 x86_64 与 aarch64；Linux 使用静态 musl 目标，macOS 使用原生 apple-darwin 目标（最低 macOS 14），执行 TypeScript/Vite 构建与 Rust 单元测试后生成 release 二进制。按 `panel/src/core-versions.json` 下载固定的 Xray/Mihomo 并检查官方附件 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
 
 产物默认放在 `release-output/v0.1.0-linux-x86_64/`（依当前版本、系统、架构变化，macOS 的系统名为 `darwin`）。包含 `chain-panel-0.1.0-linux-x86_64.tar.gz`、`release.json`、`SHA256SUMS`。这是有意保留的最终交付目录；临时源码副本、npm 缓存和 Cargo target 在成功、失败或中断后自动清理，下一次构建会重新编译。输出目录已存在时不会覆盖，请传入新的 `--output` 或更新版本。
 
@@ -91,7 +91,7 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 ./scripts/version-release.sh status
 ```
 
-目标机器需要 Linux（systemd 或 OpenRC）或 macOS 14+（launchd）、Python 3.10+；无需 npm、Rust 或额外安装代理内核。macOS 需先安装 Homebrew，再通过普通管理员账户运行 `sudo sh`。新版 Linux 静态包不依赖系统 glibc；旧 GNU 包仍检查 glibc 下限。安装前检查操作系统与 CPU 架构，拒绝混用包。旧版 CentOS 软件源可能缺少兼容 Python 或 Certbot，需要先配置相应依赖，不保证已经停止维护的系统和失效软件源。
+目标机器需要 Linux（systemd 或 OpenRC）或 macOS 14+（launchd）；原生 chainctl 无需 Python、npm、Rust 或额外安装代理内核。macOS 需先安装 Homebrew，再通过普通管理员账户运行 `sudo sh`。新版 Linux 静态包不依赖系统 glibc；旧 GNU 包仍检查 glibc 下限。安装前检查操作系统与 CPU 架构，拒绝混用包。旧版 CentOS 软件源可能缺少兼容 Certbot，需要先配置相应依赖，不保证已经停止维护的系统和失效软件源。
 
 安装器只管理 `/opt/chain` 下有归属标识的安装、`chain-panel`、`chain-agent` 服务、各自的 `/etc/chain-*` 与 `/var/lib/chain-*`。遇到同名的非本安装器目录或服务会拒绝覆盖。默认安装控制台并自动接入本机 Agent；只需控制台时使用 `--panel-only`。其他机器请自行通过 SSH 登录，运行默认安装命令，在该机器面板创建代理后将链接导入本面板；网页不执行 SSH 安装。
 
@@ -225,9 +225,9 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 `chainctl` 无参数时打开交互菜单，`chainctl help` 和 `chainctl --help` 无需管理员权限即可查看帮助。非管理员执行实际运维时自动调用 sudo；无终端且无子命令时只打印帮助。自动化调用增加 `--non-interactive`，保留原有 `--component`、`--package`、监听及令牌文件参数。
 
-安装器可单独下载运行；在 curl 管道中会从 `/dev/tty` 读取交互输入。无参数脚本执行 `setup`：首次直接安装，已安装时显示登录信息，缺失默认本机 Agent 时重试接入。`chainctl` 无参数仍打开运维菜单。缺少 Python 时使用 apt/dnf 安装并校验 Python 3.10+。在线引导从项目 main 的固定提交下载三个辅助模块，再从 GitHub Releases 下载本机架构的正式包，检查 SHA256、清单和兼容性后才询问可选域名。下载和解压目录在退出时删除。没有正式包、架构缺失或校验失败时终止，不会静默改为源码编译。
+安装器可单独下载运行；在 curl 管道中会从 `/dev/tty` 读取交互输入。无参数脚本执行 `setup`：首次直接安装，已安装时显示登录信息，缺失默认本机 Agent 时重试接入。`chainctl` 无参数仍打开运维菜单。在线引导从 GitHub Releases 下载本机架构的正式包，校验 SHA256 后只提取并运行原生 chainctl；Rust 再检查完整清单和兼容性，然后询问可选域名。下载和解压目录在退出时删除。没有正式包、架构缺失或校验失败时终止，不会静默改为源码编译。
 
-维护者需要先推送安装器和前端改动，再按本页发布流程上传对应版本的正式包；此前本机已有包可用安装向导选择。Linux 新包使用静态 musl，不再要求与构建机匹配的 glibc；系统内核、Python 与软件源仍需满足运行要求。单次正式发行需要同时提供包、release.json 和 SHA256SUMS。
+维护者需要先推送安装器和前端改动，再按本页发布流程上传对应版本的正式包；此前本机已有包可用安装向导选择。Linux 新包使用静态 musl，不再要求与构建机匹配的 glibc；系统内核与软件源仍需满足运行要求。单次正式发行需要同时提供包、release.json 和 SHA256SUMS。
 
 接入码只是将控制台地址、节点 UUID 和节点令牌合并成一份可复制凭据，不是临时兑换码；它没有单独有效期，节点重置令牌后失效。接入码不进入 shell 参数或历史，只通过隐藏输入交给向导。重新接入会保存新身份并重启 Agent，受其管理的流量可能短暂重连。HTTP 接入需要在向导中明确确认可信私网。
 
@@ -236,3 +236,5 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 控制台安装默认附带本机 Agent，通过本机 API 创建记录并保存身份。升级同时更新匹配本机控制台的 Agent，保留原节点 ID 和令牌；恢复文件只保存令牌哈希。只需控制台时使用 `--panel-only`；本机对外地址与 REALITY 目标可用 `--local-host`、`--local-target` 指定。
 
 网页 SSH 安装、购买中转入口、端口转发页面已移除。其他服务器由用户自行 SSH 登录安装，再以外部代理链接接入链式路径。
+
+原生运维实现位于 `panel/src/ctl/`。发行包中的旧 Python 文件名仅包含 `legacy_bridge.py` 的兼容转交代码，用于旧安装器固定文件列表的升级；新安装直接运行 `bin/chainctl`。仓库保留的 Python 测试调用原生程序或真实服务，不再导入已删除的 Python 运维实现。普通 CI 与发布 CI 均执行同一个发行 smoke 入口。

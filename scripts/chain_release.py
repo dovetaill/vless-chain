@@ -17,7 +17,7 @@ import urllib.request
 
 from chain_common import (Workspace, architecture, operating_system, atomic_write, json_write, output, require,
                           run, sha256, verify_archive_checksum, VERSION_RE)
-from chain_cores import RECOMMENDED, download as download_core
+from build_cores import RECOMMENDED, download as download_core
 
 ROOT = Path(__file__).resolve().parents[1]
 XRAY_VERSION = RECOMMENDED['xray']
@@ -160,19 +160,12 @@ def configure_ci_cache(env):
 
 def check(args):
     run(['bash', '-n', ROOT / 'scripts/version-release.sh', ROOT / 'scripts/install-server.sh'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_delivery.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_network.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_legacy.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_platform.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_ingress.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_maintenance.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_cores.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_time_diagnostics.py'])
-    run([sys.executable, '-B', ROOT / 'scripts/tests/test_menu.py'])
+    run([sys.executable, '-B', ROOT / 'scripts/tests/test_release_build.py'])
     if args.full:
         with Workspace(args.work_parent or ROOT.parent) as work:
             xray = work.root / 'bin/xray'
             fetch_xray(work, xray)
+            fetch_mihomo(work, work.root / 'bin/mihomo')
             command = [sys.executable, '-B', ROOT / 'panel/scripts/verify.py', '--xray', xray, '--work-parent', work.root]
             if args.browser:
                 command.append('--browser')
@@ -216,10 +209,11 @@ def build(args):
         work.run(['npm', 'run', 'build'], cwd=project / 'frontend')
         work.run(['cargo', 'test', '--locked', '--lib', '--quiet'], cwd=project)
         work.run(['cargo', 'test', '--locked', '--bin', 'chain-panel', '--quiet'], cwd=project)
+        work.run(['cargo', 'test', '--locked', '--bin', 'chainctl', '--quiet'], cwd=project)
         work.run(['cargo', 'build', '--locked', '--release', '--bins', '--target', target], cwd=project)
         stage = work.root / 'stage'
         (stage / 'bin').mkdir(parents=True)
-        for binary in ['chain-panel', 'chain-agent']:
+        for binary in ['chain-panel', 'chain-agent', 'chainctl']:
             shutil.copy2(Path(work.env['CARGO_TARGET_DIR']) / target / 'release' / binary, stage / 'bin' / binary)
             if operating_system() == 'linux':
                 headers = output(['readelf', '-l', '-d', stage / 'bin' / binary])
@@ -230,9 +224,13 @@ def build(args):
         work.run(['node', ROOT / 'panel/tests/xray-reality.cjs'], cwd=ROOT)
         fetch_mihomo(work, stage / 'bin/mihomo')
         work.run([stage / 'bin/mihomo', '-v'])
-        for name in ['install-server.sh', 'chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py', 'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_cores.py', 'chain_time.py', 'chain_tuning.py']:
-            (stage / 'scripts').mkdir(exist_ok=True)
-            shutil.copy2(ROOT / 'scripts' / name, stage / 'scripts' / name)
+        (stage / 'scripts').mkdir(exist_ok=True)
+        shutil.copy2(ROOT / 'scripts/install-server.sh', stage / 'scripts/install-server.sh')
+        # Old managers copy these exact filenames; each is only a verified native handoff.
+        for name in ['chain_install.py', 'chain_common.py', 'chain_network.py', 'chain_ingress.py',
+                     'chain_platform.py', 'chain_legacy.py', 'chain_maintenance.py', 'chain_cores.py',
+                     'chain_time.py', 'chain_tuning.py']:
+            shutil.copy2(ROOT / 'scripts/legacy_bridge.py', stage / 'scripts' / name)
         shutil.copy2(ROOT / 'panel/src/core-versions.json', stage / 'scripts/core-versions.json')
         (stage / 'share').mkdir(exist_ok=True)
         shutil.copy2(ROOT / 'panel/reality-candidates/university-domains-LICENSE.txt', stage / 'share/university-domains-LICENSE.txt')

@@ -308,10 +308,7 @@ def verify_tree(directory):
     require(manifest.get('format') == FORMAT and re.fullmatch(VERSION_RE, manifest.get('version', '')),
             '发行包格式或版本无效。')
     files = manifest.get('files', {})
-    required = {'bin/chain-panel', 'bin/chain-agent', 'bin/xray', 'scripts/chain_common.py',
-                'scripts/chain_install.py', 'scripts/chain_network.py', 'scripts/install-server.sh'}
-    if 'os' in manifest:
-        required.add('scripts/chain_platform.py')
+    required = {'bin/chain-panel', 'bin/chain-agent', 'bin/chainctl', 'bin/xray', 'scripts/install-server.sh'}
     require(required.issubset(files), '发行包缺少程序或安装脚本。')
     actual = set()
     for path in directory.rglob('*'):

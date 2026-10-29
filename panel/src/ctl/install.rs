@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct Options {
     pub listen: Option<String>,
     pub public_url: Option<String>,
@@ -251,29 +251,11 @@ async fn ensure_account(manager: &Manager, role: &str) -> Result<(u32, u32)> {
         unsafe { libc::getgrnam(CString::new(name.clone())?.as_ptr()) }.is_null(),
         "已有同名组，无法确认归属"
     );
-    ensure!(
-        manager.kind() == "systemd",
-        "此平台首次安装账户尚未迁移，未修改系统"
-    );
-    command(
-        "useradd",
-        &[
-            "--system",
-            "--user-group",
-            "--no-create-home",
-            "--home-dir",
-            &format!("/var/lib/{name}"),
-            "--shell",
-            "/usr/sbin/nologin",
-            &name,
-        ],
-        30,
-    )
-    .await?;
+    super::platform::create_account(&name).await?;
     account(&name)?.context("服务账户创建后无法读取")
 }
 
-fn owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
+pub(super) fn owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
     ordinary(path)?;
     if path.exists() {
         let info = fs::metadata(path)?;
@@ -296,7 +278,7 @@ fn owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     Ok(())
 }
-fn owned_write(path: &Path, body: &[u8], mode: u32, uid: u32, gid: u32) -> Result<()> {
+pub(super) fn owned_write(path: &Path, body: &[u8], mode: u32, uid: u32, gid: u32) -> Result<()> {
     ordinary(path)?;
     if path.exists() {
         let info = fs::metadata(path)?;
@@ -321,11 +303,25 @@ fn owned_write(path: &Path, body: &[u8], mode: u32, uid: u32, gid: u32) -> Resul
     Ok(())
 }
 
-pub fn unit(manager: &Manager, role: &str) -> Result<String> {
-    ensure!(
-        manager.kind() == "systemd",
-        "此平台安装服务定义尚未迁移，未修改系统"
-    );
+pub fn unit_with_env(
+    manager: &Manager,
+    role: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<String> {
+    ensure!(matches!(role, "panel" | "agent"), "组件无效");
+    if manager.kind() != "systemd" {
+        return super::platform::definition(
+            manager,
+            &format!("chain-{role}"),
+            &[manager
+                .base
+                .join(format!("current-{role}/bin/chain-{role}"))
+                .to_string_lossy()
+                .into()],
+            Some(&format!("chain-{role}")),
+            env,
+        );
+    }
     let quote = |path: PathBuf| -> Result<String> {
         let value = path.to_str().context("服务路径必须为 UTF-8")?;
         ensure!(!value.contains(['\r', '\n', '\0']), "服务路径无效");
@@ -354,6 +350,44 @@ pub fn unit(manager: &Manager, role: &str) -> Result<String> {
     ))
 }
 
+fn recoverable_openrc_data(manager: &Manager, role: &str) -> Result<bool> {
+    if manager.kind() != "openrc" {
+        return Ok(false);
+    }
+    let data = manager.path(&format!("/var/lib/chain-{role}"));
+    let identity = if manager.live() {
+        account(&format!("chain-{role}"))?
+    } else {
+        Some((unsafe { libc::geteuid() }, unsafe { libc::getegid() }))
+    };
+    let Some((uid, gid)) = identity else {
+        return Ok(false);
+    };
+    let owned = |path: &Path, mode: u32, uid: u32, gid: u32| {
+        fs::symlink_metadata(path).is_ok_and(|m| {
+            !m.file_type().is_symlink() && (m.mode() & 0o777, m.uid(), m.gid()) == (mode, uid, gid)
+        })
+    };
+    if !owned(
+        &manager.base.join(".chain-install.json"),
+        0o600,
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+    ) || !owned(&data, 0o700, uid, gid)
+    {
+        return Ok(false);
+    }
+    let marker = data.join(".chain-owner");
+    if owned(&marker, 0o600, uid, gid) {
+        return Ok(fs::read_to_string(marker)? == format!("chain-{role}"));
+    }
+    let entries = fs::read_dir(&data)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let log = data.join("service.log");
+    Ok(entries == [log.clone()] && log.is_file() && owned(&log, 0o600, uid, gid))
+}
+
 pub async fn component(
     manager: &Manager,
     source: &Path,
@@ -362,7 +396,6 @@ pub async fn component(
 ) -> Result<()> {
     let manifest = package::verify(source, true)?;
     package::compatible(&manifest)?;
-    let definition = unit(manager, role)?;
     let old = manager.state()?;
     let prior = old["roles"][role].is_object();
     let retained = old["retained_roles"][role].is_object();
@@ -381,7 +414,11 @@ pub async fn component(
     for path in [&etc, &data] {
         ordinary(path)?;
         ensure!(
-            prior || retained || !path.exists() || fs::read_dir(path)?.next().is_none(),
+            prior
+                || retained
+                || !path.exists()
+                || fs::read_dir(path)?.next().is_none()
+                || (path == &data && recoverable_openrc_data(manager, role)?),
             "已有目录非空，拒绝接管：{}",
             path.display()
         );
@@ -392,11 +429,25 @@ pub async fn component(
         BTreeMap::new()
     };
     let (env, secret) = configuration(manager, role, options, old_env.clone())?;
+    let definition = unit_with_env(manager, role, &env)?;
     let (uid, gid) = ensure_account(manager, role).await?;
     let _guard = manager.lock()?;
     ensure!(manager.state()? == old, "安装状态已经变化");
     for path in [&etc, &data] {
         owned_dir(path, uid, gid, 0o700)?;
+    }
+    if manager.kind() == "openrc" && !data.join(".chain-owner").exists() {
+        ensure!(
+            fs::read_dir(&data)?.next().is_none() || recoverable_openrc_data(manager, role)?,
+            "数据目录归属未确认"
+        );
+        owned_write(
+            &data.join(".chain-owner"),
+            format!("chain-{role}").as_bytes(),
+            0o600,
+            uid,
+            gid,
+        )?;
     }
     owned_dir(
         &manager.path(&format!("/var/lib/chain-acme/{role}")),
@@ -457,17 +508,17 @@ pub async fn component(
             owned_write(&paths[1], format!("{secret}\n").as_bytes(), 0o600, uid, gid)?;
         }
         fs::create_dir_all(service_path.parent().unwrap())?;
-        atomic(&service_path, definition.as_bytes(), 0o644)?;
+        atomic(
+            &service_path,
+            definition.as_bytes(),
+            if manager.kind() == "openrc" {
+                0o755
+            } else {
+                0o644
+            },
+        )?;
         manager.link(role, &id)?;
-        if manager.live() {
-            command("systemctl", &["daemon-reload"], 30).await?;
-            command(
-                "systemctl",
-                &["enable", &format!("chain-{role}.service")],
-                30,
-            )
-            .await?;
-        }
+        super::platform::enable(manager, &format!("chain-{role}")).await?;
         manager.service("start", role).await?;
         manager.healthy(role.into()).await?;
         let mut state = old.clone();
@@ -512,7 +563,7 @@ pub async fn component(
         } else if manager.base.join(format!("current-{role}")).is_symlink() {
             fs::remove_file(manager.base.join(format!("current-{role}")))?;
         }
-        if manager.live() {
+        if manager.live() && manager.kind() == "systemd" {
             command("systemctl", &["daemon-reload"], 30).await?;
         }
         if was_active {

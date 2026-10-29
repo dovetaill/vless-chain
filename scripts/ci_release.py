@@ -67,7 +67,7 @@ def publish(directory, tag, repo, commit):
                  '/main/scripts/install-server.sh | sudo sh\n```\n\n'
                  '首次只需输入可选域名。自动读取网卡公网 IPv4、选择空闲随机端口、生成登录令牌。'
                  '填写域名后检查 A/AAAA 解析，通过系统包管理器安装 Nginx/Certbot，配置 HTTPS 与自动续期。\n\n'
-                 '支持 Linux（systemd/OpenRC）的 x86_64 / ARM64 与 macOS 14+ 的 Apple Silicon、Python ≥ 3.10；Linux 使用静态 musl 包，macOS 依赖 Homebrew。'
+                 '支持 Linux（systemd/OpenRC）的 x86_64 / ARM64 与 macOS 14+ 的 Apple Silicon；原生 chainctl 不依赖 Python；Linux 使用静态 musl 包，macOS 依赖 Homebrew。'
                  '下载对应架构的 tar.gz 与 SHA256SUMS 可离线安装。')
         release_notes = Path(__file__).resolve().parents[1] / 'panel/docs/releases' / (tag + '.md')
         if release_notes.is_file():
@@ -99,6 +99,8 @@ def smoke(directory):
         restore_modes(stage, manifest)
         work.env['CHAIN_TEST_ROOT'] = str(work.root)
         root = Path(__file__).resolve().parents[1]
+        work.env['CHAIN_TEST_CTL'] = str(stage / 'bin/chainctl')
+        work.run([sys.executable, '-B', root / 'scripts/tests/test_native_upgrade.py'], cwd=root)
         work.run([sys.executable, '-B', root / 'panel/tests/local_install.py', stage], cwd=root)
         work.env.update(CHAIN_TEST_BIN_DIR=str(stage / 'bin'), CHAIN_TEST_XRAY=str(stage / 'bin/xray'))
         work.run([sys.executable, '-B', root / 'panel/tests/legacy_migration.py'], cwd=root)
@@ -149,7 +151,7 @@ def main():
     parser.add_argument('--input', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    if args.action != 'check':
+    if args.action in ('validate', 'assemble', 'publish'):
         validate_tag(args.tag)
     if args.action == 'assemble':
         assemble(args.input, args.output, args.tag, args.commit)

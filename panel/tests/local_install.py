@@ -7,10 +7,14 @@ import sys
 import tempfile
 import json
 import subprocess
+import hashlib
+import shlex
+import tarfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from chain_common import verify_tree
-from chain_install import Manager, make_parser, parse_env, provision_local_agent
+def parse_env(path):
+    return dict((k, shlex.split(v)[0]) for k, v in (line.split('=', 1) for line in path.read_text().splitlines() if '=' in line))
 from smoke import Harness
 
 
@@ -25,22 +29,35 @@ def main():
         try:
             port = harness.port()
             harness.base = f'http://127.0.0.1:{port}'
-            manager = Manager(root / 'system')
-            args = make_parser().parse_args(['install', '--root', str(manager.root), '--listen', f'127.0.0.1:{port}',
-                                             '--local-host', '127.0.0.1', '--local-target', 'localhost:443'])
-            manager.install(source, manifest, args)
-            panel_env = parse_env(manager.role_paths('panel')[0] / 'panel.env')
+            system = root / 'system'
+            system.mkdir()
+            archive = root / 'native.tar.gz'
+            with tarfile.open(archive, 'w:gz') as bundle:
+                for name in [*manifest['files'], 'release.json']:
+                    bundle.add(source / name, arcname=name, recursive=False)
+            (root / 'SHA256SUMS').write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  native.tar.gz\n')
+            command = [str(source / 'bin/chainctl'), 'install', '--root', str(system), '--package', str(archive),
+                       '--work-parent', str(root), '--non-interactive', '--listen', f'127.0.0.1:{port}',
+                       '--local-host', '127.0.0.1', '--local-target', 'localhost:443']
+            def install(*extra):
+                subprocess.run(command + list(extra), check=True, timeout=60)
+            install('--panel-only')
+            panel_env = parse_env(system / 'etc/chain-panel/panel.env')
             harness.launch('local-panel', source / 'bin/chain-panel', panel_env)
             harness.wait(lambda: harness.request('/') or True, 'local panel start')
-            provision_local_agent(manager, source, manifest, args)
-            agent_env = parse_env(manager.role_paths('agent')[0] / 'agent.env')
+            install()
+            agent_env = parse_env(system / 'etc/chain-agent/agent.env')
             harness.launch('auto-agent', source / 'bin/chain-agent', agent_env)
-            token = (manager.role_paths('panel')[1] / 'admin-token').read_text()
+            token = (system / 'var/lib/chain-panel/admin-token').read_text()
             harness.request('/api/login', 'POST', {'token': token})
             harness.wait(lambda: len(harness.state()['nodes']) == 1 and harness.state()['nodes'][0]['online'], 'automatically registered Agent online')
-            previous = manager.state()['roles']['agent'].copy()
-            provision_local_agent(manager, source, manifest, args)
-            assert manager.state()['roles']['agent'] == previous
+            state_file = system / 'opt/chain/.chain-install.json'
+            previous = json.loads(state_file.read_text())['roles']['agent'].copy()
+            identity = (system / 'etc/chain-agent/token').read_bytes()
+            install()
+            assert json.loads(state_file.read_text())['roles']['agent'] == previous
+            assert (system / 'etc/chain-agent/token').read_bytes() == identity
+            assert (system / 'usr/local/bin/chainctl').is_symlink()
             assert len(harness.state()['nodes']) == 1
             if sys.platform == 'darwin':
                 marker = root / 'watcher.json'

@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from chain_network import HttpsSite
+from types import SimpleNamespace
 from smoke import Harness
 
 
@@ -31,7 +31,7 @@ def main():
                 'CHAIN_DATA_DIR': str(root / 'data'), 'CHAIN_LISTEN': f'127.0.0.1:{upstream}',
                 'CHAIN_SECURE_COOKIE': '1', 'CHAIN_XRAY_BIN': str(source / 'bin/xray')})
             harness.wait(lambda: harness.request('/') or True, 'panel started')
-            site = HttpsSite('localhost', upstream)
+            site = SimpleNamespace()
             site.webroot, site.cert = root / 'webroot', root / 'cert'
             site.cert.mkdir()
             proc = subprocess.Popen(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
@@ -50,7 +50,10 @@ def main():
             conf.write_text(f'pid {root}/nginx.pid;\nerror_log {root}/error.log;\nevents {{}}\n'
                             'http { access_log off;\n' + ''.join(f'{name}_temp_path {root}/{name};\n'
                                 for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi')) +
-                            site.config(tls=True).replace('listen 80;', f'listen 127.0.0.1:{http_port};').replace(
+                            subprocess.check_output([str(source / 'bin/chainctl'), 'internal-render-site', '--root', str(root),
+                                '--domain', 'panel.test', '--listen', f'127.0.0.1:{upstream}'], text=True)
+                            .replace(str(root / 'etc/letsencrypt/live/chain-panel-panel.test'), str(site.cert))
+                            .replace(str(root / 'var/lib/chain-acme'), str(site.webroot)).replace('panel.test', 'localhost').replace('listen 80;', f'listen 127.0.0.1:{http_port};').replace(
                                 'listen 443 ssl;', f'listen 127.0.0.1:{https_port} ssl;') + '}\n')
             nginx_log = (root / 'nginx.log').open('wb')
             command = ['nginx', '-p', str(root), '-c', str(conf), '-g', 'daemon off; master_process off;']

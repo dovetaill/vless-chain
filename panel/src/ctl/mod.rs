@@ -1,8 +1,14 @@
-// shortcut: 安装入口尚未接入 CLI；接入时移除此测试构建限制。
-#[cfg(test)]
+pub mod cores;
+pub mod https;
+pub mod ingress;
 pub mod install;
+pub mod lifecycle;
 pub mod maintenance;
+pub mod migration;
+pub mod nginx;
 pub mod operations;
 pub mod package;
+pub mod platform;
 pub mod time;
+pub mod tuning;
 pub mod upgrade;

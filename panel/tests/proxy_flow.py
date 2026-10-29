@@ -15,7 +15,7 @@ import uuid
 from smoke import Harness, HttpHandler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from chain_network import proxy_acme_config
+
 
 
 def main():
@@ -44,8 +44,8 @@ def main():
             http_port = h.port()
             conf = root / 'nginx.conf'
             conf.write_text(f'pid {root}/nginx.pid;\nerror_log {root}/nginx.log;\nevents {{}}\n'
-                'http { access_log off;\n' + proxy_acme_config().replace('listen 80;', f'listen 127.0.0.1:{http_port};')
-                .replace('/var/lib/chain-acme', str(web)) + '}\n')
+                'http { access_log off;\n' + ''.join(f'{name}_temp_path {root}/{name};\n' for name in ('client_body','proxy','fastcgi','uwsgi','scgi')) + subprocess.check_output([str(h.bin_dir / 'chainctl'), 'internal-render-acme', '--root', str(root)], text=True).replace('listen 80;', f'listen 127.0.0.1:{http_port};')
+                .replace(str(root / 'var/lib/chain-acme'), str(web)) + '}\n')
             h.launch('nginx', 'nginx', {}, ['-p', str(root), '-c', str(conf), '-g', 'daemon off; master_process off;'])
             fake = root / 'certbot'
             fake.write_text('''#!/usr/bin/env python3
@@ -67,6 +67,7 @@ shutil.copyfile(os.environ['TEST_KEY'],live/'privkey.pem')
 ''')
             fake.chmod(0o700)
             h.http_port = h.port()
+            h.allow_loopback_target(h.http_port)
             h.server(http.server.ThreadingHTTPServer(('127.0.0.1', h.http_port), HttpHandler))
             panel_port = h.port()
             h.base = f'http://127.0.0.1:{panel_port}'

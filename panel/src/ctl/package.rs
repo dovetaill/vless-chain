@@ -262,7 +262,12 @@ pub fn copy(source: &Path, destination: &Path, manifest: &Manifest) -> Result<()
     Ok(())
 }
 
-async fn fetch(client: &reqwest::Client, url: &str, path: &Path, limit: u64) -> Result<()> {
+pub(super) async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    limit: u64,
+) -> Result<()> {
     let mut response = client.get(url).send().await?.error_for_status()?;
     ensure!(response.url().scheme() == "https", "下载必须使用 HTTPS");
     let mut file = OpenOptions::new()
@@ -397,7 +402,7 @@ fn xray_asset(releases: &serde_json::Value) -> Result<(String, String, String, b
     ))
 }
 
-fn xray_files(archive: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(super) fn xray_files(archive: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut bundle = zip::ZipArchive::new(File::open(archive)?)?;
     ensure!(bundle.len() <= 100, "Xray 附件文件数量超限");
     let mut result = Vec::new();

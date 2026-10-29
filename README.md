@@ -85,7 +85,7 @@ Chain Panel 帮你在自己的服务器上创建代理、组合出网路径，�
 | 界面组件 | Tailwind CSS 4、Radix UI、Lucide、Metronic 主题组件 | 响应式布局、表单、弹窗和图标 |
 | 代理内核 | Xray、Mihomo | 执行不同协议的接入与链式出网 |
 | HTTPS 与证书 | Nginx、Certbot | 面板 HTTPS、证书申请与续期、可选的统一 443 入口 |
-| 安装与运维 | Shell、Python 3.10+、systemd / OpenRC / launchd | 安装发行包、管理服务、备份与升级 |
+| 安装与运维 | Rust chainctl、Shell 引导、systemd / OpenRC / launchd | 安装发行包、管理服务、备份与升级 |
 
 **使用正式发行包无需安装 Rust、Node.js，也无需自行编译前端或单独下载代理内核。**内核版本随发行包固定，可在「设置 → 版本与维护」查看。主题来源与使用条件见[主题许可说明](panel/frontend/THEME.md)。
 
@@ -102,7 +102,7 @@ Chain Panel 帮你在自己的服务器上创建代理、组合出网路径，�
 安装前需要：
 
 - 可以通过 SSH 或本机终端操作的服务器，以及 root / sudo 权限。
-- `curl` 和 CA 证书，可访问 GitHub Releases 与系统软件源。安装器会检查 Python 3.10+，并按需安装 Python、Nginx、Certbot 等依赖；旧系统的软件源可能无法提供所需版本。
+- `curl` 和 CA 证书，可访问 GitHub Releases 与系统软件源。chainctl 为原生 Rust 程序，不依赖 Python；HTTPS 功能按需使用 Nginx、Certbot 等系统软件包，旧系统的软件源可能无法提供所需版本。
 - 能从客户端访问的服务器地址。使用域名自动签证书时，将域名解析到本机，并放行公网 TCP 80；面板 HTTPS 和代理监听端口也需在系统防火墙、云安全组中放行。
 
 面板域名与代理域名按各自用途配置；创建 REALITY 代理不要求你持有代理域名，但面板公网管理仍建议使用 HTTPS。

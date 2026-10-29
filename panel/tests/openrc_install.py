@@ -1,222 +1,246 @@
-"""Disposable Alpine: real installer, OpenRC services, native-v3 handover and traffic."""
-import copy
-import http.server
+"""Native installation, OpenRC recovery and maintenance in a disposable container."""
+import hashlib
+import http.cookiejar
 import json
 import os
 from pathlib import Path
 import pwd
-import re
+import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
-from urllib.parse import urlsplit
-from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-import chain_install as installer
-from chain_common import atomic_write, json_write, verify_tree
-from chain_legacy import PanelAPI, discover, guided_install
-from chain_platform import create_account, service, service_definition, service_state
-from legacy_migration import Response, public_key
-from smoke import Harness, HttpHandler, TlsServer
+import urllib.request
+import urllib.error
+import uuid
 
 
-def clean_install(manager, source, manifest):
-    assert not manager.state_file.exists()
-    args = installer.make_parser().parse_args(['install', '--non-interactive', '--listen', '127.0.0.1:37243'])
-    args.defer_proxy_acme = args.defer_access = True
-    try:
-        installer.install_components(manager, source, manifest, args)
-        assert set(manager.state()['roles']) == {'panel', 'agent'}
-        api = PanelAPI(manager)
-        try:
-            deadline = time.monotonic() + 20
-            while not api.call('state')['nodes'][0]['online']:
-                assert time.monotonic() < deadline
-                time.sleep(0.2)
-        finally:
-            api.call('logout', {})
-        for role in ['panel', 'agent']:
-            assert service_state('chain-' + role)[0]
-            assert Path('/var/lib/chain-' + role, '.chain-owner').read_text() == 'chain-' + role
-        print('PASS clean first install of real panel and Agent through OpenRC', flush=True)
-    finally:
-        for name in ['chain-agent', 'chain-panel']:
-            if Path('/etc/init.d', name).exists():
-                service('stop', name, check=False)
+def time_checks(ctl, work):
+    fake = work / 'time-tools'; fake.mkdir()
+    program = fake / 'tool'
+    program.write_text("""#!/usr/bin/python3
+import json,os,pathlib,sys
+name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]
+with open(os.environ['TIME_CALLS'],'a') as f:f.write(json.dumps([name,*args])+'\\n')
+c=json.loads(os.environ['TIME_CASE'])
+if name=='timedatectl':print('Timezone=America/New_York\\nNTP=yes\\nNTPSynchronized=yes')
+elif name=='systemctl' and args[0]=='list-unit-files':
+ print(c['units'],end='')
+ if c.get('inventory_error'):print('inventory denied',file=sys.stderr)
+ sys.exit(c.get('inventory_code',0))
+elif name=='systemctl' and args[0]=='is-active':sys.exit(0 if args[-1] in c.get('active',[]) else 3)
+elif name=='chronyc' and args[0]=='waitsync' and c.get('no_source'):sys.exit(1)
+""")
+    program.chmod(0o755)
+    for name in ['timedatectl', 'systemctl', 'chronyc', 'apt-get']:
+        (fake / name).symlink_to(program)
+    (fake / 'env').symlink_to('/usr/bin/env')
+    cases = [
+        {'units':'chrony.service enabled\nchronyd.service alias\n', 'active':['chrony.service']},
+        {'units':'', 'inventory_code':1},
+        {'units':'', 'inventory_code':1, 'inventory_error':True},
+        {'units':'chrony.service enabled\nsystemd-timesyncd.service enabled\n', 'active':['chrony.service','systemd-timesyncd.service']},
+        {'units':'chrony.service enabled\n', 'no_source':True},
+        {'units':'chrony.service disabled\nsystemd-timesyncd.service enabled\n', 'active':['systemd-timesyncd.service']},
+    ]
+    for index, case in enumerate(cases):
+        calls = work / f'time-calls-{index}'
+        result = subprocess.run([str(ctl), 'sync-time'], env={**os.environ, 'PATH':str(fake),
+            'TIME_CASE':json.dumps(case), 'TIME_CALLS':str(calls)}, capture_output=True, text=True, timeout=20)
+        recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert (result.returncode == 0) == (index in (0,1,5)), (index,result.stdout,result.stderr)
+        assert not any('set-timezone' in row for row in recorded)
+        if index in (2,3):
+            assert not any(row[0]=='apt-get' or row[1:2]==['enable'] for row in recorded)
+        if index==4:assert ['chronyc','makestep'] not in recorded
+        if index==1:assert ['apt-get','install','-y','chrony'] in recorded
+        if index==5:assert not any(row[0]=='chronyc' for row in recorded)
+        if result.returncode==0:assert 'America/New_York' in result.stdout
+    print('PASS native time synchronization decisions with isolated command fixtures', flush=True)
 
 
 def main():
     assert os.environ.get('CHAIN_TEST_OPENRC') == '1' and Path('/.dockerenv').is_file()
-    assert os.geteuid() == 0
+    assert os.geteuid() == 0 and not Path('/opt/chain').exists()
     source = Path(sys.argv[1]).resolve()
-    manifest = verify_tree(source)
-    os.environ.update(CHAIN_TEST_BIN_DIR=str(source / 'bin'), CHAIN_TEST_XRAY=str(source / 'bin/xray'))
     runtime = Path('/run/openrc')
     runtime.mkdir(exist_ok=True)
     (runtime / 'softlevel').write_text('default\n')
-    atomic_write('/etc/init.d/net', '#!/sbin/openrc-run\nstart() { return 0; }\n', 0o755)
-    service('start', 'net')
-    manager = installer.Manager()
-    assert not manager.state()['roles']
-    if sys.argv[2] == 'fresh':
-        clean_install(manager, source, manifest)
-        return
-    assert sys.argv[2] == 'recovery'
-    # Seed exactly the failed v0.2.27 state observed on Alpine, preserving its log.
-    if not manager.state_file.exists():
-        manager.base.mkdir(parents=True)
-        json_write(manager.state_file, {'owner': installer.OWNER, 'roles': {}})
-        create_account('chain-panel', '/var/lib/chain-panel')
+    net = Path('/etc/init.d/net')
+    net.write_text('#!/sbin/openrc-run\nstart() { return 0; }\nstop() { return 0; }\n')
+    net.chmod(0o755)
+    subprocess.run(['rc-service', 'net', 'start'], check=True)
+    previous = None
+    if sys.argv[2] == 'recovery':
+        subprocess.run(['addgroup', '-S', 'chain-panel'], check=True)
+        subprocess.run(['adduser', '-S', '-D', '-H', '-h', '/var/lib/chain-panel', '-s', '/sbin/nologin', '-G', 'chain-panel', 'chain-panel'], check=True)
         user = pwd.getpwnam('chain-panel')
-        data = Path('/var/lib/chain-panel')
-        data.mkdir(mode=0o700)
+        data = Path('/var/lib/chain-panel'); data.mkdir(mode=0o700)
         os.chown(data, user.pw_uid, user.pw_gid)
-        atomic_write(data / 'service.log', 'previous failed install\n')
-        os.chown(data / 'service.log', user.pw_uid, user.pw_gid)
-    data = Path('/var/lib/chain-panel')
-    assert sorted(p.name for p in data.iterdir()) == ['service.log']
-    old_log = (data / 'service.log').read_bytes()
-    old_meta = (data.stat().st_uid, data.stat().st_gid, data.stat().st_mode)
-    names = []
-    with tempfile.TemporaryDirectory(prefix='chain-openrc-install-') as temporary:
-        h = Harness(Path(temporary))
-        try:
-            cert, key = h.root / 'cert.pem', h.root / 'key.pem'
-            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt',
-                'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', str(key), '-out', str(cert),
-                '-days', '1', '-subj', '/CN=legacy.test'], check=True, capture_output=True)
-            tls_port = h.port()
-            tls = TlsServer(('127.0.0.1', tls_port), HttpHandler)
-            tls.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            tls.tls_context.minimum_version = ssl.TLSVersion.TLSv1_3
-            tls.tls_context.load_cert_chain(cert, key)
-            tls.tls_context.set_alpn_protocols(['http/1.1'])
-            h.server(tls)
-            h.http_port = h.port()
-            direct = {'protocol':'freedom','settings':{'finalRules':[{'action':'allow','network':'tcp',
-                'ip':['127.0.0.1'],'port':str(h.http_port)}]}}
-            h.server(http.server.ThreadingHTTPServer(('127.0.0.1', h.http_port), Response))
-            panel_cert = Path('/etc/letsencrypt/live/chain-panel-panel.test')
-            panel_cert.mkdir(parents=True)
-            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt',
-                'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', str(panel_cert / 'privkey.pem'),
-                '-out', str(panel_cert / 'fullchain.pem'), '-days', '1', '-subj', '/CN=panel.test',
-                '-addext', 'subjectAltName=DNS:panel.test'], check=True, capture_output=True)
-            sources = json.loads(Path(__file__).with_name('fixtures').joinpath('native-v3.json').read_text())
-            exits = []
-            # Exit services are fixtures, outside the set of old entry services to migrate.
-            for index, entry in enumerate(sources):
-                inbound = entry['config']['inbounds'][0]
-                inbound['port'] = [443, 8443, 8444, 8445][index]
-                h.ports.add(inbound['port'])
-                reality = inbound['streamSettings']['realitySettings']
-                reality.update(target=f'127.0.0.1:{tls_port}', serverNames=['legacy.test'])
-                if index:
-                    exit_port = h.port()
-                    exit_inbound = copy.deepcopy(inbound)
-                    exit_inbound.update(listen='127.0.0.1', port=exit_port)
-                    outbound = entry['config']['outbounds'][0]
-                    outbound['settings'].update(address='127.0.0.1', port=exit_port)
-                    exit_inbound['settings']['clients'][0]['id'] = outbound['settings']['id']
-                    outbound['streamSettings']['realitySettings'].update(serverName='legacy.test',
-                        publicKey=public_key(reality['privateKey']), shortId=reality['shortIds'][0])
-                    access = h.root / f'exit-{index}-access.log'
-                    config = h.root / f'exit-{index}.json'
-                    config.write_text(json.dumps({'log': {'access': str(access), 'loglevel': 'warning'},
-                        'inbounds': [exit_inbound], 'outbounds': [direct]}))
-                    h.launch(f'exit-{index}', h.xray, {}, ['run', '-config', str(config)])
-                    exits.append(access)
-                else:
-                    entry['config']['outbounds'][0]['settings'] = copy.deepcopy(direct['settings'])
-                tags = {outbound.get('tag') for outbound in entry['config']['outbounds']}
-                assert all(rule['outboundTag'] in tags for rule in entry['config']['routing']['rules'])
-                name = f'xray-chain-fixture-{index}'
-                config = h.root / f'{name}.json'
-                config.write_text(json.dumps(entry['config']))
-                definition = service_definition(name, [h.xray, 'run', '-config', config], 'openrc-test-fixture')
-                atomic_write('/etc/init.d/' + name, definition, 0o755)
-                names.append(name)
-                service('enable', name)
-                service('start', name)
-            h.wait(lambda: len([o for o in discover() if o['name'] in names]) == 4, 'four original OpenRC services')
-            originals = {o['name']: o['pids'] for o in discover() if o['name'] in names}
-            port = h.port()
-            h.base = f'http://127.0.0.1:{port}'
-            args = installer.make_parser().parse_args(['install', '--non-interactive', '--listen',
-                f'127.0.0.1:{port}', '--domain', 'panel.test', '--public-url', 'https://panel.test', '--local-host', '127.0.0.1',
-                '--local-target', f'localhost:{tls_port}'])
-            choices = []
-            def choose(question, options, default='3'):
-                if question == '为新平台选择公网 HTTPS 端口，原代理端口保持不变':
-                    return '1'
-                if question.startswith('REALITY_UNVERIFIED'):
-                    # This isolated cover server intentionally serves HTTP/1 only.
-                    assert default == '2'
-                    return '1'
-                choices.append(question)
-                assert '如何处理该服务' in question
-                return '1'
-            with patch.object(installer, 'choose', side_effect=choose):
-                assert guided_install(manager, source, manifest, args)
-            assert len(choices) == 4
-            assert set(manager.state()['roles']) == {'panel', 'agent'}
-            assert (data / 'service.log').read_bytes().startswith(old_log)
-            assert (data.stat().st_uid, data.stat().st_gid, data.stat().st_mode) == old_meta
-            h.request('/api/login', 'POST', {'token': (data / 'admin-token').read_text()})
-            state = h.state()
-            assert len(state['legacy_configs']) == 4, state['legacy_configs']
-            assert all(profile['published'] for profile in state['legacy_configs'])
-            assert not state['lines'] and not state['externals'] and not state['pending_imports']
-            https_port = urlsplit(args.public_url).port or 443
-            # Raw native configurations retain their original listener, so the
-            # panel uses the alternate HTTPS port selected by the real installer.
-            assert https_port not in {443, 8443, 8444, 8445, port}
-            def https(path):
-                return subprocess.check_output(['curl', '--noproxy', '*', '-fsS', '--max-time', '10',
-                    '--cacert', str(panel_cert / 'fullchain.pem'), '--resolve', f'panel.test:{https_port}:127.0.0.1',
-                    f'https://panel.test:{https_port}' + path])
-            html = https('/')
-            assert html == h.request('/')
-            assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', html.decode())
-            assert assets
-            for asset in assets:
-                assert https(asset) == h.request(asset)
-            for name, pids in originals.items():
-                assert not service_state(name)[0] and not service_state(name)[1]
-                assert all(not Path('/proc', str(pid)).exists() for pid in pids)
-            for index, entry in enumerate(sources):
-                inbound = entry['config']['inbounds'][0]
-                reality = inbound['streamSettings']['realitySettings']
-                client_port = h.port()
-                config = h.root / f'client-{index}.json'
-                config.write_text(json.dumps({'inbounds': [{'listen': '127.0.0.1', 'port': client_port,
-                    'protocol': 'socks', 'settings': {'auth': 'noauth'}}], 'outbounds': [{'protocol': 'vless',
-                    'settings': {'vnext': [{'address': '127.0.0.1', 'port': inbound['port'],
-                        'users': [{**inbound['settings']['clients'][0], 'encryption': 'none'}]}]},
-                    'streamSettings': {'network': 'tcp', 'security': 'reality', 'realitySettings': {
-                        'serverName': 'legacy.test', 'publicKey': public_key(reality['privateKey']),
-                        'shortId': reality['shortIds'][0], 'fingerprint': 'chrome'}}}]}))
-                client = h.launch(f'client-{index}', h.xray, {}, ['run', '-config', str(config)])
-                def probe():
-                    result = subprocess.run(['curl', '--noproxy', '', '--socks5-hostname',
-                        f'127.0.0.1:{client_port}', '--max-time', '3', '-fsS',
-                        f'http://127.0.0.1:{h.http_port}/'], capture_output=True)
-                    return result.returncode == 0 and result.stdout == b'chain-integration-ok'
-                h.wait(probe, f'original client {index} traffic', timeout=20)
-                if index:
-                    assert f'127.0.0.1:{h.http_port}' in exits[index - 1].read_text()
-                h.stop_process(client)
-            for role in ['panel', 'agent']:
-                subprocess.run(['/usr/local/bin/chainctl', 'logs', '--component', role], check=True,
-                               stdout=subprocess.DEVNULL)
-            print('PASS real OpenRC installer: failed-log recovery; panel and Agent; complete HTTPS assets on alternate port; original proxy 443 preserved; four old services imported; three external exits; four original clients carry traffic', flush=True)
-        finally:
-            for name in ['chain-ingress', 'chain-panel-cert-renew', 'chain-agent', 'chain-panel', 'nginx', *reversed(names)]:
-                if Path('/etc/init.d', name).exists():
-                    service('stop', name, check=False)
-            h.close()
+        log = data / 'service.log'; log.write_text('previous failed install\n'); log.chmod(0o600)
+        os.chown(log, user.pw_uid, user.pw_gid)
+        previous = (log.read_bytes(), log.stat().st_uid, log.stat().st_gid, log.stat().st_mode)
+        base = Path('/opt/chain'); (base / 'releases').mkdir(parents=True)
+        state = base / '.chain-install.json'
+        state.write_text(json.dumps({'owner': 'chain-panel-installer-v1', 'roles': {}})); state.chmod(0o600)
+    with tempfile.TemporaryDirectory(prefix='native-openrc-') as temporary:
+        work = Path(temporary)
+        manifest = json.loads((source / 'release.json').read_text())
+        archive = work / 'native.tar.gz'
+        with tarfile.open(archive, 'w:gz') as bundle:
+            for name in [*manifest['files'], 'release.json']:
+                bundle.add(source / name, arcname=name, recursive=False)
+        (work / 'SHA256SUMS').write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  native.tar.gz\n')
+        ctl = source / 'bin/chainctl'
+        install = [str(ctl), 'install', '--package', str(archive), '--non-interactive',
+                   '--listen', '127.0.0.1:37243', '--local-host', '127.0.0.1']
+        def run(*args):
+            result = subprocess.run([str(ctl), *args], timeout=120, capture_output=True, text=True)
+            assert result.returncode == 0, result.stdout + result.stderr
+            return result
+        subprocess.run(install, check=True, timeout=120)
+        wrapper = Path('/usr/local/bin/chainctl')
+        assert wrapper.is_symlink() and wrapper.resolve().name == 'chainctl'
+        for role in ['panel', 'agent']:
+            subprocess.run(['rc-service', 'chain-' + role, 'status'], check=True)
+            unit = Path('/etc/init.d/chain-' + role).read_text()
+            assert 'python' not in unit and ':"$PATH"' in unit
+            assert Path('/var/lib/chain-' + role, '.chain-owner').read_text() == 'chain-' + role
+        if previous:
+            log = Path('/var/lib/chain-panel/service.log')
+            assert log.read_bytes().startswith(previous[0])
+            assert (log.stat().st_uid, log.stat().st_gid, log.stat().st_mode) == previous[1:]
+        token = Path('/etc/chain-agent/token').read_bytes()
+        admin = Path('/var/lib/chain-panel/admin-token').read_bytes()
+        node = Path('/var/lib/chain-panel/local-system-node').read_bytes()
+        jar = http.cookiejar.CookieJar()
+        client = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
+        api_base = 'http://127.0.0.1:37243'
+        def api(path, value=None):
+            request = urllib.request.Request(api_base + '/api/' + path,
+                data=None if value is None else json.dumps(value).encode(),
+                headers={'Content-Type': 'application/json', 'X-Chain-Request': '1'})
+            with client.open(request, timeout=10) as response:
+                return json.load(response)
+        def ready():
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    api('login', {'token': admin.decode().strip()})
+                    break
+                except urllib.error.URLError as error:
+                    assert time.monotonic() < deadline, error
+                    time.sleep(.1)
+            while not api('state')['nodes'][0]['online']:
+                assert time.monotonic() < deadline
+                time.sleep(.2)
+        ready()
+        if sys.argv[2] == 'recovery':
+            unit = Path('/etc/init.d/chain-panel')
+            definition = unit.read_text()
+            pidfile = Path('/run/supervise-chain-panel.pid')
+            run('stop', '--component', 'panel')
+            unit.write_text(definition + '\nstart_post() { return 1; }\n')
+            failed = subprocess.run(['rc-service', 'chain-panel', 'start'], capture_output=True)
+            assert failed.returncode != 0
+            orphan = int(pidfile.read_text())
+            run('stop', '--component', 'panel')
+            assert not Path(f'/proc/{orphan}').exists() and not pidfile.exists()
+            unit.write_text(definition)
+            foreign = subprocess.Popen(['sleep', '300'])
+            try:
+                pidfile.write_text(str(foreign.pid)); pidfile.chmod(0o600)
+                result = subprocess.run([str(ctl), 'restart', '--component', 'panel'], capture_output=True, text=True, timeout=30)
+                assert result.returncode != 0 and foreign.poll() is None, result.stderr
+            finally:
+                foreign.terminate(); foreign.wait(timeout=5)
+                pidfile.unlink(missing_ok=True)
+            run('start', '--component', 'panel')
+            ready()
+        certdir = Path('/etc/native-test-cert'); certdir.mkdir()
+        cert, key = certdir / 'cert.pem', certdir / 'key.pem'
+        subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:prime256v1',
+            '-nodes','-days','1','-subj','/CN=panel.test','-addext','subjectAltName=DNS:panel.test',
+            '-out',str(cert),'-keyout',str(key)],check=True,capture_output=True)
+        with Path('/etc/hosts').open('a') as stream: stream.write('\n127.0.0.1 panel.test\n')
+        state_path = Path('/opt/chain/.chain-install.json')
+        saved = json.loads(state_path.read_text())
+        saved['roles']['panel']['manual_https'] = {'port':37443,'cert':str(cert),'key':str(key)}
+        state_path.write_text(json.dumps(saved))
+        install += ['--domain','panel.test']
+        subprocess.run(install, check=True, timeout=120)
+        context = ssl.create_default_context(cafile=str(cert))
+        client = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=context),urllib.request.HTTPCookieProcessor(jar))
+        api_base = 'https://panel.test:37443'
+        ready()
+        with client.open(api_base, timeout=10) as response:
+            assert b'<!doctype html>' in response.read().lower()
+        assert Path('/etc/chain-panel-https/nginx.conf').is_file()
+        assert len(api('state')['nodes']) == 1
+        assert Path('/etc/chain-agent/token').read_bytes() == token
+        assert Path('/var/lib/chain-panel/admin-token').read_bytes() == admin
+        assert Path('/var/lib/chain-panel/local-system-node').read_bytes() == node
+        path = '/run/chain-maintenance/control.sock'
+        panel_user = pwd.getpwnam('chain-panel')
+        def request(value, uid=panel_user.pw_uid):
+            code = "import socket,json,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()+b'\\n'); print(s.makefile('rb').readline().decode())"
+            result = subprocess.run([sys.executable, '-B', '-c', code, path, json.dumps(value)],
+                user=uid, group=panel_user.pw_gid, extra_groups=[], capture_output=True, text=True, timeout=15)
+            assert result.returncode == 0, result.stderr
+            return json.loads(result.stdout)
+        deadline = time.monotonic() + 15
+        while not Path(path).exists():
+            assert time.monotonic() < deadline
+            time.sleep(.1)
+        info = Path(path).stat()
+        assert (info.st_uid, info.st_gid, info.st_mode & 0o777) == (0, panel_user.pw_gid, 0o660)
+        pidfile = Path('/run/supervise-chain-maintenance.pid')
+        pid = pidfile.read_text()
+        run('internal-adopt')
+        assert pidfile.read_text() == pid and Path(path).stat().st_ino == info.st_ino
+        task = str(uuid.uuid4())
+        assert 'error' in request({'id': task, 'action': 'restart-all'}, pwd.getpwnam('nobody').pw_uid)
+        assert 'error' in request({'id': task, 'action': 'restart-all', 'command': 'id'})
+        assert request({'id': task, 'action': 'status'})['state'] == 'not_found'
+        assert request({'id': task, 'action': 'restart-all'})['state'] == 'queued'
+        deadline = time.monotonic() + 60
+        while True:
+            job = request({'id': task, 'action': 'status'})
+            if job['state'] not in ('queued', 'running'):
+                break
+            assert time.monotonic() < deadline
+            time.sleep(.2)
+        assert job['state'] == 'succeeded', job
+        assert request({'id': task, 'action': 'restart-all'}) == job
+        assert 'error' in request({'id': task, 'action': 'restart-panel'})
+        subprocess.run(['rc-service', 'chain-maintenance', 'restart'], check=True)
+        assert request({'id': task, 'action': 'status'})['state'] == 'succeeded'
+        ready()
+        run('update', '--package', str(archive), '--non-interactive')
+        ready()
+        assert Path('/etc/chain-agent/token').read_bytes() == token
+        run('uninstall', '--non-interactive')
+        assert not wrapper.exists()
+        assert Path('/var/lib/chain-panel/admin-token').read_bytes() == admin
+        subprocess.run(install, check=True, timeout=120)
+        ready()
+        assert Path('/etc/chain-agent/token').read_bytes() == token
+        run('uninstall', '--purge', '--non-interactive')
+        assert not Path('/var/lib/chain-agent').exists()
+        assert not Path('/var/lib/chain-panel').exists()
+        time_checks(ctl, work)
+        print('PASS native OpenRC install/recovery, identity, maintenance receipts, update, uninstall and reinstall', flush=True)
+
+
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except BaseException:
+        for path in [Path('/var/lib/chain-panel/service.log'), Path('/var/lib/chain-agent/service.log')]:
+            if path.exists():
+                print(f'{path}:\n{path.read_text(errors="replace")[-4000:]}', flush=True)
+        subprocess.run(['ps', '-ef'])
+        raise

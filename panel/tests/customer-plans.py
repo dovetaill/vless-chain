@@ -69,6 +69,7 @@ def exercise(h):
     h.wait(lambda: (h.root / "control" / "admin-token").exists() and h.request("/") or False, "controller start")
     h.login()
     admin_token = (h.root / "control" / "admin-token").read_text()
+    h.fixture_reality_target(tls_port)
     nodes, agents, agent_envs = [], [], []
     for index in range(2):
         node = h.request("/api/nodes", "POST", {"name": f"套餐入口 {index}", "host": "127.0.0.1",
@@ -155,7 +156,7 @@ def exercise(h):
         h.request("/api/lines/operate", "POST", {"line_ids": [old["id"]], "action": "disable"}, status=403)
     assert all(current(line)["rental"]["started_at"] > 0 and not current(line)["published"] for line in lines)
     # Same local HTTP/1 TLS fixture as smoke.py; it deliberately cannot advertise H2 preflight.
-    h.publish(allow_unverified_reality=True)
+    h.publish()
     synced([old, *lines])
     assert [current(line)["multiplier"] for line in lines] == [2, 1]
     print("PASS independent rights stay independent; finance opens one shared order exactly once", flush=True)

@@ -62,15 +62,23 @@ class WebsiteBackend(http.server.BaseHTTPRequestHandler):
 
 
 def exercise(h, nodes, echo_port, agents, agent_envs):
+    reality = next(line['access']['reality'] for line in h.state()['lines']
+                   if line['access']['reality']['target'])
     old = h.request('/api/nodes', 'POST', {'name': '旧版本兼容检查', 'host': '127.0.0.1'})
     h.request(f"/api/agent/{old['id']}/sync", 'POST', {'running': True, 'applied': True, 'revision': '', 'error': ''},
               authenticated=False, headers={'Authorization': 'Bearer ' + old['token']})
     legacy = h.request('/api/lines', 'POST', {'name': '旧 Agent 保护', 'kind': 'vless',
+                      'access': {'reality': reality},
                       'hops': [{'node_id': old['id'], 'port': h.port()}]})
     assert 'Agent' in h.request('/api/publish', 'POST', {}, status=400)['error']
     h.request('/api/lines/' + legacy['id'], 'DELETE')
     h.request('/api/nodes/' + old['id'], 'DELETE')
     print('PASS old-Agent capability check rejects incompatible publication before changing listeners', flush=True)
+    # These Agents share one test host. Retire the completed multi-host fixtures
+    # before reallocating internal listeners for the single-node feature checks.
+    for line in h.state()['lines']:
+        h.request('/api/lines/' + line['id'], 'DELETE')
+    h.publish()
     def create(name, kind="vless", **extra):
         return h.request("/api/lines", "POST", {"name": name, "kind": kind,
             "hops": [{"node_id": nodes[0]["id"], "port": h.port()}], **extra})
@@ -83,6 +91,7 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
     vless_tls = create("VLESS TLS Vision", access={"protocol": "vless", "tls": tls})
     port = h.port()
     h.server(http.server.ThreadingHTTPServer(("127.0.0.1", port), WebsiteBackend))
+    h.allow_loopback_target(port)
     site = create("演示网站", "website", target=f"http://127.0.0.1:{port}/app",
                   access={"tls": {"mode": "off", "domain": "app.example.test"}})
     other_site = h.request("/api/lines", "POST", {"name": "共享端口网站", "kind": "website",
@@ -96,6 +105,7 @@ def exercise(h, nodes, echo_port, agents, agent_envs):
                    limits={"monthly_gib": 8192 / 1073741824})
     occupied = next(n for n in h.state()['nodes'] if n['id'] == nodes[0]['id'])['report']['system']['listening_ports']
     automatic = h.request('/api/lines', 'POST', {'name': '自动端口分配', 'kind': 'vless',
+        'access': {'protocol': 'socks'},
         'target': f'127.0.0.1:{echo_port}', 'hops': [{'node_id': nodes[0]['id']}]})
     allocated = automatic['hops'][0]['port']
     assert allocated not in occupied, 'Automatic port conflicts with an existing host listener'

@@ -61,6 +61,7 @@ def main():
             token = h.root / 'token'
             token.write_text(node['token'])
             token.chmod(0o600)
+            h.fixture_reality_target(tls_port, enabled=False)
             h.launch('agent', h.bin_dir / 'chain-agent', {'CHAIN_AGENT_DIR': str(h.root / 'agent'),
                 'CHAIN_PANEL_URL': h.base, 'CHAIN_NODE_ID': node['id'], 'CHAIN_NODE_TOKEN_FILE': str(token),
                 'CHAIN_XRAY_BIN': str(h.xray), 'CHAIN_XRAY_LOG_LEVEL': 'debug'})
@@ -98,11 +99,16 @@ def main():
             assert len({line['name'] for line in state['lines']}) == 4
             h.request('/api/legacy-import', 'POST', request)
             assert len(h.state()['externals']) == 3
-            # This self-signed HTTP/1-only target is intentionally unverifiable;
-            # require an explicit override, without disabling production checks.
+            # The real admission check must reject our private, self-signed cover.
+            before_jobs = h.state()['jobs']
             warning = h.request('/api/publish', 'POST', {}, status=400)
-            assert 'REALITY_UNVERIFIED' in warning['error'], warning
-            h.publish(allow_unverified_reality=True)
+            assert 'REALITY' in warning['error'] and '草稿' in warning['error'], warning
+            h.request('/api/publish', 'POST', {'allow_unverified_reality': True}, status=422)
+            assert h.state()['jobs'] == before_jobs
+            assert len(h.state()['lines']) == 4
+            h.preflight_fixture.enabled = True
+            h.publish()
+            assert h.preflight_fixture.intercepted > 0
             for index, (source, line) in enumerate(zip(sources, state['lines'])):
                 inbound = source['config']['inbounds'][0]
                 reality = inbound['streamSettings']['realitySettings']
