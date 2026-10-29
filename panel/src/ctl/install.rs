@@ -640,11 +640,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.environment("agent").unwrap()["CHAIN_NODE_ID"], node);
-        assert!(
-            fs::read_to_string(manager.unit_path("agent"))
-                .unwrap()
-                .contains("LimitNOFILE=65536")
-        );
+        let unit = fs::read_to_string(manager.unit_path("agent")).unwrap();
+        match manager.kind() {
+            "launchd" => {
+                assert!(unit.contains("<key>UserName</key><string>chain-agent</string>"));
+                assert!(unit.contains("<key>GroupName</key><string>chain-agent</string>"));
+                assert!(unit.contains(&format!("<key>CHAIN_NODE_ID</key><string>{node}</string>")));
+            }
+            "openrc" => assert!(unit.contains("rc_ulimit=\"-n 65536\"")),
+            _ => assert!(unit.contains("LimitNOFILE=65536")),
+        }
         let path = manager.path("/etc/chain-agent/token");
         let before = fs::metadata(&path).unwrap();
         component(&manager, &source, "agent", &Options::default())

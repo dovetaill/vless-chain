@@ -356,9 +356,8 @@ async fn recover(manager: &Manager, j: &Value) -> Result<String> {
 fn account_groups(account: &std::ffi::CStr, gid: libc::gid_t) -> Result<Vec<libc::gid_t>> {
     // Darwin's getgrouplist uses signed int IDs; setgroups still takes gid_t IDs.
     let base_gid = gid.try_into().context("服务主组超出系统接口范围")?;
-    let mut count = 0;
-    unsafe { libc::getgrouplist(account.as_ptr(), base_gid, std::ptr::null_mut(), &mut count) };
-    ensure!(count > 0 && count < 1024, "服务组数量无效");
+    // Darwin does not report the required size when the output buffer is null.
+    let mut count = 1023;
     let mut groups = vec![0; count as usize];
     ensure!(
         unsafe { libc::getgrouplist(account.as_ptr(), base_gid, groups.as_mut_ptr(), &mut count) }
@@ -366,7 +365,7 @@ fn account_groups(account: &std::ffi::CStr, gid: libc::gid_t) -> Result<Vec<libc
         "服务组解析失败"
     );
     ensure!(
-        count >= 0 && count as usize <= groups.len(),
+        count > 0 && count as usize <= groups.len(),
         "服务组数量已改变"
     );
     groups.truncate(count as usize);

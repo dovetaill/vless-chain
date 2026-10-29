@@ -405,8 +405,16 @@ mod tests {
             &BTreeMap::from([("CHAIN_VALUE".into(), "$(id);'quoted'".into())]),
         )
         .unwrap();
-        assert!(body.contains("export CHAIN_VALUE='$(id);'\\''quoted'\\'''"));
-        assert!(body.contains("cap_net_bind_service"));
+        assert_eq!(shell("$(id);'quoted'"), "'$(id);'\\''quoted'\\'''");
+        if m.kind() == "launchd" {
+            assert!(body.contains("<string>/tmp/my binary</string>"));
+            assert!(
+                body.contains("<key>CHAIN_VALUE</key><string>$(id);&apos;quoted&apos;</string>")
+            );
+        } else {
+            assert!(body.contains("export CHAIN_VALUE='$(id);'\\''quoted'\\'''"));
+            assert!(body.contains("cap_net_bind_service"));
+        }
         assert!(!body.contains("python"));
     }
 }

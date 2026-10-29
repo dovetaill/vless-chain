@@ -717,7 +717,13 @@ mod tests {
     use crate::ctl::package::tests::fixture;
 
     fn installed(root: &Path) -> Manager {
-        let base = root.join("opt/chain");
+        let root = root.canonicalize().unwrap();
+        let manager = Manager {
+            base: root.join("opt/chain"),
+            root,
+        };
+        let root = &manager.root;
+        let base = &manager.base;
         fs::create_dir_all(base.join("releases/old")).unwrap();
         fixture(&base.join("releases/old"));
         let mut roles = serde_json::Map::new();
@@ -729,12 +735,9 @@ mod tests {
                 "CHAIN_LISTEN=\"127.0.0.1:8088\"\n",
             )
             .unwrap();
-            fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
-            fs::write(
-                root.join(format!("etc/systemd/system/chain-{role}.service")),
-                OWNER,
-            )
-            .unwrap();
+            let unit = manager.unit_path(role);
+            fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            fs::write(unit, OWNER).unwrap();
             roles.insert(role.into(), json!({"current":"old","version":"0.2.48","previous":null,"setup_complete":true,"panel_only":false,"custom":"preserve"}));
         }
         fs::write(
