@@ -353,6 +353,28 @@ async fn recover(manager: &Manager, j: &Value) -> Result<String> {
     fs::remove_file(manager.base.join(".core-pending.json"))?;
     Ok(detail.into())
 }
+fn account_groups(account: &std::ffi::CStr, gid: libc::gid_t) -> Result<Vec<libc::gid_t>> {
+    // Darwin's getgrouplist uses signed int IDs; setgroups still takes gid_t IDs.
+    let base_gid = gid.try_into().context("服务主组超出系统接口范围")?;
+    let mut count = 0;
+    unsafe { libc::getgrouplist(account.as_ptr(), base_gid, std::ptr::null_mut(), &mut count) };
+    ensure!(count > 0 && count < 1024, "服务组数量无效");
+    let mut groups = vec![0; count as usize];
+    ensure!(
+        unsafe { libc::getgrouplist(account.as_ptr(), base_gid, groups.as_mut_ptr(), &mut count) }
+            >= 0,
+        "服务组解析失败"
+    );
+    ensure!(
+        count >= 0 && count as usize <= groups.len(),
+        "服务组数量已改变"
+    );
+    groups.truncate(count as usize);
+    groups
+        .into_iter()
+        .map(|id| libc::gid_t::try_from(id).context("服务组 ID 无效"))
+        .collect()
+}
 async fn identity(
     manager: &Manager,
     env: &BTreeMap<String, String>,
@@ -431,15 +453,7 @@ async fn identity(
         uid != 0 && (data.uid(), data.gid()) == (uid, gid),
         "Agent 数据归属与服务身份不匹配"
     );
-    let mut count = 0;
-    unsafe { libc::getgrouplist(account.as_ptr(), gid, std::ptr::null_mut(), &mut count) };
-    ensure!(count > 0 && count < 1024, "服务组数量无效");
-    let mut groups = vec![0; count as usize];
-    ensure!(
-        unsafe { libc::getgrouplist(account.as_ptr(), gid, groups.as_mut_ptr(), &mut count,) } >= 0,
-        "服务组解析失败"
-    );
-    groups.truncate(count as usize);
+    let mut groups = account_groups(&account, gid)?;
     for name in supplements.split_whitespace() {
         groups.push(group_id(name)?);
     }
@@ -744,7 +758,13 @@ async fn preflight(
             cmd.uid(uid).gid(gid);
             unsafe {
                 cmd.pre_exec(move || {
-                    if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+                    let count = groups.len().try_into().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "服务组数量超出系统接口范围",
+                        )
+                    })?;
+                    if libc::setgroups(count, groups.as_ptr()) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
@@ -924,6 +944,16 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn account_groups_preserve_native_gid_type_and_primary_group() {
+        let entry = unsafe { libc::getpwuid(libc::geteuid()) };
+        assert!(!entry.is_null());
+        let account = unsafe { std::ffi::CStr::from_ptr((*entry).pw_name) }.to_owned();
+        let gid = unsafe { (*entry).pw_gid };
+        let groups: Vec<libc::gid_t> = account_groups(&account, gid).unwrap();
+        assert!(groups.contains(&gid));
+        assert!(!groups.is_empty() && groups.len() < 1024);
+    }
     fn installed(root: &Path) -> (Manager, BTreeMap<String, String>) {
         let m = super::super::lifecycle::open(root).unwrap();
         let release = m.base.join("releases/old");
