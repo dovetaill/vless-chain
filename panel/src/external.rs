@@ -5,6 +5,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use url::Url;
+mod native;
 
 fn text<'a>(node: &'a Value, key: &str, fallback: &'a str) -> Result<&'a str> {
     match node.get(key) {
@@ -23,6 +24,13 @@ fn flag(node: &Value, key: &str, fallback: bool) -> Result<bool> {
 
 pub fn import(input: &str) -> Result<(String, String)> {
     let input = input.trim();
+    if input.starts_with("mihomo://") {
+        let node = native::decode(input)?;
+        return Ok((native::encode(&node)?, text(&node,"name",text(&node,"server","代理")?)?.into()));
+    }
+    if let Some(node) = native::share_node(input)? {
+        return Ok((native::encode(&node)?,text(&node,"name",text(&node,"server","代理")?)?.into()));
+    }
     if [
         "vless://",
         "vmess://",
@@ -68,10 +76,21 @@ pub fn import(input: &str) -> Result<(String, String)> {
     ensure!(
         matches!(
             kind,
-            "vless" | "trojan" | "ss" | "http" | "socks5" | "vmess" | "hysteria2" | "tuic"
+            "vless" | "trojan" | "ss" | "ssr" | "snell" | "wireguard" | "shadowquic"
+                | "http" | "socks5" | "vmess" | "hysteria" | "hysteria2" | "tuic" | "anytls"
         ),
         "不支持此代理协议"
     );
+    // Preserve the complete Mihomo node so plugin and transport fields reach the sidecar intact.
+    if matches!(kind, "ssr" | "snell" | "wireguard" | "shadowquic" | "anytls" | "hysteria") {
+        return Ok((native::encode(&node)?, text(&node, "name", text(&node,"server","代理")?)?.into()));
+    }
+    if node.get("plugin").is_some() || node.get("plugin-opts").is_some()
+        || matches!(text(&node,"network","tcp")?, "ws" | "grpc" | "h2" | "http")
+        || kind == "hysteria2" && fields.keys().any(|k| ["obfs","ports","hop-interval","up","down","udp-mtu","handshake-timeout"].contains(&k.as_str()))
+        || kind == "socks5" && flag(&node,"tls",false)? {
+        return Ok((native::encode(&node)?,text(&node,"name",text(&node,"server","代理")?)?.into()));
+    }
     // Reject unsupported settings instead of silently changing how the proxy connects.
     let common = ["name", "type", "server", "port", "udp", "tfo", "ip-version"];
     let specific: &[&str] = match kind {
@@ -316,6 +335,15 @@ pub fn import(input: &str) -> Result<(String, String)> {
 }
 
 pub fn mihomo(link: &str, name: &str) -> Result<Value> {
+    if let Some(mut node) = native::share_node(link)? {
+        node["name"] = json!(name);
+        return Ok(node);
+    }
+    if link.starts_with("mihomo://") {
+        let mut node = native::decode(link)?;
+        node["name"] = json!(name);
+        return Ok(node);
+    }
     let out = external_outbound(link, "export")?;
     let q: std::collections::BTreeMap<String, String> = if link.starts_with("vmess://") {
         let value: Value =
@@ -435,7 +463,7 @@ mod tests {
             external_outbound(&link, "x").unwrap()
         );
         assert!(import(&format!("{input}\n{input}")).is_err());
-        assert!(import(&input.replace("network: tcp", "network: ws")).is_err());
+        assert!(import(&input.replace("network: tcp", "network: invalid")).is_err());
         assert!(import(&input.replace("tls: true", "tls: true, dialer-proxy: hidden")).is_err());
         assert!(import(&input.replace("port: 8443", "port: 0")).is_err());
         assert!(
@@ -466,4 +494,24 @@ mod tests {
             assert_eq!(mihomo(&link, "test").unwrap()["udp"], false);
         }
     }
+
+    #[test]
+    fn mihomo_only_protocols_round_trip_without_dropping_fields() {
+        let input = "{name: ssr, type: ssr, server: proxy.example, port: 443, cipher: aes-128-cfb, password: secret, obfs: tls1.2_ticket_auth, obfs-param: example.com, protocol: origin, protocol-param: user, udp: true}";
+        let (link, name) = import(input).unwrap();
+        assert!(link.starts_with("mihomo://"));
+        let node = mihomo(&link, &name).unwrap();
+        assert_eq!(node["type"], "ssr");
+        assert_eq!(node["obfs-param"], "example.com");
+        assert_eq!(node["protocol-param"], "user");
+    }
+}
+
+pub fn native_outbound(link: &str, tag: &str) -> Result<Value> {
+    let node = native::decode(link)?;
+    Ok(json!({"tag":tag,"protocol":"mihomo","settings":node}))
+}
+
+pub fn extended_outbound(link: &str, tag: &str) -> Result<Option<Value>> {
+    Ok(native::share_node(link)?.map(|node| json!({"tag":tag,"protocol":"mihomo","settings":node})))
 }

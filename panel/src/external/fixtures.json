@@ -1,0 +1,277 @@
+[
+  {
+    "name": "ssr-0",
+    "type": "ssr",
+    "server": "127.0.0.1",
+    "port": 443,
+    "cipher": "aes-128-cfb",
+    "password": "test",
+    "obfs": "plain",
+    "protocol": "origin"
+  },
+  {
+    "name": "snell-1",
+    "type": "snell",
+    "server": "127.0.0.1",
+    "port": 443,
+    "psk": "test",
+    "version": 3
+  },
+  {
+    "name": "wireguard-2",
+    "type": "wireguard",
+    "server": "127.0.0.1",
+    "port": 443,
+    "ip": "10.0.0.2",
+    "private-key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "public-key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "mtu": 1280
+  },
+  {
+    "name": "shadowquic-3",
+    "type": "shadowquic",
+    "server": "127.0.0.1",
+    "port": 443,
+    "username": "test",
+    "password": "test",
+    "sni": "example.com"
+  },
+  {
+    "name": "anytls-4",
+    "type": "anytls",
+    "server": "127.0.0.1",
+    "port": 443,
+    "password": "test",
+    "sni": "example.com"
+  },
+  {
+    "name": "hysteria-5",
+    "type": "hysteria",
+    "server": "127.0.0.1",
+    "port": 443,
+    "auth-str": "test",
+    "up": "10 Mbps",
+    "down": "10 Mbps",
+    "sni": "example.com"
+  },
+  {
+    "name": "ss-6",
+    "type": "ss",
+    "server": "127.0.0.1",
+    "port": 443,
+    "cipher": "aes-128-gcm",
+    "password": "test",
+    "plugin": "obfs",
+    "plugin-opts": {
+      "mode": "http",
+      "host": "example.com"
+    }
+  },
+  {
+    "name": "ss-7",
+    "type": "ss",
+    "server": "127.0.0.1",
+    "port": 443,
+    "cipher": "aes-128-gcm",
+    "password": "test",
+    "plugin": "v2ray-plugin",
+    "plugin-opts": {
+      "mode": "websocket",
+      "host": "example.com",
+      "path": "/proxy",
+      "tls": true
+    }
+  },
+  {
+    "name": "hysteria2-8",
+    "type": "hysteria2",
+    "server": "127.0.0.1",
+    "port": 443,
+    "password": "test",
+    "sni": "example.com",
+    "obfs": "salamander",
+    "obfs-password": "test",
+    "ports": "443,8443-8445",
+    "hop-interval": "30",
+    "up": "10 Mbps",
+    "down": "10 Mbps",
+    "udp-mtu": 1200,
+    "handshake-timeout": 10000
+  },
+  {
+    "name": "vmess-9",
+    "type": "vmess",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "ws",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "alterId": 0,
+    "cipher": "auto",
+    "ws-opts": {
+      "path": "/proxy",
+      "headers": {
+        "Host": "example.com"
+      }
+    }
+  },
+  {
+    "name": "vmess-10",
+    "type": "vmess",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "grpc",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "alterId": 0,
+    "cipher": "auto",
+    "grpc-opts": {
+      "grpc-service-name": "proxy"
+    }
+  },
+  {
+    "name": "vmess-11",
+    "type": "vmess",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "h2",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "alterId": 0,
+    "cipher": "auto",
+    "h2-opts": {
+      "path": "/proxy",
+      "host": [
+        "example.com"
+      ]
+    }
+  },
+  {
+    "name": "vmess-12",
+    "type": "vmess",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "http",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "alterId": 0,
+    "cipher": "auto",
+    "http-opts": {
+      "path": [
+        "/proxy"
+      ],
+      "method": "GET",
+      "headers": {
+        "Host": [
+          "example.com"
+        ]
+      }
+    }
+  },
+  {
+    "name": "vless-13",
+    "type": "vless",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "ws",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "ws-opts": {
+      "path": "/proxy",
+      "headers": {
+        "Host": "example.com"
+      }
+    }
+  },
+  {
+    "name": "vless-14",
+    "type": "vless",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "grpc",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "grpc-opts": {
+      "grpc-service-name": "proxy"
+    }
+  },
+  {
+    "name": "vless-15",
+    "type": "vless",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "h2",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "h2-opts": {
+      "path": "/proxy",
+      "host": [
+        "example.com"
+      ]
+    }
+  },
+  {
+    "name": "vless-16",
+    "type": "vless",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "http",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "tls": true,
+    "servername": "example.com",
+    "http-opts": {
+      "path": [
+        "/proxy"
+      ],
+      "method": "GET",
+      "headers": {
+        "Host": [
+          "example.com"
+        ]
+      }
+    }
+  },
+  {
+    "name": "trojan-17",
+    "type": "trojan",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "ws",
+    "password": "test",
+    "sni": "example.com",
+    "ws-opts": {
+      "path": "/proxy",
+      "headers": {
+        "Host": "example.com"
+      }
+    }
+  },
+  {
+    "name": "trojan-18",
+    "type": "trojan",
+    "server": "127.0.0.1",
+    "port": 443,
+    "network": "grpc",
+    "password": "test",
+    "sni": "example.com",
+    "grpc-opts": {
+      "grpc-service-name": "proxy"
+    }
+  },
+  {
+    "name": "socks5-19",
+    "type": "socks5",
+    "server": "127.0.0.1",
+    "port": 443,
+    "username": "test",
+    "password": "test",
+    "tls": true
+  }
+]

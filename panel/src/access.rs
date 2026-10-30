@@ -215,8 +215,9 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
         "ss" => {
             ensure!(
                 u.query_pairs()
-                    .all(|(key, _)| matches!(key.as_ref(), "tfo" | "udp")),
-                "暂不支持 Shadowsocks 插件参数"
+                    .all(|(key, value)| matches!(key.as_ref(), "tfo" | "udp")
+                        || (key == "type" && value == "tcp")),
+                "暂不支持该 Shadowsocks 参数；仅支持 type=tcp、tfo 和 udp"
             );
             let credential = if u.password().is_some() {
                 format!("{user}:{pass}")
@@ -801,6 +802,17 @@ mod tests {
         );
         let auth = URL_SAFE_NO_PAD.encode("aes-128-gcm:secret");
         assert!(external(&format!("ss://{auth}@proxy.example.com:8388"), "a").is_ok());
+        assert!(external(&format!("ss://{auth}@proxy.example.com:8388?type=tcp"), "a").is_ok());
         assert!(external(&format!("ss://{auth}@proxy.example.com:8388?plugin=x"), "a").is_err());
+    }
+
+    #[test]
+    fn ss_2022_multi_user_credentials_with_tcp_type_parse() {
+        let credentials = format!("2022-blake3-aes-256-gcm:{}:{}", STANDARD.encode([1u8; 32]), STANDARD.encode([2u8; 32]));
+        let link = format!("ss://{}@proxy.example:33688?type=tcp#HK", STANDARD.encode(&credentials));
+        let out = external(&link, "test").unwrap();
+        assert_eq!(out["protocol"], "shadowsocks");
+        assert_eq!(out["settings"]["servers"][0]["address"], "proxy.example");
+        assert_eq!(out["settings"]["servers"][0]["port"], 33688);
     }
 }

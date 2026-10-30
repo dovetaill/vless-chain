@@ -45,6 +45,10 @@ pub fn address(host: &str, port: u16) -> String {
     }
 }
 pub fn external_outbound(link: &str, tag: &str) -> Result<Value> {
+    if link.starts_with("mihomo://") {
+        return crate::external::native_outbound(link, tag);
+    }
+    if let Some(outbound) = crate::external::extended_outbound(link, tag)? { return Ok(outbound); }
     if !link.starts_with("vless://") {
         return crate::access::external(link, tag);
     }
@@ -260,11 +264,11 @@ pub fn needs_mihomo(outbound: &Value) -> bool {
     // Keep SS handshakes, QUIC sessions and nested HTTPS TLS in the same core.
     matches!(
         outbound["protocol"].as_str(),
-        Some("tuic" | "hysteria" | "shadowsocks")
+        Some("tuic" | "hysteria" | "shadowsocks" | "mihomo")
     ) || outbound["protocol"] == "http" && outbound["streamSettings"]["security"] == "tls"
 }
 fn udp_after(udp: bool, protocol: &str, supported: bool, index: usize) -> Result<bool> {
-    if matches!(protocol, "hysteria2" | "tuic") {
+    if matches!(protocol, "hysteria2" | "tuic" | "hysteria" | "wireguard" | "shadowquic") {
         ensure!(
             udp,
             "第 {} 跳 {} 需要 UDP，前面的代理路径仅支持 TCP；请调整链式顺序",
@@ -875,6 +879,23 @@ mod tests {
                 c["a"]["_mihomo"]["proxies"][0]["port"]
             );
             assert_eq!(c["a"]["_chain"][0]["network"], "udp");
+        }
+    }
+    #[test]
+    fn native_imports_compile_to_sidecar() {
+        let nodes: Vec<Value> = serde_json::from_str(include_str!("external/fixtures.json")).unwrap();
+        for mut node in nodes {
+            let mut doc = fixture();
+            doc.lines[0].hops.truncate(1);
+            let (url,name) = crate::external::import(&node.to_string()).unwrap();
+            doc.externals.push(External { id:"native".into(),name,url });
+            doc.lines[0].chain = vec!["external:native".into()];
+            let configs = compile(&doc).unwrap();
+            let proxy = &configs["a"]["_mihomo"]["proxies"][0];
+            node["name"] = proxy["name"].clone();
+            if node.get("udp").is_none() { node["udp"] = json!(true); }
+            assert_eq!(proxy,&node);
+            assert!(configs["a"]["outbounds"].as_array().unwrap().iter().all(|v| v["protocol"] != "mihomo"));
         }
     }
     #[test]
