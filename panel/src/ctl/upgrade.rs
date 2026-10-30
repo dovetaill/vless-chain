@@ -215,14 +215,6 @@ impl Manager {
             self.environment(role)?;
             running.push(self.active(role).await?);
         }
-        let temporary = tempfile::Builder::new()
-            .prefix(".update-core-")
-            .tempdir_in(&self.base)?;
-        let stage = temporary.path().join("stage");
-        package::copy(source, &stage, &manifest)?;
-        super::cores::preserve(self, &stage)?;
-        let source = stage.as_path();
-        let manifest = package::verify(source, true)?;
         let id = format!(
             "{}-{}-{}-{}",
             manifest.version,
@@ -756,7 +748,28 @@ mod tests {
         fixture(&source);
         let env = root.path().join("etc/chain-agent/agent.env");
         let before = fs::metadata(&env).unwrap();
+        let old = manager.base.join("releases/old");
+        let mut selected: Value =
+            serde_json::from_slice(&fs::read(old.join("release.json")).unwrap()).unwrap();
+        for core in ["xray", "mihomo"] {
+            selected[format!("{core}_selected")] = json!(true);
+            selected[core] = json!("1.0.0");
+        }
+        fs::write(
+            old.join("release.json"),
+            serde_json::to_vec(&selected).unwrap(),
+        )
+        .unwrap();
+        let expected = fs::read(source.join("release.json")).unwrap();
         manager.update(&source, None).await.unwrap();
+        assert_eq!(
+            fs::read(manager.base.join("current-agent/release.json")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::read(manager.base.join("current-agent/bin/xray")).unwrap(),
+            fs::read(source.join("bin/xray")).unwrap()
+        );
         let state = manager.state().unwrap();
         for role in ["panel", "agent"] {
             assert_eq!(state["roles"][role]["version"], "0.3.0");

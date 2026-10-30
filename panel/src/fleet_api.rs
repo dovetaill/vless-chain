@@ -481,7 +481,7 @@ async fn load_core_releases(core: &str) -> Result<Value> {
     let recommended: Value = serde_json::from_str(include_str!("core-versions.json"))?;
     let client = reqwest::Client::builder().https_only(true).user_agent("chain-panel")
         .timeout(Duration::from_secs(15)).build()?;
-    let mut response = client.get(format!("https://api.github.com/repos/{repo}/releases?per_page=30"))
+    let mut response = client.get(format!("https://api.github.com/repos/{repo}/releases?per_page=5"))
         .send().await?.error_for_status()?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {

@@ -199,26 +199,6 @@ pub fn replace(stage: &Path, core: &str, source: &Path, meta: &Value) -> Result<
     package::verify(stage, true)?;
     Ok(())
 }
-pub fn preserve(manager: &Manager, stage: &Path) -> Result<()> {
-    let state = manager.state()?;
-    if let Some(id) = state["roles"]["agent"]["current"].as_str() {
-        super::upgrade::release_name(id)?;
-        let source = manager.base.join("releases").join(id);
-        package::verify(&source, false)?;
-        let old: Value = serde_json::from_slice(&fs::read(source.join("release.json"))?)?;
-        for core in ["xray", "mihomo"] {
-            if old[format!("{core}_selected")] == true {
-                replace(
-                    stage,
-                    core,
-                    &source,
-                    &json!({"version":old[core],"source":old[format!("{core}_source")],"archive_sha256":old[format!("{core}_archive_sha256")],"prerelease":old[format!("{core}_prerelease")]}),
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
 fn configs(env: &BTreeMap<String, String>, core: &str) -> Result<Vec<(PathBuf, String)>> {
     let data = Path::new(env.get("CHAIN_AGENT_DIR").context("缺少 Agent 数据目录")?);
     let active = data.join("active.json");
@@ -1018,33 +998,6 @@ mod tests {
             }
             assert!(!m.base.join(".core-pending.json").exists());
         }
-    }
-    #[test]
-    fn selected_kernel_survives_application_update() {
-        let root = tempfile::tempdir().unwrap();
-        let (m, _) = installed(root.path());
-        let old = m.base.join("releases/old");
-        fs::create_dir(old.join("share")).unwrap();
-        fs::write(old.join("share/Xray-LICENSE"), "license").unwrap();
-        let mut v: Value =
-            serde_json::from_slice(&fs::read(old.join("release.json")).unwrap()).unwrap();
-        v["xray_selected"] = json!(true);
-        v["xray"] = json!("26.10.21");
-        v["files"]["share/Xray-LICENSE"] =
-            json!({"sha256":package::digest(&old.join("share/Xray-LICENSE")).unwrap(),"mode":420});
-        fs::write(old.join("release.json"), serde_json::to_vec(&v).unwrap()).unwrap();
-        let stage = root.path().join("stage");
-        package::tests::fixture(&stage);
-        preserve(&m, &stage).unwrap();
-        let updated: Value =
-            serde_json::from_slice(&fs::read(stage.join("release.json")).unwrap()).unwrap();
-        assert_eq!(updated["xray"], "26.10.21");
-        assert_eq!(updated["xray_selected"], true);
-        assert_eq!(
-            fs::read(stage.join("bin/xray")).unwrap(),
-            fs::read(old.join("bin/xray")).unwrap()
-        );
-        package::verify(&stage, true).unwrap();
     }
     #[test]
     fn rejects_unsafe_core_operations() {
