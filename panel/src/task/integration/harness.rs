@@ -496,33 +496,35 @@ impl<'a> Harness<'a> {
         };
         let cert = self.root.join(format!("{domain}-cert.pem"));
         let key = self.root.join(format!("{domain}-key.pem"));
-        self.work
-            .run(
-                &self.root,
-                &strings(&[
-                    "openssl",
-                    "req",
-                    "-x509",
-                    "-newkey",
-                    "ec",
-                    "-pkeyopt",
-                    "ec_paramgen_curve:prime256v1",
-                    "-nodes",
-                    "-days",
-                    "90",
-                    "-subj",
-                    &format!("/CN={domain}"),
-                    "-addext",
-                    &format!("subjectAltName=DNS:{domain}"),
-                    "-addext",
-                    "basicConstraints=critical,CA:FALSE",
-                    "-out",
-                    cert.to_str().unwrap(),
-                    "-keyout",
-                    key.to_str().unwrap(),
-                ]),
-            )
-            .await?;
+        use openssl::{
+            asn1::Asn1Time,
+            bn::BigNum,
+            ec::{EcGroup, EcKey},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::PKey,
+            x509::{X509, X509NameBuilder, extension::SubjectAlternativeName},
+        };
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let private = PKey::from_ec_key(EcKey::generate(&group)?)?;
+        let mut name = X509NameBuilder::new()?;
+        name.append_entry_by_text("CN", domain)?;
+        let name = name.build();
+        let mut certificate = X509::builder()?;
+        certificate.set_version(2)?;
+        certificate.set_serial_number(BigNum::from_u32(1)?.to_asn1_integer()?.as_ref())?;
+        certificate.set_subject_name(&name)?;
+        certificate.set_issuer_name(&name)?;
+        certificate.set_pubkey(&private)?;
+        certificate.set_not_before(Asn1Time::days_from_now(0)?.as_ref())?;
+        certificate.set_not_after(Asn1Time::days_from_now(90)?.as_ref())?;
+        let san = SubjectAlternativeName::new()
+            .dns(domain)
+            .build(&certificate.x509v3_context(None, None))?;
+        certificate.append_extension(san)?;
+        certificate.sign(&private, MessageDigest::sha256())?;
+        fs::write(&cert, certificate.build().to_pem()?)?;
+        fs::write(&key, private.private_key_to_pem_pkcs8()?)?;
         let config =
             (*crate::website::tls_config(&fs::read_to_string(&cert)?, &fs::read_to_string(&key)?)?)
                 .clone();
@@ -702,6 +704,29 @@ impl<'a> Harness<'a> {
         Ok(())
     }
 }
+#[tokio::test]
+async fn fixture_certificate_supports_verified_tls() -> Result<()> {
+    let parent = tempfile::tempdir()?;
+    let mut work = Workspace::new(parent.path())?;
+    let stage = work.root.join("stage");
+    fs::create_dir_all(stage.join("bin"))?;
+    let harness = Harness::new(&work, &stage, "tls-check")?;
+    let (port, cert, _) = harness.tls("localhost").await?;
+    let result = async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(reqwest::Certificate::from_pem(&fs::read(cert)?)?)
+            .build()?;
+        ensure!(client.get(format!("https://localhost:{port}/")).send().await?
+            .error_for_status()?.text().await? == "chain-integration-ok", "TLS 响应错误");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    harness.close().await?;
+    drop(harness);
+    work.close()?;
+    result
+}
+
 fn rebind(port: u16) -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
