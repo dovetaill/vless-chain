@@ -856,7 +856,7 @@ verify_http_challenge() {
       status=""
       : > "$response"
       if status="$(curl --noproxy '*' -sS --connect-timeout 3 --max-time 5 \
-        "${curl_args[@]}" -o "$response" -w '%{http_code}' "$url" \
+        ${curl_args[@]+"${curl_args[@]}"} -o "$response" -w '%{http_code}' "$url" \
         2>"$WORK_DIR/http-preflight.error")" &&
         [[ "$status" == 200 && "$(<"$response")" == "$expected" ]]; then
         matched=1
