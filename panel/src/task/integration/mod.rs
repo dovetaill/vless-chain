@@ -63,6 +63,8 @@ pub async fn smoke(args: &Options) -> Result<()> {
                 "run",
                 "--rm",
                 "--init",
+                "--cap-add",
+                "SYS_PTRACE",
                 "--name",
                 &name,
                 "-v",

@@ -86,7 +86,8 @@ for role in ("ingress", "maintenance"):
 def fixture(kind, roles, missing_ingress=False, enabled_ingress=False, bad_download=False,
             delayed_download=False, fresh_failure=False):
     """Exercise main with private files and fake service commands, as an unprivileged UID."""
-    with tempfile.TemporaryDirectory(prefix="chain-repair-flow-") as directory:
+    # Keep the real Unix socket below its path limit inside CI's nested TMPDIR.
+    with tempfile.TemporaryDirectory(prefix="cr-") as directory:
         root = Path(directory)
         def path(value):
             value = Path(value)
