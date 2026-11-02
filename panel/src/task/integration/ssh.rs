@@ -418,7 +418,7 @@ impl<'a> Case<'a> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = self.work.poll(pid)? {
-                let body = fs::read_to_string(&log)?;
+                let body = String::from_utf8_lossy(&fs::read(&log)?).into_owned();
                 ensure!(
                     status.success() == success,
                     "SSH 验收退出不符：{status}\n{body}"
