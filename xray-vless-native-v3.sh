@@ -141,7 +141,7 @@ dual 使用两个端口、同一个 UUID，绑定同一个落地。
 落地导入：TLS/REALITY + TCP/raw 或 XHTTP；支持 vless://、单个 YAML/JSON。
 多行节点最后输入 END；缺少字段进入补填向导。
 停止只改变当前运行状态；关闭开机自启只改变自启设置。
-默认管理目录：$MANAGER_DIR。旧部署导入保留配置、UUID、目录和服务。
+默认管理目录：${MANAGER_DIR}。旧部署导入保留配置、UUID、目录和服务。
 
 证书方式：CERT_MODE=http/cloudflare/existing/none
   http：原生 ACME webroot HTTP-01，要求域名解析到本机、公网 80 可达。
@@ -440,7 +440,7 @@ install_base_tools() {
 
 install_xray_if_needed() {
   if [[ -x "$XRAY_BIN" ]]; then
-    "$XRAY_BIN" version >/dev/null 2>&1 || die "现有 Xray 无法运行：$XRAY_BIN，请先安装适用于本机的版本"
+    "$XRAY_BIN" version >/dev/null 2>&1 || die "现有 Xray 无法运行：${XRAY_BIN}，请先安装适用于本机的版本"
     green "检测到 Xray：$($XRAY_BIN version 2>/dev/null | head -n1 || true)"
     return 0
   fi
@@ -868,7 +868,7 @@ verify_http_challenge() {
       if [[ "$target" == local ]]; then
         yellow "本机 HTTP-01 自检失败（HTTP ${status:-000}）：$url"
         yellow "请确认实际运行的 Nginx 加载了 $NGINX_CONF_DIR/xray-chain-http-$DOMAIN.conf，且没有同域名的 80 端口站点冲突。"
-        yellow "ACME webroot 应为：$root；检查生效的 Nginx 配置。"
+        yellow "ACME webroot 应为：${root}；检查生效的 Nginx 配置。"
         yellow "请同时检查该目录所有父目录的执行权限及 Nginx error.log 中的 Permission denied。"
       else
         yellow "域名 HTTP-01 自检失败（HTTP ${status:-000}）：$url"
@@ -1672,7 +1672,7 @@ rename_instance() {
   load_instance "$1"
   sync_access_info
   local name
-  read -rp "新的租户显示名称 [当前 $INSTANCE_NAME；留空保持]: " name || return 0
+  read -rp "新的租户显示名称 [当前 ${INSTANCE_NAME}；留空保持]: " name || return 0
   [[ -n "$name" ]] || return 0
   [[ ! "$name" =~ [[:cntrl:]] ]] || die "名称不能包含控制字符"
   begin_instance_update
@@ -1690,7 +1690,7 @@ edit_instance_ports() {
   for key in REALITY_PORT TLS_PORT; do
     old="${!key}"
     [[ -n "$old" ]] || continue
-    read -rp "${key%_PORT} 入口端口 [当前 $old；留空保持，0 取消]: " value || return 0
+    read -rp "${key%_PORT} 入口端口 [当前 ${old}；留空保持，0 取消]: " value || return 0
     [[ "$value" != 0 ]] || { yellow "已取消"; return 0; }
     [[ -n "$value" ]] || value="$old"
     check_port_number "$value" || die "端口必须为 1–65535"
@@ -1810,7 +1810,7 @@ delete_instance() {
   if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload; fi
   if [[ -f "$WORK_DIR/delete.nginx.backup" ]]; then nginx -t; service_action reload nginx; fi
   DELETE_PENDING=0
-  rm -rf -- "$WEB_ROOT" "$APP_DIR" || die "实例已停用，但目录未完全删除：$WEB_ROOT；$APP_DIR"
+  rm -rf -- "$WEB_ROOT" "$APP_DIR" || die "实例已停用，但目录未完全删除：${WEB_ROOT}；$APP_DIR"
   green "已删除租户：$INSTANCE_ID"
 }
 
@@ -1946,7 +1946,7 @@ run_menu_command() {
   set -e
   trap 'exit 130' INT
   if [[ "$result" != 0 && "$result" != 130 ]]; then
-    yellow "操作未完成（退出码 $result），已返回菜单"
+    yellow "操作未完成（退出码 ${result}），已返回菜单"
   fi
   return 0
 }
@@ -2128,7 +2128,7 @@ main() {
         logs) service_logs ;;
         follow) service_logs true ;;
         links) show_client_info ;;
-        *) manager_lock; service_action "$action"; green "$INSTANCE_ID：$action 已执行" ;;
+        *) manager_lock; service_action "$action"; green "${INSTANCE_ID}：$action 已执行" ;;
       esac ;;
     *) usage; die "未知命令：$action" ;;
   esac
