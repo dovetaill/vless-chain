@@ -226,18 +226,20 @@ def fixture(kind, roles, missing_ingress=False, enabled_ingress=False, bad_downl
             response.headers = {}
             return response
         original_stat = Path.stat
+        original_lstat = Path.lstat
         class RootStat:
             st_uid = st_gid = 0
             def __init__(self, value): self.value = value
             def __getattr__(self, name): return getattr(self.value, name)
         def root_stat(self, *args, **kwargs): return RootStat(original_stat(self, *args, **kwargs))
+        def root_lstat(self): return RootStat(original_lstat(self))
         def sleep(seconds):
             clock[0] += seconds
             if pending_request[0]:
                 new_request()
                 pending_request[0] = False
         try:
-            with patch.dict(namespace, {"Path": path, "PATCH_SHA256": digest}), patch.object(Path, "stat", root_stat), patch.object(os, "geteuid", return_value=0), patch.object(os, "uname", return_value=SimpleNamespace(machine="x86_64")), patch.object(namespace["subprocess"], "run", fake_run), patch.object(namespace["shutil"], "which", side_effect=lambda name: "/usr/sbin/nginx" if name == "nginx" else "/sbin/supervise-daemon"), patch.object(namespace["urllib"].request, "build_opener", return_value=SimpleNamespace(open=download)), patch.object(namespace["time"], "monotonic", side_effect=lambda: clock[0]), patch.object(namespace["time"], "sleep", sleep), contextlib.redirect_stdout(io.StringIO()):
+            with patch.dict(namespace, {"Path": path, "PATCH_SHA256": digest}), patch.object(Path, "stat", root_stat), patch.object(Path, "lstat", root_lstat), patch.object(os, "geteuid", return_value=0), patch.object(os, "uname", return_value=SimpleNamespace(machine="x86_64")), patch.object(namespace["subprocess"], "run", fake_run), patch.object(namespace["shutil"], "which", side_effect=lambda name: "/usr/sbin/nginx" if name == "nginx" else "/sbin/supervise-daemon"), patch.object(namespace["urllib"].request, "build_opener", return_value=SimpleNamespace(open=download)), patch.object(namespace["time"], "monotonic", side_effect=lambda: clock[0]), patch.object(namespace["time"], "sleep", sleep), contextlib.redirect_stdout(io.StringIO()):
                 if missing_ingress:
                     try:
                         namespace["main"]()
