@@ -209,6 +209,11 @@ async fn run() -> Result<()> {
         ensure!(words.len() == 3, "内部数据库操作参数无效");
         return ctl::operations::reset_database(std::path::Path::new(&words[2]));
     }
+    if std::env::args().nth(1).as_deref() == Some("internal-maintenance-handoff") {
+        let args = std::env::args().skip(2).collect::<Vec<_>>();
+        ensure!(args.len() == 1, "维护接管参数无效");
+        return ctl::lifecycle::maintenance_handoff(&args[0]).await;
+    }
     let mut args = Args::parse(std::env::args().skip(1))?;
     use std::io::IsTerminal;
     if args.action == "menu" && !std::io::stdin().is_terminal() {
@@ -537,6 +542,7 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
     }
     let manager = ctl::upgrade::Manager::open(&args.root)?;
     if args.action == "internal-adopt" {
+        manager.adopt().await?;
         let _lock = manager.lock()?;
         ctl::lifecycle::handoff(&manager)?;
         return ctl::lifecycle::maintenance(&manager).await;

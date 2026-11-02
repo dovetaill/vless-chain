@@ -324,8 +324,38 @@ pub async fn validate(manager: &Manager) -> Result<()> {
     let main = main_path(manager);
     validate_config(manager, &main).await
 }
+fn redirect_log(d: &Directive, root: &Path, source: &Path) -> Result<Option<String>> {
+    ensure!(d.words.len() >= 2, "日志指令缺少输出参数");
+    if d.words[0] == "access_log" && d.words[1] == "off" {
+        return Ok(None);
+    }
+    let path = root.join(format!(
+        "{}-{}-{}",
+        d.words[0],
+        source.file_stem().context("隔离配置路径无效")?.to_string_lossy(),
+        d.start
+    ));
+    let mut words = vec![d.words[0].clone(), quote(path.to_str().unwrap())];
+    // Log conditions must retain variable expansion, unlike literal output paths.
+    words.extend(d.words.iter().skip(2).map(|word| {
+        format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+    }));
+    Ok(Some(format!("{};", words.join(" "))))
+}
+fn compiled_prefix(version: &str) -> Result<PathBuf> {
+    let arguments = version.lines().find_map(|line| line.strip_prefix("configure arguments: "))
+        .context("无法确认 Nginx 编译参数")?;
+    let directives = parse(&format!("{arguments};"))?;
+    ensure!(directives.len() == 1 && !directives[0].block, "Nginx 编译参数无效");
+    let prefix = directives[0].words.iter().find_map(|word| word.strip_prefix("--prefix="))
+        .context("无法确认 Nginx 模块加载前缀")?;
+    let prefix = PathBuf::from(prefix);
+    ensure!(prefix.is_absolute(), "Nginx 模块加载前缀不是绝对路径");
+    Ok(prefix)
+}
 pub async fn validate_config(manager: &Manager, main: &Path) -> Result<()> {
     let files = files(&main).with_context(|| format!("读取 Nginx 配置 {}", main.display()))?;
+    let mut prefix = None;
     let work = tempfile::Builder::new()
         .prefix("chain-nginx-check-")
         .tempdir_in(manager.path("/var/tmp"))?;
@@ -364,9 +394,25 @@ pub async fn validate_config(manager: &Manager, main: &Path) -> Result<()> {
                         .collect::<Result<Vec<_>>>()?
                         .join("\n"),
                 )
+            } else if key == "load_module" {
+                ensure!(d.words.len() == 2, "load_module 参数无效");
+                let module = Path::new(&d.words[1]);
+                if module.is_absolute() {
+                    None
+                } else {
+                    if prefix.is_none() {
+                        let version = output("nginx", &["-V"], 10).await?;
+                        ensure!(version.status.success(), "无法读取 Nginx 编译参数");
+                        prefix = Some(compiled_prefix(&String::from_utf8(version.stderr)?)?);
+                    }
+                    let module = prefix.as_ref().unwrap().join(module).canonicalize()?;
+                    Some(format!("load_module {};", quote(module.to_str().context("模块路径无效")?)))
+                }
             } else if key == "user" {
                 Some("user root;".into())
-            } else if ["error_log", "access_log", "pid", "lock_file"].contains(&key) {
+            } else if ["error_log", "access_log"].contains(&key) {
+                redirect_log(&d, root, &rewritten[path])?
+            } else if ["pid", "lock_file"].contains(&key) {
                 Some(format!(
                     "{key} {};",
                     quote(root.join(format!("{key}-{}", d.start)).to_str().unwrap())
@@ -491,5 +537,50 @@ mod tests {
         assert_eq!(d.last().unwrap().depth, ["http"]);
         assert!(parse("http {").is_err());
         assert!(domain("x;bad.com").is_err());
+    }
+    #[test]
+    fn redirected_logs_preserve_off_and_all_parameters() {
+        let root = Path::new("/isolated");
+        let source = root.join("conf-0.conf");
+        for text in ["http { access_log off; }", "stream { access_log off; }"] {
+            let directives = parse(text).unwrap();
+            let log = directives.iter().find(|d| d.words[0] == "access_log").unwrap();
+            assert!(redirect_log(log, root, &source).unwrap().is_none());
+        }
+        for text in [
+            "access_log /var/log/nginx/stream.log basic buffer=32k gzip=1 flush=1s if=$loggable;",
+            "access_log /var/log/nginx/access.log combined;",
+            "error_log stderr warn;",
+        ] {
+            let original = parse(text).unwrap().remove(0);
+            let rewritten = redirect_log(&original, root, &source).unwrap().unwrap();
+            let result = parse(&rewritten).unwrap().remove(0);
+            assert_eq!(result.words[0], original.words[0]);
+            assert!(Path::new(&result.words[1]).starts_with(root));
+            assert_eq!(result.words[2..], original.words[2..]);
+            assert!(!rewritten.contains("\\$loggable"));
+        }
+    }
+    #[test]
+    fn redirected_logs_from_different_includes_do_not_share_a_path() {
+        let root = Path::new("/isolated");
+        let log = parse("access_log /var/log/nginx/stream.log basic buffer=32k;")
+            .unwrap()
+            .remove(0);
+        let first = redirect_log(&log, root, &root.join("conf-0.conf")).unwrap().unwrap();
+        let second = redirect_log(&log, root, &root.join("conf-1.conf")).unwrap().unwrap();
+        assert_ne!(parse(&first).unwrap()[0].words[1], parse(&second).unwrap()[0].words[1]);
+    }
+    #[test]
+    fn module_prefix_preserves_configure_argument_quoting() {
+        for (arguments, expected) in [
+            ("--prefix=/usr/lib/nginx --with-stream=dynamic", "/usr/lib/nginx"),
+            ("--with-cc-opt='-O2 -g' --prefix='/opt/nginx modules'", "/opt/nginx modules"),
+            ("'--prefix=/opt/nginx modules' --with-stream=dynamic", "/opt/nginx modules"),
+        ] {
+            assert_eq!(compiled_prefix(&format!("nginx version: nginx/1.28.0\nconfigure arguments: {arguments}\n")).unwrap(), Path::new(expected));
+        }
+        assert!(compiled_prefix("configure arguments: --with-stream").is_err());
+        assert!(compiled_prefix("configure arguments: --prefix=relative").is_err());
     }
 }

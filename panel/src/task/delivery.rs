@@ -395,6 +395,12 @@ pub async fn check(args: &Options) -> Result<()> {
         ]),
     )
     .await?;
+    work.run(&root, &strings(&["sh", "-n", "scripts/repair-native-services.sh"]))
+        .await?;
+    work.run(&root, &strings(&["python3", "-B", "scripts/tests/repair-native-services.py"]))
+        .await?;
+    work.run(&root, &strings(&["python3", "-B", "scripts/tests/legacy-native.py"]))
+        .await?;
     work.run(
         &root.join("panel"),
         &strings(&["cargo", "test", "--locked", "--lib", "task::", "--quiet"]),

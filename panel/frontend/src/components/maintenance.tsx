@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { Modal, Status, errorText, stamp } from "./shared";
 import { requestId, statuses } from "./fleet-state";
 import { NetworkTuning, type NetworkRequest, type NetworkStatus } from "./network-tuning";
+import { upgradeVersionReached } from "./maintenance-state";
 
 type Release = { version: string };
 type Task = {
@@ -18,6 +19,9 @@ type Task = {
   error?: string;
   core?: string;
   core_version?: string;
+  before?: Record<string, string>;
+  finished?: number;
+  xray_channel?: string;
   after?: Record<string, string>;
   network?: { after: NetworkStatus };
 };
@@ -93,6 +97,8 @@ export function Maintenance({ state }: { state: PanelState }) {
   const supported = !!state.maintenance;
   const networkAdmin = !state.viewer || state.viewer.role === "admin";
   const upToDate = !!release && state.version === release.version && (!state.agent_version || state.agent_version === release.version);
+  const historicalUpgrade = !!task && upgradeVersionReached(task, state);
+  const TaskContainer = historicalUpgrade ? "details" : "div";
   return (
     <Card role="region" aria-label="版本与维护">
       <CardHeader>
@@ -154,7 +160,8 @@ export function Maintenance({ state }: { state: PanelState }) {
         {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
         {connection && <p role="status" className="text-sm text-amber-700">{connection}</p>}
         {task && (
-          <div role="status" className="space-y-2 rounded-lg border p-4 text-sm">
+          <TaskContainer role={historicalUpgrade ? undefined : "status"} className="space-y-2 rounded-lg border p-4 text-sm">
+            {historicalUpgrade && <summary className="cursor-pointer text-muted-foreground">历史升级记录 · 当前组件版本已更新</summary>}
             <p>{task.action === "upgrade" ? `升级 ${task.version || ""}` : "维护任务"}：{statuses[task.state] || task.state}</p>
             {task.error && <p className="text-red-600">{task.error}</p>}
             {["failed", "unknown"].includes(task.state) && state.core_maintenance?.pending && state.core_maintenance.pending !== task.id &&
@@ -181,7 +188,7 @@ export function Maintenance({ state }: { state: PanelState }) {
             {task.state === "succeeded" && task.action === "upgrade" && (
               <Button variant="outline" onClick={() => location.reload()}>刷新页面使用新版界面</Button>
             )}
-          </div>
+          </TaskContainer>
         )}
         {networkOpen && <NetworkTuning targets={[{ id: "local", name: "本机", snapshot: state }]}
           close={() => setNetworkOpen(false)} submitLocal={submit} />}

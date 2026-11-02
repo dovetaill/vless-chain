@@ -335,7 +335,9 @@ pub fn unit_with_env(
     };
     Ok(format!(
         "# {OWNER}\n[Unit]\nDescription=Chain {role}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=chain-{role}\nGroup=chain-{role}\nStateDirectory=chain-{role}\nStateDirectoryMode=0700\nUMask=0077\nEnvironmentFile={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\nKillMode=control-group\nTimeoutStopSec=50\n{}NoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
-        quote(manager.path(&format!("/etc/chain-{role}/{role}.env")))?,
+        // EnvironmentFile takes one literal path, unlike ExecStart's quoted command words.
+        manager.path(&format!("/etc/chain-{role}/{role}.env"))
+            .to_str().context("环境文件路径必须为 UTF-8")?.replace('%', "%%"),
         quote(
             manager
                 .base
@@ -577,6 +579,22 @@ pub async fn component(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_environment_file_is_a_literal_path() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager {
+            root: root.path().join("root with space%"),
+            base: root.path().join("root with space%/opt/chain"),
+        };
+        for role in ["panel", "agent"] {
+            let text = unit_with_env(&manager, role, &BTreeMap::new()).unwrap();
+            let expected = format!("EnvironmentFile={}\n", manager.path(&format!("/etc/chain-{role}/{role}.env")).display().to_string().replace('%', "%%"));
+            assert!(text.contains(&expected));
+            assert!(!text.contains("EnvironmentFile=\""));
+            assert!(text.contains("ExecStart=\""));
+        }
+    }
     #[test]
     fn enrollment_rejects_credentials_paths_and_invalid_tokens() {
         for value in [

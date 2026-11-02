@@ -27,6 +27,14 @@ pub const MANIFESTS: &[&str] = &[
     "panel/frontend/package.json",
     "panel/frontend/package-lock.json",
 ];
+pub(super) const LEGACY_ENTRIES: &[&str] = &[
+    "chain_common.py",
+    "chain_install.py",
+    "chain_network.py",
+    "chain_platform.py",
+    "chain_ingress.py",
+    "chain_maintenance.py",
+];
 pub fn system() -> &'static str {
     if cfg!(target_os = "macos") {
         "darwin"
@@ -349,6 +357,9 @@ pub async fn build(args: &Options) -> Result<()> {
         root.join("scripts/install-server.sh"),
         stage.join("scripts/install-server.sh"),
     )?;
+    for name in LEGACY_ENTRIES {
+        fs::copy(root.join("scripts/legacy-native.py"), stage.join("scripts").join(name))?;
+    }
     fs::copy(
         root.join("panel/src/core-versions.json"),
         stage.join("scripts/core-versions.json"),

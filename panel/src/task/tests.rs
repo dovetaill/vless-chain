@@ -49,6 +49,15 @@ fn version_updates_four_manifests_and_rejects_invalid_input_before_writing() {
     super::delivery::validate_tag(root.path(), "v0.3.7").unwrap();
 }
 #[test]
+fn release_keeps_the_pre_native_verifier_and_manager_entrypoints() {
+    let entries = release::LEGACY_ENTRIES.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    // v0.2.61 verifies four modules, copies ingress, and requires maintenance for web upgrades.
+    for name in ["chain_common.py", "chain_install.py", "chain_network.py", "chain_platform.py", "chain_ingress.py", "chain_maintenance.py"] {
+        assert!(entries.contains(name), "旧版升级入口缺失：{name}");
+    }
+    assert_eq!(entries.len(), release::LEGACY_ENTRIES.len());
+}
+#[test]
 fn github_token_is_exclusive_to_the_exact_api_origin() {
     let client = reqwest::Client::new();
     for token in [None, Some(""), Some("fixture-token")] {

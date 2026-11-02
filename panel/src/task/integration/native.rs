@@ -60,7 +60,14 @@ impl<'a> Case<'a> {
             }
             let unit = manager.unit_path(role);
             fs::create_dir_all(unit.parent().unwrap())?;
-            fs::write(&unit, format!("# {OWNER}\n"))?;
+            fs::write(
+                &unit,
+                format!(
+                    "# {OWNER}\n[Service]\nEnvironmentFile={}\nExecStart=\"{}/current-{role}/bin/chain-{role}\"\n",
+                    etc.join(format!("{role}.env")).display(),
+                    base.display()
+                ),
+            )?;
             protected.push(unit);
             symlink("releases/old", base.join(format!("current-{role}")))?;
             state["roles"][role] =

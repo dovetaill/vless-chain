@@ -161,6 +161,22 @@ impl Manager {
         self.update_checked(source, component, |role| self.healthy(role))
             .await
     }
+    pub async fn adopt(&self) -> Result<()> {
+        let state = self.state()?;
+        let roles = self.roles(&state, None)?;
+        let services = super::lifecycle::ServiceMigration::prepare(self, &roles)?;
+        if services.needed(self, &roles).await? {
+            self.update(
+                &self
+                    .base
+                    .join(format!("current-{}", roles[0]))
+                    .canonicalize()?,
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
     async fn update_checked<F, Fut>(
         &self,
         source: &Path,
@@ -215,6 +231,7 @@ impl Manager {
             self.environment(role)?;
             running.push(self.active(role).await?);
         }
+        let services = super::lifecycle::ServiceMigration::prepare(self, &roles)?;
         let id = format!(
             "{}-{}-{}-{}",
             manifest.version,
@@ -252,7 +269,7 @@ impl Manager {
         atomic(
             &journal,
             &serde_json::to_vec(
-                &json!({"before":old,"target":id,"roles":roles,"running":running}),
+                &json!({"before":old,"target":id,"roles":roles,"running":running,"services":services.journal()}),
             )?,
             0o600,
         )?;
@@ -261,11 +278,24 @@ impl Manager {
             for role in &roles {
                 attempted += 1;
                 self.service("stop", role).await?;
+                let baseline = if role == "agent" {
+                    services.ingress(self, "stop").await?;
+                    services.request(self)?
+                } else {
+                    None
+                };
                 self.link(role, &id)?;
+                services.write(self, role, true).await?;
+                if role == "agent" {
+                    services.ingress(self, "start").await?;
+                }
                 self.service("start", role).await?;
                 check(role.clone())
                     .await
                     .with_context(|| format!("{role} 启动检查失败"))?;
+                if role == "agent" {
+                    services.applied(self, baseline)?;
+                }
             }
             let mut state = old.clone();
             for role in &roles {
@@ -286,7 +316,14 @@ impl Manager {
             for (role, was_running) in roles.iter().zip(&running).take(attempted).rev() {
                 let restore: Result<()> = async {
                     self.service("stop", role).await?;
+                    if role == "agent" {
+                        services.ingress(self, "stop").await?;
+                    }
                     self.link(role, old["roles"][role]["current"].as_str().unwrap())?;
+                    services.write(self, role, false).await?;
+                    if role == "agent" {
+                        services.ingress(self, "start").await?;
+                    }
                     if *was_running {
                         self.service("start", role).await?;
                     }
@@ -452,11 +489,46 @@ impl Manager {
         } else {
             String::new()
         };
+        let mut process = None;
         let mut active_count = 0;
-        for _ in 0..20 {
+        for _ in 0..60 {
             if self.active(&role).await? {
+                if self.kind() != "launchd" {
+                    let current = super::lifecycle::service_process(self, &role).await?;
+                    if let Some(pid) = current {
+                        ensure!(
+                            super::lifecycle::process_matches(
+                                pid,
+                                &self.base.join(format!("current-{role}/bin/chain-{role}"))
+                            )?,
+                            "chain-{role} 仍在运行旧程序"
+                        );
+                        ensure!(
+                            process.is_none_or(|prior| prior == pid),
+                            "chain-{role} 在升级验收期间重启"
+                        );
+                        process = Some(pid);
+                        if role == "agent" {
+                            let variables = fs::read(format!("/proc/{pid}/environ"))?;
+                            let expected = format!(
+                                "CHAIN_AGENT_DIR={}",
+                                env.get("CHAIN_AGENT_DIR").context("缺少 CHAIN_AGENT_DIR")?
+                            );
+                            ensure!(
+                                variables
+                                    .split(|c| *c == 0)
+                                    .any(|v| v == expected.as_bytes()),
+                                "Agent 环境文件未生效"
+                            );
+                        }
+                    } else {
+                        active_count = 0;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                }
                 active_count += 1;
-                if role == "agent" && active_count >= 2 {
+                if role == "agent" && active_count >= 41 {
                     return Ok(());
                 }
                 if role == "panel" {
@@ -729,7 +801,7 @@ mod tests {
             .unwrap();
             let unit = manager.unit_path(role);
             fs::create_dir_all(unit.parent().unwrap()).unwrap();
-            fs::write(unit, OWNER).unwrap();
+            fs::write(unit, format!("# {OWNER}\n[Service]\nEnvironmentFile=\"{}\"\nExecStart=\"{}/current-{role}/bin/chain-{role}\"\n", root.join(format!("etc/chain-{role}/{role}.env")).display(), base.display())).unwrap();
             roles.insert(role.into(), json!({"current":"old","version":"0.2.48","previous":null,"setup_complete":true,"panel_only":false,"custom":"preserve"}));
         }
         fs::write(
@@ -797,6 +869,71 @@ mod tests {
         );
         assert!(!root.path().join("var/backups").exists());
         assert!(!manager.base.join(".update-pending.json").exists());
+        assert!(!manager.path("/var/lib/chain-ingress").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn update_migrates_ingress_and_rolls_back_exact_service_definitions() {
+        for fail in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = installed(root.path());
+            let source = root.path().join("source");
+            fixture(&source);
+            let directory = manager.path("/var/lib/chain-ingress");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("state.json"), "{}").unwrap();
+            let unit = manager.unit_path("ingress");
+            let before = format!(
+                "# chain-ingress managed v1\n[Service]\nExecStart=\"/usr/bin/python3\" -B \"{}/current-agent/scripts/chain_ingress.py\" apply\nTimeoutStartSec=90\n",
+                manager.base.display()
+            );
+            fs::write(&unit, &before).unwrap();
+            fs::write(
+                manager.path("/etc/systemd/system/chain-ingress.path"),
+                "# chain-ingress managed v1\n[Path]\n",
+            )
+            .unwrap();
+            let info = fs::metadata(&unit).unwrap();
+            let agent = fs::read_to_string(manager.unit_path("agent")).unwrap();
+            let result = manager
+                .update_checked(&source, None, |role| async move {
+                    ensure!(!fail || role != "agent", "injected failure");
+                    Ok(())
+                })
+                .await;
+            let after = fs::metadata(&unit).unwrap();
+            assert_eq!(
+                (info.ino(), info.uid(), info.gid(), info.mode()),
+                (after.ino(), after.uid(), after.gid(), after.mode())
+            );
+            if fail {
+                assert!(result.is_err());
+                assert_eq!(fs::read_to_string(&unit).unwrap(), before);
+                assert_eq!(
+                    fs::read_to_string(manager.unit_path("agent")).unwrap(),
+                    agent
+                );
+            } else {
+                result.unwrap();
+                let text = fs::read_to_string(&unit).unwrap();
+                assert!(text.contains("/current-agent/bin/chainctl\" internal-ingress-apply"));
+                assert!(text.ends_with("TimeoutStartSec=90\n"));
+                assert!(
+                    !fs::read_to_string(manager.unit_path("agent"))
+                        .unwrap()
+                        .contains("EnvironmentFile=\"")
+                );
+                let metadata = fs::metadata(&unit).unwrap();
+                manager.adopt().await.unwrap();
+                let unchanged = fs::metadata(&unit).unwrap();
+                assert_eq!(
+                    (metadata.ctime(), metadata.ctime_nsec()),
+                    (unchanged.ctime(), unchanged.ctime_nsec())
+                );
+            }
+            assert!(!manager.base.join(".update-pending.json").exists());
+        }
     }
 
     #[tokio::test]
