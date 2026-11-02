@@ -240,7 +240,7 @@ pub async fn legacy(work: &Workspace, stage: &Path) -> Result<()> {
             .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
             .timeout(Duration::from_secs(3))
             .build()?;
-        wait("原始客户端真实流量", async || {
+        let traffic = wait("原始客户端真实流量", async || {
             Ok(
                 match client.get(format!("http://127.0.0.1:{http}/")).send().await {
                     Ok(r) => r
@@ -251,7 +251,19 @@ pub async fn legacy(work: &Workspace, stage: &Path) -> Result<()> {
                 },
             )
         })
-        .await?;
+        .await;
+        if let Err(error) = traffic {
+            let mut logs = String::new();
+            for entry in fs::read_dir(&h.root)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|v| v == "log") {
+                    let bytes = fs::read(&path)?;
+                    logs.push_str(&format!("\n{}:\n{}", path.display(),
+                        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(8192)..])));
+                }
+            }
+            return Err(error.context(format!("迁移线路 {index}{logs}")));
+        }
         if index > 0 {
             wait("外部出口流量日志", async || {
                 Ok(fs::read_to_string(&exits[index - 1])

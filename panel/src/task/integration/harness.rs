@@ -503,7 +503,7 @@ impl<'a> Harness<'a> {
             hash::MessageDigest,
             nid::Nid,
             pkey::PKey,
-            x509::{X509, X509NameBuilder, extension::SubjectAlternativeName},
+            x509::{X509, X509NameBuilder, extension::{SubjectAlternativeName, BasicConstraints, SubjectKeyIdentifier, AuthorityKeyIdentifier}},
         };
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let private = PKey::from_ec_key(EcKey::generate(&group)?)?;
@@ -522,6 +522,12 @@ impl<'a> Harness<'a> {
             .dns(domain)
             .build(&certificate.x509v3_context(None, None))?;
         certificate.append_extension(san)?;
+        certificate.append_extension(BasicConstraints::new().critical().build()?)?;
+        let subject = SubjectKeyIdentifier::new().build(&certificate.x509v3_context(None, None))?;
+        certificate.append_extension(subject)?;
+        let authority = AuthorityKeyIdentifier::new().keyid(true)
+            .build(&certificate.x509v3_context(None, None))?;
+        certificate.append_extension(authority)?;
         certificate.sign(&private, MessageDigest::sha256())?;
         fs::write(&cert, certificate.build().to_pem()?)?;
         fs::write(&key, private.private_key_to_pem_pkcs8()?)?;
