@@ -278,6 +278,7 @@ export function Fleet({ state }: { state: PanelState }) {
       mihomo: string;
     }>(),
     [releaseLoading, setReleaseLoading] = useState(false);
+  const [maintenanceTab, setMaintenanceTab] = useState("");
   const [coreChoice, setCoreChoice] = useState<CoreChoice>(initialCoreChoice);
   const [invite, setInvite] = useState(""),
     [policy, setPolicy] = useState<Policy>(defaultPolicy),
@@ -725,7 +726,7 @@ export function Fleet({ state }: { state: PanelState }) {
   }
   function networkTuning(targets: NetworkTarget[]) {
     setDetail(undefined);
-    setModal(<NetworkTuning targets={targets} close={close} submitted={async id => {
+    setModal(<NetworkTuning targets={targets} localTarget={{ id: "local", name: "本机（主控）", snapshot: state }} initialIncludeLocal={includeLocal} close={close} submitted={async id => {
       await refresh();
       navigate("tasks");
       setTaskId(id);
@@ -1109,15 +1110,6 @@ export function Fleet({ state }: { state: PanelState }) {
           {tab === "vps" && (
             <>
               <div className="fleet-selection" aria-label="VPS 批量操作">
-                <div className="flex flex-wrap items-center gap-3">
-                  <Button variant="outline" disabled={busy || running.some(t => t.state === "running") || !state.maintenance_actions?.includes("network-tune")}
-                    onClick={() => networkTuning([{ id: "local", name: "本机（主控）", snapshot: state }])}>本机网络算法 / BBR</Button>
-                  <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={includeLocal}
-                    onChange={e => setIncludeLocal(e.target.checked)} />网络批量设置包含本机</label>
-                  <Button variant="outline" disabled={busy || (!chosen.length && !includeLocal) || running.some(t => t.state === "running")}
-                    onClick={() => networkTuning([...chosen, ...(includeLocal ? [{ id: "local", name: "本机（主控）", snapshot: state }] : [])])}>网络算法 / BBR</Button>
-                  <p className="text-xs text-muted-foreground">勾选下方 VPS 可批量设置，无需重启。</p>
-                </div>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="text-sm"><strong>已选 {chosen.length} 台 VPS</strong><span className="ml-2 text-xs text-muted-foreground">含其他页与隐藏项</span></p>
                   <div className="flex flex-wrap gap-1">
@@ -1126,22 +1118,28 @@ export function Fleet({ state }: { state: PanelState }) {
                     <Button size="sm" variant="ghost" disabled={!chosen.length} onClick={() => setSelected([])}>清空选择</Button>
                   </div>
                 </div>
-                {chosen.length > 0 && <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
-                  <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap gap-2">
+                  {[['program', '程序更新'], ['core', '代理内核'], ['more', '更多维护']].map(([key, label]) => <Button key={key} variant="outline" disabled={!chosen.length} aria-expanded={maintenanceTab === key} onClick={() => setMaintenanceTab(maintenanceTab === key ? "" : key)}>{label}</Button>)}
+                  <Button variant="outline" disabled={busy || (!chosen.length && !includeLocal) || running.some(t => t.state === "running")}
+                    onClick={() => networkTuning(chosen)}>网络设置 / BBR</Button>
+                </div>
+                {chosen.length > 0 && maintenanceTab && <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
+                  {maintenanceTab === "program" && <div className="flex flex-wrap items-center gap-2">
                     <Button disabled={busy || releaseLoading || !release || running.some(t => t.state === "running")} onClick={() => batch("upgrade")}>批量升级</Button>
                     <Button variant="outline" disabled={busy || releaseLoading} onClick={() => void fetchRelease()}>{releaseLoading ? "正在获取最新版本…" : "检查最新版本"}</Button>
                     <span className="text-xs text-muted-foreground">{release ? `最新正式版 ${release.version}` : "先检查版本，再升级所选 VPS"}</span>
-                  </div>
+                  </div>}
+                  {maintenanceTab === "core" && <>
                   <CoreSelector value={coreChoice} onChange={setCoreChoice} disabled={busy || running.some(t => t.state === "running")} />
                   <Button disabled={busy || running.some(t => t.state === "running") || !/^\d+\.\d+\.\d+$/.test(coreChoice.version)} onClick={() => batch("core-upgrade")}>逐台升级所选 VPS 的 {coreChoice.core}</Button>
-                  <details className="text-sm">
-                    <summary className="cursor-pointer text-muted-foreground">重启与维护说明</summary>
+                  </>}
+                  {maintenanceTab === "more" && <div className="text-sm">
                     <div className="mt-3 space-y-3 border-t pt-3">
                       <div className="flex flex-wrap gap-2">{["restart-all", "restart-panel", "restart-agent"].map(action => <Button key={action} variant="outline" disabled={busy || running.some(t => t.state === "running")} onClick={() => batch(action)}>{actions[action]}</Button>)}</div>
-                      <p className="text-xs leading-5 text-muted-foreground">最多同时维护 5 台 VPS，单台失败不阻塞其他机器。升级会更新整套发行版本并重启相关服务；连接验证在后台自动进行。远端需已安装 Linux systemd 维护组件。</p>
+                      <p className="text-xs leading-5 text-muted-foreground">最多同时维护 5 台 VPS，单台失败不阻塞其他机器。程序升级保留独立更新的内核并重启相关服务；连接验证在后台自动进行。远端需已安装 Linux systemd 维护组件。</p>
                       {release && <p className="text-xs text-muted-foreground">版本包含：控制台／Agent {release.version} · Xray {release.xray || "未知"} · Mihomo {release.mihomo || "未知"}</p>}
                     </div>
-                  </details>
+                  </div>}
                 </div>}
               </div>
               {table(

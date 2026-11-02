@@ -477,20 +477,29 @@ async fn load_core_releases(core: &str) -> Result<Value> {
     let recommended: Value = serde_json::from_str(include_str!("core-versions.json"))?;
     let client = reqwest::Client::builder().https_only(true).user_agent("chain-panel")
         .timeout(Duration::from_secs(15)).build()?;
-    let mut response = client.get(format!("https://api.github.com/repos/{repo}/releases?per_page=5"))
-        .send().await?.error_for_status()?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        ensure!(bytes.len() + chunk.len() <= 2 * 1024 * 1024, "发行信息过大");
-        bytes.extend_from_slice(&chunk);
+    let mut releases = Vec::new();
+    for endpoint in ["releases/latest", "releases?per_page=5"] {
+        let mut response = client.get(format!("https://api.github.com/repos/{repo}/{endpoint}"))
+            .send().await?.error_for_status()?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(bytes.len() + chunk.len() <= 2 * 1024 * 1024, "发行信息过大");
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes)?;
+        if endpoint == "releases/latest" {
+            releases.push(value);
+        } else {
+            releases.extend(value.as_array().context("发行信息无效")?.iter().cloned());
+        }
     }
-    let releases: Value = serde_json::from_slice(&bytes)?;
-    let versions: Vec<_> = releases.as_array().context("发行信息无效")?.iter()
-        .filter(|r| r["draft"] == false)
-        .filter_map(|r| {
-            let version = r["tag_name"].as_str()?.strip_prefix('v')?;
-            version_valid(version).then(|| json!({"version":version,"prerelease":r["prerelease"] == true}))
-        }).collect();
+    let mut versions = Vec::new();
+    for release in releases.iter().filter(|r| r["draft"] == false) {
+        let Some(version) = release["tag_name"].as_str().and_then(|tag| tag.strip_prefix('v')) else { continue };
+        if version_valid(version) && !versions.iter().any(|v: &Value| v["version"] == version) {
+            versions.push(json!({"version":version,"prerelease":release["prerelease"] == true}));
+        }
+    }
     Ok(json!({"recommended":recommended[core],"versions":versions}))
 }
 async fn task_status(

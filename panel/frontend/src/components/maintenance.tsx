@@ -9,6 +9,8 @@ import { requestId, statuses } from "./fleet-state";
 import { NetworkTuning, type NetworkRequest, type NetworkStatus } from "./network-tuning";
 import { upgradeVersionReached } from "./maintenance-state";
 
+import { CoreSelector, initialCoreChoice, type CoreChoice } from "./core-selector";
+
 type Release = { version: string };
 type Task = {
   id: string;
@@ -35,8 +37,10 @@ export function Maintenance({ state }: { state: PanelState }) {
   const [taskId, setTaskId] = useState(() => localStorage.getItem(storageKey));
   const [task, setTask] = useState<Task>();
   const [submitting, setSubmitting] = useState(false);
+  const [coreOpen, setCoreOpen] = useState(false);
+  const [coreChoice, setCoreChoice] = useState<CoreChoice>(initialCoreChoice);
   const [networkOpen, setNetworkOpen] = useState(false);
-  const [confirm, setConfirm] = useState<{ id: string; action: string; version?: string; core?: string; task_id?: string }>();
+  const [confirm, setConfirm] = useState<{ id: string; action: string; version?: string; core?: string; task_id?: string; prerelease?: boolean; security_update?: boolean; rollback_safe?: boolean }>();
   const busy = submitting || (!!taskId && (!task || ["queued", "running", "awaiting_verification"].includes(task.state)));
   useEffect(() => {
     if (state.core_maintenance?.pending && !submitting) { setTaskId(state.core_maintenance.pending); localStorage.setItem(storageKey, state.core_maintenance.pending); }
@@ -81,6 +85,7 @@ export function Maintenance({ state }: { state: PanelState }) {
     setTaskId(request.id);
     setConfirm(undefined);
     setNetworkOpen(false);
+    setCoreOpen(false);
     setError("");
     try {
       setTask(await api<Task>("/federation/task", "POST", request));
@@ -138,20 +143,22 @@ export function Maintenance({ state }: { state: PanelState }) {
           </div>)}
         </dl>
         {state.agent_version && state.version !== state.agent_version && <Status tone="warn">面板与 Agent 版本不一致</Status>}
-        <p className="text-xs text-muted-foreground">按 GitHub 最新正式发行版统一更新本机组件。重启会短暂断开连接，配置和业务数据保留。</p>
+        <p className="text-xs text-muted-foreground">更新面板与 Agent，保留独立更新的代理内核。重启会短暂断开连接，配置和业务数据保留。</p>
         {!supported && (
           <p role="status" className="text-sm text-amber-700">
             当前部署未提供网页维护。Linux systemd / OpenRC（含 Alpine）请先手工升级以安装维护组件；macOS 和纯 Agent 安装暂不支持。
           </p>
         )}
         {state.core_maintenance?.blocked && <p role="alert" className="text-red-600">安全更新未完成，本机代理已停用；管理面板仍可使用。请先恢复安全内核。</p>}
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" disabled={busy || !state.maintenance_actions?.includes("core-upgrade")} onClick={() => setCoreOpen(true)}>代理内核</Button>
+          <Button variant="outline" disabled={!networkAdmin || busy || !state.maintenance_actions?.includes("network-tune")} onClick={() => setNetworkOpen(true)}>网络设置 / BBR</Button>
+        </div>
         <details className="border-t pt-3 text-sm">
           <summary className="cursor-pointer text-muted-foreground">其他维护</summary>
           <div className="mt-3 flex flex-wrap gap-2">
             <Button variant="outline" disabled={!supported || !state.maintenance_actions?.includes("restart-all") || busy}
               onClick={() => setConfirm({ id: requestId(), action: "restart-all" })}>整套重启</Button>
-            <Button variant="outline" disabled={!networkAdmin || busy || !state.maintenance_actions?.includes("network-tune")}
-              onClick={() => setNetworkOpen(true)}>网络算法 / BBR</Button>
           </div>
           <p className="mt-2 text-xs text-muted-foreground">仅操作本机；其他 VPS 请前往多机总控。{state.agent_seen ? `Agent 最近上报：${stamp(state.agent_seen)}` : ""}</p>
           {!networkAdmin ? <p className="muted">网络算法设置仅管理员可操作。</p>
@@ -190,6 +197,11 @@ export function Maintenance({ state }: { state: PanelState }) {
             )}
           </TaskContainer>
         )}
+        {coreOpen && <Modal title="更新本机代理内核" close={() => setCoreOpen(false)}
+          submit={!busy && /^\d+\.\d+\.\d+$/.test(coreChoice.version) ? `更新 ${coreChoice.core} ${coreChoice.version}` : undefined}
+          action={() => submit({ id: requestId(), action: "core-upgrade", ...coreChoice })}>
+          <CoreSelector value={coreChoice} onChange={setCoreChoice} disabled={busy} />
+        </Modal>}
         {networkOpen && <NetworkTuning targets={[{ id: "local", name: "本机", snapshot: state }]}
           close={() => setNetworkOpen(false)} submitLocal={submit} />}
         {confirm && (

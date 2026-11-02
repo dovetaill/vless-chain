@@ -232,6 +232,14 @@ impl Manager {
             running.push(self.active(role).await?);
         }
         let services = super::lifecycle::ServiceMigration::prepare(self, &roles)?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".update-core-")
+            .tempdir_in(&self.base)?;
+        let stage = temporary.path().join("stage");
+        package::copy(source, &stage, &manifest)?;
+        super::cores::preserve(self, &stage)?;
+        let source = stage.as_path();
+        let manifest = package::verify(source, true)?;
         let id = format!(
             "{}-{}-{}-{}",
             manifest.version,
@@ -827,20 +835,26 @@ mod tests {
             selected[format!("{core}_selected")] = json!(true);
             selected[core] = json!("1.0.0");
         }
-        fs::write(
-            old.join("release.json"),
-            serde_json::to_vec(&selected).unwrap(),
-        )
-        .unwrap();
-        let expected = fs::read(source.join("release.json")).unwrap();
+        fs::create_dir_all(old.join("share")).unwrap();
+        fs::write(old.join("bin/mihomo"), "mihomo-selected").unwrap();
+        selected["files"]["bin/mihomo"] = json!({"sha256":package::digest(&old.join("bin/mihomo")).unwrap(),"mode":493});
+        for core in ["Xray", "Mihomo"] {
+            let name = format!("share/{core}-LICENSE");
+            fs::write(old.join(&name), "license").unwrap();
+            selected["files"][&name] = json!({"sha256":package::digest(&old.join(&name)).unwrap(),"mode":420});
+        }
+        fs::write(old.join("release.json"), serde_json::to_vec(&selected).unwrap()).unwrap();
         manager.update(&source, None).await.unwrap();
-        assert_eq!(
-            fs::read(manager.base.join("current-agent/release.json")).unwrap(),
-            expected
-        );
+        let updated: Value = serde_json::from_slice(
+            &fs::read(manager.base.join("current-agent/release.json")).unwrap(),
+        ).unwrap();
+        for core in ["xray", "mihomo"] {
+            assert_eq!(updated[core], "1.0.0");
+            assert_eq!(updated[format!("{core}_selected")], true);
+        }
         assert_eq!(
             fs::read(manager.base.join("current-agent/bin/xray")).unwrap(),
-            fs::read(source.join("bin/xray")).unwrap()
+            fs::read(old.join("bin/xray")).unwrap()
         );
         let state = manager.state().unwrap();
         for role in ["panel", "agent"] {

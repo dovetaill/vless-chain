@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, remoteApi } from "../api";
 import { Field, Modal, errorText } from "./shared";
 import { requestId, type Remote } from "./fleet-state";
@@ -13,10 +13,13 @@ export type NetworkStatus = {
 export type NetworkTarget = Pick<Remote, "id" | "name" | "snapshot">;
 export type NetworkRequest = { id: string; action: "network-tune"; congestion_control: string; qdisc: string };
 
-export function NetworkTuning({ targets, close, submitted, submitLocal }: {
+export function NetworkTuning({ targets: selectedTargets, localTarget, initialIncludeLocal = false, close, submitted, submitLocal }: {
+  localTarget?: NetworkTarget; initialIncludeLocal?: boolean;
   targets: NetworkTarget[]; close: () => void; submitted?: (id: string) => Promise<void>;
   submitLocal?: (request: NetworkRequest) => Promise<void>;
 }) {
+  const [includeLocal, setIncludeLocal] = useState(initialIncludeLocal);
+  const targets = useMemo(() => [...selectedTargets, ...(includeLocal && localTarget ? [localTarget] : [])], [selectedTargets, includeLocal, localTarget]);
   const [states, setStates] = useState<Record<string, NetworkStatus>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [cc, setCc] = useState("bbr");
@@ -58,6 +61,7 @@ export function NetworkTuning({ targets, close, submitted, submitLocal }: {
       }
       close();
     } : undefined}>
+    {localTarget && <label className="flex items-center gap-2"><input type="checkbox" checked={includeLocal} onChange={e => setIncludeLocal(e.target.checked)} />同时应用到本机</label>}
     <div className="grid gap-4 sm:grid-cols-2">
       <Field label="拥塞控制算法"><select className="select" value={cc} onChange={e => setCc(e.target.value)}>
         {!algorithms.includes(cc) && <option value={cc} disabled>{cc}（所选机器尚未全部确认支持）</option>}
