@@ -351,10 +351,8 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
             h.root.to_str().unwrap(),
             "-c",
             conf.to_str().unwrap(),
-            "-e",
-            h.root.join("error.log").to_str().unwrap(),
             "-g",
-            "daemon off; master_process off;",
+            "daemon off; master_process off; error_log stderr;",
         ]),
     )?;
     let client = reqwest::Client::builder()

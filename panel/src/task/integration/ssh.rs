@@ -32,6 +32,7 @@ pub fn command_fixture() -> Result<Option<i32>> {
     ensure!(
         [
             "id",
+            "flock",
             "systemctl",
             "rc-service",
             "rc-update",
@@ -65,6 +66,15 @@ pub fn command_fixture() -> Result<Option<i32>> {
     let value = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
     let mut code = 0;
     match name {
+        "flock" => {
+            ensure!(args.len() == 2 && args[0] == "-n", "不支持的测试锁参数");
+            let fd = args[1].parse::<i32>()?;
+            code = if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                0
+            } else {
+                1
+            };
+        }
         "id" => {
             if args == ["-u"] {
                 println!("0")
@@ -290,6 +300,7 @@ impl<'a> Case<'a> {
             .context("无法保存独立 SSH 命令夹具，拒绝回退到宿主机命令")?;
         for name in [
             "id",
+            "flock",
             "systemctl",
             "rc-service",
             "rc-update",
