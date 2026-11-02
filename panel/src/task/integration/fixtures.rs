@@ -273,8 +273,8 @@ pub async fn terminal_command(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         } == 0,
         "无法创建 PTY"
