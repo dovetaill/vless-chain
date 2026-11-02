@@ -415,6 +415,6 @@ mod tests {
             assert!(body.contains("export CHAIN_VALUE='$(id);'\\''quoted'\\'''"));
             assert!(body.contains("cap_net_bind_service"));
         }
-        assert!(!body.contains("python"));
+        assert!(!body.replace(root.path().to_str().unwrap(), "<fixture-root>").contains("python"));
     }
 }

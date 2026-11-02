@@ -333,18 +333,14 @@ async fn release_info(Path(version): Path<String>) -> ApiResult<Json<Value>> {
         return Err(error(StatusCode::BAD_REQUEST, "发行版本不匹配"));
     }
     let version = resolved;
-    let source = client.get(format!("https://raw.githubusercontent.com/dovetaill/vless-chain/v{version}/scripts/chain_release.py"))
-        .send().await.map_err(anyhow::Error::from)?.error_for_status().map_err(anyhow::Error::from)?
-        .text().await.map_err(anyhow::Error::from)?;
-    let constant = |key: &str| {
-        source
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{key} = ")))
-            .map(|v| v.trim_matches(['\'', '"']).to_string())
-            .unwrap_or_default()
+    let response = client.get(format!("https://raw.githubusercontent.com/dovetaill/vless-chain/v{version}/panel/src/core-versions.json"))
+        .send().await.map_err(anyhow::Error::from)?;
+    let versions: Value = if response.status() == StatusCode::NOT_FOUND { json!({}) } else {
+        response.error_for_status().map_err(anyhow::Error::from)?.json().await.map_err(anyhow::Error::from)?
     };
+    let constant = |key: &str| versions[key].as_str().filter(|v| version_valid(v)).unwrap_or_default();
     Ok(Json(
-        json!({"version":version,"xray":constant("XRAY_VERSION"),"mihomo":constant("MIHOMO_VERSION")}),
+        json!({"version":version,"xray":constant("xray"),"mihomo":constant("mihomo")}),
     ))
 }
 async fn probe_document(State(app): State<App>) -> Json<Value> {

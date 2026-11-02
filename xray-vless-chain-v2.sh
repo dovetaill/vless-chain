@@ -33,6 +33,8 @@ UPSTREAM_ALLOW_INSECURE="${UPSTREAM_ALLOW_INSECURE:-false}"
 UPSTREAM_REALITY_PUBLIC_KEY="${UPSTREAM_REALITY_PUBLIC_KEY:-}"
 UPSTREAM_REALITY_SHORT_ID="${UPSTREAM_REALITY_SHORT_ID:-}"
 UPSTREAM_REALITY_MLDSA65_VERIFY="${UPSTREAM_REALITY_MLDSA65_VERIFY:-}"
+CHAINCTL_BIN="${CHAINCTL_BIN:-}"
+CERT_LINEAGE=""
 
 red() { echo -e "\033[31m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
@@ -467,7 +469,7 @@ prepare_dirs() {
     yellow "检测到旧部署，先停止旧容器..."
     (cd "$APP_DIR" && compose down --remove-orphans) || true
   fi
-  mkdir -p "$APP_DIR"/{xray,nginx,certbot/conf,site,certs}
+  mkdir -p "$APP_DIR"/{xray,nginx,acme,site,certs}
 
   cat > "$APP_DIR/site/index.html" <<HTML
 <!doctype html>
@@ -537,13 +539,6 @@ ${port_lines}    volumes:
     networks:
       - xray-net
 
-  certbot:
-    image: certbot/dns-cloudflare
-    container_name: xray-certbot
-    volumes:
-      - ./certbot/conf:/etc/letsencrypt
-      - ./cloudflare.ini:/cloudflare.ini:ro
-
 networks:
   xray-net:
     driver: bridge
@@ -583,30 +578,47 @@ pull_images() {
   blue "拉取 Xray/Nginx 镜像..."
   cd "$APP_DIR"
   compose pull nginx xray
-  if needs_cert; then compose pull certbot; fi
+}
+
+ensure_native_acme() {
+  if [[ -n "$CHAINCTL_BIN" ]]; then
+    [[ -x "$CHAINCTL_BIN" ]] || die "CHAINCTL_BIN 不是可执行的原生工具"
+    if [[ "$CHAINCTL_BIN" != "$APP_DIR/chainctl" && ! -e "$APP_DIR/chainctl" ]]; then
+      cp "$CHAINCTL_BIN" "$APP_DIR/chainctl"
+      chmod 700 "$APP_DIR/chainctl"
+    fi
+  elif [[ ! -x "$APP_DIR/chainctl" ]]; then
+    local bootstrap
+    bootstrap="$(mktemp "$APP_DIR/.native-bootstrap.XXXXXXXX")"
+    if ! curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 \
+      https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh -o "$bootstrap"; then
+      rm -f "$bootstrap"; die "原生证书工具引导下载失败"
+    fi
+    local result=0
+    sh "$bootstrap" bootstrap-native "$APP_DIR/chainctl" || result=$?
+    rm -f "$bootstrap"
+    [[ "$result" == 0 ]] || die "原生证书工具下载失败"
+  fi
+  CHAINCTL_BIN="$APP_DIR/chainctl"
+  [[ "$("$CHAINCTL_BIN" internal-legacy protocol 2>/dev/null)" == 1 ]] || die "原生证书工具版本不兼容，请使用同版本发行包中的 chainctl"
 }
 
 obtain_cert() {
   needs_cert || return 0
   blue "通过 Cloudflare DNS-01 申请/续用证书..."
-  cd "$APP_DIR"
-  compose run --rm certbot certonly \
-    --dns-cloudflare \
-    --dns-cloudflare-credentials /cloudflare.ini \
-    --dns-cloudflare-propagation-seconds 60 \
-    -d "$DOMAIN" \
-    --email "$EMAIL" \
-    --agree-tos \
-    --no-eff-email \
-    --non-interactive \
-    --keep-until-expiring
-  [[ -f "$APP_DIR/certbot/conf/live/$DOMAIN/fullchain.pem" ]] || die "证书申请失败"
+  ensure_native_acme
+  local result
+  local config="$APP_DIR/acme"
+  [[ ! -d "$APP_DIR/certbot/conf/live/$DOMAIN" ]] || config="$APP_DIR/certbot/conf"
+  result="$("$CHAINCTL_BIN" internal-cert-obtain cloudflare "$config" "$DOMAIN" "$DOMAIN" "$APP_DIR/cloudflare.ini")" || die "证书申请失败"
+  CERT_LINEAGE="${result##*$'\n'}"
+  [[ -f "$CERT_LINEAGE/fullchain.pem" && -f "$CERT_LINEAGE/privkey.pem" ]] || die "证书申请失败"
 }
 
 sync_cert() {
   needs_cert || return 0
-  cp -L "$APP_DIR/certbot/conf/live/$DOMAIN/fullchain.pem" "$APP_DIR/certs/fullchain.pem"
-  cp -L "$APP_DIR/certbot/conf/live/$DOMAIN/privkey.pem" "$APP_DIR/certs/privkey.pem"
+  cp -L "$CERT_LINEAGE/fullchain.pem" "$APP_DIR/certs/fullchain.pem"
+  cp -L "$CERT_LINEAGE/privkey.pem" "$APP_DIR/certs/privkey.pem"
   chmod 644 "$APP_DIR/certs/fullchain.pem" "$APP_DIR/certs/privkey.pem"
 }
 
@@ -875,9 +887,13 @@ set -Eeuo pipefail
 APP_DIR="$APP_DIR"
 DOMAIN="$DOMAIN"
 cd "\$APP_DIR"
-docker compose run --rm certbot renew --quiet
-cp -L "\$APP_DIR/certbot/conf/live/\$DOMAIN/fullchain.pem" "\$APP_DIR/certs/fullchain.pem"
-cp -L "\$APP_DIR/certbot/conf/live/\$DOMAIN/privkey.pem" "\$APP_DIR/certs/privkey.pem"
+config="\$APP_DIR/acme"
+[[ ! -d "\$APP_DIR/certbot/conf/live/\$DOMAIN" ]] || config="\$APP_DIR/certbot/conf"
+result="\$("\$APP_DIR/chainctl" internal-cert-obtain cloudflare "\$config" "\$DOMAIN" "\$DOMAIN" "\$APP_DIR/cloudflare.ini")"
+lineage="\${result##*\$'\n'}"
+if cmp -s "\$lineage/fullchain.pem" "\$APP_DIR/certs/fullchain.pem" && cmp -s "\$lineage/privkey.pem" "\$APP_DIR/certs/privkey.pem"; then exit 0; fi
+cp -L "\$lineage/fullchain.pem" "\$APP_DIR/certs/fullchain.pem"
+cp -L "\$lineage/privkey.pem" "\$APP_DIR/certs/privkey.pem"
 chmod 644 "\$APP_DIR/certs/fullchain.pem" "\$APP_DIR/certs/privkey.pem"
 docker compose restart nginx xray >/dev/null 2>&1
 RENEW

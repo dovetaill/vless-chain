@@ -34,8 +34,8 @@ REALITY_PORT="${REALITY_PORT:-}"
 LISTEN_PORT="${LISTEN_PORT:-}"
 
 # Certificate modes:
-#   http       = Certbot HTTP-01 via Nginx (DNS provider independent, port 80 required)
-#   cloudflare = Certbot Cloudflare DNS-01
+#   http       = native ACME HTTP-01 via Nginx (port 80 required)
+#   cloudflare = native ACME Cloudflare DNS-01
 #   existing   = reuse an existing certificate/key
 #   none       = only valid when no local TLS certificate is required
 CF_API_TOKEN="${CF_API_TOKEN:-}"
@@ -84,6 +84,9 @@ INSTALL_APP_CREATED=0
 INSTALL_SERVICE_CREATED=0
 INSTALL_NGINX_CREATED=0
 INSTALL_HOOK_CREATED=0
+INSTALL_RENEW_SERVICE_CREATED=0
+INSTALL_RENEW_TIMER_CREATED=0
+INSTALL_RENEW_CRON_CREATED=0
 INSTALL_HTTP_CREATED=0
 INSTALL_CF_CHANGED=0
 INSTALL_CF_PATH=""
@@ -92,9 +95,11 @@ UPDATE_WAS_ACTIVE=0
 DELETE_PENDING=0
 DELETE_WAS_ACTIVE=0
 DELETE_WAS_ENABLED=0
+DELETE_RENEW_WAS_ACTIVE=0
+DELETE_RENEW_WAS_ENABLED=0
 EXPORT_PATH=""
 
-# Only named fields cross the Bash/Python boundary. Never source imported data.
+# Only named fields cross the Bash/Rust boundary. Never source imported data.
 STATE_FIELDS=(INSTANCE_ID INSTANCE_NAME INSTANCE_IMPORTED APP_DIR WEB_ROOT SERVICE_NAME INIT_SYSTEM
   XRAY_BIN DOMAIN UUID NODE_MODE SECURITY_MODE CERT_MODE CERT_FILE KEY_FILE TLS_PORT
   REALITY_PORT REALITY_TARGET_MODE REALITY_TARGET REALITY_SERVER_NAME REALITY_PRIVATE_KEY
@@ -139,7 +144,7 @@ dual 使用两个端口、同一个 UUID，绑定同一个落地。
 默认管理目录：$MANAGER_DIR。旧部署导入保留配置、UUID、目录和服务。
 
 证书方式：CERT_MODE=http/cloudflare/existing/none
-  http：Certbot webroot HTTP-01，要求域名解析到本机、公网 80 可达。
+  http：原生 ACME webroot HTTP-01，要求域名解析到本机、公网 80 可达。
   cloudflare：DNS-01，需要 CF_API_TOKEN。
   existing：提供 CERT_FILE、KEY_FILE。
   none：仅限 REALITY + 外部伪装目标。
@@ -160,474 +165,27 @@ USAGE
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-native_helper() {
-  python3 - "$@" <<'PY'
-import ipaddress
-import json
-import os
-import re
-import sys
-import tempfile
-from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit, urlencode, quote
-
-STATE = """INSTANCE_ID INSTANCE_NAME INSTANCE_IMPORTED APP_DIR WEB_ROOT SERVICE_NAME INIT_SYSTEM
-XRAY_BIN DOMAIN UUID NODE_MODE SECURITY_MODE CERT_MODE CERT_FILE KEY_FILE TLS_PORT
-REALITY_PORT REALITY_TARGET_MODE REALITY_TARGET REALITY_SERVER_NAME REALITY_PRIVATE_KEY
-REALITY_PUBLIC_KEY REALITY_SHORT_ID REALITY_FINGERPRINT INTERNAL_HTTP_PORT INTERNAL_HTTPS_PORT""".split()
-UP = """UPSTREAM_ADDRESS UPSTREAM_PORT UPSTREAM_UUID UPSTREAM_SECURITY UPSTREAM_SNI
-UPSTREAM_FLOW UPSTREAM_FINGERPRINT UPSTREAM_ALLOW_INSECURE UPSTREAM_REALITY_PUBLIC_KEY
-UPSTREAM_REALITY_SHORT_ID UPSTREAM_REALITY_MLDSA65_VERIFY UPSTREAM_TRANSPORT UPSTREAM_NAME
-UPSTREAM_XHTTP_PATH UPSTREAM_XHTTP_HOST UPSTREAM_XHTTP_MODE UPSTREAM_XHTTP_EXTRA UPSTREAM_ALPN""".split()
-
-def fail(message):
-    raise ValueError(message)
-
-def clean(value):
-    text = str(value if value is not None else "")
-    if any(ord(c) < 32 for c in text):
-        fail("节点字段不能包含换行或控制字符")
-    return text
-
-def boolean(value):
-    if isinstance(value, bool):
-        return value
-    if str(value).lower() in ("true", "1"):
-        return True
-    if str(value).lower() in ("false", "0", ""):
-        return False
-    fail("布尔字段必须为 true/false")
-
-def dump(data):
-    print(json.dumps(data, ensure_ascii=False, indent=2))
-
-def read_json(path):
-    return json.loads(Path(path).read_text())
-
-def atomic(path, data):
-    path = Path(path)
-    fd, temp = tempfile.mkstemp(prefix=".state-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        os.replace(temp, path)
-    finally:
-        if os.path.exists(temp):
-            os.unlink(temp)
-
-def values(data, fields):
-    for key in fields:
-        value = clean(data.get(key, ""))
-        sys.stdout.buffer.write((key + "\0" + value + "\0").encode())
-
-def environment(fields):
-    return {key: os.environ.get(key, "") for key in fields}
-
-def parse_node(text):
-    data = dict.fromkeys(UP, "")
-    data.update(UPSTREAM_FINGERPRINT="chrome", UPSTREAM_ALLOW_INSECURE="false",
-                UPSTREAM_XHTTP_MODE="auto", UPSTREAM_XHTTP_EXTRA="{}")
-    if text.startswith("vless://"):
-        node = urlsplit(text)
-        if node.password:
-            fail("VLESS 链接不能包含密码段")
-        data.update(UPSTREAM_UUID=unquote(node.username or ""),
-                    UPSTREAM_ADDRESS=node.hostname or "",
-                    UPSTREAM_PORT=str(node.port or ""),
-                    UPSTREAM_NAME=unquote(node.fragment),
-                    UPSTREAM_TRANSPORT="raw")
-        query = parse_qs(node.query, keep_blank_values=True)
-        mapping = {"security": "SECURITY", "type": "TRANSPORT", "sni": "SNI",
-                   "flow": "FLOW", "fp": "FINGERPRINT", "pbk": "REALITY_PUBLIC_KEY",
-                   "sid": "REALITY_SHORT_ID", "pqv": "REALITY_MLDSA65_VERIFY",
-                   "path": "XHTTP_PATH", "host": "XHTTP_HOST", "mode": "XHTTP_MODE",
-                   "extra": "XHTTP_EXTRA", "alpn": "ALPN"}
-        for key, suffix in mapping.items():
-            if key in query:
-                if len(query[key]) != 1:
-                    fail("链接包含重复参数：" + key)
-                data["UPSTREAM_" + suffix] = query[key][0]
-        if query.get("encryption", ["none"])[0] not in ("", "none"):
-            fail("当前仅支持 encryption=none 的落地")
-        insecure = query.get("allowInsecure", query.get("insecure", ["false"]))[0]
-        data["UPSTREAM_ALLOW_INSECURE"] = str(boolean(insecure)).lower()
-    else:
-        try:
-            node = json.loads(text)
-        except json.JSONDecodeError:
-            try:
-                import yaml
-            except ImportError:
-                fail("结构化节点需要 python3-yaml，请先安装该依赖")
-            try:
-                node = yaml.safe_load(text)
-            except yaml.YAMLError:
-                fail("YAML/JSON 格式不正确；请粘贴完整的单个节点")
-        if isinstance(node, dict) and "proxies" in node:
-            node = node["proxies"]
-        if isinstance(node, list):
-            if len(node) != 1:
-                fail("一次只能导入一个节点，请粘贴目标节点")
-            node = node[0]
-        if not isinstance(node, dict):
-            fail("请输入 vless:// 链接或单个 YAML/JSON 节点")
-        if node.get("type", "vless") != "vless":
-            fail("只支持 type: vless 的节点")
-        if node.get("encryption", "none") not in ("", "none", None):
-            fail("当前仅支持 encryption=none 的落地")
-        for option in ("shadow-tls-opts", "restls-opts", "jls-opts", "ech-opts",
-                       "certificate", "private-key", "name-cert-verify"):
-            if node.get(option):
-                fail("当前不能转换节点参数：" + option)
-        if isinstance(node.get("smux"), dict) and node["smux"].get("enabled"):
-            fail("当前不能转换 smux，请使用不依赖 smux 的落地配置")
-        reality = node.get("reality-opts") or {}
-        if not isinstance(reality, dict):
-            fail("reality-opts 必须是对象")
-        data.update(UPSTREAM_NAME=node.get("name", ""), UPSTREAM_ADDRESS=node.get("server", ""),
-                    UPSTREAM_PORT=node.get("port", ""), UPSTREAM_UUID=node.get("uuid", ""),
-                    UPSTREAM_SECURITY="reality" if reality else (
-                        "tls" if boolean(node.get("tls", False)) else ""),
-                    UPSTREAM_TRANSPORT=node.get("network", ""),
-                    UPSTREAM_FLOW=node.get("flow", ""),
-                    UPSTREAM_SNI=node.get("servername", node.get("sni", "")),
-                    UPSTREAM_FINGERPRINT=node.get("client-fingerprint") or "chrome",
-                    UPSTREAM_ALLOW_INSECURE=str(boolean(node.get("skip-cert-verify", False))).lower(),
-                    UPSTREAM_REALITY_PUBLIC_KEY=reality.get("public-key", ""),
-                    UPSTREAM_REALITY_SHORT_ID=reality.get("short-id", ""),
-                    UPSTREAM_REALITY_MLDSA65_VERIFY=reality.get("mldsa65-verify", ""))
-        alpn = node.get("alpn", [])
-        data["UPSTREAM_ALPN"] = ",".join(alpn) if isinstance(alpn, list) else alpn
-        xhttp = node.get("xhttp-opts") or {}
-        if not isinstance(xhttp, dict):
-            fail("xhttp-opts 必须是对象")
-        if xhttp:
-            data["UPSTREAM_TRANSPORT"] = node.get("network", "xhttp")
-            data.update(UPSTREAM_XHTTP_PATH=xhttp.get("path", ""),
-                        UPSTREAM_XHTTP_HOST=xhttp.get("host", ""),
-                        UPSTREAM_XHTTP_MODE=xhttp.get("mode", "auto"))
-            extra = {}
-            translated = {"headers": "headers", "no-grpc-header": "noGRPCHeader",
-                          "no-sse-header": "noSSEHeader", "x-padding-bytes": "xPaddingBytes",
-                          "sc-max-each-post-bytes": "scMaxEachPostBytes",
-                          "sc-min-posts-interval-ms": "scMinPostsIntervalMs"}
-            for key, value in xhttp.items():
-                if key in ("path", "host", "mode"):
-                    continue
-                if key in translated:
-                    extra[translated[key]] = value
-                elif key == "reuse-settings":
-                    if not isinstance(value, dict):
-                        fail("reuse-settings 必须是对象")
-                    xmux = {"max-concurrency": "maxConcurrency", "max-connections": "maxConnections",
-                            "c-max-reuse-times": "cMaxReuseTimes", "h-max-request-times": "hMaxRequestTimes",
-                            "h-max-reusable-secs": "hMaxReusableSecs", "h-keep-alive-period": "hKeepAlivePeriod"}
-                    if any(k not in xmux for k in value):
-                        fail("存在不能转换的 reuse-settings 参数")
-                    extra["xmux"] = {xmux[k]: v for k, v in value.items()}
-                elif key == "extra" and isinstance(value, dict):
-                    extra.update(value)
-                else:
-                    fail("当前不能转换 xhttp-opts 参数：" + key + "；可改用带原生 extra 的分享链接")
-            data["UPSTREAM_XHTTP_EXTRA"] = json.dumps(extra, ensure_ascii=False)
-    data = {key: clean(value) for key, value in data.items()}
-    if data["UPSTREAM_TRANSPORT"] == "tcp":
-        data["UPSTREAM_TRANSPORT"] = "raw"
-    if data["UPSTREAM_TRANSPORT"] not in ("", "raw", "xhttp"):
-        fail("仅支持 TCP/raw 和 XHTTP 落地")
-    if data["UPSTREAM_SECURITY"] not in ("", "tls", "reality"):
-        fail("仅支持 TLS / REALITY 落地")
-    return data
-
-def validate(data):
-    host = data["UPSTREAM_ADDRESS"]
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        if len(host) > 253 or not re.fullmatch(
-                r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", host):
-            fail("落地地址格式不正确")
-        if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
-               for label in host.split(".")):
-            fail("落地地址格式不正确")
-    if not data["UPSTREAM_PORT"].isdigit() or not 1 <= int(data["UPSTREAM_PORT"]) <= 65535:
-        fail("落地端口必须为 1–65535")
-    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
-                        data["UPSTREAM_UUID"]):
-        fail("落地 UUID 格式不正确")
-    if data["UPSTREAM_TRANSPORT"] not in ("raw", "xhttp"):
-        fail("请选择落地传输方式 raw 或 xhttp")
-    if data["UPSTREAM_SECURITY"] not in ("tls", "reality"):
-        fail("请选择落地安全方式 tls 或 reality")
-    flow = data["UPSTREAM_FLOW"]
-    if flow not in ("", "xtls-rprx-vision", "xtls-rprx-vision-udp443"):
-        fail("不支持该落地 flow")
-    if data["UPSTREAM_TRANSPORT"] == "xhttp" and flow:
-        fail("XHTTP + encryption=none 不能设置 Vision flow，请核对落地配置")
-    boolean(data["UPSTREAM_ALLOW_INSECURE"])
-    if data["UPSTREAM_SECURITY"] == "reality":
-        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", data["UPSTREAM_REALITY_PUBLIC_KEY"]):
-            fail("REALITY 落地需要有效的 public-key/pbk（43 位）")
-        if not re.fullmatch(r"(?:[0-9a-fA-F]{2}){0,8}", data["UPSTREAM_REALITY_SHORT_ID"]):
-            fail("REALITY short-id/sid 必须是最多 16 位、偶数长度的十六进制")
-    if data["UPSTREAM_TRANSPORT"] == "xhttp":
-        if not data["UPSTREAM_XHTTP_PATH"].startswith("/"):
-            fail("XHTTP path 必须以 / 开头")
-        if data["UPSTREAM_XHTTP_MODE"] not in ("auto", "stream-one", "stream-up", "packet-up"):
-            fail("XHTTP mode 不正确")
-        if not isinstance(json.loads(data["UPSTREAM_XHTTP_EXTRA"]), dict):
-            fail("XHTTP extra 必须是 JSON 对象")
-
-def upstream_outbound(data):
-    validate(data)
-    settings = {"address": data["UPSTREAM_ADDRESS"], "port": int(data["UPSTREAM_PORT"]),
-                "id": data["UPSTREAM_UUID"], "encryption": "none"}
-    if data["UPSTREAM_FLOW"]:
-        settings["flow"] = data["UPSTREAM_FLOW"]
-    stream = {"network": data["UPSTREAM_TRANSPORT"], "security": data["UPSTREAM_SECURITY"]}
-    if stream["security"] == "tls":
-        tls = {"serverName": data["UPSTREAM_SNI"] or data["UPSTREAM_ADDRESS"],
-               "allowInsecure": boolean(data["UPSTREAM_ALLOW_INSECURE"]),
-               "fingerprint": data["UPSTREAM_FINGERPRINT"] or "chrome"}
-        if data["UPSTREAM_ALPN"]:
-            tls["alpn"] = data["UPSTREAM_ALPN"].split(",")
-        stream["tlsSettings"] = tls
-    else:
-        reality = {"serverName": data["UPSTREAM_SNI"] or data["UPSTREAM_ADDRESS"],
-                   "fingerprint": data["UPSTREAM_FINGERPRINT"] or "chrome",
-                   "publicKey": data["UPSTREAM_REALITY_PUBLIC_KEY"],
-                   "shortId": data["UPSTREAM_REALITY_SHORT_ID"]}
-        if data["UPSTREAM_REALITY_MLDSA65_VERIFY"]:
-            reality["mldsa65Verify"] = data["UPSTREAM_REALITY_MLDSA65_VERIFY"]
-        stream["realitySettings"] = reality
-    if stream["network"] == "xhttp":
-        stream["xhttpSettings"] = {"path": data["UPSTREAM_XHTTP_PATH"],
-                                 "host": data["UPSTREAM_XHTTP_HOST"],
-                                 "mode": data["UPSTREAM_XHTTP_MODE"],
-                                 "extra": json.loads(data["UPSTREAM_XHTTP_EXTRA"])}
-    return {"tag": "upstream-vless", "protocol": "vless", "settings": settings, "streamSettings": stream}
-
-def access_data(config, data):
-    """Recover exported credentials from the running service's config, not a cache."""
-    ids, modes = set(), set()
-    data.update(TLS_PORT="", REALITY_PORT="")
-    for inbound in config.get("inbounds", []):
-        if inbound.get("protocol") != "vless":
-            continue
-        clients = inbound.get("settings", {}).get("clients", [])
-        ids.update(c.get("id") for c in clients)
-        stream = inbound.get("streamSettings", {})
-        security = stream.get("security")
-        if security not in ("tls", "reality"):
-            fail("链接导出仅支持 TLS / REALITY 入站")
-        if security in modes:
-            fail("同种安全模式存在多个入站，不能确定要导出的端口")
-        modes.add(security)
-        data[security.upper() + "_PORT"] = str(inbound["port"])
-        if security == "reality":
-            reality = stream["realitySettings"]
-            data.update(REALITY_PRIVATE_KEY=reality["privateKey"], REALITY_PUBLIC_KEY="",
-                        REALITY_SERVER_NAME=(reality.get("serverNames") or [""])[0],
-                        REALITY_SHORT_ID=(reality.get("shortIds") or [""])[0])
-    if len(ids) != 1 or None in ids or not modes:
-        fail("实例必须只有一个 UUID 才能导出或修改接入信息")
-    data["UUID"] = ids.pop()
-    data["SECURITY_MODE"] = "dual" if len(modes) == 2 else next(iter(modes))
-    return data
-
-def client_nodes(data):
-    for security, port in (("reality", data["REALITY_PORT"]), ("tls", data["TLS_PORT"])):
-        if not port or data["SECURITY_MODE"] not in (security, "dual"):
-            continue
-        label = (data["INSTANCE_NAME"] or data["DOMAIN"]) + "-" + security
-        node = {"name": label, "type": "vless", "server": data["DOMAIN"], "port": int(port),
-                "uuid": data["UUID"], "network": "tcp", "tls": True,
-                "flow": "xtls-rprx-vision", "skip-cert-verify": False,
-                "client-fingerprint": data["REALITY_FINGERPRINT"] or "chrome",
-                "servername": data["DOMAIN"]}
-        if security == "reality":
-            node.update(servername=data["REALITY_SERVER_NAME"], **{
-                "reality-opts": {"public-key": data["REALITY_PUBLIC_KEY"],
-                                 "short-id": data["REALITY_SHORT_ID"]}})
-        yield security, node
-
-def records():
-    root = Path(os.environ["MANAGER_DIR"]) / "instances"
-    for path in sorted(root.glob("*/state.json")):
-        try:
-            state = read_json(path)
-            if state.get("INSTANCE_ID") != path.parent.name:
-                fail("实例编号与目录不匹配")
-            yield state
-        except (ValueError, OSError):
-            print("无法读取实例登记：" + str(path), file=sys.stderr)
-
-def legacy(app):
-    config = read_json(Path(app) / "config.json")
-    data = environment(STATE + UP)
-    data.update(APP_DIR=str(Path(app).resolve()), INSTANCE_IMPORTED="true",
-                NODE_MODE="direct", CERT_MODE="existing")
-    for filename in ("install.env", "reality.env"):
-        path = Path(app) / filename
-        if path.exists():
-            for line in path.read_text().splitlines():
-                key, sep, value = line.partition("=")
-                if sep and key in STATE and key not in (
-                        "INSTANCE_ID", "INSTANCE_NAME", "INSTANCE_IMPORTED", "APP_DIR",
-                        "SERVICE_NAME", "XRAY_BIN", "INIT_SYSTEM"):
-                    data[key] = value
-    ids = set()
-    modes = set()
-    for inbound in config.get("inbounds", []):
-        if inbound.get("protocol") != "vless":
-            fail("旧配置含非 VLESS 入站，暂不能导入")
-        clients = inbound.get("settings", {}).get("clients", [])
-        ids.update(c.get("id") for c in clients)
-        stream = inbound.get("streamSettings", {})
-        if stream.get("network", stream.get("method", "raw")) not in ("raw", "tcp"):
-            fail("旧配置仅能导入 TCP/raw 入站")
-        security = stream.get("security")
-        modes.add(security)
-        if security == "tls":
-            data["TLS_PORT"] = str(inbound["port"])
-            cert = stream.get("tlsSettings", {}).get("certificates", [{}])[0]
-            data["CERT_FILE"] = cert.get("certificateFile", "")
-            data["KEY_FILE"] = cert.get("keyFile", "")
-        elif security == "reality":
-            data["REALITY_PORT"] = str(inbound["port"])
-            reality = stream.get("realitySettings", {})
-            data.update(REALITY_PRIVATE_KEY=reality.get("privateKey", ""),
-                        REALITY_SHORT_ID=(reality.get("shortIds") or [""])[0],
-                        REALITY_SERVER_NAME=(reality.get("serverNames") or [""])[0],
-                        REALITY_TARGET=reality.get("target", reality.get("dest", "")))
-        else:
-            fail("旧配置仅能导入 TLS / REALITY 入站")
-    if len(ids) != 1 or None in ids:
-        fail("旧配置必须只有一个 UUID；dual 两个入站可以共用同一 UUID")
-    data["UUID"] = ids.pop()
-    data["SECURITY_MODE"] = "dual" if modes == {"tls", "reality"} else next(iter(modes))
-    routes = {rule.get("outboundTag") for rule in config.get("routing", {}).get("rules", [])
-              if rule.get("inboundTag")}
-    if len(routes) != 1 or not routes <= {"direct", "upstream-vless"}:
-        fail("旧配置路由结构不能安全导入")
-    if routes == {"upstream-vless"}:
-        outbound = next(o for o in config["outbounds"] if o.get("tag") == "upstream-vless")
-        settings = outbound["settings"]
-        if "vnext" in settings:
-            server = settings["vnext"][0]
-            settings = dict(server["users"][0], address=server["address"], port=server["port"])
-        stream = outbound["streamSettings"]
-        reality = stream.get("realitySettings", {})
-        tls = stream.get("tlsSettings", {})
-        xhttp = stream.get("xhttpSettings", {})
-        data.update(NODE_MODE="relay", UPSTREAM_ADDRESS=settings["address"],
-                    UPSTREAM_PORT=str(settings["port"]), UPSTREAM_UUID=settings["id"],
-                    UPSTREAM_FLOW=settings.get("flow", ""), UPSTREAM_SECURITY=stream["security"],
-                    UPSTREAM_TRANSPORT=stream.get("network", stream.get("method", "raw")),
-                    UPSTREAM_SNI=reality.get("serverName", tls.get("serverName", "")),
-                    UPSTREAM_FINGERPRINT=reality.get("fingerprint", tls.get("fingerprint", "chrome")),
-                    UPSTREAM_ALLOW_INSECURE=str(tls.get("allowInsecure", False)).lower(),
-                    UPSTREAM_REALITY_PUBLIC_KEY=reality.get("publicKey", reality.get("password", "")),
-                    UPSTREAM_REALITY_SHORT_ID=reality.get("shortId", ""),
-                    UPSTREAM_REALITY_MLDSA65_VERIFY=reality.get("mldsa65Verify", ""),
-                    UPSTREAM_XHTTP_PATH=xhttp.get("path", ""), UPSTREAM_XHTTP_HOST=xhttp.get("host", ""),
-                    UPSTREAM_XHTTP_MODE=xhttp.get("mode", "auto"),
-                    UPSTREAM_XHTTP_EXTRA=json.dumps(xhttp.get("extra", {})),
-                    UPSTREAM_ALPN=",".join(tls.get("alpn", [])))
-        validate(data)
-    return data
-
-try:
-    action = sys.argv[1]
-    if action == "parse":
-        dump(parse_node(Path(sys.argv[2]).read_text().strip()))
-    elif action == "upstream-values":
-        values(read_json(sys.argv[2]), UP)
-    elif action == "validate":
-        validate(environment(UP))
-    elif action == "outbound":
-        dump(upstream_outbound(environment(UP)))
-    elif action == "state-save":
-        atomic(sys.argv[2], environment(STATE + UP))
-    elif action == "state-values":
-        values(read_json(sys.argv[2]), STATE + UP)
-    elif action == "access-values":
-        values(access_data(read_json(sys.argv[2]), environment(STATE + UP)), STATE + UP)
-    elif action == "legacy":
-        dump(legacy(sys.argv[2]))
-    elif action == "list":
-        for data in records():
-            destination = "Internet" if data["NODE_MODE"] == "direct" else (
-                data["UPSTREAM_ADDRESS"] + ":" + data["UPSTREAM_PORT"])
-            ports = "/".join(p for p in (data.get("REALITY_PORT"), data.get("TLS_PORT")) if p)
-            print("\t".join(clean(x) for x in (data["INSTANCE_ID"], data["INSTANCE_NAME"],
-                  data["NODE_MODE"], ports, destination, data["SERVICE_NAME"])))
-    elif action == "ports":
-        for data in records():
-            for key in ("TLS_PORT", "REALITY_PORT", "INTERNAL_HTTP_PORT", "INTERNAL_HTTPS_PORT"):
-                if data.get(key):
-                    print(data[key])
-    elif action == "unique":
-        for data in records():
-            if data["UUID"].lower() == os.environ["UUID"].lower():
-                fail("该 UUID 已被实例 " + data["INSTANCE_ID"] + " 使用")
-            if data["APP_DIR"] == os.environ["APP_DIR"] or data["SERVICE_NAME"] == os.environ["SERVICE_NAME"]:
-                fail("该目录或服务已登记为实例 " + data["INSTANCE_ID"])
-    elif action == "uuid-unique":
-        for data in records():
-            if data["INSTANCE_ID"] != os.environ["INSTANCE_ID"] and data["UUID"].lower() == os.environ["UUID"].lower():
-                fail("该 UUID 已被实例 " + data["INSTANCE_ID"] + " 使用")
-    elif action == "edit-access":
-        config = read_json(sys.argv[2])
-        access_data(config, environment(STATE + UP))
-        for inbound in config["inbounds"]:
-            if inbound.get("protocol") != "vless":
-                continue
-            for client in inbound["settings"]["clients"]:
-                client["id"] = os.environ["UUID"]
-            security = inbound["streamSettings"]["security"]
-            inbound["port"] = int(os.environ[security.upper() + "_PORT"])
-            if security == "reality":
-                reality = inbound["streamSettings"]["realitySettings"]
-                reality["privateKey"] = os.environ["REALITY_PRIVATE_KEY"]
-                reality["shortIds"] = [os.environ["REALITY_SHORT_ID"]]
-        dump(config)
-    elif action == "replace-upstream":
-        config = read_json(sys.argv[2])
-        config["outbounds"] = [upstream_outbound(environment(UP))] + [
-            o for o in config["outbounds"] if o.get("tag") != "upstream-vless"]
-        dump(config)
-    elif action in ("client", "client-yaml"):
-        data = environment(STATE)
-        common = {"encryption": "none", "type": "tcp", "flow": "xtls-rprx-vision"}
-        if action == "client-yaml":
-            print("proxies:")
-        for security, node in client_nodes(data):
-            if action == "client-yaml":
-                # JSON flow objects are valid YAML; strings such as short-id stay quoted.
-                print("  - " + json.dumps(node, ensure_ascii=False))
-                continue
-            query = dict(common, security=security, fp=data["REALITY_FINGERPRINT"] or "chrome")
-            if security == "reality":
-                query.update(sni=data["REALITY_SERVER_NAME"], pbk=data["REALITY_PUBLIC_KEY"],
-                             sid=data["REALITY_SHORT_ID"])
-            else:
-                query["sni"] = data["DOMAIN"]
-            print("vless://" + data["UUID"] + "@" + data["DOMAIN"] + ":" + str(node["port"]) + "?" +
-                  urlencode(query, quote_via=quote) + "#" + quote(node["name"]))
-    else:
-        fail("未知内部操作")
-except (ValueError, KeyError, IndexError, StopIteration, OSError, TypeError):
-    # Do not include parser source snippets or credential-bearing exception reprs.
-    message = sys.exc_info()[1]
-    if isinstance(message, ValueError) and not isinstance(message, json.JSONDecodeError):
-        print("错误：" + str(message), file=sys.stderr)
-    else:
-        print("错误：配置格式或登记文件不正确，请检查字段", file=sys.stderr)
-    sys.exit(1)
-PY
+ensure_native_helper() {
+  if [[ -n "${CHAINCTL_BIN:-}" ]]; then
+    [[ -x "$CHAINCTL_BIN" ]] || die "CHAINCTL_BIN 不是可执行的原生工具"
+    [[ "$("$CHAINCTL_BIN" internal-legacy protocol 2>/dev/null)" == 1 ]] || die "chainctl 版本不支持此安装器，请使用同版本发行包中的原生工具"
+    return 0
+  fi
+  if [[ -x "$MANAGER_DIR/chainctl" && "$("$MANAGER_DIR/chainctl" internal-legacy protocol 2>/dev/null)" == 1 ]]; then CHAINCTL_BIN="$MANAGER_DIR/chainctl"; return 0; fi
+  if need_cmd chainctl && [[ "$(chainctl internal-legacy protocol 2>/dev/null)" == 1 ]]; then CHAINCTL_BIN="$(command -v chainctl)"; return 0; fi
+  ensure_work_dir
+  curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 \
+    https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh -o "$WORK_DIR/native-bootstrap.sh"
+  sh "$WORK_DIR/native-bootstrap.sh" bootstrap-native "$WORK_DIR/chainctl"
+  CHAINCTL_BIN="$WORK_DIR/chainctl"
+  [[ "$("$CHAINCTL_BIN" internal-legacy protocol 2>/dev/null)" == 1 ]] || die "当前正式发行包尚不支持此安装器，请使用对应版本的脚本和 chainctl"
 }
+
+native_helper() {
+  ensure_native_helper
+  "$CHAINCTL_BIN" internal-legacy "$@"
+}
+
 
 normalize_domain() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g'
@@ -652,7 +210,7 @@ check_host() {
   local h="$1"
   check_domain "$h" || check_ipv4 "$h" || {
     [[ "$h" =~ ^[0-9a-fA-F:]+$ ]] &&
-      python3 -c 'import ipaddress, sys; ipaddress.IPv6Address(sys.argv[1])' "$h" 2>/dev/null
+      native_helper ipv6 "$h" 2>/dev/null
   }
 }
 
@@ -853,7 +411,6 @@ install_base_tools() {
   local packages=() cmd needs_coreutils=0
   need_cmd curl || packages+=(curl)
   need_cmd openssl || packages+=(openssl)
-  need_cmd python3 || packages+=(python3)
   need_cmd unzip || packages+=(unzip)
   # Respect working curl-minimal/coreutils-single alternatives on CentOS.
   for cmd in timeout install mktemp chmod cp mv; do
@@ -872,19 +429,13 @@ install_base_tools() {
     else packages+=(util-linux)
     fi
   fi
-  if ! python3 -c 'import yaml' >/dev/null 2>&1; then
-    case "$PACKAGE_MANAGER" in
-      apt) packages+=(python3-yaml) ;;
-      dnf|yum) packages+=(python3-pyyaml) ;;
-      apk) packages+=(py3-yaml) ;;
-    esac
-  fi
   if [[ "${#packages[@]}" -gt 0 ]]; then
     blue "安装缺少的基础依赖..."
     package_install ca-certificates "${packages[@]}"
   else
     green "基础依赖已满足"
   fi
+  ensure_native_helper
 }
 
 install_xray_if_needed() {
@@ -912,7 +463,7 @@ install_xray_if_needed() {
   if [[ "$release" == latest ]]; then
     curl -fsSL --retry 3 https://api.github.com/repos/XTLS/Xray-core/releases/latest \
       -o "$WORK_DIR/release.json"
-    release="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "$WORK_DIR/release.json")"
+    release="$(native_helper release-tag "$WORK_DIR/release.json")"
   fi
   [[ "$release" =~ ^v[0-9][0-9.]*$ ]] || die "XRAY_VERSION 格式不正确"
   asset="Xray-linux-${arch}.zip"
@@ -945,23 +496,16 @@ install_nginx_if_needed() {
   service_action enable nginx >/dev/null 2>&1 || true
 }
 
-install_certbot_for_mode() {
+install_acme_for_mode() {
   [[ "$CERT_MODE" == http || "$CERT_MODE" == cloudflare ]] || return 0
-
-  blue "检查 Certbot..."
-  local plugin=""
-  if [[ "$CERT_MODE" == cloudflare ]]; then
-    if [[ "$PACKAGE_MANAGER" == apk ]]; then plugin=certbot-dns-cloudflare
-    else plugin=python3-certbot-dns-cloudflare
-    fi
+  ensure_native_helper
+  if [[ ! -e "$MANAGER_DIR/chainctl" ]]; then
+    install -m 700 "$CHAINCTL_BIN" "$MANAGER_DIR/chainctl"
   fi
-  if [[ "$PACKAGE_MANAGER" == dnf || "$PACKAGE_MANAGER" == yum ]]; then
-    # Certbot and DNS plugins are supplied by EPEL on CentOS/RHEL derivatives.
-    if ! rpm -q epel-release >/dev/null 2>&1; then package_install epel-release; fi
-  fi
-  package_install certbot ${plugin:+"$plugin"}
-  need_cmd certbot || die "Certbot 安装失败"
+  CHAINCTL_BIN="$MANAGER_DIR/chainctl"
+  [[ "$("$CHAINCTL_BIN" internal-legacy protocol 2>/dev/null)" == 1 ]] || die "现有证书工具版本不兼容，请先更新管理目录中的 chainctl"
 }
+
 
 ask_domain_and_role() {
   if [[ -z "$DOMAIN" ]]; then
@@ -1034,7 +578,7 @@ ask_cert_mode() {
   if [[ -z "$CERT_MODE" ]]; then
     echo
     blue "请选择证书方式："
-    echo "  1) Certbot HTTP-01（推荐：域名不在 Cloudflare 也能用；要求公网 80 可访问）"
+    echo "  1) 原生 ACME HTTP-01（推荐：域名不在 Cloudflare 也能用；要求公网 80 可访问）"
     echo "  2) Cloudflare DNS-01（需要 CF_API_TOKEN；不要求公网 80）"
     echo "  3) 使用已有证书文件"
     read -rp "请选择 [1/2/3，默认1]: " CERT_MODE
@@ -1088,7 +632,7 @@ choose_port_interactive() {
 }
 
 choose_public_ports() {
-  # Product default: Certbot HTTP-01 still prefers 443 for the actual proxy service.
+  # HTTP-01 still prefers 443 for the actual proxy service.
   # HTTP-01 itself validates on port 80; certificate usage is not limited to 443.
   if [[ "$SECURITY_MODE" == tls ]]; then
     [[ -n "$TLS_PORT" ]] || TLS_PORT="${LISTEN_PORT:-443}"
@@ -1324,7 +868,7 @@ verify_http_challenge() {
       if [[ "$target" == local ]]; then
         yellow "本机 HTTP-01 自检失败（HTTP ${status:-000}）：$url"
         yellow "请确认实际运行的 Nginx 加载了 $NGINX_CONF_DIR/xray-chain-http-$DOMAIN.conf，且没有同域名的 80 端口站点冲突。"
-        yellow "Certbot webroot 应为：$root；使用 nginx -T 检查生效配置。"
+        yellow "ACME webroot 应为：$root；检查生效的 Nginx 配置。"
         yellow "请同时检查该目录所有父目录的执行权限及 Nginx error.log 中的 Permission denied。"
       else
         yellow "域名 HTTP-01 自检失败（HTTP ${status:-000}）：$url"
@@ -1362,14 +906,10 @@ obtain_or_copy_cert() {
 
   if [[ "$CERT_MODE" == http ]]; then
     verify_http_challenge
-    blue "使用 Certbot webroot 执行 HTTP-01 证书申请..."
-    certbot certonly --webroot -w "$MANAGER_WEB_ROOT/domains/$DOMAIN" \
-      -d "$DOMAIN" \
-      --email "$EMAIL" \
-      --agree-tos \
-      --no-eff-email \
-      --non-interactive \
-      --keep-until-expiring
+    blue "使用 Rust ACME 执行 HTTP-01 证书申请..."
+    local issued
+    issued="$("$CHAINCTL_BIN" internal-cert-obtain http /etc/letsencrypt "$DOMAIN" "$DOMAIN" "$MANAGER_WEB_ROOT/domains/$DOMAIN")"
+    le_live="${issued##*$'\n'}"
     CERT_FILE="${le_live}/fullchain.pem"
     KEY_FILE="${le_live}/privkey.pem"
   elif [[ "$CERT_MODE" == cloudflare ]]; then
@@ -1386,16 +926,9 @@ obtain_or_copy_cert() {
 dns_cloudflare_api_token = ${CF_API_TOKEN}
 CF
     chmod 600 "$credentials"
-    certbot certonly \
-      --dns-cloudflare \
-      --dns-cloudflare-credentials "$credentials" \
-      --dns-cloudflare-propagation-seconds 60 \
-      -d "$DOMAIN" \
-      --email "$EMAIL" \
-      --agree-tos \
-      --no-eff-email \
-      --non-interactive \
-      --keep-until-expiring
+    local issued
+    issued="$("$CHAINCTL_BIN" internal-cert-obtain cloudflare /etc/letsencrypt "$DOMAIN" "$DOMAIN" "$credentials")"
+    le_live="${issued##*$'\n'}"
     CERT_FILE="${le_live}/fullchain.pem"
     KEY_FILE="${le_live}/privkey.pem"
   fi
@@ -1418,37 +951,15 @@ configure_selinux() {
   needs_nginx || return 0
   need_cmd getenforce || return 0
   [[ "$(getenforce)" == Enforcing ]] || return 0
-  if ! need_cmd semanage; then
-    local policy_package=policycoreutils-python-utils
-    if [[ "$PACKAGE_MANAGER" == yum ]] && rpm -q --qf '%{VERSION}' centos-release 2>/dev/null | grep -q '^7'; then
-      policy_package=policycoreutils-python
-    fi
-    package_install policycoreutils "$policy_package"
-  fi
-  local port
-  for port in "$INTERNAL_HTTP_PORT" "$INTERNAL_HTTPS_PORT"; do
-    if ! semanage port -l | python3 -c '
-import sys
-p=int(sys.argv[1]); found=False
-for line in sys.stdin:
-    fields=line.split()
-    if fields[:2] != ["http_port_t","tcp"]: continue
-    for part in "".join(fields[2:]).split(","):
-        if not part: continue
-        nums=[int(v) for v in part.split("-")]
-        if nums[0] <= p <= nums[-1]: found=True
-sys.exit(0 if found else 1)' "$port"; then
-      semanage port -a -t http_port_t -p tcp "$port" ||
-        die "SELinux 端口 $port 已被其它类型使用，请调整 INTERNAL_HTTP_PORT/INTERNAL_HTTPS_PORT"
-    fi
-  done
+  if ! need_cmd semodule || ! need_cmd restorecon; then package_install policycoreutils; fi
   local root="$MANAGER_WEB_ROOT/domains/$DOMAIN"
   mkdir -p "$root/.well-known/acme-challenge"
-  # Keep SELinux enabled; label only this manager's website and certificate paths.
-  semanage fcontext -a -t httpd_sys_content_t "$MANAGER_WEB_ROOT(/.*)?" 2>/dev/null ||
-    semanage fcontext -m -t httpd_sys_content_t "$MANAGER_WEB_ROOT(/.*)?"
-  semanage fcontext -a -t httpd_config_t "$APP_DIR/certs(/.*)?" 2>/dev/null ||
-    semanage fcontext -m -t httpd_config_t "$APP_DIR/certs(/.*)?"
+  # Native policy tools load CIL directly, without Python-based semanage.
+  ensure_work_dir
+  local policy_name
+  policy_name="xray_chain_$(printf '%s' "$INSTANCE_ID" | openssl dgst -sha256 | awk '{print $NF}')"
+  MANAGER_WEB_ROOT="$MANAGER_WEB_ROOT" native_helper selinux-policy > "$WORK_DIR/$policy_name.cil"
+  semodule -i "$WORK_DIR/$policy_name.cil" || die "SELinux 策略加载失败，请检查端口或路径类型冲突"
   restorecon -RF "$MANAGER_WEB_ROOT" "$APP_DIR/certs"
 }
 
@@ -1741,16 +1252,29 @@ start_xray() {
 setup_cert_renew_hook() {
   [[ "$CERT_MODE" == http || "$CERT_MODE" == cloudflare ]] || return 0
   mkdir -p "$RENEW_HOOK_DIR"
-  local hook="$RENEW_HOOK_DIR/$SERVICE_NAME.sh"
-  [[ ! -e "$hook" ]] || die "续期脚本已存在：$hook"
+  local hook="$RENEW_HOOK_DIR/$SERVICE_NAME.sh" source
+  [[ ! -e "$hook" && ! -L "$hook" ]] || die "续期脚本已存在：$hook"
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    local renewal_path
+    for renewal_path in "$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.service" "$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.timer"; do
+      [[ ! -e "$renewal_path" && ! -L "$renewal_path" ]] || die "证书续期服务已存在：$renewal_path"
+    done
+  else
+    [[ ! -e "$OPENRC_DIR/../periodic/daily/$SERVICE_NAME-cert-renew" && ! -L "$OPENRC_DIR/../periodic/daily/$SERVICE_NAME-cert-renew" ]] || die "证书续期定时入口已存在"
+  fi
   INSTALL_HOOK_CREATED=1
+  if [[ "$CERT_MODE" == http ]]; then source="$MANAGER_WEB_ROOT/domains/$DOMAIN"
+  else source="$MANAGER_DIR/credentials/$DOMAIN.ini"
+  fi
   cat > "$hook" <<HOOK
 #!/usr/bin/env bash
+# Managed by xray-vless-native-v3.sh
 set -Eeuo pipefail
-# Only copy this instance's own certificate; unrelated renewals are ignored.
-[[ "\${RENEWED_LINEAGE:-}" == "/etc/letsencrypt/live/$DOMAIN" ]] || exit 0
-cp -L "\$RENEWED_LINEAGE/fullchain.pem" "$APP_DIR/certs/fullchain.pem"
-cp -L "\$RENEWED_LINEAGE/privkey.pem" "$APP_DIR/certs/privkey.pem"
+result="\$("$MANAGER_DIR/chainctl" internal-cert-obtain "$CERT_MODE" /etc/letsencrypt "$DOMAIN" "$DOMAIN" "$source")"
+lineage="\${result##*\$'\n'}"
+if cmp -s "\$lineage/fullchain.pem" "$APP_DIR/certs/fullchain.pem" && cmp -s "\$lineage/privkey.pem" "$APP_DIR/certs/privkey.pem"; then exit 0; fi
+cp -L "\$lineage/fullchain.pem" "$APP_DIR/certs/fullchain.pem"
+cp -L "\$lineage/privkey.pem" "$APP_DIR/certs/privkey.pem"
 chmod 644 "$APP_DIR/certs/fullchain.pem"
 chmod 600 "$APP_DIR/certs/privkey.pem"
 nginx -t
@@ -1764,19 +1288,40 @@ fi
 HOOK
   chmod 700 "$hook"
   if [[ "$INIT_SYSTEM" == systemd ]]; then
-    systemctl enable --now certbot.timer >/dev/null 2>&1 ||
-      systemctl enable --now certbot-renew.timer >/dev/null 2>&1 ||
-      yellow "未找到 Certbot timer，请配置定时运行 certbot renew"
+    INSTALL_RENEW_SERVICE_CREATED=1
+    cat > "$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.service" <<UNIT
+# Managed by xray-vless-native-v3.sh
+[Unit]
+Description=Renew $SERVICE_NAME certificate
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $hook
+UNIT
+    INSTALL_RENEW_TIMER_CREATED=1
+    cat > "$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.timer" <<UNIT
+# Managed by xray-vless-native-v3.sh
+[Unit]
+Description=Renew $SERVICE_NAME certificate daily
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3600
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME-cert-renew.timer"
   else
-    mkdir -p /etc/periodic/daily
-    if [[ ! -e /etc/periodic/daily/xray-chain-certbot ]]; then
-      printf '#!/bin/sh\ncertbot renew --quiet\n' > /etc/periodic/daily/xray-chain-certbot
-      chmod 755 /etc/periodic/daily/xray-chain-certbot
-    fi
+    local periodic="$OPENRC_DIR/../periodic/daily"
+    mkdir -p "$periodic"
+    INSTALL_RENEW_CRON_CREATED=1
+    printf '#!/bin/sh\n# Managed by xray-vless-native-v3.sh\nexec /bin/bash %q\n' "$hook" > "$periodic/$SERVICE_NAME-cert-renew"
+    chmod 700 "$periodic/$SERVICE_NAME-cert-renew"
     service_action enable crond >/dev/null 2>&1 || true
     service_action active crond >/dev/null 2>&1 || service_action start crond
   fi
 }
+
 
 render_client_info() {
     printf '租户：%s\n角色：%s\n入口域名：%s\nUUID：%s\n' "$INSTANCE_NAME" "$NODE_MODE" "$DOMAIN" "$UUID"
@@ -1927,7 +1472,7 @@ cleanup() {
   if [[ "$DELETE_PENDING" == 1 ]]; then
     yellow "删除未完成，恢复原服务和站点..." >&2
     local entry
-    for entry in service nginx hook; do
+    for entry in service nginx hook renew_service renew_timer renew_cron; do
       if [[ -f "$WORK_DIR/delete.$entry.backup" ]]; then
         local destination
         destination="$(cat "$WORK_DIR/delete.$entry.path")"
@@ -1935,13 +1480,27 @@ cleanup() {
           red "恢复失败：$destination" >&2
       fi
     done
-    if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload; fi
+    if [[ "$INIT_SYSTEM" == systemd ]]; then
+      systemctl daemon-reload
+      if [[ -f "$WORK_DIR/delete.renew_timer.backup" ]]; then
+        if [[ "$DELETE_RENEW_WAS_ENABLED" == 1 ]]; then systemctl enable "$SERVICE_NAME-cert-renew.timer"; else systemctl disable "$SERVICE_NAME-cert-renew.timer"; fi
+        if [[ "$DELETE_RENEW_WAS_ACTIVE" == 1 ]]; then systemctl start "$SERVICE_NAME-cert-renew.timer"; fi
+      fi
+    fi
     if [[ -f "$WORK_DIR/delete.nginx.backup" ]]; then nginx -t && service_action reload nginx; fi
     if [[ "$DELETE_WAS_ENABLED" == 1 ]]; then service_action enable; else service_action disable; fi
     if [[ "$DELETE_WAS_ACTIVE" == 1 ]]; then service_action start; fi
   fi
   if [[ "$INSTALL_PENDING" == 1 ]]; then
     yellow "安装未完成，清理本次新增实例..." >&2
+    if [[ "$INSTALL_RENEW_TIMER_CREATED" == 1 ]]; then
+      systemctl stop "$SERVICE_NAME-cert-renew.timer" "$SERVICE_NAME-cert-renew.service" >/dev/null 2>&1
+      systemctl disable "$SERVICE_NAME-cert-renew.timer" >/dev/null 2>&1
+      rm -f "$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.timer"
+    fi
+    [[ "$INSTALL_RENEW_SERVICE_CREATED" != 1 ]] || rm -f "$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.service"
+    [[ "$INSTALL_RENEW_CRON_CREATED" != 1 ]] || rm -f "$OPENRC_DIR/../periodic/daily/$SERVICE_NAME-cert-renew"
+    if [[ "$INSTALL_RENEW_SERVICE_CREATED" == 1 || "$INSTALL_RENEW_TIMER_CREATED" == 1 ]]; then systemctl daemon-reload; fi
     if [[ "$INSTALL_SERVICE_CREATED" == 1 ]]; then
       service_action stop >/dev/null 2>&1
       service_action disable >/dev/null 2>&1
@@ -1992,7 +1551,7 @@ import_instance() {
   local source="${2:-/etc/xray-chain}" service="${3:-xray-chain}"
   safe_path "$source"
   [[ "$service" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$ ]] || die "旧服务名格式不正确"
-  need_cmd python3 || install_base_tools
+  ensure_native_helper
   manager_lock
   [[ ! -e "$MANAGER_DIR/instances/$INSTANCE_ID" ]] || die "该租户编号已存在"
   SERVICE_NAME="$service"
@@ -2217,20 +1776,37 @@ delete_instance() {
   if [[ -f "$conf" ]]; then nginx -t || die "请先修复现有 Nginx 配置，再删除租户"; fi
   confirm_instance_action "将停止并删除这个实例的服务、配置和伪装网页；共享证书及 HTTP 验证站保留。" || return 0
   ensure_work_dir
-  for entry in service nginx hook; do
-    case "$entry" in service) path="$unit" ;; nginx) path="$conf" ;; hook) path="$hook" ;; esac
+  for entry in service nginx hook renew_service renew_timer renew_cron; do
+    case "$entry" in
+      service) path="$unit" ;; nginx) path="$conf" ;; hook) path="$hook" ;;
+      renew_service) [[ "$INIT_SYSTEM" == systemd ]] || continue; path="$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.service" ;;
+      renew_timer) [[ "$INIT_SYSTEM" == systemd ]] || continue; path="$SYSTEMD_DIR/$SERVICE_NAME-cert-renew.timer" ;;
+      renew_cron) [[ "$INIT_SYSTEM" == openrc ]] || continue; path="$OPENRC_DIR/../periodic/daily/$SERVICE_NAME-cert-renew" ;;
+    esac
     [[ ! -L "$path" ]] || die "实例文件不能是符号链接：$path"
     if [[ -f "$path" ]]; then
+      if [[ "$entry" == renew_* ]]; then grep -q '^# Managed by xray-vless-native-v3.sh$' "$path" || die "续期文件不属于当前管理器：$path"; fi
       cp -p "$path" "$WORK_DIR/delete.$entry.backup"
       printf '%s' "$path" > "$WORK_DIR/delete.$entry.path"
     fi
   done
   if service_action active >/dev/null 2>&1; then DELETE_WAS_ACTIVE=1; fi
   if service_action enabled >/dev/null 2>&1; then DELETE_WAS_ENABLED=1; fi
+  if [[ -f "$WORK_DIR/delete.renew_timer.backup" ]]; then
+    if systemctl is-active --quiet "$SERVICE_NAME-cert-renew.timer"; then DELETE_RENEW_WAS_ACTIVE=1; fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME-cert-renew.timer"; then DELETE_RENEW_WAS_ENABLED=1; fi
+  fi
   DELETE_PENDING=1
+  if [[ -f "$WORK_DIR/delete.renew_timer.backup" ]]; then
+    systemctl stop "$SERVICE_NAME-cert-renew.timer" "$SERVICE_NAME-cert-renew.service"
+    systemctl disable "$SERVICE_NAME-cert-renew.timer"
+  fi
   if [[ "$DELETE_WAS_ACTIVE" == 1 ]]; then service_action stop; fi
   service_action disable
   rm -f -- "$unit" "$conf" "$hook"
+  for entry in renew_service renew_timer renew_cron; do
+    [[ ! -f "$WORK_DIR/delete.$entry.path" ]] || rm -f -- "$(cat "$WORK_DIR/delete.$entry.path")"
+  done
   if [[ "$INIT_SYSTEM" == systemd ]]; then systemctl daemon-reload; fi
   if [[ -f "$WORK_DIR/delete.nginx.backup" ]]; then nginx -t; service_action reload nginx; fi
   DELETE_PENDING=0
@@ -2282,7 +1858,7 @@ diagnose_instance() {
     fi
     if [[ -f "$APP_DIR/certs/fullchain.pem" ]]; then
       if openssl x509 -checkend 604800 -noout -in "$APP_DIR/certs/fullchain.pem" >/dev/null 2>&1; then green "证书有效期超过 7 天"
-      else yellow "证书将在 7 天内过期或无法读取，请检查 Certbot 续期任务"
+      else yellow "证书将在 7 天内过期或无法读取，请检查原生证书续期任务"
       fi
     fi
   fi
@@ -2492,7 +2068,7 @@ install_instance() {
   chmod 755 "$MANAGER_WEB_ROOT" "$MANAGER_WEB_ROOT/instances" "$WEB_ROOT"
   install_xray_if_needed
   install_nginx_if_needed
-  install_certbot_for_mode
+  install_acme_for_mode
   choose_internal_ports
   configure_selinux
   if needs_nginx; then detect_preexisting_nginx_domain; fi

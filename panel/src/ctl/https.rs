@@ -59,7 +59,7 @@ pub async fn public_ipv4() -> Result<String> {
             if let Some(addrs) = link["addr_info"].as_array() {
                 for addr in addrs {
                     if let Some(ip) = addr["local"].as_str() {
-                        if ip.parse().is_ok_and(chain_panel::rules::public_ip) {
+                        if ip.parse().is_ok_and(crate::rules::public_ip) {
                             return Ok(ip.into());
                         }
                     }
@@ -72,7 +72,7 @@ pub async fn public_ipv4() -> Result<String> {
             let words = line.split_whitespace().collect::<Vec<_>>();
             if words.first() == Some(&"inet") {
                 if let Some(ip) = words.get(1) {
-                    if ip.parse().is_ok_and(chain_panel::rules::public_ip) {
+                    if ip.parse().is_ok_and(crate::rules::public_ip) {
                         return Ok((*ip).into());
                     }
                 }
@@ -109,7 +109,10 @@ pub async fn proxy_acme(manager: &Manager) -> Result<()> {
     Ok(())
 }
 pub fn site(manager: &Manager, domain: &str, port: u16, tls: bool) -> String {
-    let cert = manager.path(&format!("/etc/letsencrypt/live/chain-panel-{domain}"));
+    let cert = crate::acme::paths(
+        &manager.path("/etc/letsencrypt"),
+        &format!("chain-panel-{domain}"),
+    );
     let root = manager.path("/var/lib/chain-acme");
     let mut text = format!(
         "{OWNER}\nserver {{\n listen 80;\n server_name {domain};\n location ^~ /.well-known/acme-challenge/ {{ root {}; default_type text/plain; try_files $uri /agent$uri /panel$uri =404; }}\n location / {{ {} }}\n}}\n",
@@ -126,7 +129,10 @@ pub fn site(manager: &Manager, domain: &str, port: u16, tls: bool) -> String {
     text
 }
 async fn existing_certificate(manager: &Manager, domain: &str) -> Result<bool> {
-    let dir = manager.path(&format!("/etc/letsencrypt/live/chain-panel-{domain}"));
+    let dir = crate::acme::paths(
+        &manager.path("/etc/letsencrypt"),
+        &format!("chain-panel-{domain}"),
+    );
     let cert = dir.join("fullchain.pem");
     let key = dir.join("privkey.pem");
     certificate(&cert, &key, domain).await
@@ -206,7 +212,7 @@ pub async fn activate(
             "域名包含非本机地址 {ip}，请修正 A/AAAA"
         );
     }
-    packages(&["nginx", "certbot", "openssl"]).await?;
+    packages(&["nginx", "openssl"]).await?;
     let main = nginx::main_path(manager);
     let files = nginx::files(&main)?;
     let directory = nginx::site_directory(&main)?;
@@ -237,7 +243,7 @@ pub async fn activate(
     };
     let webroot = manager.path("/var/lib/chain-acme");
     ordinary(&webroot)?;
-    fs::create_dir_all(webroot.join(".well-known/acme-challenge"))?;
+    crate::acme::challenge_directory(&webroot.join(".well-known/acme-challenge"))?;
     let reusable = existing_certificate(manager, &domain).await?;
     let result: Result<()> = async {
         if !reusable {
@@ -250,7 +256,7 @@ pub async fn activate(
             nginx::reload(manager).await?;
             let marker = uuid::Uuid::new_v4().to_string();
             let challenge = webroot.join(".well-known/acme-challenge").join(&marker);
-            fs::write(&challenge, &marker)?;
+            atomic(&challenge, marker.as_bytes(), 0o644)?;
             let response = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -266,23 +272,11 @@ pub async fn activate(
             fs::remove_file(challenge)?;
             let checked = checked?;
             ensure!(checked == marker, "ACME HTTP 路径验证失败");
-            command(
-                "certbot",
-                &[
-                    "certonly",
-                    "--webroot",
-                    "-w",
-                    webroot.to_str().unwrap(),
-                    "--cert-name",
-                    &format!("chain-panel-{domain}"),
-                    "-d",
-                    &domain,
-                    "--non-interactive",
-                    "--agree-tos",
-                    "--register-unsafely-without-email",
-                    "--keep-until-expiring",
-                ],
-                180,
+            crate::acme::obtain(
+                &manager.path("/etc/letsencrypt"),
+                &format!("chain-panel-{domain}"),
+                &domain,
+                &webroot,
             )
             .await?;
         }
@@ -324,19 +318,10 @@ pub async fn renewal(manager: &Manager, domain: &str) -> Result<()> {
             "续期 hook 归属不匹配"
         );
     }
-    fs::create_dir_all(hook.parent().unwrap())?;
+    if hook.exists() {
+        fs::remove_file(&hook)?;
+    }
     let ctl = manager.path("/usr/local/bin/chainctl");
-    let body = format!(
-        "#!/bin/sh\n{OWNER}\nset -eu\n[ \"${{RENEWED_LINEAGE:-}}\" = {} ] || exit 0\nexec {} internal-nginx-reload\n",
-        platform::shell(
-            manager
-                .path(&format!("/etc/letsencrypt/live/chain-panel-{domain}"))
-                .to_str()
-                .unwrap()
-        ),
-        platform::shell(ctl.to_str().unwrap())
-    );
-    atomic(&hook, body.as_bytes(), 0o755)?;
     if manager.kind() == "systemd" {
         let service = manager.path("/etc/systemd/system/chain-panel-cert-renew.service");
         let timer = manager.path("/etc/systemd/system/chain-panel-cert-renew.timer");
@@ -346,7 +331,10 @@ pub async fn renewal(manager: &Manager, domain: &str) -> Result<()> {
                 ensure!(fs::read_to_string(p)?.contains(OWNER), "续期服务归属不匹配");
             }
         }
-        atomic(&service,format!("{OWNER}\n[Unit]\nDescription=Chain certificate renewal\n[Service]\nType=oneshot\nExecStart={} renew --cert-name chain-panel-{domain} --quiet\n",platform::executable("certbot").context("缺少 Certbot")?.display()).as_bytes(),0o644)?;
+        let executable = platform::shell(ctl.to_str().context("管理器路径无效")?)
+            .replace('%', "%%")
+            .replace('$', "$$");
+        atomic(&service,format!("{OWNER}\n[Unit]\nDescription=Chain certificate renewal\n[Service]\nType=oneshot\nExecStart={executable} internal-cert-renew --domain {domain}\n").as_bytes(),0o644)?;
         atomic(&timer,format!("{OWNER}\n[Unit]\nDescription=Chain certificate renewal timer\n[Timer]\nOnCalendar=*-*-* 03,15:00:00\nRandomizedDelaySec=3600\nPersistent=true\n[Install]\nWantedBy=timers.target\n").as_bytes(),0o644)?;
         command("systemctl", &["daemon-reload"], 30).await?;
         command(
@@ -392,6 +380,56 @@ pub async fn renewal(manager: &Manager, domain: &str) -> Result<()> {
         )?;
         platform::enable(manager, "chain-panel-cert-renew").await?;
         platform::related(manager, "restart", "chain-panel-cert-renew").await?;
+    }
+    Ok(())
+}
+
+pub async fn renew_once(manager: &Manager, domain: &str) -> Result<()> {
+    let domain = nginx::domain(domain)?;
+    let config = manager.path("/etc/letsencrypt");
+    let name = format!("chain-panel-{domain}");
+    let changed = crate::acme::obtain(
+        &config,
+        &name,
+        &domain,
+        &manager.path("/var/lib/chain-acme"),
+    )
+    .await?;
+    let path = nginx::site_directory(&nginx::main_path(manager))?.join("chain-panel.conf");
+    let before = fs::read_to_string(&path)?;
+    ensure!(before.starts_with(OWNER), "续期站点归属不匹配");
+    let old = config.join("live").join(&name);
+    let new = crate::acme::paths(&config, &name);
+    let replace = |text: &str| {
+        let mut text = text.to_string();
+        for file in ["fullchain.pem", "privkey.pem"] {
+            text = text.replace(
+                &nginx::quote(old.join(file).to_str().unwrap()),
+                &nginx::quote(new.join(file).to_str().unwrap()),
+            );
+        }
+        text
+    };
+    let after = replace(&before);
+    if after != before {
+        nginx::replace_owned(&path, Some(&before), &after, OWNER)?;
+    }
+    if changed || after != before {
+        if let Err(error) = nginx::reload(manager).await {
+            if after != before {
+                nginx::replace_owned(&path, Some(&after), &before, OWNER)?;
+            }
+            return Err(error.context("证书已保留，Nginx 重载失败，原站点配置已保留"));
+        }
+    }
+    let ingress = manager.path("/var/lib/chain-ingress/state.json");
+    if ingress.exists() {
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(ingress)?)?;
+        let key = path.canonicalize()?.to_string_lossy().into_owned();
+        let original = state["files"][&key]["before"]
+            .as_str()
+            .context("统一入口站点快照缺失")?;
+        super::ingress::refresh_panel_site(manager, &path, &replace(original), &after)?;
     }
     Ok(())
 }
@@ -591,5 +629,85 @@ mod tests {
         assert!(nginx::parse(&s).is_ok());
         assert!(s.contains("try_files $uri /agent$uri /panel$uri =404"));
         assert!(s.contains("proxy_pass http://127.0.0.1:12345"));
+    }
+
+    #[tokio::test]
+    async fn native_certificate_reuse_restores_old_site_when_reload_fails() -> Result<()> {
+        use openssl::{
+            asn1::Asn1Time,
+            ec::{EcGroup, EcKey},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::PKey,
+            x509::{X509, X509NameBuilder, extension::SubjectAlternativeName},
+        };
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir()?;
+        let manager = Manager {
+            root: root.path().into(),
+            base: root.path().join("opt/chain"),
+        };
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let key = PKey::from_ec_key(EcKey::generate(&group)?)?;
+        let mut name = X509NameBuilder::new()?;
+        name.append_entry_by_nid(Nid::COMMONNAME, "panel.test")?;
+        let name = name.build();
+        let mut cert = X509::builder()?;
+        cert.set_version(2)?;
+        cert.set_subject_name(&name)?;
+        cert.set_issuer_name(&name)?;
+        cert.set_pubkey(&key)?;
+        cert.set_not_before(Asn1Time::days_from_now(0)?.as_ref())?;
+        cert.set_not_after(Asn1Time::days_from_now(90)?.as_ref())?;
+        let san = SubjectAlternativeName::new()
+            .dns("panel.test")
+            .build(&cert.x509v3_context(None, None))?;
+        cert.append_extension(san)?;
+        cert.sign(&key, MessageDigest::sha256())?;
+        let certificates = manager.path("/etc/letsencrypt/rust/live/chain-panel-panel.test");
+        fs::create_dir_all(&certificates)?;
+        let certificate = certificates.join("fullchain.pem");
+        atomic(&certificate, &cert.build().to_pem()?, 0o600)?;
+        atomic(
+            &certificates.join("privkey.pem"),
+            &key.private_key_to_pem_pkcs8()?,
+            0o600,
+        )?;
+        let metadata = fs::metadata(&certificate)?;
+        let main = nginx::main_path(&manager);
+        let sites = main.parent().unwrap().join("conf.d");
+        fs::create_dir_all(&sites)?;
+        fs::write(&main, "events {} http { include conf.d/*.conf; }\n")?;
+        let site = sites.join("chain-panel.conf");
+        let current = super::site(&manager, "panel.test", 8088, true);
+        let old = current.replace("/rust/live/", "/live/");
+        atomic(&site, old.as_bytes(), 0o644)?;
+        let error = renew_once(&manager, "panel.test").await.unwrap_err();
+        assert!(format!("{error:#}").contains("离线安装"));
+        assert_eq!(fs::read_to_string(&site)?, old);
+        let after = fs::metadata(&certificate)?;
+        assert_eq!(
+            (
+                after.ino(),
+                after.uid(),
+                after.gid(),
+                after.mode(),
+                after.ctime(),
+                after.ctime_nsec()
+            ),
+            (
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode(),
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            )
+        );
+        atomic(&site, current.as_bytes(), 0o644)?;
+        renew_once(&manager, "panel.test").await?;
+        assert_eq!(fs::read_to_string(&site)?, current);
+        assert!(!manager.path("/etc/letsencrypt/rust/account.json").exists());
+        Ok(())
     }
 }

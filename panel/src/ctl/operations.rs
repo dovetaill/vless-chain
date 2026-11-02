@@ -34,15 +34,22 @@ fn backup_files<W: Write>(
         let relative = path.strip_prefix(directory)?;
         if kind.is_symlink() {
             let target = fs::read_link(&path)?;
+            let native = relative.starts_with("acme/config/rust/live");
             ensure!(
                 prefix == "data"
-                    && relative.starts_with("acme/config/live")
+                    && (relative.starts_with("acme/config/live") || native)
                     && target.is_relative()
-                    && path
-                        .canonicalize()?
-                        .starts_with(directory.join("acme/config/archive").canonicalize()?)
-                    && path.is_file(),
-                "备份路径包含非 Certbot 内部证书链接：{}",
+                    && path.canonicalize()?.starts_with(
+                        directory
+                            .join(if native {
+                                "acme/config/rust/archive"
+                            } else {
+                                "acme/config/archive"
+                            })
+                            .canonicalize()?
+                    )
+                    && (path.is_file() || native && path.is_dir()),
+                "备份路径包含非 ACME 内部证书链接：{}",
                 path.display()
             );
             bundle.append_path_with_name(&path, Path::new(prefix).join(relative))?;
@@ -381,6 +388,18 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::write(data.join("traffic.db"), "database").unwrap();
         fs::write(data.join("traffic.db-wal"), "committed").unwrap();
+        let native = data.join("acme/config/rust");
+        fs::create_dir_all(native.join("archive/example/gen-1")).unwrap();
+        fs::create_dir_all(native.join("live")).unwrap();
+        fs::write(
+            native.join("archive/example/gen-1/fullchain.pem"),
+            "certificate",
+        )
+        .unwrap();
+        let live = native.join("live/example");
+        std::os::unix::fs::symlink("../archive/example/gen-1", &live).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let before = fs::symlink_metadata(&live).unwrap();
         let manager = Manager::open(root.path()).unwrap();
         let archive = backup(&manager, "agent").unwrap();
         let decoder = flate2::read::GzDecoder::new(File::open(&archive).unwrap());
@@ -391,6 +410,33 @@ mod tests {
             .map(|e| e.unwrap().path().unwrap().into_owned())
             .collect::<Vec<_>>();
         assert!(names.contains(&Path::new("data/traffic.db-wal").to_path_buf()));
+        assert!(names.contains(&Path::new("data/acme/config/rust/live/example").to_path_buf()));
+        assert!(names.contains(
+            &Path::new("data/acme/config/rust/archive/example/gen-1/fullchain.pem").to_path_buf()
+        ));
+        let after = fs::symlink_metadata(&live).unwrap();
+        assert_eq!(
+            (
+                before.ino(),
+                before.uid(),
+                before.gid(),
+                before.mode(),
+                before.ctime(),
+                before.ctime_nsec()
+            ),
+            (
+                after.ino(),
+                after.uid(),
+                after.gid(),
+                after.mode(),
+                after.ctime(),
+                after.ctime_nsec()
+            )
+        );
+        fs::remove_file(&live).unwrap();
+        std::os::unix::fs::symlink("../../../../../traffic.db", &live).unwrap();
+        assert!(backup(&manager, "agent").is_err());
+        fs::remove_file(&live).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", data.join("foreign")).unwrap();
         assert!(backup(&manager, "agent").is_err());
         assert_eq!(fs::read_dir(archive.parent().unwrap()).unwrap().count(), 1);

@@ -56,7 +56,7 @@ pub fn tls_config(cert: &str, key: &str) -> Result<Arc<rustls::ServerConfig>> {
 }
 fn certificate(tls: &Tls, dir: &Path) -> Result<(String, String)> {
     if tls.mode == "auto" {
-        let live = dir.join("acme/config/live").join(&tls.domain);
+        let live = crate::acme::paths(&dir.join("acme/config"), &tls.domain);
         Ok((
             std::fs::read_to_string(live.join("fullchain.pem"))?,
             std::fs::read_to_string(live.join("privkey.pem"))?,
@@ -74,7 +74,7 @@ pub fn certificate_expiry(specs: &[Spec], dir: &Path) -> serde_json::Value {
     for spec in specs.iter().filter(|s| matches!(s.tls.mode.as_str(), "auto" | "manual")) {
         let expiry = (|| -> Result<u64> {
             let pem = if spec.tls.mode == "auto" {
-                std::fs::read(dir.join("acme/config/live").join(&spec.tls.domain).join("fullchain.pem"))?
+                std::fs::read(crate::acme::paths(&dir.join("acme/config"), &spec.tls.domain).join("fullchain.pem"))?
             } else { spec.tls.cert.as_bytes().to_vec() };
             let cert = openssl::x509::X509::from_pem(&pem)?;
             let epoch = openssl::asn1::Asn1Time::from_unix(0)?;
@@ -126,7 +126,7 @@ pub async fn prepare(specs: &[Spec], dir: &Path, existing_challenge: bool) -> Re
     if automatic.is_empty() {
         return Ok(());
     }
-    for sub in ["config", "work", "logs", "web"] {
+    for sub in ["config", "web"] {
         std::fs::create_dir_all(dir.join("acme").join(sub))?;
     }
     let shared_webroot = std::env::var_os("CHAIN_ACME_WEBROOT").map(PathBuf::from);
@@ -146,44 +146,8 @@ pub async fn prepare(specs: &[Spec], dir: &Path, existing_challenge: bool) -> Re
     let result = async {
         for spec in automatic {
             let tls = &spec.tls;
-            let mut command = tokio::process::Command::new(
-                std::env::var("CHAIN_CERTBOT_BIN").unwrap_or_else(|_| "certbot".into()),
-            );
-            command
-                .args([
-                    "certonly",
-                    "--webroot",
-                    "--non-interactive",
-                    "--agree-tos",
-                    "--register-unsafely-without-email",
-                    "--keep-until-expiring",
-                    "--cert-name",
-                    &tls.domain,
-                    "-d",
-                    &tls.domain,
-                    "--webroot-path",
-                ])
-                .arg(&webroot)
-                .arg("--config-dir")
-                .arg(dir.join("acme/config"))
-                .arg("--work-dir")
-                .arg(dir.join("acme/work"))
-                .arg("--logs-dir")
-                .arg(dir.join("acme/logs"))
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true);
-            let output = tokio::time::timeout(Duration::from_secs(150), command.output())
-                .await
-                .context("证书申请超时")??;
-            ensure!(
-                output.status.success(),
-                "域名 {} 的证书申请失败：{}",
-                tls.domain,
-                String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(1600)
-                    .collect::<String>()
-            );
+            crate::acme::obtain(&dir.join("acme/config"), &tls.domain, &tls.domain, &webroot)
+                .await.with_context(|| format!("域名 {} 的证书申请失败", tls.domain))?;
             load_tls(tls, dir)?;
         }
         Ok::<(), anyhow::Error>(())

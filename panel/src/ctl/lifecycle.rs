@@ -340,7 +340,7 @@ pub async fn local_agent(manager: &Manager, source: &Path, host: &str, target: &
     let server_name = if target.is_empty() {
         String::new()
     } else {
-        chain_panel::compiler::target(target)?.0
+        crate::compiler::target(target)?.0
     };
     let node: Value = request("nodes")
         .json(&json!({"name":"本机节点","host":host,"target":target,"server_name":server_name}))

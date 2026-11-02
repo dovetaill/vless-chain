@@ -12,9 +12,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  PYTHONDONTWRITEBYTECODE: '1'
-
 jobs:
   build:
     name: ${{ matrix.system }} ${{ matrix.arch }}
@@ -39,15 +36,11 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      CHAIN_BUILD_CACHE: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Validate release tag
-        if: github.ref_type == 'tag'
-        run: |
-          test "$GITHUB_REF_TYPE" = tag
-          python3 -B scripts/ci_release.py validate
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22.23.3'
@@ -69,12 +62,16 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ runner.temp }}/chain-build-cache
-          key: build-v1-${{ matrix.runner }}-${{ matrix.arch }}-rust1.96.0-node22.23.3-${{ hashFiles('panel/Cargo.lock', 'panel/frontend/package-lock.json', 'scripts/chain_release.py') }}-${{ github.sha }}
+          key: build-v2-${{ matrix.runner }}-${{ matrix.arch }}-rust1.96.0-node22.23.3-${{ hashFiles('panel/Cargo.lock', 'panel/frontend/package-lock.json', 'panel/src/task/**', 'scripts/version-release.sh') }}-${{ github.sha }}
           restore-keys: |
-            build-v1-${{ matrix.runner }}-${{ matrix.arch }}-rust1.96.0-node22.23.3-${{ hashFiles('panel/Cargo.lock', 'panel/frontend/package-lock.json', 'scripts/chain_release.py') }}-
-            build-v1-${{ matrix.runner }}-${{ matrix.arch }}-rust1.96.0-node22.23.3-
+            build-v2-${{ matrix.runner }}-${{ matrix.arch }}-rust1.96.0-node22.23.3-${{ hashFiles('panel/Cargo.lock', 'panel/frontend/package-lock.json', 'panel/src/task/**', 'scripts/version-release.sh') }}-
+            build-v2-${{ matrix.runner }}-${{ matrix.arch }}-rust1.96.0-node22.23.3-
+      - name: Validate release tag
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          ./scripts/version-release.sh validate
       - name: Check installer
-        run: python3 -B scripts/ci_release.py check
+        run: ./scripts/version-release.sh check
       - name: Build native release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,7 +84,7 @@ jobs:
         env:
           RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
         run: |
-          python3 -B scripts/ci_release.py smoke --input "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
+          ./scripts/version-release.sh smoke --input "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.ref_type == 'tag'
         with:
@@ -121,9 +118,12 @@ jobs:
       - name: Validate all platform builds and publish
         env:
           GH_TOKEN: ${{ github.token }}
+          CHAIN_TASK_REPO: ${{ github.workspace }}
         run: |
-          python3 -B scripts/ci_release.py assemble --input "$RUNNER_TEMP/chain-artifacts" --output "$RUNNER_TEMP/chain-release"
-          python3 -B scripts/ci_release.py publish --input "$RUNNER_TEMP/chain-release"
+          task_binary="$RUNNER_TEMP/chain-artifacts/release-linux-x86_64/verify-xtask"
+          chmod 755 "$task_binary"
+          "$task_binary" assemble --input "$RUNNER_TEMP/chain-artifacts" --output "$RUNNER_TEMP/chain-release"
+          "$task_binary" publish-ci --input "$RUNNER_TEMP/chain-release"
       - name: Remove task artifacts
         if: always()
         run: |

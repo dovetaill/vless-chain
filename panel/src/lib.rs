@@ -1,4 +1,7 @@
 pub mod access;
+pub mod acme;
+pub mod ctl;
+pub mod task;
 pub mod compiler;
 pub mod external;
 pub mod gateway;

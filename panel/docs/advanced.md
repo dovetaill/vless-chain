@@ -11,7 +11,7 @@
 - 同时管理多条独立 VLESS + REALITY + Vision 线路，每条 1–8 个受管节点，可共享物理节点，入口端口、UUID 和路径分别保存。
 - 本机代理按顺序引用外部代理或其他本机代理，支持链式出网与循环检查。
 - 受管 HTTP、SOCKS5、SS2022、Trojan/TLS 代理；外部可导入 HTTP(S)、SOCKS5、Shadowsocks、Trojan TCP/TLS 和 VLESS TCP/raw、XHTTP TLS/REALITY 链接。
-- 原生 HTTP/HTTPS 网站反代、同端口多域名、WebSocket、手工证书和 Certbot webroot 自动申请/续期。
+- 原生 HTTP/HTTPS 网站反代、同端口多域名、WebSocket、手工证书和 Rust ACME webroot 自动申请/续期。
 - 默认保存并应用，支持草稿、端口冲突和循环检查、影响范围确认、逐节点应用、运行确认与失败恢复。每个 Agent 管理一个独立 Xray，多条线路共享进程；修改可能使其相关连接短暂重连。仅限速/额度变动支持在线更新。
 - 真实入口 HTTP/HTTPS 探测，以及 TCP/UDP 回显探测。后两者要求目标运行回显服务，不把端口连通当作整链成功。
 - 二维码、协议分享链接、完整 Mihomo YAML / 节点 YAML、可撤销订阅，支持导入单节点 Mihomo YAML / JSON。
@@ -24,7 +24,7 @@
 
 `npm ci` 报缺少锁文件时，先检查所在目录：前端清单与锁文件位于 `panel/frontend/`，仓库根目录没有 npm 项目。不要为了消除报错在根目录生成新锁文件。
 
-需要 Linux 或 macOS 14+、Rust 2024 edition 工具链、Node.js 20.19+ 或 22.12+、npm、C 编译器、Perl 和 make。WebAuthn 的 OpenSSL 随程序静态编译，不要求目标系统安装匹配版本的 libssl。Linux 发行构建还需要 musl-tools 和对应 Rust 目标（`rustup target add x86_64-unknown-linux-musl` 或 `aarch64-unknown-linux-musl`）；macOS 使用本机 apple-darwin 目标。运行时包括 chain-panel、chain-agent、chainctl 三个 Rust 二进制，以及 Xray/Mihomo；Agent 自动证书还需要 Certbot，安装器会补齐。前端静态文件编译进 `chain-panel`，不需要 Node.js 服务。
+需要 Linux 或 macOS 14+、Rust 2024 edition 工具链、Node.js 20.19+ 或 22.12+、npm、C 编译器、Perl 和 make。WebAuthn 的 OpenSSL 随程序静态编译，不要求目标系统安装匹配版本的 libssl。Linux 发行构建还需要 musl-tools 和对应 Rust 目标（`rustup target add x86_64-unknown-linux-musl` 或 `aarch64-unknown-linux-musl`）；macOS 使用本机 apple-darwin 目标。运行时包括 chain-panel、chain-agent、chainctl 三个 Rust 二进制，以及 Xray/Mihomo；自动证书已集成 Rust ACME 客户端，无需 Python 或 Certbot。前端静态文件编译进 `chain-panel`，不需要 Node.js 服务。
 
 ```bash
 cd /home/wwwroot/vless-chain/panel/frontend
@@ -40,7 +40,7 @@ cargo build --release --bins
 
 ## 构建、安装与运维脚本
 
-在仓库根目录执行以下命令即可打开菜单，不再需要手工切换 npm/Cargo 目录。构建、版本和发版工具仍使用 Python 3.10+；安装引导为 Shell，安装后的运维入口为 Rust `chainctl`。
+在仓库根目录执行以下命令即可打开菜单，不再需要手工切换 npm/Cargo 目录。构建、版本、发版和集成验收由 Rust `xtask` 执行；Shell 入口仅引导编译或下载原生工具。构建和部署均无需 Python。
 
 ```bash
 ./scripts/version-release.sh
@@ -76,7 +76,7 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 
 域名安装查询公共 DNS 的 A/AAAA 记录并核对网卡公网地址，使用 Nginx webroot 完成 HTTP-01 验证。自动安装调用系统包管理器 apt、dnf、yum、apk、pacman、zypper 或 Homebrew；不下载第三方 Nginx/ACME 安装脚本。受管站点为主配置 `http` 块实际包含目录中的 `chain-panel.conf`，证书名为 `chain-panel-域名`，验证目录为 `/var/lib/chain-acme`。签证书前检查真实 HTTP 验证路径，重载后最多等待 15 秒让新站点生效；失败时显示验证 URL、HTTP 状态码或连接错误，HTTP 404/403 不再统一误报为防火墙问题。本机自检通过后仍由证书机构从公网验证 TCP 80；HTTPS 访问使用 TCP 443。同域名已有站点或 80/443 被其他程序占用时拒绝覆盖。支持系统包安装的 Nginx 配置；Linux 由 systemd/OpenRC 管理，macOS 使用独立的系统 LaunchDaemon。macOS 已有其他方式启动的 Nginx 时须先停止原服务，安装器保留已有站点配置。TLS 配置失败恢复原站点与此前服务状态，已签发证书保留供重试。
 
-证书续期在 systemd 使用 `chain-panel-cert-renew.timer`，OpenRC 使用受监控的定时任务，macOS 使用 launchd 的 StartInterval；每 12 小时检查一次，Certbot 只续期该面板证书；deploy hook 也核对证书路径后才检查并重载 Nginx。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
+证书续期在 systemd 使用 `chain-panel-cert-renew.timer`，OpenRC 使用受监控的定时任务，macOS 使用 launchd 的 StartInterval；每 12 小时由 Rust ACME 客户端检查该面板证书，剩余有效期不足 30 天时续期，成功后检查并重载 Nginx。保留读取已有 Certbot 证书的兼容性，不调用 Certbot。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
 
 构建支持 Linux/macOS 的 x86_64 与 aarch64；Linux 使用静态 musl 目标，macOS 使用原生 apple-darwin 目标（最低 macOS 14），执行 TypeScript/Vite 构建与 Rust 单元测试后生成 release 二进制。按 `panel/src/core-versions.json` 下载固定的 Xray/Mihomo 并检查官方附件 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
 
@@ -91,7 +91,7 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 ./scripts/version-release.sh status
 ```
 
-目标机器需要 Linux（systemd 或 OpenRC）或 macOS 14+（launchd）；原生 chainctl 无需 Python、npm、Rust 或额外安装代理内核。macOS 需先安装 Homebrew，再通过普通管理员账户运行 `sudo sh`。新版 Linux 静态包不依赖系统 glibc；旧 GNU 包仍检查 glibc 下限。安装前检查操作系统与 CPU 架构，拒绝混用包。旧版 CentOS 软件源可能缺少兼容 Certbot，需要先配置相应依赖，不保证已经停止维护的系统和失效软件源。
+目标机器需要 Linux（systemd 或 OpenRC）或 macOS 14+（launchd）；原生 chainctl 无需 Python、npm、Rust 或额外安装代理内核。macOS 需先安装 Homebrew，再通过普通管理员账户运行 `sudo sh`。新版 Linux 静态包不依赖系统 glibc；旧 GNU 包仍检查 glibc 下限。安装前检查操作系统与 CPU 架构，拒绝混用包。HTTPS 仍需要 Nginx 和可用的软件源，不保证已经停止维护的系统和失效软件源。
 
 安装器只管理 `/opt/chain` 下有归属标识的安装、`chain-panel`、`chain-agent` 服务、各自的 `/etc/chain-*` 与 `/var/lib/chain-*`。遇到同名的非本安装器目录或服务会拒绝覆盖。默认安装控制台并自动接入本机 Agent；只需控制台时使用 `--panel-only`。其他机器请自行通过 SSH 登录，运行默认安装命令，在该机器面板创建代理后将链接导入本面板；网页不执行 SSH 安装。
 
@@ -197,15 +197,15 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 ## 验证
 
-`scripts/verify.py --xray /绝对路径/xray --work-parent /大容量目录` 在独立临时目录构建前后端、运行 Rust 测试和真实 Xray 集成测试，结束自动清理。可加 `--browser` 做 Chromium 桌面和移动端流程验证；浏览器及 npm 缓存也位于临时目录内。
+`./scripts/version-release.sh verify --xray /绝对路径/xray --work-parent /大容量目录` 在独立临时目录构建前后端、运行 Rust 测试和真实 Xray 集成测试，结束自动清理。可加 `--browser` 做 Chromium 桌面和移动端流程验证；浏览器及 npm 缓存也位于临时目录内。
 
-提供 `CHAIN_TEST_MIHOMO=/已校验的/mihomo` 时，集成测试还会用真实 Mihomo 验证五类导出配置并请求本机测试站点。兼容验证使用 v1.19.32；只替换本地客户端监听端口，代理配置保持导出原样，测试 TLS CA 仅注入测试进程。
+提供 `CHAIN_TEST_MIHOMO=/已校验的/mihomo` 时，集成测试还会用真实 Mihomo 验证导出配置并请求本机测试站点。内核版本由 `panel/src/core-versions.json` 固定；只替换本地客户端监听端口，代理配置保持导出原样，测试 TLS CA 仅注入测试进程。
 
-专项链式回归使用 `tests/chain_matrix.py`：在独立的 `CHAIN_TEST_ROOT` 中，配合 `CHAIN_TEST_BIN_DIR`、`CHAIN_TEST_XRAY`、`CHAIN_TEST_MIHOMO` 和 `CHAIN_MIHOMO_BIN`，检查 13 种入口、169 种中间跳/出口组合及两条四跳混合链。检查首次 TCP 响应全文、UDP 小包/4 KiB 大包，以及 TCP、UDP 各自的逐跳流量；HTTP 前置无法承载 QUIC 的组合必须被拒绝。可重复传入 `--case` 运行指定用例；`--case 'exports and probes'` 检查面板探测、嵌套引用导出与订阅。脚本回收测试服务和端口，构建目录仍须由拥有它的验证工作区回收。
+专项链式回归使用 `xtask integration --case chain-matrix`：在独立的 `CHAIN_TEST_ROOT` 中，配合 `CHAIN_TEST_BIN_DIR`、`CHAIN_TEST_XRAY` 和 `CHAIN_TEST_MIHOMO`，检查 13 种入口、169 种中间跳/出口组合及两条四跳混合链。检查首次 TCP 响应全文、UDP 小包/4 KiB 大包，以及 TCP、UDP 各自的逐跳流量；HTTP 前置无法承载 QUIC 的组合必须被拒绝。用例选择放在 `--` 后，例如 `-- 'exports and probes'`。工具回收测试服务和端口，构建目录由拥有它的验证工作区回收。
 
-同时提供 `CHAIN_TEST_STREAM_MODULE=/与系统Nginx匹配的/ngx_stream_module.so` 时，验证脚本追加 `fronting.py`：检查 REALITY 目标/SNI、四种 VLESS 组合、批量保存失败的原子性、网站回落，以及独立 Nginx 中的 SNI 分流、网站保留、域名冲突回滚和路由删除。需已有 Nginx、OpenSSL、支持 HTTP/2 的 curl 和上述 Mihomo；测试不会安装系统模块或改动生产 Nginx。
+同时提供 `CHAIN_TEST_STREAM_MODULE=/与系统Nginx匹配的/ngx_stream_module.so` 时，验证入口追加 `xtask integration --case fronting`：检查 REALITY 目标/SNI、四种 VLESS 组合、批量保存失败的原子性、网站回落，以及独立 Nginx 中的 SNI 分流、网站保留、域名冲突回滚和路由删除。需已有 Nginx、OpenSSL、支持 HTTP/2 的 curl 和上述 Mihomo；测试不会安装系统模块或改动生产 Nginx。
 
-集成测试使用本机独立控制台、三个 Agent、真实 Xray、TLS 目标和 TCP/UDP 回显服务；覆盖多跳共享节点、稳定入口、外部出口、端口占用回滚、离线恢复；新增 features.py 验证 HTTP/SOCKS/SS/Trojan、HTTPS/WebSocket、多域名、SOCKS UDP 认证生命周期、八连接聚合限速、配额持久化、在线限速变更、导出/订阅、TOTP 和密钥轮换。browser.cjs 使用 Chromium 虚拟 CTAP2 验证 Passkey 注册/登录/撤销，检查桌面、手机和真实保存流程，并生成手册截图。测试不连接已有生产服务，进程组、端口和临时文件有归属记录，退出检查清理。
+Rust 集成测试使用本机独立控制台、三个 Agent、真实 Xray、TLS 目标和 TCP/UDP 回显服务；覆盖多跳共享节点、稳定入口、外部出口、端口占用回滚、离线恢复；`--case smoke` 同时验证 HTTP/SOCKS/SS/Trojan、HTTPS/WebSocket、多域名、SOCKS UDP 认证生命周期、八连接聚合限速、配额持久化、在线限速变更、导出/订阅、TOTP 和密钥轮换。`--case load-protocols --profiles socks5 tls-vision --stages basic auth load rate quota` 运行指定协议的有界负载验收；`udp-rights` 阶段额外检查 UDP 共享限速、硬额度和线路隔离。browser.cjs 使用 Chromium 虚拟 CTAP2 验证 Passkey 注册/登录/撤销，检查桌面、手机和真实保存流程，并生成手册截图。测试不连接已有生产服务，进程组、端口和临时文件有归属记录，退出检查清理。
 
 ## Agent 入口网关与数据
 
@@ -213,7 +213,7 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 `traffic.json` 持久化线路计量，约每 2 秒写入并在正常退出前保存；`active.json` 保存已应用版本。Agent 上报网关能力、已占用 TCP/UDP 端口及系统临时连接端口范围；内部端口优先使用 50000–65534，必要时回退到 30000–49999，避开 macOS 默认的 49152–65535 临时范围及已有监听；防止与出站连接或 TIME_WAIT 冲突。旧 Agent 未上报范围时按 Linux 默认 32768–60999 处理。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
 
-自动证书在 Agent 数据目录的 `acme/` 下，Certbot 使用独立 config/work/logs/web 路径，以 Agent 用户执行；可用 `CHAIN_CERTBOT_BIN` 指定程序位置。安装器安装 Nginx，由独立 ACME 站点将验证请求路由至 `/var/lib/chain-acme/{agent,panel}`；`CHAIN_ACME_WEBROOT` 指定对应目录，Agent 无需监听 TCP 80。手工部署未设置此变量时仍使用独立挑战监听。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
+自动证书在 Agent 数据目录的 `acme/` 下，Rust ACME 使用独立账户、挑战及证书版本目录，以 Agent 用户执行；不再使用 `CHAIN_CERTBOT_BIN`。安装器安装 Nginx，由独立 ACME 站点将验证请求路由至 `/var/lib/chain-acme/{agent,panel}`；`CHAIN_ACME_WEBROOT` 指定对应目录，Agent 无需监听 TCP 80。手工部署未设置此变量时仍使用独立挑战监听。HTTP-01 挑战结束会删除验证文件，独立 SSH 安装器也支持 Cloudflare DNS-01 并清理本次创建的 TXT。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
 
 控制台订阅 token 和恢复码只保存哈希；TOTP 秘钥和业务证书需要在私有数据目录中保留原文。Passkey 使用 webauthn-rs 的挑战、来源、用户验证和签名检查，挑战有有效期且单次使用。管理员密钥轮换会退出全部会话；本地 `chainctl reset-auth` 先备份并停止控制台，再清除登录二步验证配置，保留业务数据。
 
@@ -237,4 +237,4 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 
 网页 SSH 安装、购买中转入口、端口转发页面已移除。其他服务器由用户自行 SSH 登录安装，再以外部代理链接接入链式路径。
 
-原生运维实现位于 `panel/src/ctl/`。发行包中的旧 Python 文件名仅包含 `legacy_bridge.py` 的兼容转交代码，用于旧安装器固定文件列表的升级；新安装直接运行 `bin/chainctl`。仓库保留的 Python 测试调用原生程序或真实服务，不再导入已删除的 Python 运维实现。普通 CI 与发布 CI 均执行同一个发行 smoke 入口。
+原生运维实现位于 `panel/src/ctl/`，构建、发版及集成验收位于 `panel/src/task/`，自动证书位于 `panel/src/acme.rs`。发行包直接运行 `bin/chainctl`，不再携带旧 Python 转交文件。仍由 Python 管理的老安装应使用新版 `scripts/install-server.sh update` 进入原生升级流程。普通 CI 与发布 CI 均执行同一个 Rust 发行 smoke 入口。

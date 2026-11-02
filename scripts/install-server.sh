@@ -11,6 +11,12 @@ case "$(uname -m)" in x86_64) arch=x86_64;; aarch64|arm64) arch=aarch64;; *) ech
 [ "$platform-$arch" != darwin-x86_64 ] || { echo 'macOS 仅支持 ARM64' >&2; exit 1; }
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -x "$script_dir/../bin/chainctl" ]; then
+  if [ "${1:-}" = bootstrap-native ]; then
+    [ "$#" = 2 ] && [ ! -e "$2" ] && [ ! -L "$2" ] || { echo '原生工具输出路径必须不存在' >&2; exit 1; }
+    cp "$script_dir/../bin/chainctl" "$2"
+    chmod 700 "$2"
+    exit 0
+  fi
   case "${1:-}" in ''|-*) set -- setup "$@";; esac
   exec "$script_dir/../bin/chainctl" "$@"
 fi
@@ -54,6 +60,12 @@ tar -xOzf "$bootstrap_dir/$archive" bin/chainctl > "$bootstrap_dir/chainctl" || 
 }
 [ -s "$bootstrap_dir/chainctl" ] || exit 1
 chmod 700 "$bootstrap_dir/chainctl"
+if [ "${1:-}" = bootstrap-native ]; then
+  [ "$#" = 2 ] && [ ! -e "$2" ] && [ ! -L "$2" ] || { echo '原生工具输出路径必须不存在' >&2; exit 1; }
+  cp "$bootstrap_dir/chainctl" "$2"
+  chmod 700 "$2"
+  exit 0
+fi
 case "${1:-}" in ''|-*) set -- setup "$@";; esac
 has_package=false
 for arg in "$@"; do [ "$arg" != --package ] || has_package=true; done

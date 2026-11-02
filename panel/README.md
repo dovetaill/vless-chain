@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh | sudo sh
 ```
 
-正式发行包支持 Linux（systemd / OpenRC）的 x86_64 / ARM64，以及 macOS 14+ 的 Apple Silicon（ARM64）；不再提供 macOS Intel 包。Linux 发行包使用静态 musl，兼容 Alpine 与 glibc 系统；chainctl 不再依赖 Python；HTTPS 功能仍需包含 Nginx/Certbot 的软件源。macOS 需先安装 Homebrew，并从普通管理员账户通过 sudo 执行。Windows 暂不支持。安装脚本下载正式 Release；本次跨平台包发布前需从源码构建对应平台包，开发中的界面与功能需使用对应源码构建，见[高级部署与开发](docs/advanced.md#构建)。
+正式发行包支持 Linux（systemd / OpenRC）的 x86_64 / ARM64，以及 macOS 14+ 的 Apple Silicon（ARM64）；不再提供 macOS Intel 包。Linux 发行包使用静态 musl，兼容 Alpine 与 glibc 系统；安装运维和自动证书不依赖 Python，HTTPS 按需安装 Nginx。macOS 需先安装 Homebrew，并从普通管理员账户通过 sudo 执行。Windows 暂不支持。安装脚本下载正式 Release；本次跨平台包发布前需从源码构建对应平台包，开发中的界面与功能需使用对应源码构建，见[高级部署与开发](docs/advanced.md#构建)。
 
 保存安装结束时显示的控制台地址和管理员密钥。填写面板域名可配置 Nginx、HTTPS 与证书续期；公网登录请使用 HTTPS。Passkey 需要固定 HTTPS 域名，本机开发可用 `http://localhost`。
 
@@ -177,7 +177,7 @@ Xray 26.10.21 的 Freedom 出站默认拦截 VLESS 等代理访问私网地址�
 7. 重新绑定后重启备用 A、B，核对服务自启动、绑定与配置保留，以及代理实际出网。关闭 A 时 B 应能独立管理，代理继续工作。
 8. 最后在备用机验收批量维护：核对目标发行版、先升级一台，检查面板／Agent／内核版本和实际出网，再扩至多台。核对同时维护不超过 5 台；模拟单台失败时其他机器应继续，维护成功但连接验证失败时应自动复查且不重复升级。结果未知时先查询原任务，不反复新建升级任务。
 
-`tests/fleet-two-panels.py` 用两个独立面板进程验证 HTTPS 接入、远程 CRUD、定时同步、策略覆盖、失联／恢复记录、重启持久化及解绑。它要求非 root 身份、独占临时目录，以及仅在隔离测试构建中信任的本机测试证书；不会启动 Agent、代理内核或维护服务，也不外发通知。因此它不能替代上述真实出网、渠道收件、系统开机和升级验收。
+Rust 验收入口 `xtask integration --case fleet-two-panels` 用两个独立面板进程验证 HTTPS 接入、远程 CRUD、定时同步、策略覆盖、失联／恢复记录、重启持久化及解绑。它要求非 root 身份、独占临时目录，以及仅在隔离测试构建中信任的本机测试证书；不会启动 Agent、代理内核或维护服务，也不外发通知。因此它不能替代上述真实出网、渠道收件、系统开机和升级验收。
 
 安装自动接入控制台所在机器；本机记录缺失时，创建流程会恢复安装器保存的身份，无需额外添加服务器。旧安装缺少恢复信息时先执行 `sudo chainctl update`。
 
@@ -234,7 +234,7 @@ HTTP/HTTPS 出口仅支持 TCP；经它连接 Shadowsocks 或 SOCKS5 时也不�
 
 ## 使用限制与排错
 
-安装器安装 Nginx 和 Certbot，由 Nginx 提供 TCP 80 证书验证；Agent 不再争用 80 端口。域名需解析到本机，TCP 80 和代理监听端口需放行系统防火墙及云安全组。已有同域名站点必须能提供 ACME 验证路径，否则申请失败会显示具体错误，不会显示创建成功。
+安装器安装 Nginx，由 Rust ACME 客户端申请证书，Nginx 提供 TCP 80 证书验证；Agent 不再争用 80 端口。域名需解析到本机，TCP 80 和代理监听端口需放行系统防火墙及云安全组。已有同域名站点必须能提供 ACME 验证路径，否则申请失败会显示具体错误，不会显示创建成功。
 
 外部代理仅支持已实现的链接组合，不支持的传输或插件会报错。检查失败时先看服务器在线状态与应用结果，再核对端口、证书、目标可达性和客户端协议支持；修改路径或协议可能让共享服务器上的连接短暂重连，应用失败会尝试恢复旧配置。
 

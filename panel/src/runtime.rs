@@ -472,7 +472,7 @@ impl ManagedXray {
                 && matches!(spec.protocol, Protocol::Vless | Protocol::Hysteria2)
                 && spec.tls.mode == "auto"
             {
-                let live = self.dir.join("acme/config/live").join(&spec.tls.domain);
+                let live = crate::acme::paths(&self.dir.join("acme/config"), &spec.tls.domain);
                 let inbound = value["inbounds"]
                     .as_array_mut()
                     .context("缺少入站配置")?
@@ -508,7 +508,7 @@ impl ManagedXray {
             {
                 continue;
             }
-            let live = self.dir.join("acme/config/live").join(&spec.tls.domain);
+            let live = crate::acme::paths(&self.dir.join("acme/config"), &spec.tls.domain);
             let listener = value["listeners"]
                 .as_array_mut()
                 .context("缺少 QUIC 入口")?

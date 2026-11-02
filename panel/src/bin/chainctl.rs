@@ -1,5 +1,4 @@
-#[path = "../ctl/mod.rs"]
-mod ctl;
+use chain_panel::ctl;
 
 use anyhow::{Context, Result, bail, ensure};
 use std::path::PathBuf;
@@ -172,6 +171,22 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref()==Some("internal-cert-obtain") {
+        let words=std::env::args().skip(2).collect::<Vec<_>>();
+        ensure!(words.len()==5,"证书内部参数无效");
+        let config=std::path::Path::new(&words[1]);
+        let changed=match words[0].as_str(){
+            "http"=>chain_panel::acme::obtain(config,&words[2],&words[3],std::path::Path::new(&words[4])).await?,
+            "cloudflare"=>chain_panel::acme::obtain_dns(config,&words[2],&words[3],std::path::Path::new(&words[4])).await?,
+            _=>bail!("证书验证方式无效"),
+        };
+        println!("{}",if changed{"renewed"}else{"reused"});
+        println!("{}",chain_panel::acme::paths(config,&words[2]).display());
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref()==Some("internal-legacy") {
+        return ctl::legacy::run(&std::env::args().skip(2).collect::<Vec<_>>());
+    }
     if std::env::args().nth(1).as_deref() == Some("internal-render-routes") {
         use std::io::Read;
         let mut body = String::new();
@@ -552,19 +567,11 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
         ensure!(manager.live(), "离线树不会续期");
         let domain = ctl::nginx::domain(args.domain.as_deref().context("缺少续期域名")?)?;
         loop {
-            ctl::upgrade::command(
-                "certbot",
-                &[
-                    "renew",
-                    "--cert-name",
-                    &format!("chain-panel-{domain}"),
-                    "--quiet",
-                ],
-                300,
-            )
-            .await?;
+            ctl::https::renew_once(&manager, &domain).await?;
+            if manager.kind() == "systemd" { break; }
             tokio::time::sleep(std::time::Duration::from_secs(43200)).await;
         }
+        return Ok(());
     }
     if args.action == "uninstall" {
         if !args.non_interactive {

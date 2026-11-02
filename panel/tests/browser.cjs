@@ -1,4 +1,4 @@
-// Real UI and WebAuthn acceptance tests against smoke.py's isolated controller.
+// Real UI and WebAuthn acceptance tests against the isolated Rust smoke controller.
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');

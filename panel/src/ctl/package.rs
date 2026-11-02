@@ -268,7 +268,8 @@ pub(super) async fn fetch(
     path: &Path,
     limit: u64,
 ) -> Result<()> {
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    let request = download_request(client, url, std::env::var("GH_TOKEN").ok().as_deref());
+    let mut response = request.send().await?.error_for_status()?;
     ensure!(response.url().scheme() == "https", "下载必须使用 HTTPS");
     let mut file = OpenOptions::new()
         .write(true)
@@ -283,6 +284,17 @@ pub(super) async fn fetch(
     }
     file.sync_all()?;
     Ok(())
+}
+pub(crate) fn download_request(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match token.filter(|v| !v.is_empty() && url.starts_with("https://api.github.com/")) {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
 }
 
 pub async fn download(
@@ -537,7 +549,7 @@ pub(crate) mod tests {
 
     #[test]
     fn checked_extraction_rejects_links_and_duplicates() {
-        for variant in ["valid", "symlink", "duplicate", "checksum"] {
+        for variant in ["valid", "escape", "symlink", "duplicate", "checksum"] {
             let tmp = tempfile::tempdir().unwrap();
             let source = tmp.path().join("source");
             fixture(&source);
@@ -563,6 +575,14 @@ pub(crate) mod tests {
                 header.set_mode(0o644);
                 tar.append_link(&mut header, "bad", "/etc/passwd").unwrap();
             }
+            if variant == "escape" {
+                let mut header = tar::Header::new_gnu();
+                header.as_mut_bytes()[..10].copy_from_slice(b"../outside");
+                header.set_size(1);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append(&header, b"x".as_slice()).unwrap();
+            }
             if variant == "duplicate" {
                 tar.append_path_with_name(source.join("release.json"), "release.json")
                     .unwrap();
@@ -582,6 +602,7 @@ pub(crate) mod tests {
             let result = extract(&archive, &target);
             assert_eq!(result.is_ok(), variant == "valid", "{variant}: {result:?}");
             assert_eq!(target.exists(), variant == "valid");
+            assert!(!tmp.path().join("outside").exists());
         }
     }
 

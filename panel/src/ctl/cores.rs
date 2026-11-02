@@ -80,6 +80,50 @@ pub async fn download(core: &str, version: &str, directory: &Path, allow: bool) 
     )
     .await?;
     let release: Value = serde_json::from_slice(&fs::read(meta)?)?;
+    let (url, digest, name) = asset(core, version, &release, allow)?;
+    let archive = directory.join(&name);
+    package::fetch(&client, &url, &archive, LIMIT).await?;
+    ensure!(package::digest(&archive)? == digest, "附件摘要不匹配");
+    fs::create_dir_all(directory.join("bin"))?;
+    fs::create_dir_all(directory.join("share"))?;
+    if core == "xray" {
+        let (binary, license) = package::xray_files(&archive)?;
+        fs::write(directory.join("bin/xray"), binary)?;
+        fs::write(directory.join("share/Xray-LICENSE"), license)?;
+    } else {
+        let mut bytes = vec![];
+        flate2::read::GzDecoder::new(fs::File::open(archive)?)
+            .take(LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            !bytes.is_empty() && bytes.len() as u64 <= LIMIT,
+            "内核解压大小无效"
+        );
+        fs::write(directory.join("bin/mihomo"), bytes)?;
+        package::fetch(
+            &client,
+            &format!("https://raw.githubusercontent.com/{repo}/v{version}/LICENSE"),
+            &directory.join("share/Mihomo-LICENSE"),
+            65536,
+        )
+        .await?;
+    }
+    fs::set_permissions(
+        directory.join(format!("bin/{core}")),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    Ok(
+        json!({"version":version,"source":url,"archive_sha256":digest,"prerelease":release["prerelease"]==true}),
+    )
+}
+pub(crate) fn asset(
+    core: &str,
+    version: &str,
+    release: &Value,
+    allow: bool,
+) -> Result<(String, String, String)> {
+    let repo = valid(core)?;
+    package::version(version)?;
     ensure!(
         release["tag_name"] == format!("v{version}")
             && release["draft"] == false
@@ -123,40 +167,7 @@ pub async fn download(core: &str, version: &str, directory: &Path, allow: bool) 
         digest.len() == 64 && digest.bytes().all(|c| c.is_ascii_hexdigit()),
         "附件摘要无效"
     );
-    let archive = directory.join(&name);
-    package::fetch(&client, &url, &archive, LIMIT).await?;
-    ensure!(package::digest(&archive)? == digest, "附件摘要不匹配");
-    fs::create_dir_all(directory.join("bin"))?;
-    fs::create_dir_all(directory.join("share"))?;
-    if core == "xray" {
-        let (binary, license) = package::xray_files(&archive)?;
-        fs::write(directory.join("bin/xray"), binary)?;
-        fs::write(directory.join("share/Xray-LICENSE"), license)?;
-    } else {
-        let mut bytes = vec![];
-        flate2::read::GzDecoder::new(fs::File::open(archive)?)
-            .take(LIMIT + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            !bytes.is_empty() && bytes.len() as u64 <= LIMIT,
-            "内核解压大小无效"
-        );
-        fs::write(directory.join("bin/mihomo"), bytes)?;
-        package::fetch(
-            &client,
-            &format!("https://raw.githubusercontent.com/{repo}/v{version}/LICENSE"),
-            &directory.join("share/Mihomo-LICENSE"),
-            65536,
-        )
-        .await?;
-    }
-    fs::set_permissions(
-        directory.join(format!("bin/{core}")),
-        fs::Permissions::from_mode(0o755),
-    )?;
-    Ok(
-        json!({"version":version,"source":url,"archive_sha256":digest,"prerelease":release["prerelease"]==true}),
-    )
+    Ok((url, digest.into(), name))
 }
 pub fn replace(stage: &Path, core: &str, source: &Path, meta: &Value) -> Result<()> {
     valid(core)?;
