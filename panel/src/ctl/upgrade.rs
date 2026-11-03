@@ -510,17 +510,16 @@ impl Manager {
                 if self.kind() != "launchd" {
                     let current = super::lifecycle::service_process(self, &role).await?;
                     if let Some(pid) = current {
-                        ensure!(
-                            super::lifecycle::process_matches(
-                                pid,
-                                &self.base.join(format!("current-{role}/bin/chain-{role}"))
-                            )?,
-                            "chain-{role} 仍在运行旧程序"
-                        );
-                        ensure!(
-                            process.is_none_or(|prior| prior == pid),
-                            "chain-{role} 在升级验收期间重启"
-                        );
+                        if !super::lifecycle::process_ready(
+                            pid,
+                            &self.base.join(format!("current-{role}/bin/chain-{role}")),
+                            process,
+                        ).with_context(|| format!("chain-{role} 启动检查失败"))? {
+                            // Type=simple can become active before the child executes the service binary.
+                            active_count = 0;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
                         process = Some(pid);
                         if role == "agent" {
                             let variables = fs::read(format!("/proc/{pid}/environ"))?;

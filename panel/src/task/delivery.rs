@@ -401,6 +401,8 @@ pub async fn check(args: &Options) -> Result<()> {
         .await?;
     work.run(&root, &strings(&["python3", "-B", "scripts/tests/legacy-native.py"]))
         .await?;
+    work.run(&root, &strings(&["python3", "-B", "scripts/tests/local-package.py"]))
+        .await?;
     work.run(
         &root.join("panel"),
         &strings(&["cargo", "test", "--locked", "--lib", "task::", "--quiet"]),

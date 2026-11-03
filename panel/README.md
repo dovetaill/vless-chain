@@ -160,6 +160,8 @@ sudo chainctl ingress-enable
 
 程序升级保留此前独立更新的 Xray、Mihomo，未独立更新的内核采用发行包版本。本机和多机总控均支持独立更新内核，默认选择官方最新正式版；准确版本、预发布和回退设置位于高级选项。预发布需主动允许，历史回退只替换对应内核，不回退业务数据库。旧 VPS 需先更新维护组件；CLI 的旧 `--xray-channel latest` 显式覆盖方式保留。
 
+独立安装脚本默认从 GitHub 最新正式发行版启动。需要使用服务器上已有的发行包时，将包和对应 `SHA256SUMS` 放在同一目录，运行 `sh install-server.sh update --package /path/chain-panel-VERSION-linux-x86_64.tar.gz --non-interactive`；脚本校验包后直接运行该包内的 `chainctl`，不查询或下载 GitHub，也不使用旁边已有的旧 `chainctl`。`--package` 也接受 HTTPS 发行包地址：自动下载该包和同目录的 `SHA256SUMS`，校验后升级，无需预先上传包到 VPS。例如 `curl -fsSL https://chain.bareai.io/install-server.sh | sh -s -- update --package https://chain.bareai.io/releases/v0.2.71/chain-panel-0.2.71-linux-x86_64.tar.gz --non-interactive`。
+
 安全更新失败后，程序升级仍可修复面板与 Agent，但不会启动被停用的 Agent、清除安全停用标记或自动认定内核安全。升级程序后须继续安装安全内核并验证原链接。`0.2.67`–`0.2.69` 的旧维护程序会拦截这种程序升级：已陷入停用的机器可用 `curl -fsSL https://chain.bareai.io/install-server.sh | sh -s -- update --non-interactive` 调用最新正式发行包里的维护程序完成升级（需要 `0.2.70` 或更新版本）；无需手改权限、服务文件或删除停用标记。未停用的机器继续从本机 Web 或多机总控升级程序即可。
 
 内核批量升级单独采用逐台流程：先选择一台试点，核对实际版本、原链接传输及需要的 UDP 功能，确认后再选择其余 VPS 提交批次。每台到达“待验证”后必须人工确认才继续下一台；任一失败或结果未知暂停批次。总控自动 HTTP 检测只能发现部分连接故障，不能代替旧客户端与 UDP 验收。普通失败恢复原内核；包含安全修复时默认禁止回退未确认安全的版本，无安全回退版本则停用本机代理并保留管理面板，重启机器也不会自动解禁，安装安全内核成功后恢复。

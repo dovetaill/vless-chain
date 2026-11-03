@@ -5,12 +5,27 @@ PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bi
 export PATH
 case "${1:-}" in help|--help|-h)
   echo 'Chain Panel 原生安装：Linux x86_64 / ARM64、macOS ARM64。'
-  echo '安装后运行 chainctl；自动化安装使用 --non-interactive。'; exit 0;; esac
+  echo '安装后运行 chainctl；自动化安装使用 --non-interactive。'
+  echo '指定本地发行包：update --package /path/package.tar.gz --non-interactive（同目录需有 SHA256SUMS）。'
+  echo '也可使用 --package https://下载站/目录/chain-panel-VERSION-linux-x86_64.tar.gz，自动下载同目录的 SHA256SUMS。'; exit 0;; esac
 case "$(uname -s)" in Linux) platform=linux;; Darwin) platform=darwin;; *) echo '不支持的操作系统' >&2; exit 1;; esac
 case "$(uname -m)" in x86_64) arch=x86_64;; aarch64|arm64) arch=aarch64;; *) echo '不支持的 CPU 架构' >&2; exit 1;; esac
 [ "$platform-$arch" != darwin-x86_64 ] || { echo 'macOS 仅支持 ARM64' >&2; exit 1; }
+local_package=
+expect_package=false
+for arg in "$@"; do
+  if [ "$expect_package" = true ]; then
+    [ -n "$arg" ] && [ -z "$local_package" ] || { echo '--package 路径为空或重复' >&2; exit 1; }
+    local_package=$arg
+    expect_package=false
+  elif [ "$arg" = --package ]; then
+    [ -z "$local_package" ] || { echo '--package 不可重复' >&2; exit 1; }
+    expect_package=true
+  fi
+done
+[ "$expect_package" = false ] || { echo '--package 缺少路径' >&2; exit 1; }
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ -x "$script_dir/../bin/chainctl" ]; then
+if [ -z "$local_package" ] && [ -x "$script_dir/../bin/chainctl" ]; then
   if [ "${1:-}" = bootstrap-native ]; then
     [ "$#" = 2 ] && [ ! -e "$2" ] && [ ! -L "$2" ] || { echo '原生工具输出路径必须不存在' >&2; exit 1; }
     cp "$script_dir/../bin/chainctl" "$2"
@@ -20,7 +35,14 @@ if [ -x "$script_dir/../bin/chainctl" ]; then
   case "${1:-}" in ''|-*) set -- setup "$@";; esac
   exec "$script_dir/../bin/chainctl" "$@"
 fi
-command -v curl >/dev/null || { echo '请先安装 curl 和 CA 证书' >&2; exit 1; }
+package_url=
+case "$local_package" in
+  https://*) package_url=$local_package;;
+  *://*) echo '下载地址必须使用 HTTPS' >&2; exit 1;;
+esac
+if [ -z "$local_package" ] || [ -n "$package_url" ]; then
+  command -v curl >/dev/null || { echo '请先安装 curl 和 CA 证书' >&2; exit 1; }
+fi
 command -v tar >/dev/null || { echo '请先安装 tar' >&2; exit 1; }
 bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/chain-bootstrap-XXXXXXXX")
 bootstrap_pid=
@@ -34,6 +56,32 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [ -n "$package_url" ]; then
+  archive=${package_url##*/}
+  case "$archive" in chain-panel-*-$platform-$arch.tar.gz) ;; *) echo '发行包名称或平台架构不匹配' >&2; exit 1;; esac
+  for name in SHA256SUMS "$archive"; do
+    curl --proto '=https' --proto-redir '=https' -fSL --max-time 180 --max-filesize 536870912 "${package_url%/*}/$name" -o "$bootstrap_dir/$name"
+  done
+  local_package=$bootstrap_dir/$archive
+  # Replace only the package argument; chainctl receives the verified local download.
+  remaining=$#
+  expect_package=false
+  while [ "$remaining" -gt 0 ]; do
+    arg=$1; shift
+    if [ "$expect_package" = true ]; then arg=$local_package; expect_package=false
+    elif [ "$arg" = --package ]; then expect_package=true
+    fi
+    set -- "$@" "$arg"
+    remaining=$((remaining - 1))
+  done
+elif [ -n "$local_package" ]; then
+  [ -f "$local_package" ] || { echo '本地发行包不存在' >&2; exit 1; }
+  package_parent=$(CDPATH= cd -- "$(dirname -- "$local_package")" && pwd)
+  archive=$(basename -- "$local_package")
+  [ -f "$package_parent/SHA256SUMS" ] || { echo '请将 SHA256SUMS 与发行包放在同一目录' >&2; exit 1; }
+  cp "$local_package" "$bootstrap_dir/$archive"
+  cp "$package_parent/SHA256SUMS" "$bootstrap_dir/SHA256SUMS"
+else
 repo=https://github.com/dovetaill/vless-chain
 latest=$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
 tag=${latest##*/}
@@ -45,6 +93,7 @@ archive=chain-panel-$version-$platform-$arch.tar.gz
 for name in SHA256SUMS "$archive"; do
   curl --proto '=https' --proto-redir '=https' -fSL --max-time 180 --max-filesize 536870912 "$repo/releases/download/$tag/$name" -o "$bootstrap_dir/$name"
 done
+fi
 expected=$(awk -v name="$archive" '$2 == name { print $1; count++ } END { if (count != 1) exit 1 }' "$bootstrap_dir/SHA256SUMS")
 case "$expected" in *[!0-9a-f]*|'') echo 'SHA256 清单无效' >&2; exit 1;; esac
 [ "${#expected}" = 64 ] || exit 1
@@ -67,9 +116,7 @@ if [ "${1:-}" = bootstrap-native ]; then
   exit 0
 fi
 case "${1:-}" in ''|-*) set -- setup "$@";; esac
-has_package=false
-for arg in "$@"; do [ "$arg" != --package ] || has_package=true; done
-if [ "$has_package" = false ]; then set -- "$@" --package "$bootstrap_dir/$archive"; fi
+if [ -z "$local_package" ]; then set -- "$@" --package "$bootstrap_dir/$archive"; fi
 if [ ! -t 0 ] && [ -r /dev/tty ] && { true </dev/tty; } 2>/dev/null; then
   "$bootstrap_dir/chainctl" "$@" </dev/tty &
 else

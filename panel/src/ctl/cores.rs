@@ -336,7 +336,9 @@ async fn recover(manager: &Manager, j: &Value) -> Result<String> {
     let mut state = manager.state()?;
     let env: BTreeMap<String, String> = serde_json::from_value(j["env"].clone())?;
     let core = j["core"].as_str().context("缺少内核名")?;
+    let services = super::lifecycle::ServiceMigration::prepare(manager, &["agent".into()])?;
     manager.service("stop", "agent").await?;
+    services.ingress(manager, "stop").await?;
     let detail = if j["rollback_allowed"] == true && snapshot(&env, core)? == j["config_snapshot"] {
         let old = &j["before"];
         let release = old["current"].as_str().context("缺少原版本")?;
@@ -346,8 +348,11 @@ async fn recover(manager: &Manager, j: &Value) -> Result<String> {
         state["roles"]["agent"] = old.clone();
         save(manager, &state)?;
         if j["was_running"] == true {
+            let baseline = services.request(manager)?;
+            services.ingress(manager, "start").await?;
             manager.service("start", "agent").await?;
             manager.healthy("agent".into()).await?;
+            services.applied(manager, baseline)?;
         }
         "已恢复原内核；配置和节点身份保持原样"
     } else {
@@ -926,9 +931,12 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         package::copy(&stage, &destination, &package::verify(&stage, true)?)?;
     }
     let j = json!({"task_id":job["id"],"core":core,"before":before,"target":release,"env":env,"config_snapshot":baseline,"previous_version":old[core],"rollback_allowed":allowed&&state["core_blocked"].is_null(),"was_running":manager.active("agent").await?});
+    let services = super::lifecycle::ServiceMigration::prepare(manager, &["agent".into()])?;
     atomic(&journal, &serde_json::to_vec(&j)?, 0o600)?;
     let result: Result<()> = async {
         manager.service("stop", "agent").await?;
+        services.ingress(manager, "stop").await?;
+        let baseline = services.request(manager)?;
         manager.link("agent", &release)?;
         state["roles"]["agent"]["current"] = json!(release);
         state.as_object_mut().unwrap().remove("core_blocked");
@@ -943,8 +951,10 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
             );
             fs::remove_file(marker)?;
         }
+        services.ingress(manager, "start").await?;
         manager.service("start", "agent").await?;
         manager.healthy("agent".into()).await?;
+        services.applied(manager, baseline)?;
         Ok(())
     }
     .await;
@@ -1018,6 +1028,9 @@ mod tests {
             "CHAIN_AGENT_DIR".into(),
             data.to_string_lossy().into_owned(),
         )]);
+        let unit = m.unit_path("agent");
+        fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        fs::write(&unit, super::super::install::unit_with_env(&m, "agent", &env).unwrap()).unwrap();
         (m, env)
     }
     #[tokio::test]

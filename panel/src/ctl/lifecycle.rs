@@ -246,6 +246,15 @@ pub(super) async fn service_process(manager: &Manager, role: &str) -> Result<Opt
     };
     Ok((pid > 1).then_some(pid))
 }
+pub(super) fn process_ready(pid: u32, binary: &Path, confirmed: Option<u32>) -> Result<bool> {
+    if !process_matches(pid, binary)? {
+        ensure!(confirmed.is_none(), "验收期间程序发生变化");
+        return Ok(false);
+    }
+    ensure!(confirmed.is_none_or(|prior| prior == pid), "验收期间进程重启");
+    Ok(true)
+}
+
 pub(super) fn process_matches(pid: u32, binary: &Path) -> Result<bool> {
     let process = Path::new("/proc").join(pid.to_string());
     if !process.exists() {
@@ -1076,6 +1085,43 @@ pub async fn local_agent(manager: &Manager, source: &Path, host: &str, target: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_waits_for_exec_but_rejects_changes_after_confirmation() {
+        use std::io::Write;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Instant;
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("agent");
+        fs::copy("/bin/sleep", &binary).unwrap();
+        let mut child = Reap(Command::new("/bin/sh")
+            .args(["-c", "read ready; exec \"$1\" 30", "startup"])
+            .arg(&binary).stdin(Stdio::piped()).spawn().unwrap());
+        let pid = child.0.id();
+        // A live pre-exec process must neither pass acceptance nor fail immediately.
+        for _ in 0..3 {
+            assert!(!process_ready(pid, &binary, None).unwrap());
+        }
+        writeln!(child.0.stdin.take().unwrap(), "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_ready(pid, &binary, None).unwrap() {
+            assert!(Instant::now() < deadline, "child did not exec");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_ready(pid, &binary, Some(pid)).unwrap());
+        assert!(process_ready(pid, &binary, Some(pid + 1)).is_err());
+        assert!(process_ready(pid, Path::new("/bin/sh"), Some(pid)).is_err());
+        assert!(!process_ready(pid, Path::new("/bin/sh"), None).unwrap());
+    }
+
     #[tokio::test]
     async fn fresh_maintenance_does_not_query_a_missing_service() {
         let root = tempfile::tempdir().unwrap();
