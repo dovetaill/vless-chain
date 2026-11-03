@@ -668,6 +668,26 @@ pub fn worker(directory: &Path) -> Result<()> {
         .exec()
         .into())
 }
+fn preflight_identity(cmd: &mut tokio::process::Command, uid: libc::uid_t, gid: libc::gid_t, groups: Vec<libc::gid_t>) {
+    // Set supplementary groups before dropping the privilege needed to change them.
+    unsafe {
+        cmd.pre_exec(move || {
+            let count = groups.len().try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "服务组数量超出系统接口范围",
+                )
+            })?;
+            if libc::setgroups(count, groups.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 async fn preflight(
     manager: &Manager,
     env: &BTreeMap<String, String>,
@@ -764,24 +784,9 @@ async fn preflight(
             .kill_on_drop(true)
             .process_group(0);
         if unsafe { libc::geteuid() } == 0 {
-            let groups = groups.clone();
-            cmd.uid(uid).gid(gid);
-            unsafe {
-                cmd.pre_exec(move || {
-                    let count = groups.len().try_into().map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "服务组数量超出系统接口范围",
-                        )
-                    })?;
-                    if libc::setgroups(count, groups.as_ptr()) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
+            preflight_identity(&mut cmd, uid, gid, groups.clone());
         }
-        let mut child = cmd.spawn()?;
+        let mut child = cmd.spawn().context("无法以 Agent 身份启动内核预检进程")?;
         let pid = child.id().context("预检进程未启动")?;
         let result = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
         unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
@@ -963,6 +968,36 @@ mod tests {
         let groups: Vec<libc::gid_t> = account_groups(&account, gid).unwrap();
         assert!(groups.contains(&gid));
         assert!(!groups.is_empty() && groups.len() < 1024);
+    }
+    #[tokio::test]
+    #[ignore = "requires root inside a disposable container"]
+    async fn preflight_identity_sets_groups_before_dropping_root() {
+        assert_eq!(std::env::var("CHAIN_TEST_IDENTITY_CONTAINER").as_deref(), Ok("1"));
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let entry = unsafe { libc::getpwnam(c"nobody".as_ptr()) };
+        assert!(!entry.is_null());
+        let (uid, gid) = unsafe { ((*entry).pw_uid, (*entry).pw_gid) };
+        assert_ne!(uid, 0);
+        let mut old = tokio::process::Command::new("/usr/bin/id");
+        old.uid(uid).gid(gid);
+        unsafe {
+            old.pre_exec(move || {
+                if libc::setgroups(1, &gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert_eq!(old.output().await.unwrap_err().raw_os_error(), Some(libc::EPERM));
+        for field in ["-u", "-g", "-G"] {
+            let mut cmd = tokio::process::Command::new("/usr/bin/id");
+            cmd.arg(field).env_clear();
+            preflight_identity(&mut cmd, uid, gid, vec![gid]);
+            let result = cmd.output().await.unwrap();
+            assert!(result.status.success());
+            assert_eq!(String::from_utf8(result.stdout).unwrap().trim(),
+                if field == "-u" { uid } else { gid }.to_string());
+        }
     }
     fn installed(root: &Path) -> (Manager, BTreeMap<String, String>) {
         let m = super::super::lifecycle::open(root).unwrap();
