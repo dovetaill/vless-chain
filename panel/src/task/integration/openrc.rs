@@ -45,7 +45,10 @@ async fn api(
     if let Some(value) = value {
         request = request.json(value);
     }
-    let response = request.send().await?.error_for_status()?;
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("API {}: {}", response.status(), response.text().await?);
+    }
     if let Some(header) = response.headers().get("set-cookie") {
         *cookie = header.to_str()?.split(';').next().unwrap().into();
     }
@@ -196,13 +199,16 @@ pub async fn run(args: &Options) -> Result<()> {
     } else {
         None
     };
+    let program_upgrade = args.values.get("--case").is_some_and(|v| v == "program-upgrade");
+    let core_repair = program_upgrade || args.values.get("--case").is_some_and(|v| v == "core-repair");
+    let install_source = if core_repair { Path::new("/old") } else { source.as_path() };
     let archive = work.root.join("native.tar.gz");
-    release::archive(&source, &archive)?;
+    release::archive(install_source, &archive)?;
     fs::write(
         work.root.join("SHA256SUMS"),
         format!("{}  native.tar.gz\n", package::digest(&archive)?),
     )?;
-    let ctl = source.join("bin/chainctl");
+    let ctl = install_source.join("bin/chainctl");
     let mut install = strings(&[
         ctl.to_str().unwrap(),
         "install",
@@ -328,6 +334,10 @@ pub async fn run(args: &Options) -> Result<()> {
         ]),
     )
     .await?;
+    if core_repair {
+        fs::copy("/controller/cert.pem", &cert)?;
+        fs::copy("/controller/key.pem", &key)?;
+    }
     writeln!(
         fs::OpenOptions::new().append(true).open("/etc/hosts")?,
         "\n127.0.0.1 panel.test"
@@ -372,6 +382,86 @@ pub async fn run(args: &Options) -> Result<()> {
             && fs::read("/var/lib/chain-panel/local-system-node")? == node,
         "HTTPS 安装改变身份"
     );
+    if core_repair {
+        if program_upgrade {
+            let job = core_task(&client, &base, &mut cookie, json!({"action":"upgrade","version":"0.2.69"})).await?;
+            ensure!(job["state"] == "succeeded", "旧版 Web 程序升级失败：{job}");
+            ready(&client, &base, &admin, &mut cookie).await?;
+        } else {
+        let failed = core_task(&client, &base, &mut cookie,
+            json!({"action":"core-upgrade","core":"xray","version":"26.10.31","prerelease":false,"security_update":true,"rollback_safe":false})).await?;
+        ensure!(failed["state"] == "failed" && failed["error"].as_str().unwrap_or("").contains("Operation not permitted"), "旧版未复现预检 EPERM：{failed}");
+        }
+        let blocked = fs::read("/var/lib/chain-agent/.core-upgrade-blocked").ok();
+        let state_path = Path::new("/opt/chain/.chain-install.json");
+        let before: Value = serde_json::from_slice(&fs::read(state_path)?)?;
+        let repair = work.root.join("repair.tar.gz");
+        release::archive(&source, &repair)?;
+        fs::write(work.root.join("SHA256SUMS"), format!("{}  repair.tar.gz\n", package::digest(&repair)?))?;
+        cli(&work, &source.join("bin/chainctl"), &["update", "--package", repair.to_str().unwrap(), "--non-interactive"]).await?;
+        ready(&client, &base, &admin, &mut cookie).await?;
+        ensure!(fs::read("/var/lib/chain-agent/.core-upgrade-blocked").ok() == blocked, "程序更新清除了安全停用标记");
+        let after: Value = serde_json::from_slice(&fs::read(state_path)?)?;
+        ensure!(after["core_blocked"] == before["core_blocked"], "程序更新清除了安全状态");
+        if blocked.is_some() {
+            ensure!(!std::process::Command::new("rc-service").args(["chain-agent", "status"]).status()?.success(), "安全停用期间启动了 Agent");
+        }
+        for (core, version) in [("xray", "26.10.31"), ("mihomo", "1.19.33")] {
+            let job = core_task(&client, &base, &mut cookie,
+                json!({"action":"core-upgrade","core":core,"version":version,"prerelease":false,"security_update":true,"rollback_safe":false})).await?;
+            ensure!(job["state"] == "awaiting_verification", "真实 Web 内核更新失败：{job}");
+            wait("新内核心跳", async || {
+                let state = api(&client, &base, "state", None, &mut cookie).await?;
+                Ok(state["agent_version"] == after["roles"]["agent"]["version"]
+                    && state["core_maintenance"]["versions"][core] == version
+                    && state["agent_seen"].as_u64().unwrap_or(0) >= job["started"].as_u64().unwrap_or(u64::MAX))
+            }).await?;
+            let confirmed = core_task(&client, &base, &mut cookie,
+                json!({"action":"core-confirm","core":core,"task_id":job["id"]})).await?;
+            ensure!(confirmed["state"] == "succeeded", "内核确认失败：{confirmed}");
+        }
+        let controller_data = work.root.join("controller-data");
+        let controller = work.spawn(&work.root, &strings(&["/controller/chain-panel"]), &map(&[
+            ("CHAIN_DATA_DIR", controller_data.display().to_string()),
+            ("CHAIN_LISTEN", "127.0.0.1:37244".into()),
+            ("CHAIN_SECURE_COOKIE", "0".into()),
+        ]), &work.root.join("controller.log"))?;
+        wait("总控令牌", async || Ok(controller_data.join("admin-token").exists())).await?;
+        let mut controller_cookie = String::new();
+        let controller_base = "http://127.0.0.1:37244";
+        let controller_token = fs::read_to_string(controller_data.join("admin-token"))?;
+        wait("独立总控登录", async || {
+            Ok(api(&client, controller_base, "login", Some(&json!({"token":controller_token.trim()})), &mut controller_cookie).await.is_ok())
+        }).await?;
+        let invite = api(&client, &base, "fleet/invite", Some(&json!({})), &mut cookie).await?;
+        let remote = api(&client, controller_base, "fleet/connect", Some(&json!({"name":"old-vps","code":invite["code"],"url":base})), &mut controller_cookie).await?["id"].clone();
+        for (core, version) in [("xray", "26.10.31"), ("mihomo", "1.19.33")] {
+            let id = uuid::Uuid::new_v4().to_string();
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            api(&client, controller_base, "fleet/batch", Some(&json!({"id":id,"action":"core-upgrade","targets":[remote],"core":core,"version":version,"security_update":true,"rollback_safe":false})), &mut controller_cookie).await?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            let job = loop {
+                let task = api(&client, controller_base, "fleet", None, &mut controller_cookie).await?["tasks"][&id].clone();
+                let target = &task["targets"][0];
+                if target["state"] == "awaiting_verification" { break target.clone(); }
+                ensure!(!matches!(target["state"].as_str(), Some("failed" | "unknown")), "总控内核升级失败：{task}");
+                ensure!(std::time::Instant::now() < deadline, "总控内核升级超时：{task}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            api(&client, controller_base, &format!("fleet/{}/forward", remote.as_str().unwrap()), Some(&json!({"method":"POST","path":"/federation/task","body":{"id":uuid::Uuid::new_v4().to_string(),"action":"core-confirm","core":core,"task_id":job["task_id"]}})), &mut controller_cookie).await?;
+            wait("总控内核确认", async || {
+                let task = api(&client, controller_base, "fleet", None, &mut controller_cookie).await?["tasks"][&id].clone();
+                Ok(task["targets"][0]["state"] == "succeeded")
+            }).await?;
+        }
+        work.stop(controller).await?;
+        ensure!(fs::read("/etc/chain-agent/token")? == token && fs::read("/var/lib/chain-panel/local-system-node")? == node, "恢复改变了节点身份");
+        cli(&work, &source.join("bin/chainctl"), &["uninstall", "--purge", "--non-interactive"]).await?;
+        work.close()?;
+        println!("PASS 已发布旧版真实 Web 内核升级 EPERM、安全停用后程序更新、本机与独立总控 Xray/Mihomo 更新与新心跳、确认及身份保留");
+        return Ok(());
+    }
     let socket = Path::new("/run/chain-maintenance/control.sock");
     wait("维护 socket", async || Ok(socket.exists())).await?;
     let (uid, gid) = account("chain-panel")?;
@@ -488,6 +578,29 @@ pub async fn run(args: &Options) -> Result<()> {
     work.close()?;
     println!("PASS OpenRC 安装/恢复、身份、维护回执、HTTPS、升级、卸载及重装");
     Ok(())
+}
+
+async fn core_task(client: &reqwest::Client, base: &str, cookie: &mut String, mut value: Value) -> Result<Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    value["id"] = json!(id);
+    api(client, base, "federation/task", Some(&value), cookie).await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let job = match api(client, base, &format!("federation/task?id={id}"), None, cookie).await {
+            Ok(job) => job,
+            Err(_) if value["action"] == "upgrade" => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                cookie.clear();
+                let _ = api(client, base, "login", Some(&json!({"token":fs::read_to_string("/var/lib/chain-panel/admin-token")?.trim()})), cookie).await;
+                ensure!(std::time::Instant::now() < deadline, "程序升级后管理连接未恢复");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if !matches!(job["state"].as_str(), Some("queued" | "running")) { return Ok(job); }
+        ensure!(std::time::Instant::now() < deadline, "内核维护任务超时：{job}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 pub async fn time_checks(work: &Workspace, ctl: &Path) -> Result<()> {

@@ -299,6 +299,9 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
         super::lifecycle::handoff(manager)?;
         super::lifecycle::maintenance(manager).await?;
         manager.prune().await?;
+        if !manager.state()?["core_blocked"].is_null() {
+            job["detail"] = json!("程序已更新；代理仍安全停用，请继续更新安全内核并验证原链接。");
+        }
     } else if action == "network-tune" {
         job["network"] = network(
             manager,

@@ -197,8 +197,8 @@ impl Manager {
         );
         let old = self.state()?;
         ensure!(
-            !self.base.join(".core-pending.json").exists() && old["core_blocked"].is_null(),
-            "请先完成内核升级验证或恢复安全版本"
+            !self.base.join(".core-pending.json").exists(),
+            "请先完成待验证的内核升级任务"
         );
         let roles = self.roles(&old, component)?;
         let mut running = Vec::new();
@@ -294,6 +294,9 @@ impl Manager {
                 };
                 self.link(role, &id)?;
                 services.write(self, role, true).await?;
+                if role == "agent" && !old["core_blocked"].is_null() {
+                    continue;
+                }
                 if role == "agent" {
                     services.ingress(self, "start").await?;
                 }
@@ -329,6 +332,9 @@ impl Manager {
                     }
                     self.link(role, old["roles"][role]["current"].as_str().unwrap())?;
                     services.write(self, role, false).await?;
+                    if role == "agent" && !old["core_blocked"].is_null() {
+                        return Ok(());
+                    }
                     if role == "agent" {
                         services.ingress(self, "start").await?;
                     }
@@ -884,6 +890,30 @@ mod tests {
         assert!(!root.path().join("var/backups").exists());
         assert!(!manager.base.join(".update-pending.json").exists());
         assert!(!manager.path("/var/lib/chain-ingress").exists());
+    }
+
+    #[tokio::test]
+    async fn blocked_core_allows_program_repair_without_starting_agent() {
+        for fail in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = installed(root.path());
+            let source = root.path().join("source");
+            fixture(&source);
+            let mut state = manager.state().unwrap();
+            state["core_blocked"] = json!({"core":"xray","task_id":"blocked"});
+            fs::write(manager.base.join(".chain-install.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+            let result = manager.update_checked(&source, None, |role| async move {
+                assert_eq!(role, "panel", "blocked Agent must not be started or health checked");
+                ensure!(!fail, "panel failure");
+                Ok(())
+            }).await;
+            assert_eq!(result.is_err(), fail);
+            let after = manager.state().unwrap();
+            assert_eq!(after["core_blocked"], state["core_blocked"]);
+            for role in ["panel", "agent"] {
+                assert_eq!(after["roles"][role]["version"], if fail { "0.2.48" } else { "0.3.0" });
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
