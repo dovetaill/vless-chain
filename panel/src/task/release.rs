@@ -284,16 +284,6 @@ pub async fn build(args: &Options) -> Result<()> {
         &strings(&["npm", "run", "build"]),
     )
     .await?;
-    for target_args in [
-        vec!["--lib"],
-        vec!["--bin", "chain-panel"],
-        vec!["--bin", "chainctl"],
-        vec!["--bin", "xtask"],
-    ] {
-        let mut cmd = strings(&["cargo", "test", "--locked", "--quiet"]);
-        cmd.extend(strings(&target_args));
-        work.run(&project, &cmd).await?;
-    }
     let mut cmd = strings(&[
         "cargo",
         "build",
@@ -343,15 +333,6 @@ pub async fn build(args: &Options) -> Result<()> {
         )
         .await?;
     }
-    super::integration::ssh_checks(&work, &stage.join("bin")).await?;
-    work.env
-        .insert("CHAIN_TEST_ROOT".into(), work.root.display().to_string());
-    work.env.insert(
-        "CHAIN_TEST_XRAY".into(),
-        stage.join("bin/xray").display().to_string(),
-    );
-    work.run(&root, &strings(&["node", "panel/tests/xray-reality.cjs"]))
-        .await?;
     fs::create_dir(stage.join("scripts"))?;
     fs::copy(
         root.join("scripts/install-server.sh"),

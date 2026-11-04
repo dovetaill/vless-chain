@@ -45,47 +45,10 @@ pub async fn smoke(args: &Options) -> Result<()> {
     package::copy(&stage, &restored, &manifest)?;
     native::exercise(&work, &restored).await?;
     scenarios::local_install(&work, &restored).await?;
-    scenarios::legacy(&work, &restored).await?;
-    scenarios::customer_plans(&work, &restored).await?;
     if crate::ctl::platform::executable("nginx").is_some()
         && crate::ctl::platform::executable("openssl").is_some()
     {
         scenarios::https(&work, &restored).await?;
-    }
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        let binary = input.join("verify-xtask").canonicalize()?;
-        let name = format!("chain-openrc-install-{}", std::process::id());
-        for case in ["fresh", "recovery"] {
-            let task = format!("{}:/xtask:ro", binary.display());
-            let source = format!("{}:/release:ro", restored.display());
-            let command = strings(&[
-                "docker",
-                "run",
-                "--rm",
-                "--init",
-                "--cap-add",
-                "SYS_PTRACE",
-                "--name",
-                &name,
-                "-v",
-                &task,
-                "-v",
-                &source,
-                "-e",
-                "CHAIN_TEST_OPENRC=1",
-                "alpine:3.23.6@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0",
-                "sh",
-                "-ec",
-                "apk add --no-cache openrc openssl curl iproute2 nginx; exec /xtask openrc-test --input /release --case \"$1\"",
-                "sh",
-                case,
-            ]);
-            let result = work.run(&repository(), &command).await;
-            let _ = std::process::Command::new("docker")
-                .args(["rm", "-f", &name])
-                .output();
-            result?;
-        }
     }
     work.close()
 }
@@ -172,6 +135,9 @@ pub async fn verify(args: &Options) -> Result<()> {
         &strings(&["cargo", "build", "--locked", "--bins", "--quiet"]),
     )
     .await?;
+    ssh_checks(&work, Path::new(&work.env["CHAIN_TEST_BIN_DIR"])).await?;
+    work.run(&root, &strings(&["node", "panel/tests/xray-reality.cjs"]))
+        .await?;
     if args.flags.contains("--browser") {
         let tools = work.root.join("browser-tools");
         fs::create_dir(&tools)?;

@@ -2,3 +2,7 @@
 /.chain-build-*/
 __pycache__/
 *.pyc
+/metronic-tailwind-html-demos_v9.5.0.zip
+/metronic-tailwind-html-starter-kit_v9.5.0.zip
+/metronic-tailwind-react-demos_v9.5.0.zip
+/metronic-tailwind-react-starter-kit_v9.5.0.zip

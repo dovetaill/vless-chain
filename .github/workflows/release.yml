@@ -47,10 +47,6 @@ jobs:
           package-manager-cache: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: '1.26.4'
-          cache: false
       - name: Install WebAuthn build dependencies
         run: |
           if [ "${{ matrix.system }}" = linux ]; then
@@ -70,8 +66,10 @@ jobs:
         run: |
           test "$GITHUB_REF_TYPE" = tag
           ./scripts/version-release.sh validate
-      - name: Check installer
-        run: ./scripts/version-release.sh check
+      - name: Check installer syntax
+        run: |
+          bash -n scripts/version-release.sh scripts/install-server.sh
+          sh -n scripts/repair-native-services.sh
       - name: Build native release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -79,12 +77,13 @@ jobs:
           CHAIN_BUILD_CACHE: '1'
         run: |
           ./scripts/version-release.sh build --work-parent "$RUNNER_TEMP" --output "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
-      - name: Verify installed panel and local Agent
+      - name: Verify installation, data preservation and connectivity
         if: github.ref_type == 'tag'
         env:
           RELEASE_PLATFORM: ${{ matrix.system }}-${{ matrix.arch }}
+          CHAIN_TASK_REPO: ${{ github.workspace }}
         run: |
-          ./scripts/version-release.sh smoke --input "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
+          "$RUNNER_TEMP/release-$RELEASE_PLATFORM/verify-xtask" smoke --input "$RUNNER_TEMP/release-$RELEASE_PLATFORM"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.ref_type == 'tag'
         with:

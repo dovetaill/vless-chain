@@ -78,7 +78,7 @@ ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
 
 证书续期在 systemd 使用 `chain-panel-cert-renew.timer`，OpenRC 使用受监控的定时任务，macOS 使用 launchd 的 StartInterval；每 12 小时由 Rust ACME 客户端检查该面板证书，剩余有效期不足 30 天时续期，成功后检查并重载 Nginx。保留读取已有 Certbot 证书的兼容性，不调用 Certbot。面板数据、证书私钥和其他站点保持独立。已有 HTTP 安装可通过 `chainctl install --domain panel.example.com` 增加 HTTPS，并保留后端端口和本机 Agent 身份。
 
-构建支持 Linux/macOS 的 x86_64 与 aarch64；Linux 使用静态 musl 目标，macOS 使用原生 apple-darwin 目标（最低 macOS 14），执行 TypeScript/Vite 构建与 Rust 单元测试后生成 release 二进制。按 `panel/src/core-versions.json` 下载固定的 Xray/Mihomo 并检查官方附件 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
+构建支持 Linux/macOS 的 x86_64 与 aarch64；Linux 使用静态 musl 目标，macOS 使用原生 apple-darwin 目标（最低 macOS 14），执行 TypeScript/Vite 构建后生成 release 二进制。`build` 只构建打包，Rust 单元测试及 SSH/REALITY 回归通过 `verify` 单独执行。按 `panel/src/core-versions.json` 下载固定的 Xray/Mihomo 并检查官方附件 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
 
 产物默认放在 `release-output/v0.1.0-linux-x86_64/`（依当前版本、系统、架构变化，macOS 的系统名为 `darwin`）。包含 `chain-panel-0.1.0-linux-x86_64.tar.gz`、`release.json`、`SHA256SUMS`。这是有意保留的最终交付目录；临时源码副本、npm 缓存和 Cargo target 在成功、失败或中断后自动清理，下一次构建会重新编译。输出目录已存在时不会覆盖，请传入新的 `--output` 或更新版本。
 
@@ -196,6 +196,10 @@ CHAIN_XRAY_BIN=/opt/chain/bin/xray \
 应用完成后从「分享」扫码、复制链接或下载 Mihomo 节点。在代理的更多操作中检查连接。检查与导出使用已应用快照，草稿不会被导出为可用配置。
 
 ## 验证
+
+普通 CI 与发布 Actions 只执行脚本语法检查、三平台构建、发行包完整性检查，以及 `smoke` 的离线安装、数据/权限保留、登录和 Agent 心跳；环境具备 Nginx/OpenSSL 时还检查 HTTPS 与完整静态资源传输。业务回归、旧版本升级及死锁/时序问题应在开发时按实际改动定向测试，并在发布前人工复测；Actions 成功不代表这些场景通过。
+
+`check`、`verify` 和 `integration --case` 的 `legacy-migration`、`customer-plans` 场景保留为手动入口。OpenRC 的 `openrc-test --case` 支持 `fresh`、`recovery`、`program-upgrade` 和 `core-repair`，只在独占容器中手动执行，不再由每次构建自动启动。
 
 `./scripts/version-release.sh verify --xray /绝对路径/xray --work-parent /大容量目录` 在独立临时目录构建前后端、运行 Rust 测试和真实 Xray 集成测试，结束自动清理。可加 `--browser` 做 Chromium 桌面和移动端流程验证；浏览器及 npm 缓存也位于临时目录内。
 
