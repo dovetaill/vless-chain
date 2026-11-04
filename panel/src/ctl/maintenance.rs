@@ -334,7 +334,7 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
         for role in &roles {
             ensure!(before[role].is_string(), "该组件未安装");
             manager.service("restart", role).await?;
-            ensure!(manager.active(role).await?, "chain-{role} 服务未运行");
+            manager.healthy(role.clone()).await?;
         }
         if let Some(service) = https {
             super::platform::related(manager, "restart", service).await?;

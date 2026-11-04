@@ -178,6 +178,9 @@ pub async fn request(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value> {
+    if method == "POST" && path == "/api/federation/task" {
+        check_maintenance_version(&remote.snapshot, body.as_ref().unwrap_or(&Value::Null))?;
+    }
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(if path.contains("/diagnostics/") || path == "/api/publish" {
@@ -211,8 +214,9 @@ pub async fn request(
         );
         bytes.extend_from_slice(&chunk);
     }
-    let value: Value =
-        serde_json::from_slice(&bytes).context("远端响应不是 JSON；请检查版本和面板地址")?;
+    let value: Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!("远端 HTTP {} 响应不是 JSON；可能正在重启或入口暂不可用，操作结果需重新查询", status.as_u16())
+    })?;
     ensure!(
         status.is_success(),
         "远端 HTTP {}：{}",
@@ -220,6 +224,21 @@ pub async fn request(
         value["error"].as_str().unwrap_or("请求失败")
     );
     Ok(value)
+}
+fn check_maintenance_version(state: &Value, request: &Value) -> Result<()> {
+    let Some(version) = state["version"].as_str() else { return Ok(()) };
+    let Ok(version) = chain_panel::ctl::package::version(version) else { return Ok(()) };
+    let blocked = state["core_maintenance"]["blocked"].is_object();
+    let core_upgrade = request["action"] == "core-upgrade";
+    if (core_upgrade && version < [0, 2, 69])
+        || (request["action"] == "upgrade" && blocked && version < [0, 2, 70])
+    {
+        if blocked {
+            anyhow::bail!("旧版维护程序已进入安全停用状态，Web 无法自行升级。请在该 VPS 执行一次程序恢复，再返回更新内核并验证原链接：\ncurl -fsSL https://chain.bareai.io/install-server.sh | sh -s -- update --non-interactive\n此操作更新程序和维护入口；不会将代理停用状态误报为业务恢复。");
+        }
+        anyhow::bail!("该 VPS 的旧版内核预检存在 EPERM 缺陷，已阻止下发以免停掉 Agent。请先执行程序升级至 0.2.71 或更新正式版本，等待新维护程序接管后再升级内核。");
+    }
+    Ok(())
 }
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let r = remote(&app, &id)?;
@@ -928,7 +947,9 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
                 }
             } else if !lines {
                 result["maintenance_state"] = result["state"].clone();
-                result["verification"] = if target["id"] == "local" {
+                result["verification"] = if result["state"] != "succeeded" {
+                    Value::Null
+                } else if target["id"] == "local" {
                     json!({"state":if result["state"] == "succeeded" { "succeeded" } else { "pending" },
                         "detail":"已回读本机网络默认值与实际队列；现有连接算法未验证"})
                 } else {
@@ -1059,6 +1080,73 @@ async fn verify_remote(app: &App, remote: &Remote) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_maintenance_cannot_repeat_the_security_upgrade_deadlock() {
+        for version in ["0.2.67", "0.2.68"] {
+            let mut state = json!({"version":version,"core_maintenance":{"blocked":null}});
+            assert!(check_maintenance_version(&state, &json!({"action":"core-upgrade"})).unwrap_err().to_string().contains("EPERM"));
+            assert!(check_maintenance_version(&state, &json!({"action":"upgrade"})).is_ok());
+            state["core_maintenance"]["blocked"] = json!({"core":"xray"});
+            for action in ["upgrade", "core-upgrade"] {
+                assert!(check_maintenance_version(&state, &json!({"action":action})).unwrap_err().to_string().contains("install-server.sh"));
+            }
+            assert!(check_maintenance_version(&state, &json!({"action":"status"})).is_ok());
+        }
+        let mut state = json!({"version":"0.2.69","core_maintenance":{"blocked":{"core":"xray"}}});
+        assert!(check_maintenance_version(&state, &json!({"action":"core-upgrade"})).is_ok());
+        assert!(check_maintenance_version(&state, &json!({"action":"upgrade"})).is_err());
+        for version in ["0.2.70", "0.2.71", "0.3.0"] {
+            state["version"] = json!(version);
+            for action in ["upgrade", "core-upgrade"] {
+                assert!(check_maintenance_version(&state, &json!({"action":action})).is_ok());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn upgrade_retries_html_response_with_same_task_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed = calls.clone();
+        let router = Router::new().route("/api/federation/task", post(move |Json(body): Json<Value>| {
+            let observed = observed.clone();
+            async move {
+                let mut calls = observed.lock().unwrap();
+                calls.push(body["id"].clone());
+                match calls.len() {
+                    1 => Json(json!({"state":"queued"})).into_response(),
+                    2 => (StatusCode::BAD_GATEWAY, "<html>restarting</html>").into_response(),
+                    _ => Json(json!({"state":"succeeded"})).into_response(),
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let (job, remote_id, task) = (id(), id(), id());
+        {
+            let mut s = app.store.lock().unwrap();
+            s.doc.fleet.remotes.push(Remote { id:remote_id.clone(), name:"fixture".into(), url:format!("http://{address}"), token:"test".into(), seen:now(), error:String::new(), policy_error:String::new(), snapshot:Value::Null });
+            s.doc.fleet.receipts.insert(job.clone(), json!({"id":job,"action":"upgrade","version":"0.2.71","state":"running","targets":[{"id":remote_id,"task_id":task,"state":"pending"}]}));
+        }
+        for step in 0..3 {
+            work_batch(&app).await.unwrap();
+            let saved = app.store.lock().unwrap().doc.fleet.receipts[&job].clone();
+            let target = &saved["targets"][0];
+            if step < 2 {
+                assert!(target["result"]["verification"].is_null());
+                assert_ne!(target["state"], "succeeded");
+            } else {
+                assert_eq!(target["state"], "succeeded");
+                assert_eq!(target["result"]["verification"]["state"], "pending");
+                assert!(target["error"].is_null());
+            }
+            if step == 1 { assert!(target["error"].as_str().unwrap().contains("502")); }
+        }
+        assert_eq!(*calls.lock().unwrap(), vec![json!(task); 3]);
+        server.abort(); let _ = server.await;
+        let _released = std::net::TcpListener::bind(address).unwrap();
+    }
     #[tokio::test]
     async fn core_batches_wait_for_confirmation_and_stop_at_first_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

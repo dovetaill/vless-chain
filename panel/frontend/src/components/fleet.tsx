@@ -668,7 +668,7 @@ export function Fleet({ state }: { state: PanelState }) {
     setModal(
       <Modal
         title={`确认${actions[action]}`}
-        description={action === "core-upgrade" ? `${targets.length} 台 VPS · ${coreChoice.core} ${version}。请先完成一台试点。按所选顺序逐台升级，每台实际连接确认后继续；失败即停止后续节点。UUID、密钥及原链接保留。${coreChoice.security_update && !coreChoice.rollback_safe ? "安全更新失败时停用本机代理并保留面板。" : "失败时恢复原内核。"}` : `${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，保留独立选择的内核版本，升级后自动重启相关服务` : ""}。最多同时处理 5 台，单台失败不阻塞其他机器；操作可能中断对应机器的连接。`}
+        description={action === "core-upgrade" ? `${targets.length} 台 VPS · ${coreChoice.core} ${version}。请先完成一台试点。按所选顺序逐台升级，每台实际连接确认后继续；失败即停止后续节点。UUID、密钥及原链接保留。${coreChoice.security_update && !coreChoice.rollback_safe ? "下载或预检失败保持现有服务；切换后失败且无法安全回退时停用代理并保留面板。" : "失败时恢复原内核。"}` : `${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，保留独立选择的内核版本，升级后自动重启相关服务` : ""}。最多同时处理 5 台，单台失败不阻塞其他机器；操作可能中断对应机器的连接。`}
         submit={
           blocked.length || (action === "upgrade" && !release)
             ? undefined
@@ -1770,7 +1770,7 @@ export function Fleet({ state }: { state: PanelState }) {
               {activeTask.targets.map((t) => {
                 const remote = remotes.find(r => r.id === t.id);
                 const verifyFailed = verificationFailed(t);
-                const verifyPending = t.id !== "local" && t.result?.verification?.state === "pending";
+                const verifyPending = t.id !== "local" && maintenanceSucceeded(t) && t.result?.verification?.state === "pending";
                 const maintenanceDone = activeTask.action === "core-upgrade" ? t.state === "succeeded" : maintenanceSucceeded(t);
                 const issue = verifyFailed
                   ? t.result?.verification?.detail || (t.error || t.result?.error || "").replace(/^组件维护已完成，但整链验证失败[：:]?\s*/, "")

@@ -904,15 +904,8 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
   let (download,meta)=if action=="core-rollback"{ensure!(state["core_blocked"].is_null(),"停用后必须明确选择安全版本");let history=&state["core_history"][core];ensure!(history["safe"]==true,"没有确认安全的上一版");let id=history["release"].as_str().context("缺少回退记录")?;super::upgrade::release_name(id)?;let path=manager.base.join("releases").join(id);package::verify(&path,true)?;let m:Value=serde_json::from_slice(&fs::read(path.join("release.json"))?)?;(path,json!({"version":m[core],"source":m[format!("{core}_source")],"archive_sha256":m[format!("{core}_archive_sha256")],"prerelease":m[format!("{core}_prerelease")]}))}else{let path=work.path().join("download");fs::create_dir(&path)?;let meta=download(core,job["version"].as_str().unwrap(),&path,job["prerelease"]==true).await?;(path,meta)};
   preflight(manager,&env,core,&download.join(format!("bin/{core}")),meta["version"].as_str().context("缺少候选版本")?).await?;ensure!(snapshot(&env,core)?==baseline,"预检期间配置已变化");replace(&stage,core,&download,&meta)?;Ok(meta)
  }.await;
-    let meta = match preparation {
-        Ok(v) => v,
-        Err(e) => {
-            if security && !allowed {
-                block(manager, &mut state, core, job["id"].as_str().unwrap(), &env).await?;
-            }
-            return Err(e);
-        }
-    };
+    // Preparation has not switched kernels; preserve the existing service and any prior block.
+    let meta = preparation.context("内核准备失败，未切换内核，原服务及停用状态保持不变")?;
     let release = format!(
         "{}-{}-{}-{}",
         manifest.version,
@@ -1032,6 +1025,29 @@ mod tests {
         fs::create_dir_all(unit.parent().unwrap()).unwrap();
         fs::write(&unit, super::super::install::unit_with_env(&m, "agent", &env).unwrap()).unwrap();
         (m, env)
+    }
+    #[tokio::test]
+    #[ignore = "requires a network-disabled disposable container"]
+    async fn preparation_failure_preserves_service_state() {
+        for blocked in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (m, mut env) = installed(root.path());
+            env.insert("CHAIN_XRAY_BIN".into(), m.base.join("current-agent/bin/xray").to_string_lossy().into_owned());
+            let path = m.path("/etc/chain-agent/agent.env");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, env.iter().map(|(k,v)| format!("{k}={}\n", serde_json::to_string(v).unwrap())).collect::<String>()).unwrap();
+            if blocked { block(&m, &mut m.state().unwrap(), "xray", "previous", &env).await.unwrap(); }
+            let before = fs::read(m.base.join(".chain-install.json")).unwrap();
+            let marker = Path::new(&env["CHAIN_AGENT_DIR"]).join(".core-upgrade-blocked");
+            let prior = fs::read(&marker).ok();
+            let job = json!({"id":uuid::Uuid::new_v4().to_string(),"action":"core-upgrade","core":"xray","version":"26.10.31","security_update":true,"rollback_safe":false});
+            let error = operate(&m, &job, root.path()).await.unwrap_err();
+            assert!(format!("{error:#}").contains("内核准备失败"), "{error:#}");
+            assert_eq!(fs::read(m.base.join(".chain-install.json")).unwrap(), before);
+            assert_eq!(fs::read(marker).ok(), prior);
+            assert_eq!(fs::read_link(m.base.join("current-agent")).unwrap(), std::path::PathBuf::from("releases/old"));
+            assert!(!m.base.join(".core-pending.json").exists());
+        }
     }
     #[tokio::test]
     async fn recovery_restores_safe_binary_but_never_changed_customer_config() {
