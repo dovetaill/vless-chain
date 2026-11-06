@@ -3,6 +3,15 @@ use chain_panel::ctl;
 use anyhow::{Context, Result, bail, ensure};
 use std::path::PathBuf;
 
+fn panel_domain(public_url: &str) -> Result<String> {
+    let url = ctl::install::url(public_url)?;
+    ensure!(
+        url.scheme() == "https" && url.port_or_known_default() == Some(443),
+        "面板安装必须使用域名和 HTTPS 443"
+    );
+    ctl::nginx::domain(url.host_str().context("缺少面板域名")?)
+}
+
 #[derive(Clone, Debug)]
 struct Args {
     action: String,
@@ -158,7 +167,33 @@ impl Args {
             !args.latest_xray || args.action == "update",
             "--xray-channel latest 仅用于主动 update"
         );
+        args.validate_install()?;
         Ok(args)
+    }
+
+    fn validate_install(&mut self) -> Result<()> {
+        if matches!(self.action.as_str(), "install" | "setup")
+            && self.component.as_deref().unwrap_or("panel") == "panel"
+            && self.root.canonicalize()? == std::path::Path::new("/")
+        {
+            self.root = "/".into();
+            if let Some(domain) = self.domain.as_deref() {
+                self.domain = Some(ctl::nginx::domain(domain)?);
+            }
+            if let Some(public_url) = self.install.public_url.as_deref() {
+                let domain = panel_domain(public_url)?;
+                ensure!(
+                    self.domain.as_ref().is_none_or(|value| value == &domain),
+                    "--domain 与 --public-url 域名不一致"
+                );
+                self.domain = Some(domain);
+            }
+            ensure!(
+                !self.non_interactive || self.domain.is_some(),
+                "面板安装必须明确指定 --domain 域名，使用 HTTPS 443；不复用旧访问地址"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -278,6 +313,7 @@ async fn run() -> Result<()> {
 }
 
 async fn dispatch(mut args: Args, menu: bool) -> Result<()> {
+    args.validate_install()?;
     if args.action == "maintenance" {
         return ctl::maintenance::serve().await;
     }
@@ -299,6 +335,8 @@ logs / backup / rollback / reset-auth / uninstall
 --connection-code 接入码  --listen IP:端口  --panel-only
 --domain 域名  --non-interactive
 
+面板安装必须明确填写域名并使用 HTTPS 443，不复用旧域名或 IP 入口。
+uninstall 交互选择只删除程序或删除全部数据；非交互删除全部数据使用 --purge。
 update 默认更新本机全部组件；--component agent 仅更新 Agent。"
         );
         return Ok(());
@@ -331,10 +369,23 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
     }
     if matches!(args.action.as_str(), "install" | "setup") {
         let role = args.component.as_deref().unwrap_or("panel");
+        if role == "panel" && args.root == std::path::Path::new("/") && args.domain.is_none() {
+            loop {
+                let domain = ctl::lifecycle::prompt("面板域名（必填，使用 HTTPS 443）", "")?;
+                match ctl::nginx::domain(&domain) {
+                    Ok(domain) => {
+                        args.domain = Some(domain);
+                        break;
+                    }
+                    Err(error) => eprintln!("{error}；请输入域名，不能留空或填写 IP。"),
+                }
+            }
+        }
         let manager = ctl::lifecycle::open(&args.root)?;
         let state = manager.state()?;
         if args.action == "setup"
             && role == "panel"
+            && !manager.live()
             && state["roles"]["panel"]["setup_complete"] == true
             && (state["roles"]["panel"]["panel_only"] == true
                 || state["roles"]["agent"].is_object())
@@ -404,10 +455,6 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             ctl::package::extract(&archive, &stage)?;
             stage
         };
-        if !args.non_interactive && role == "panel" && args.domain.is_none() && existing.is_empty()
-        {
-            args.domain = Some(ctl::lifecycle::prompt("面板域名（留空使用 IP）", "")?);
-        }
         let local_host = match args.local_host {
             Some(host) => host,
             None if role == "panel" && manager.live() => ctl::https::public_ipv4().await?,
@@ -415,7 +462,7 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
         };
         let mut https_previous = None;
         let mut manual_https = state["roles"]["panel"]["manual_https"].clone();
-        if manual_https.is_null() {
+        if manual_https.is_null() && !manager.live() {
             manual_https = state["retained_roles"]["panel"]["manual_https"].clone();
         }
         if let Some(domain) = args.domain.as_deref().filter(|s| !s.is_empty()) {
@@ -426,30 +473,10 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
                 .as_deref()
                 .context("缺少监听")?
                 .parse()?;
-            if manual_https.is_null()
-                && !args.non_interactive
-                && manager.live()
-                && ([80, 443]
-                    .into_iter()
-                    .any(|p| std::net::TcpListener::bind(("0.0.0.0", p)).is_err()))
-            {
-                if ctl::lifecycle::prompt(
-                    "端口已有服务：输入 manual 使用已有证书及独立端口，留空尝试系统 Nginx",
-                    "",
-                )? == "manual"
-                {
-                    let socket = std::net::TcpListener::bind(("0.0.0.0", 0))?;
-                    let port: u16 = ctl::lifecycle::prompt(
-                        "独立 HTTPS 端口",
-                        &socket.local_addr()?.port().to_string(),
-                    )?
-                    .parse()?;
-                    ensure!(port != 0 && port != listen.port(), "HTTPS 端口无效");
-                    manual_https = serde_json::json!({"port":port,
-                        "cert":ctl::lifecycle::prompt("证书完整链绝对路径", "")?,
-                        "key":ctl::lifecycle::prompt("证书私钥绝对路径", "")?});
-                }
-            }
+            ensure!(
+                !manager.live() || manual_https.is_null() || manual_https["port"] == 443,
+                "已有独立 HTTPS 端口不符合 443 要求；请先选择仅卸载程序、保留数据，再重新安装；未切换现有服务"
+            );
             if manual_https.is_null() {
                 let previous =
                     ctl::https::activate(&manager, &domain, listen.port(), &local_host).await?;
@@ -581,6 +608,16 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
     }
     if args.action == "uninstall" {
         if !args.non_interactive {
+            if !args.purge {
+                args.purge = match ctl::lifecycle::prompt(
+                    "卸载范围：1 只删除程序，保留 VLESS 等数据；2 删除程序及全部数据",
+                    "1",
+                )?.as_str() {
+                    "1" => false,
+                    "2" => true,
+                    _ => bail!("卸载选项无效，未执行卸载"),
+                };
+            }
             let word = if args.purge { "PURGE" } else { "UNINSTALL" };
             ensure!(
                 ctl::lifecycle::prompt(&format!("输入 {word} 确认卸载"), "")? == word,
@@ -688,6 +725,38 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn panel_install_requires_explicit_domain_and_https_443() {
+        let mut menu = Args::parse(["--domain", ""].map(str::to_owned)).unwrap();
+        menu.action = "install".into();
+        assert!(menu.validate_install().is_err());
+        for words in [
+            vec!["setup", "--non-interactive"],
+            vec!["install", "--non-interactive"],
+            vec!["install", "--domain", ""],
+            vec!["install", "--domain", "204.138.145.91"],
+            vec!["install", "--public-url", "http://panel.test"],
+            vec!["install", "--public-url", "https://panel.test:8443"],
+            vec!["install", "--public-url", "https://204.138.145.91"],
+            vec!["install", "--domain", "panel.test", "--public-url", "https://other.test"],
+        ] {
+            assert!(Args::parse(words.into_iter().map(str::to_owned)).is_err());
+        }
+        for words in [
+            vec!["install", "--domain", "Panel.Test", "--non-interactive"],
+            vec!["setup", "--public-url", "https://panel.test:443", "--non-interactive"],
+        ] {
+            let args = Args::parse(words.into_iter().map(str::to_owned)).unwrap();
+            assert_eq!(args.domain.as_deref(), Some("panel.test"));
+        }
+        for words in [
+            vec!["update", "--non-interactive"],
+            vec!["install", "--component", "agent", "--non-interactive"],
+            vec!["uninstall", "--non-interactive", "--purge"],
+        ] {
+            assert!(Args::parse(words.into_iter().map(str::to_owned)).is_ok());
+        }
+    }
     #[test]
     fn refuses_unknown_options_before_any_mutation() {
         for args in [

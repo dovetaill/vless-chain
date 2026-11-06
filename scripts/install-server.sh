@@ -6,6 +6,7 @@ export PATH
 case "${1:-}" in help|--help|-h)
   echo 'Chain Panel 原生安装：Linux x86_64 / ARM64、macOS ARM64。'
   echo '安装后运行 chainctl；自动化安装使用 --non-interactive。'
+  echo '面板安装必须明确填写域名并使用 HTTPS 443；自动化安装增加 --domain 域名。'
   echo '指定本地发行包：update --package /path/package.tar.gz --non-interactive（同目录需有 SHA256SUMS）。'
   echo '也可使用 --package https://下载站/目录/chain-panel-VERSION-linux-x86_64.tar.gz，自动下载同目录的 SHA256SUMS。'; exit 0;; esac
 case "$(uname -s)" in Linux) platform=linux;; Darwin) platform=darwin;; *) echo '不支持的操作系统' >&2; exit 1;; esac

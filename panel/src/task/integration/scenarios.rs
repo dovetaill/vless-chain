@@ -350,11 +350,19 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
     for name in ["client_body", "proxy", "fastcgi", "uwsgi", "scgi"] {
         body.push_str(&format!("{name}_temp_path {}/{name};\n", h.root.display()));
     }
-    body.push_str(&site);
+    let sites = h.root.join("sites");
+    fs::create_dir(&sites)?;
+    body.push_str(&format!(
+        "server {{ listen 127.0.0.1:{http} default_server; server_name _; return 404; }}\n\
+         server {{ listen 127.0.0.1:{http}; listen 127.0.0.1:{https} ssl; server_name existing.test;\n\
+         ssl_certificate {}; ssl_certificate_key {}; return 200 'existing-site'; }}\n\
+         include {}/*.conf;\n",
+        cert.display(), key.display(), sites.display()
+    ));
     body.push_str("}\n");
     let conf = h.root.join("nginx.conf");
     fs::write(&conf, body)?;
-    h.launch(
+    let nginx = h.launch(
         "nginx",
         Path::new("nginx"),
         BTreeMap::new(),
@@ -364,7 +372,7 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
             "-c",
             conf.to_str().unwrap(),
             "-g",
-            "daemon off; master_process off; error_log stderr;",
+            "daemon off; error_log stderr;",
         ]),
     )?;
     let client = reqwest::Client::builder()
@@ -373,6 +381,17 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
         .timeout(Duration::from_secs(3))
         .build()?;
     let base = format!("https://localhost:{https}");
+    let probe = format!("http://localhost:{http}/.well-known/acme-challenge/probe");
+    wait("原默认站点", async || {
+        Ok(client.get(&probe).send().await.is_ok_and(|response| response.status() == 404))
+    }).await?;
+    fs::write(sites.join("chain-panel.conf"), site)?;
+    ensure!(unsafe { libc::kill(nginx as i32, libc::SIGHUP) } == 0, "测试 Nginx 重载失败");
+    crate::ctl::https::check_http_challenge(&probe, "owned-challenge", Duration::from_secs(15)).await?;
+    for endpoint in [format!("http://localhost:{http}"), base.clone()] {
+        ensure!(client.get(endpoint).header("Host", "existing.test").send().await?
+            .error_for_status()?.text().await? == "existing-site", "已有域名站点被改变");
+    }
     wait("HTTPS 完整页面", async || {
         Ok(match client.get(&base).send().await {
             Ok(r) => r
@@ -386,7 +405,7 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
     ensure!(
         client
             .get(format!(
-                "http://127.0.0.1:{http}/.well-known/acme-challenge/probe"
+                "http://localhost:{http}/.well-known/acme-challenge/probe"
             ))
             .send()
             .await?
@@ -444,7 +463,7 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
         "Nginx 出现权限错误"
     );
     h.close().await?;
-    println!("PASS 真实 HTTPS、可信证书、安全 cookie、API、HTTP-01 和完整静态资源");
+    println!("PASS Nginx 重载后 HTTP-01 就绪、已有域名共用端口、真实 HTTPS、可信证书、安全 cookie、API 和完整静态资源");
     Ok(())
 }
 

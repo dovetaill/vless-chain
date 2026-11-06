@@ -1,5 +1,5 @@
 use super::upgrade::{command, output};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::{collections::BTreeMap, time::Duration};
 
 const UNITS: [&str; 6] = [
@@ -22,7 +22,8 @@ async fn status() -> Result<BTreeMap<String, String>> {
         ],
         10,
     )
-    .await?;
+    .await
+    .context("timedatectl 查询时间状态失败")?;
     ensure!(result.status.success(), "无法查询系统时间状态");
     Ok(String::from_utf8(result.stdout)?
         .lines()
@@ -33,6 +34,15 @@ async fn status() -> Result<BTreeMap<String, String>> {
 
 pub async fn prepare(manager: &super::upgrade::Manager) {
     if !manager.live() || manager.kind() != "systemd" {
+        return;
+    }
+    println!("检查系统时间同步状态，保持现有时区。");
+    if available("chronyc")
+        && output("chronyc", &["waitsync", "1", "0.1", "0", "0.1"], 3)
+            .await
+            .is_ok_and(|result| result.status.success())
+    {
+        println!("Chrony 已确认系统时间同步。");
         return;
     }
     let result: Result<()> = async {
@@ -167,6 +177,39 @@ fn available(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_confirms_chrony_before_using_timedatectl() {
+        use std::{fs, os::unix::{fs::PermissionsExt, process::CommandExt}, process::{Command, Stdio}};
+        if std::env::var_os("CHAIN_TEST_TIME_PREPARE").is_some() {
+            let manager = super::super::upgrade::Manager { root: "/".into(), base: "/unused".into() };
+            tokio::runtime::Runtime::new().unwrap().block_on(prepare(&manager));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("chronyc"), "#!/bin/sh\nprintf 'chronyc %s\\n' \"$*\" >> \"$TIME_CALLS\"\nexit \"$CHRONY_RESULT\"\n").unwrap();
+        fs::write(root.path().join("timedatectl"), "#!/bin/sh\nprintf 'timedatectl %s\\n' \"$*\" >> \"$TIME_CALLS\"\nprintf 'Timezone=America/New_York\\nNTP=yes\\nNTPSynchronized=yes\\n'\n").unwrap();
+        for name in ["chronyc", "timedatectl"] {
+            fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for result in ["0", "1"] {
+            let calls = root.path().join(format!("calls-{result}"));
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ctl::time::tests::prepare_confirms_chrony_before_using_timedatectl", "--nocapture"])
+                .env("CHAIN_TEST_TIME_PREPARE", "1")
+                .env("CHRONY_RESULT", result)
+                .env("TIME_CALLS", &calls)
+                .env("PATH", root.path())
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0)
+                .spawn().unwrap();
+            println!("时间检查夹具 PID/PGID={}，目录={}", child.id(), root.path().display());
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let calls = fs::read_to_string(calls).unwrap();
+            assert!(calls.starts_with("chronyc waitsync 1 0.1 0 0.1\n"));
+            assert_eq!(calls.contains("timedatectl"), result == "1");
+        }
+    }
     #[test]
     fn aliases_and_unrelated_units_are_not_time_daemons() {
         assert_eq!(

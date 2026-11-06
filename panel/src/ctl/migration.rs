@@ -17,6 +17,20 @@ fn proxy(name: &str) -> bool {
         .iter()
         .any(|p| name == *p || name.starts_with(&format!("{p}-")))
 }
+fn proxy_executable(process: &Path) -> Result<Option<PathBuf>> {
+    let executable = match fs::read_link(process.join("exe")) {
+        Ok(path) => path,
+        // Kernel threads and exited processes have no executable to take over.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("进程可执行文件路径无效")?
+        .trim_end_matches(" (deleted)");
+    Ok(proxy(name).then_some(executable))
+}
 pub fn json_config(body: &str) -> Result<Value> {
     let mut out = String::new();
     let mut chars = body.chars().peekable();
@@ -358,16 +372,20 @@ pub async fn discover(proc: &Path) -> Result<Vec<Owner>> {
         else {
             continue;
         };
+        let exe = match proxy_executable(&path) {
+            Ok(Some(exe)) => exe,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!("无法检查进程 PID {pid} 的可执行文件，保留原进程：{error:#}");
+                continue;
+            }
+        };
         let inspected: Result<()> = async {
-            let exe = fs::read_link(path.join("exe"))?;
             let name = exe
                 .file_name()
                 .and_then(|s| s.to_str())
                 .context("程序路径无效")?
                 .trim_end_matches(" (deleted)");
-            if !proxy(name) {
-                return Ok(());
-            }
             let args = fs::read(path.join("cmdline"))?
                 .split(|c| *c == 0)
                 .filter(|s| !s.is_empty())
@@ -954,6 +972,19 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_real_proxy_executables_enter_ownership_checks() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        assert!(proxy_executable(root.path()).unwrap().is_none());
+        for (name, expected) in [("nginx", false), ("xray", true), ("xray (deleted)", true)] {
+            symlink(format!("/usr/bin/{name}"), root.path().join("exe")).unwrap();
+            assert_eq!(proxy_executable(root.path()).unwrap().is_some(), expected);
+            fs::remove_file(root.path().join("exe")).unwrap();
+        }
+        fs::write(root.path().join("exe"), "invalid proc entry").unwrap();
+        assert!(proxy_executable(root.path()).is_err());
+    }
     #[test]
     fn migration_refuses_changed_processes_configuration_and_management() {
         let owner = Owner {

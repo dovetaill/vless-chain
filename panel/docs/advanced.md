@@ -58,21 +58,15 @@ sudo chainctl token
 
 已有适用发行包时可跳过 `build`，直接安装；输出目录已存在时，重新构建需指定新的 `--output`。使用 root 登录时可省略 `sudo`。`release-output/` 不进入 Git，克隆源码后需要自行构建或复制已有发行包与校验文件。
 
-首次交互安装自动选择空闲随机端口，只询问可选域名。网卡公网 IPv4 通过 `ip -j address` 获取，并优先采用本机路由选中的已分配公网源地址，不会以外部 IP 查询服务返回的代理出口地址代替入站地址。域名留空时监听 `0.0.0.0:随机端口`；填写域名时仅监听 `127.0.0.1:随机端口`，由 Nginx 提供 HTTPS。
+在线面板安装必须明确填写域名，输入框不提供旧域名默认值；保留数据后重装也一样。网卡公网 IPv4 通过 `ip -j address` 获取，不会以外部 IP 查询服务返回的代理出口地址代替入站地址。面板后端仅监听 `127.0.0.1:随机端口`，由 Nginx 对外提供 HTTPS 443，不能改用 IP 或独立 HTTPS 端口。
 
-高级非交互安装未指定监听地址时，仍默认 `127.0.0.1:8088`。例如需要 SSH 隧道时可显式这样安装：
-
-```bash
-sudo ./scripts/install-server.sh install --non-interactive --listen 127.0.0.1:8088
-```
-
-在自己电脑上运行以下命令，再打开 `http://127.0.0.1:18088`，输入 `chainctl token` 显示的管理令牌：
+非交互安装必须明确指定域名，例如：
 
 ```bash
-ssh -N -L 18088:127.0.0.1:8088 root@服务器IP
+sudo ./scripts/install-server.sh install --domain panel.example.com --non-interactive
 ```
 
-按 `Ctrl+C` 关闭隧道。高级自动化可用 `install --domain panel.example.com --non-interactive` 自动配置 HTTPS，或 `--domain '' --non-interactive` 自动选择 IP 和随机端口。NAT 环境通过 `--local-host` 明确公网入站地址。需要固定监听地址时增加 `--listen 0.0.0.0:8088`，并按需要配置防火墙访问范围。
+NAT 环境通过 `--local-host` 明确公网入站地址。需要固定后端端口时增加 `--listen 127.0.0.1:8088`；公网访问仍使用域名和 HTTPS 443。升级和 Agent 接入保持原入口；`--root` 离线安装树不启动服务、不提供公网访问。
 
 域名安装查询公共 DNS 的 A/AAAA 记录并核对网卡公网地址，使用 Nginx webroot 完成 HTTP-01 验证。自动安装调用系统包管理器 apt、dnf、yum、apk、pacman、zypper 或 Homebrew；不下载第三方 Nginx/ACME 安装脚本。受管站点为主配置 `http` 块实际包含目录中的 `chain-panel.conf`，证书名为 `chain-panel-域名`，验证目录为 `/var/lib/chain-acme`。签证书前检查真实 HTTP 验证路径，重载后最多等待 15 秒让新站点生效；失败时显示验证 URL、HTTP 状态码或连接错误，HTTP 404/403 不再统一误报为防火墙问题。本机自检通过后仍由证书机构从公网验证 TCP 80；HTTPS 访问使用 TCP 443。同域名已有站点或 80/443 被其他程序占用时拒绝覆盖。支持系统包安装的 Nginx 配置；Linux 由 systemd/OpenRC 管理，macOS 使用独立的系统 LaunchDaemon。macOS 已有其他方式启动的 Nginx 时须先停止原服务，安装器保留已有站点配置。TLS 配置失败恢复原站点与此前服务状态，已签发证书保留供重试。
 
@@ -229,7 +223,7 @@ Rust 集成测试使用本机独立控制台、三个 Agent、真实 Xray、TLS 
 
 `chainctl` 无参数时打开交互菜单，`chainctl help` 和 `chainctl --help` 无需管理员权限即可查看帮助。非管理员执行实际运维时自动调用 sudo；无终端且无子命令时只打印帮助。自动化调用增加 `--non-interactive`，保留原有 `--component`、`--package`、监听及令牌文件参数。
 
-安装器可单独下载运行；在 curl 管道中会从 `/dev/tty` 读取交互输入。无参数脚本执行 `setup`：首次直接安装，已安装时显示登录信息，缺失默认本机 Agent 时重试接入。`chainctl` 无参数仍打开运维菜单。在线引导从 GitHub Releases 下载本机架构的正式包，校验 SHA256 后只提取并运行原生 chainctl；Rust 再检查完整清单和兼容性，然后询问可选域名。下载和解压目录在退出时删除。没有正式包、架构缺失或校验失败时终止，不会静默改为源码编译。
+安装器可单独下载运行；在 curl 管道中会从 `/dev/tty` 读取交互输入。无参数脚本执行 `setup`：先明确填写面板域名，再安装或修复；保留的数据不会让它跳过域名输入，缺失默认本机 Agent 时重试接入。`chainctl` 无参数仍打开运维菜单。在线引导从 GitHub Releases 下载本机架构的正式包，校验 SHA256 后只提取并运行原生 chainctl；Rust 检查完整清单和兼容性。下载和解压目录在退出时删除。没有正式包、架构缺失或校验失败时终止，不会静默改为源码编译。
 
 维护者需要先推送安装器和前端改动，再按本页发布流程上传对应版本的正式包；此前本机已有包可用安装向导选择。Linux 新包使用静态 musl，不再要求与构建机匹配的 glibc；系统内核与软件源仍需满足运行要求。单次正式发行需要同时提供包、release.json 和 SHA256SUMS。
 

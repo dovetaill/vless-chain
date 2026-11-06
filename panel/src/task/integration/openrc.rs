@@ -208,6 +208,49 @@ pub async fn run(args: &Options) -> Result<()> {
         work.root.join("SHA256SUMS"),
         format!("{}  native.tar.gz\n", package::digest(&archive)?),
     )?;
+    fs::create_dir("/etc/native-test-cert")?;
+    let cert = Path::new("/etc/native-test-cert/cert.pem");
+    let key = Path::new("/etc/native-test-cert/key.pem");
+    work.run(
+        &work.root,
+        &strings(&[
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-days",
+            "90",
+            "-subj",
+            "/CN=panel.test",
+            "-addext",
+            "subjectAltName=DNS:panel.test",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-out",
+            cert.to_str().unwrap(),
+            "-keyout",
+            key.to_str().unwrap(),
+        ]),
+    )
+    .await?;
+    if core_repair {
+        fs::copy("/controller/cert.pem", &cert)?;
+        fs::copy("/controller/key.pem", &key)?;
+    }
+    writeln!(
+        fs::OpenOptions::new().append(true).open("/etc/hosts")?,
+        "\n127.0.0.1 panel.test"
+    )?;
+    if !core_repair {
+        let certificates = Path::new("/etc/letsencrypt/live/chain-panel-panel.test");
+        fs::create_dir_all(certificates)?;
+        fs::copy(cert, certificates.join("fullchain.pem"))?;
+        fs::copy(key, certificates.join("privkey.pem"))?;
+    }
     let ctl = install_source.join("bin/chainctl");
     let mut install = strings(&[
         ctl.to_str().unwrap(),
@@ -220,6 +263,9 @@ pub async fn run(args: &Options) -> Result<()> {
         "--local-host",
         "127.0.0.1",
     ]);
+    if !core_repair {
+        install.extend(strings(&["--domain", "panel.test"]));
+    }
     work.run(&work.root, &install).await?;
     let wrapper = Path::new("/usr/local/bin/chainctl");
     ensure!(
@@ -254,9 +300,10 @@ pub async fn run(args: &Options) -> Result<()> {
     let admin = fs::read("/var/lib/chain-panel/admin-token")?;
     let node = fs::read("/var/lib/chain-panel/local-system-node")?;
     let mut cookie = String::new();
-    let mut base = "http://127.0.0.1:37243".to_string();
+    let mut base = if core_repair { "http://127.0.0.1:37243" } else { "https://panel.test" }.to_string();
     let mut client = reqwest::Client::builder()
         .no_proxy()
+        .add_root_certificate(reqwest::Certificate::from_pem(&fs::read(cert)?)?)
         .timeout(Duration::from_secs(10))
         .build()?;
     ready(&client, &base, &admin, &mut cookie).await?;
@@ -305,55 +352,20 @@ pub async fn run(args: &Options) -> Result<()> {
         cli(&work, &ctl, &["start", "--component", "panel"]).await?;
         ready(&client, &base, &admin, &mut cookie).await?;
     }
-    fs::create_dir("/etc/native-test-cert")?;
-    let cert = Path::new("/etc/native-test-cert/cert.pem");
-    let key = Path::new("/etc/native-test-cert/key.pem");
-    work.run(
-        &work.root,
-        &strings(&[
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:prime256v1",
-            "-nodes",
-            "-days",
-            "90",
-            "-subj",
-            "/CN=panel.test",
-            "-addext",
-            "subjectAltName=DNS:panel.test",
-            "-addext",
-            "basicConstraints=critical,CA:FALSE",
-            "-out",
-            cert.to_str().unwrap(),
-            "-keyout",
-            key.to_str().unwrap(),
-        ]),
-    )
-    .await?;
-    if core_repair {
-        fs::copy("/controller/cert.pem", &cert)?;
-        fs::copy("/controller/key.pem", &key)?;
-    }
-    writeln!(
-        fs::OpenOptions::new().append(true).open("/etc/hosts")?,
-        "\n127.0.0.1 panel.test"
-    )?;
     let state_path = Path::new("/opt/chain/.chain-install.json");
-    let mut saved = release::read(state_path)?;
-    saved["roles"]["panel"]["manual_https"] = json!({"port":37443,"cert":cert,"key":key});
-    fs::write(state_path, serde_json::to_vec(&saved)?)?;
-    install.extend(strings(&["--domain", "panel.test"]));
+    if core_repair {
+        let mut saved = release::read(state_path)?;
+        saved["roles"]["panel"]["manual_https"] = json!({"port":37443,"cert":cert,"key":key});
+        fs::write(state_path, serde_json::to_vec(&saved)?)?;
+        install.extend(strings(&["--domain", "panel.test"]));
+    }
     work.run(&work.root, &install).await?;
     client = reqwest::Client::builder()
         .no_proxy()
         .add_root_certificate(reqwest::Certificate::from_pem(&fs::read(cert)?)?)
         .timeout(Duration::from_secs(10))
         .build()?;
-    base = "https://panel.test:37443".into();
+    base = if core_repair { "https://panel.test:37443" } else { "https://panel.test" }.into();
     ready(&client, &base, &admin, &mut cookie).await?;
     ensure!(
         client
@@ -368,7 +380,13 @@ pub async fn run(args: &Options) -> Result<()> {
         "真实 HTTPS 页面未完整传输"
     );
     ensure!(
-        Path::new("/etc/chain-panel-https/nginx.conf").is_file()
+        (if core_repair {
+            Path::new("/etc/chain-panel-https/nginx.conf").is_file()
+        } else {
+            let manager = crate::ctl::upgrade::Manager::open(Path::new("/"))?;
+            crate::ctl::nginx::site_directory(&crate::ctl::nginx::main_path(&manager))?
+                .join("chain-panel.conf").is_file()
+        })
             && api(&client, &base, "state", None, &mut cookie).await?["nodes"]
                 .as_array()
                 .unwrap()
@@ -562,6 +580,14 @@ pub async fn run(args: &Options) -> Result<()> {
     ensure!(
         !wrapper.exists() && fs::read("/var/lib/chain-panel/admin-token")? == admin,
         "卸载丢失业务数据或管理链接残留"
+    );
+    let retained = fs::read(state_path)?;
+    ensure!(
+        work.failure(&work.root, &strings(&[
+            source.join("bin/chainctl").to_str().unwrap(), "setup", "--non-interactive",
+        ])).await?.contains("必须明确指定 --domain")
+            && fs::read(state_path)? == retained,
+        "保留数据后重装默认复用了旧域名，或拒绝前改变安装状态"
     );
     work.run(&work.root, &install).await?;
     ready(&client, &base, &admin, &mut cookie).await?;

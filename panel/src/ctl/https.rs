@@ -186,6 +186,40 @@ async fn certificate(cert: &std::path::Path, key: &std::path::Path, domain: &str
     .await?;
     Ok(true)
 }
+pub(crate) async fn check_http_challenge(
+    url: &str,
+    marker: &str,
+    budget: Duration,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
+        .timeout(budget)
+        .build()?;
+    let mut last_error = anyhow::anyhow!("HTTP-01 请求未完成：{url}");
+    // Reload only sends a signal; old workers can still answer the first request.
+    let ready = tokio::time::timeout(budget, async {
+        loop {
+            let checked: Result<()> = async {
+                let body = client.get(url).send().await?.error_for_status()?.text().await?;
+                ensure!(body == marker, "ACME HTTP 路径返回内容不匹配：{url}");
+                Ok(())
+            }
+            .await;
+            match checked {
+                Ok(()) => return,
+                Err(error) => last_error = error,
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        return Err(last_error.context(format!("等待 Nginx HTTP-01 路径生效超时：{url}")));
+    }
+    Ok(())
+}
 pub async fn activate(
     manager: &Manager,
     name: &str,
@@ -257,21 +291,14 @@ pub async fn activate(
             let marker = uuid::Uuid::new_v4().to_string();
             let challenge = webroot.join(".well-known/acme-challenge").join(&marker);
             atomic(&challenge, marker.as_bytes(), 0o644)?;
-            let response = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(15))
-                .build()?
-                .get(format!(
-                    "http://{domain}/.well-known/acme-challenge/{marker}"
-                ))
-                .send()
-                .await;
-            let checked: Result<String> =
-                async { Ok(response?.error_for_status()?.text().await?) }.await;
+            let checked = check_http_challenge(
+                &format!("http://{domain}/.well-known/acme-challenge/{marker}"),
+                &marker,
+                Duration::from_secs(15),
+            )
+            .await;
             fs::remove_file(challenge)?;
-            let checked = checked?;
-            ensure!(checked == marker, "ACME HTTP 路径验证失败");
+            checked?;
             crate::acme::obtain(
                 &manager.path("/etc/letsencrypt"),
                 &format!("chain-panel-{domain}"),
@@ -618,6 +645,47 @@ pub async fn manual(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn http_challenge_waits_for_reload_but_rejects_real_failures() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new()
+            .route("/ready", get(move || {
+                let count = count.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) < 2 {
+                        (StatusCode::NOT_FOUND, "old worker")
+                    } else {
+                        (StatusCode::OK, "owned-marker")
+                    }
+                }
+            }))
+            .route("/missing", get(|| async { (StatusCode::NOT_FOUND, "missing") }))
+            .route("/wrong", get(|| async { "wrong marker" }))
+            .route("/slow", get(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                "owned-marker"
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        check_http_challenge(&format!("http://{address}/ready"), "owned-marker", Duration::from_secs(3))
+            .await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        for (path, detail) in [("missing", "404"), ("wrong", "内容不匹配"), ("slow", "超时")] {
+            let url = format!("http://{address}/{path}");
+            let start = std::time::Instant::now();
+            let error = check_http_challenge(&url, "owned-marker", Duration::from_millis(300))
+                .await.unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(&url) && error.contains(detail), "{error}");
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+        server.abort();
+        let _ = server.await;
+    }
     #[test]
     fn generated_site_is_parseable_and_keeps_acme() {
         let r = tempfile::tempdir().unwrap();
