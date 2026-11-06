@@ -31,7 +31,7 @@ jobs:
           - runner: ubuntu-22.04-arm
             arch: aarch64
             system: linux
-          - runner: macos-14
+          - runner: macos-15
             arch: aarch64
             system: darwin
     env:

@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "chain-panel"
-version = "0.2.73"
+version = "0.2.74"
 dependencies = [
  "anyhow",
  "axum",
