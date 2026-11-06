@@ -223,8 +223,8 @@ pub fn extract(archive: &Path, destination: &Path) -> Result<Manifest> {
                 .open(path)?;
             let written = std::io::copy(&mut entry, &mut file)?;
             ensure!(written == entry.size(), "发行文件截断");
-            file.sync_all()?;
         }
+        // This temporary tree is verified, then copied before installation; it need not be durable.
         verify(destination, true)
     })();
     if result.is_err() {
@@ -549,10 +549,15 @@ pub(crate) mod tests {
 
     #[test]
     fn checked_extraction_rejects_links_and_duplicates() {
-        for variant in ["valid", "escape", "symlink", "duplicate", "checksum"] {
+        for variant in [
+            "valid", "escape", "symlink", "duplicate", "checksum", "tampered", "truncated",
+        ] {
             let tmp = tempfile::tempdir().unwrap();
             let source = tmp.path().join("source");
             fixture(&source);
+            if variant == "tampered" {
+                fs::write(source.join("bin/xray"), "tampered").unwrap();
+            }
             let archive = tmp.path().join("release.tar.gz");
             let encoder = flate2::write::GzEncoder::new(
                 File::create(&archive).unwrap(),
@@ -588,6 +593,10 @@ pub(crate) mod tests {
                     .unwrap();
             }
             tar.into_inner().unwrap().finish().unwrap();
+            if variant == "truncated" {
+                let file = OpenOptions::new().write(true).open(&archive).unwrap();
+                file.set_len(file.metadata().unwrap().len() / 2).unwrap();
+            }
             let sum = if variant == "checksum" {
                 "0".repeat(64)
             } else {

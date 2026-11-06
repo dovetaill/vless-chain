@@ -44,7 +44,18 @@ if [ -z "$local_package" ] || [ -n "$package_url" ]; then
   command -v curl >/dev/null || { echo '请先安装 curl 和 CA 证书' >&2; exit 1; }
 fi
 command -v tar >/dev/null || { echo '请先安装 tar' >&2; exit 1; }
-bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/chain-bootstrap-XXXXXXXX")
+bootstrap_dir=
+for bootstrap_parent in "${TMPDIR:-/tmp}" /var/tmp; do
+  [ -d "$bootstrap_parent" ] && [ -w "$bootstrap_parent" ] || continue
+  bootstrap_space=$(LC_ALL=C df -Pk "$bootstrap_parent" 2>/dev/null) || continue
+  # Budget for the 512 MiB archive, 1 GiB stage, bootstrap binary and headroom.
+  printf '%s\n' "$bootstrap_space" | awk 'NR == 2 && $4 ~ /^[0-9]+$/ && $4 >= 3145728 { enough=1 } END { exit !enough }' || continue
+  bootstrap_dir=$(mktemp -d "$bootstrap_parent/chain-bootstrap-XXXXXXXX") && break
+done
+[ -n "$bootstrap_dir" ] || {
+  printf '未找到可用的安装临时目录（已检查 %s、/var/tmp；需至少 3 GiB 可用空间），请释放空间或将 TMPDIR 指向其他磁盘目录。\n' "${TMPDIR:-/tmp}" >&2
+  exit 1
+}
 bootstrap_pid=
 cleanup() {
   if [ -n "$bootstrap_pid" ]; then
@@ -56,6 +67,11 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [ "$bootstrap_parent" != "${TMPDIR:-/tmp}" ]; then
+  printf '原临时目录空间不足或不可用，已改用 %s；安装结束后自动清理。\n' "$bootstrap_parent" >&2
+fi
+TMPDIR=$bootstrap_dir
+export TMPDIR
 if [ -n "$package_url" ]; then
   archive=${package_url##*/}
   case "$archive" in chain-panel-*-$platform-$arch.tar.gz) ;; *) echo '发行包名称或平台架构不匹配' >&2; exit 1;; esac
