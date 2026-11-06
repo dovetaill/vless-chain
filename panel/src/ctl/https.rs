@@ -253,7 +253,10 @@ pub async fn activate(
     let path = directory.join("chain-panel.conf");
     ordinary(&path)?;
     for (file, text) in &files {
-        if file == &path {
+        if file == &path
+            || (file == &directory.join("chain-proxy-acme.conf")
+                && text == &proxy_acme_config(manager))
+        {
             continue;
         }
         for d in nginx::parse(text)? {

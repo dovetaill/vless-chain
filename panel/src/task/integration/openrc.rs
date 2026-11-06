@@ -358,6 +358,21 @@ pub async fn run(args: &Options) -> Result<()> {
         saved["roles"]["panel"]["manual_https"] = json!({"port":37443,"cert":cert,"key":key});
         fs::write(state_path, serde_json::to_vec(&saved)?)?;
         install.extend(strings(&["--domain", "panel.test"]));
+    } else {
+        let proxy = Path::new("/etc/nginx/http.d/chain-proxy-acme.conf");
+        let original = fs::read_to_string(proxy)?;
+        let state = fs::read(state_path)?;
+        for (path, body) in [
+            (proxy.to_path_buf(), original.replace("~^.+$", "panel.test")),
+            (proxy.with_file_name("foreign-acme.conf"), original.clone()),
+        ] {
+            fs::write(&path, body)?;
+            let rejected = work.failure(&work.root, &install).await;
+            if path == proxy { fs::write(&path, &original)?; } else { fs::remove_file(&path)?; }
+            ensure!(rejected?.contains("域名与已有站点冲突"), "未拒绝修改过或外来 ACME 站点");
+            ensure!(fs::read(state_path)? == state, "站点冲突改变了安装状态");
+            ready(&client, &base, &admin, &mut cookie).await?;
+        }
     }
     work.run(&work.root, &install).await?;
     client = reqwest::Client::builder()
