@@ -242,12 +242,17 @@ fn check_maintenance_version(state: &Value, request: &Value) -> Result<()> {
 }
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let r = remote(&app, &id)?;
-    request(&r, "POST", "/api/federation/revoke", Some(json!({}))).await?;
+    let revocation = request(&r, "POST", "/api/federation/revoke", Some(json!({}))).await;
+    let (remote_revoked, warning) = match revocation {
+        Ok(value) if value["ok"] == true => (true, None),
+        Ok(_) => (false, Some("远端未返回明确的撤销确认".to_string())),
+        Err(error) => (false, Some(error.to_string())),
+    };
     edit(&app, |d| {
         d.fleet.remotes.retain(|r| r.id != id);
         Ok(())
     })?;
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(json!({"ok":true,"remote_revoked":remote_revoked,"warning":warning})))
 }
 async fn revoke(State(app): State<App>) -> ApiResult<Json<Value>> {
     edit(&app, |d| {
@@ -1267,6 +1272,74 @@ mod tests {
             local_url: "http://127.0.0.1:1".into(),
         }
     }
+    #[tokio::test]
+    async fn disconnect_removes_local_record_and_reports_remote_revocation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let router = Router::new().route("/{case}/api/federation/revoke", post(move |Path(case): Path<String>| {
+            let calls = recorded.clone();
+            async move {
+                calls.lock().unwrap().push(case.clone());
+                match case.as_str() {
+                    "confirmed" => Json(json!({"ok":true})).into_response(),
+                    "ambiguous" => Json(json!({"accepted":true})).into_response(),
+                    _ => (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response(),
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let directory = tempfile::tempdir().unwrap();
+        for case in ["confirmed", "ambiguous", "error"] {
+            let app = app(directory.path());
+            let removed = Remote { id: "removed".into(), name: "fixture".into(), url: format!("http://{address}/{case}"), token: "test".into(), seen: 0, error: String::new(), policy_error: String::new(), snapshot: Value::Null };
+            let mut retained = removed.clone(); retained.id = "retained".into();
+            {
+                let mut store = app.store.lock().unwrap();
+                store.doc.fleet.remotes = vec![removed, retained];
+                store.doc.fleet.controller_hash = "preserve-parent-binding".into();
+            }
+            let result = disconnect(State(app.clone()), Path("removed".into())).await.unwrap().0;
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["remote_revoked"], case == "confirmed");
+            assert_eq!(result["warning"].is_null(), case == "confirmed");
+            let store = app.store.lock().unwrap();
+            assert_eq!(store.doc.fleet.remotes.len(), 1);
+            assert_eq!(store.doc.fleet.remotes[0].id, "retained");
+            assert_eq!(store.doc.fleet.controller_hash, "preserve-parent-binding");
+            let persisted: String = store.conn.query_row("SELECT body FROM state WHERE id=1", [], |row| row.get(0)).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&persisted).unwrap()["fleet"]["remotes"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(*calls.lock().unwrap(), ["confirmed", "ambiguous", "error"]);
+        server.abort(); let _ = server.await;
+        let _released = std::net::TcpListener::bind(address).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_offline_and_failed_local_save_preserve_truth() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let directory = tempfile::tempdir().unwrap();
+        let app = app(directory.path());
+        let removed = Remote { id: "offline".into(), name: "offline fixture".into(), url: format!("http://{address}"), token: "test".into(), seen: 0, error: String::new(), policy_error: String::new(), snapshot: Value::Null };
+        app.store.lock().unwrap().doc.fleet.remotes.push(removed.clone());
+        let result = disconnect(State(app.clone()), Path("offline".into())).await.unwrap().0;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["remote_revoked"], false);
+        assert!(result["warning"].as_str().unwrap().contains("远端连接失败或超时"));
+        assert!(app.store.lock().unwrap().doc.fleet.remotes.is_empty());
+        {
+            let mut store = app.store.lock().unwrap();
+            store.doc.fleet.remotes.push(removed);
+            store.save().unwrap();
+            store.conn.execute_batch("PRAGMA query_only=ON").unwrap();
+        }
+        assert!(disconnect(State(app.clone()), Path("offline".into())).await.is_err());
+        assert_eq!(app.store.lock().unwrap().doc.fleet.remotes[0].id, "offline", "本地保存失败不能丢失接入记录或宣告成功");
+    }
+
     #[tokio::test]
     async fn archive_preserves_failure_and_never_dispatches_or_resumes() {
         let directory = tempfile::tempdir().unwrap();

@@ -344,7 +344,7 @@ export function Fleet({ state }: { state: PanelState }) {
     const signature = data.remotes
       .map(
         (r) =>
-          `${r.id}:${localNode(r)?.report.system.sampled_at}:${connected(r, now)}:${recent(localNode(r)?.seen, remoteNow(r, now))}:${recent(localNode(r)?.report.system.sampled_at, remoteNow(r, now))}`,
+          `${r.id}:${localNode(r)?.report.system?.sampled_at}:${connected(r, now)}:${recent(localNode(r)?.seen, remoteNow(r, now))}:${recent(localNode(r)?.report.system?.sampled_at, remoteNow(r, now))}`,
       )
       .join("|");
     if (signature === lastSample.current) return;
@@ -1646,7 +1646,7 @@ export function Fleet({ state }: { state: PanelState }) {
             <div className="grid gap-3 sm:grid-cols-2">
               {(() => {
                 const n = localNode(activeDetail)!,
-                  s = n.report.system,
+                  s = n.report.system ?? {},
                   valid =
                     connected(activeDetail, now) &&
                     n.online &&
@@ -1725,22 +1725,26 @@ export function Fleet({ state }: { state: PanelState }) {
             </Button>
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
+              className="border-red-300 text-red-700 hover:bg-red-50 hover:text-red-800"
               disabled={busy}
               onClick={() => {
                 if (
                   window.confirm(
-                    `解除 ${activeDetail.name} 的接入授权？远端需在线确认撤销。`,
+                    `从总控移除 ${activeDetail.name}？会尝试撤销远端授权；远端不可达时仍移除本地记录，但无法确认远端授权及已有免密会话已失效。此操作不会卸载或停止远端代理。`,
                   )
                 )
                   void run(async () => {
-                    await api(`/fleet/${activeDetail.id}`, "DELETE");
+                    const result = await api<{ remote_revoked?: boolean; warning?: string }>(`/fleet/${activeDetail.id}`, "DELETE");
+                    setMessage(result.remote_revoked
+                      ? `${activeDetail.name}：已从总控移除，远端授权已撤销。`
+                      : `${activeDetail.name}：已从总控移除；远端授权及已有免密会话的撤销尚未确认。如远端仍在使用，请在该面板解除总控绑定。${result.warning ? `原因：${result.warning}` : ""}`);
                     setDetail(undefined);
                     await refresh();
                   });
               }}
             >
-              解除接入
+              从总控移除
             </Button>
           </div>
         </Modal>
@@ -1888,6 +1892,7 @@ export function Fleet({ state }: { state: PanelState }) {
           kind={editor.line?.kind || "vless"}
           state={editor.state}
           remoteName={editor.remote.name}
+          defaultHost={new URL(editor.remote.url).hostname.replace(/^\[|\]$/g, "")}
           request={remoteApi(editor.remote.id)}
           close={() => setEditor(undefined)}
           ensureLocalServer={async () => {

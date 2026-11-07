@@ -31,7 +31,7 @@ export function Dashboard({ state, manage }: { state: PanelState; manage?: (line
     <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
     <Card className="min-w-0"><CardHeader className="px-4 py-4"><div className="min-w-0"><CardTitle className="leading-5">服务器实时状态</CardTitle><p className="muted mt-1">主机网卡统计包含全部业务，与代理计费流量分开统计。</p></div></CardHeader><CardContent className="p-4">
       {!state.nodes.length ? <p className="muted">新建代理后自动接入本机，等待首次采样。</p> : <div className="space-y-3">{state.nodes.map(node => {
-        const system = node.report.system;
+        const system = node.report.system ?? {};
         const fresh = node.online && Boolean(system.sampled_at && state.time - system.sampled_at <= 30);
         return <section key={node.id} className="min-w-0 rounded-lg border border-border bg-slate-50/60 p-3" aria-label={`${node.name} 实时状态`}>
           <div className="mb-3 flex items-start justify-between gap-3"><div className="min-w-0"><h3 className="break-all text-sm font-semibold">{node.name}</h3><p className="mt-1 break-all text-xs text-slate-500">{node.host}</p></div><Status tone={node.online ? "good" : "bad"}>{node.online ? "在线" : "离线"}</Status></div>

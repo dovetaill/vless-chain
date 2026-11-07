@@ -42,7 +42,7 @@ export interface NodeInfo {
       disk_used?: number;
       network_rx_bps?: number | null;
       network_tx_bps?: number | null;
-    };
+    } | null;
   };
 }
 export interface External {

@@ -27,7 +27,7 @@ const root = process.env.CHAIN_TEST_ROOT;
     const fleet = {remotes:Array.from({length:50},(_,i)=>({id:`vps-${i}`,name:`VPS ${String(i).padStart(2,'0')}`,url:`https://vps-${i}.example`,seen:now,error:'',snapshot:{...state,time:now,local_node_id:'local',version:'0.2.29',agent_version:i===0?'0.2.28':'0.2.29',agent_seen:now,maintenance:true,
       nodes:[{id:'local',name:'本机',host:'192.0.2.1',seen:now,online:true,report:{running:true,applied:true,error:'',revision:'',traffic:{},system:{sampled_at:now,network_rx_bps:1024,network_tx_bps:2048,cpu_percent:10,memory_total:4096,memory_used:1024}}}],
       lines:Array.from({length:10},(_,j)=>line(j)),externals:[{id:'ext-a',name:'外部落地',url:'socks5://a:b@example.com:1080'}]}})),controller:'',policy:null,tasks:{}};
-    let failSave = false, failLatest = false, disconnected = false;
+    let failSave = false, failLatest = false, disconnected = false, remoteRevoked = false;
 
     await page.route('**/*', async route => {
       const request = route.request(), url = new URL(request.url());
@@ -42,6 +42,10 @@ const root = process.env.CHAIN_TEST_ROOT;
         else if (url.pathname === '/api/fleet') result = fleet;
         else if (url.pathname === '/api/fleet/release/latest') { if(failLatest) return route.fulfill({status:502,json:{error:'发行版本暂不可用'}}); result = {version:'0.2.30',xray:'26.3.27',mihomo:'1.19.32'}; }
         else if (url.pathname === '/api/fleet/invite') result = {code:'once-only-code'};
+        else if (request.method() === 'DELETE' && /^\/api\/fleet\/vps-\d+$/.test(url.pathname)) {
+          fleet.remotes = fleet.remotes.filter(r => r.id !== url.pathname.split('/').at(-1));
+          result = {ok:true,remote_revoked:remoteRevoked,warning:remoteRevoked ? null : '远端连接失败或超时；操作结果需重新查询'};
+        }
         else if (/^\/api\/fleet\/vps-\d+\/forward$/.test(url.pathname)) {
           const body = request.postDataJSON(), remote = fleet.remotes.find(r=>url.pathname.includes(`/${r.id}/`));
           if (body.path === '/state') result = remote.snapshot;
@@ -85,6 +89,15 @@ const root = process.env.CHAIN_TEST_ROOT;
     await page.getByText('↑ 100.0 KiB/s · 有效 50/50 台',{exact:true}).waitFor();
     assert.equal(await page.getByText('接入与授权',{exact:true}).count(),0);
     await go('VPS');
+    const originalSystem = fleet.remotes[0].snapshot.nodes[0].report.system;
+    fleet.remotes[0].snapshot.nodes[0].report.system = null;
+    await page.getByRole('button',{name:'刷新总控',exact:true}).click();
+    await page.getByRole('button',{name:'查看 VPS',exact:true}).first().click();
+    await dialog().getByText('CPU：—',{exact:true}).waitFor();
+    assert.deepEqual(errors, [], '总控图表与VPS详情必须接受空采样');
+    await closeDialog();
+    fleet.remotes[0].snapshot.nodes[0].report.system = originalSystem;
+    await page.getByRole('button',{name:'刷新总控',exact:true}).click();
     assert.equal(await page.getByRole('button',{name:'批量升级',exact:true}).count(),0);
     assert.equal(await page.getByLabel('目标正式版本').count(),0);
     await page.getByRole('region',{name:'VPS 列表',exact:true}).getByText('版本不一致',{exact:true}).waitFor();
@@ -132,6 +145,7 @@ const root = process.env.CHAIN_TEST_ROOT;
     if(!await page.getByRole('button',{name:'重启面板',exact:true}).isVisible()) await page.getByRole('button',{name:'更多维护',exact:true}).click();
     await page.getByRole('button',{name:'重启面板',exact:true}).click();
     await dialog().getByText(/失联或数据过期/).waitFor();assert.equal(await dialog().getByRole('button',{name:'确认执行',exact:true}).count(),0);await closeDialog();
+    await page.getByRole('button',{name:'更多维护',exact:true}).click();
     fleet.remotes[0].error='';fleet.remotes[0].snapshot.agent_version='0.2.28';
     await page.getByRole('button',{name:'刷新总控',exact:true}).click();
     await go('所有代理');
@@ -163,7 +177,7 @@ const root = process.env.CHAIN_TEST_ROOT;
     await dialog().getByRole('heading',{name:'编辑代理 · VPS 01'}).waitFor();
     assert.ok(!page.url().includes('remote='));
     await page.waitForFunction(()=>{const r=document.querySelector('[role=dialog]').getBoundingClientRect();return Math.abs(r.right-window.innerWidth)<2 && r.width>600;});
-    await dialog().getByRole('button',{name:'在节点验证 REALITY 握手',exact:true}).click();await dialog().getByText('通过：通过（10 ms）',{exact:true}).waitFor();
+    await dialog().getByRole('button',{name:'检测 REALITY 握手与回落风险',exact:true}).click();await dialog().getByText(/握手通过：通过（10 ms）/).waitFor();
     await dialog().getByLabel('名称',{exact:true}).fill('原位修改');
     failSave=true;await dialog().getByRole('button',{name:'保存并预览',exact:true}).click();await dialog().getByText('模拟保存失败',{exact:true}).waitFor();
     assert.equal(await dialog().getByLabel('名称',{exact:true}).inputValue(),'原位修改');
@@ -357,6 +371,26 @@ const root = process.env.CHAIN_TEST_ROOT;
     }
 
 
+    await page.setViewportSize({width:1280,height:900});
+    await go('VPS');
+    const clearRemoval = page.getByRole('button',{name:'清除筛选',exact:true});
+    if (await clearRemoval.count()) await clearRemoval.click();
+    await page.getByRole('button',{name:'查看 VPS',exact:true}).first().click();
+    await dialog().getByRole('button',{name:'管理代理',exact:true}).click();
+    await page.getByRole('button',{name:'新建代理',exact:true}).click();
+    assert.equal(await dialog().getByLabel('本机 IP 或域名').inputValue(), 'vps-0.example', '远端新建使用目标控制台域名');
+    await closeDialog(); await go('VPS');
+    for (const confirmed of [false, true]) {
+      remoteRevoked = confirmed;
+      const beforeRemove = fleet.remotes.length;
+      await page.getByRole('button',{name:'查看 VPS',exact:true}).first().click();
+      const remove = dialog().getByRole('button',{name:'从总控移除',exact:true});
+      assert.ok(await remove.evaluate(el => parseFloat(getComputedStyle(el).borderTopWidth) > 0), '移除按钮须有可辨识边框');
+      await remove.click();
+      await dialog().waitFor({state:'hidden'});
+      await page.getByText(confirmed ? /已从总控移除，远端授权已撤销/ : /已从总控移除；远端授权及已有免密会话的撤销尚未确认/).waitFor();
+      assert.equal(fleet.remotes.length, beforeRemove - 1);
+    }
     await page.goto('about:blank');
     await page.goto('http://chain.test/admin#fleet-ticket=one-time-ticket');
     await page.locator('aside').waitFor();

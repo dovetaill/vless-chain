@@ -40,7 +40,7 @@ assert.equal(health({ ...remote, snapshot: null }, now), "等待首次同步");
 const skewed = structuredClone(remote);
 skewed.snapshot!.time += 360;
 skewed.snapshot!.nodes[0].seen += 360;
-skewed.snapshot!.nodes[0].report.system.sampled_at! += 360;
+skewed.snapshot!.nodes[0].report.system!.sampled_at! += 360;
 assert.equal(connected(skewed, now), true);
 assert.equal(health(skewed, now), "机器时钟不一致");
 assert.equal(remoteNow(skewed, now + 10), 1370);

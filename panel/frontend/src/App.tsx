@@ -664,6 +664,7 @@ export function App() {
       {editor && <LineEditor
         {...editor}
         state={state}
+        defaultHost={remotePanel ? state.nodes.find(n => n.id === state.local_node_id)?.host || "" : location.hostname.replace(/^\[|\]$/g, "")}
         ensureLocalServer={ensureLocalServer}
         importExternal={importExternal}
         close={() => setEditor(null)}
