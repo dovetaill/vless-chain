@@ -12,7 +12,7 @@ use std::{
     fs::{self, File},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -255,6 +255,29 @@ async fn ensure_account(manager: &Manager, role: &str) -> Result<(u32, u32)> {
     account(&name)?.context("服务账户创建后无法读取")
 }
 
+/// New program and challenge directories must be traversable by the service accounts.
+pub(super) fn shared_dir(path: &Path) -> Result<()> {
+    ordinary(path)?;
+    if path.is_dir() {
+        return Ok(());
+    }
+    let parent = path.parent().context("安装目录缺少父目录")?;
+    if !parent.is_dir() {
+        shared_dir(parent)?;
+    }
+    match fs::create_dir(path) {
+        Ok(()) => File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)?
+            .set_permissions(fs::Permissions::from_mode(0o755))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
+            && fs::symlink_metadata(path)?.is_dir() => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
 pub(super) fn owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
     ordinary(path)?;
     if path.exists() {
@@ -435,6 +458,7 @@ pub async fn component(
     let (uid, gid) = ensure_account(manager, role).await?;
     let _guard = manager.lock()?;
     ensure!(manager.state()? == old, "安装状态已经变化");
+    shared_dir(&manager.path("/var/lib/chain-acme"))?;
     for path in [&etc, &data] {
         owned_dir(path, uid, gid, 0o700)?;
     }
@@ -458,8 +482,7 @@ pub async fn component(
         0o755,
     )?;
     let releases = manager.base.join("releases");
-    ordinary(&releases)?;
-    fs::create_dir_all(&releases)?;
+    shared_dir(&releases)?;
     let id = format!(
         "{}-{}-{}-{}",
         manifest.version,
@@ -579,6 +602,23 @@ pub async fn component(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_directories_keep_existing_modes_and_reject_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o711)).unwrap();
+        let child = existing.join("releases");
+        shared_dir(&child).unwrap();
+        shared_dir(&existing).unwrap();
+        assert_eq!(fs::metadata(&existing).unwrap().mode() & 0o777, 0o711);
+        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o777, 0o755);
+        let link = root.path().join("alias");
+        std::os::unix::fs::symlink(&existing, &link).unwrap();
+        assert!(shared_dir(&link.join("foreign")).is_err());
+        assert!(!existing.join("foreign").exists());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn systemd_environment_file_is_a_literal_path() {

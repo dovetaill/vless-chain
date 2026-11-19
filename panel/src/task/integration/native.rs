@@ -293,6 +293,10 @@ pub async fn exercise(work: &Workspace, stage: &Path) -> Result<()> {
     let fresh = work.root.join("fresh-native");
     fs::create_dir(&fresh)?;
     let command = strings(&[
+        "sh",
+        "-c",
+        "umask 077; exec \"$@\"",
+        "install-test",
         install
             .base
             .join("releases/old/bin/chainctl")
@@ -309,6 +313,12 @@ pub async fn exercise(work: &Workspace, stage: &Path) -> Result<()> {
         read(&fresh.join("opt/chain/.chain-install.json"))?["roles"]["panel"]["version"] == "0.3.0",
         "打包安装未使用本地发行树"
     );
+    for path in ["opt/chain", "opt/chain/releases", "var/lib/chain-acme"] {
+        ensure!(fs::metadata(fresh.join(path))?.mode() & 0o777 == 0o755,
+            "服务账户无法进入新建的 {path}");
+    }
+    ensure!(fs::metadata(fresh.join("opt/chain/.chain-install.json"))?.mode() & 0o777 == 0o600,
+        "安装状态权限错误");
     install.unchanged()?;
 
     let rejected = Case::new(work, stage, "checksum")?;

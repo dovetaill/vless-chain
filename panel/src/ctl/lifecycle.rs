@@ -673,7 +673,7 @@ pub fn open(root: &Path) -> Result<Manager> {
             !base.exists() || fs::read_dir(&base)?.next().is_none(),
             "安装目录已有未识别内容，拒绝接管"
         );
-        fs::create_dir_all(base.join("releases"))?;
+        install::shared_dir(&base.join("releases"))?;
         atomic(
             &base.join(".chain-install.json"),
             serde_json::to_string(&json!({"owner":OWNER,"roles":{}}))?.as_bytes(),
