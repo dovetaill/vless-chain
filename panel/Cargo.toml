@@ -1,6 +1,6 @@
 [package]
 name = "chain-panel"
-version = "0.2.75"
+version = "0.2.76"
 edition = "2024"
 
 [dependencies]
@@ -36,13 +36,16 @@ tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 totp-rs = { version = "5.7", features = ["gen_secret", "otpauth"] }
 webauthn-rs = "0.5"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 strip = true

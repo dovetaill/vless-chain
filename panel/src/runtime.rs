@@ -128,7 +128,9 @@ fn spawn_core(mut cmd: Command, log: &Path) -> Result<Child> {
     let secrets = args.windows(2).find(|args| args[0] == "-config" || args[0] == "-f")
         .and_then(|args| std::fs::read(args[1]).ok()).and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .map(|value| crate::diagnostics::secrets(&value)).unwrap_or_default();
-    crate::diagnostics::append(log, "代理组件启动；此前日志保留")?;
+    if let Err(error) = crate::diagnostics::append(log, "代理组件启动；此前日志保留") {
+        eprintln!("代理诊断日志写入失败: {error}");
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -302,7 +304,8 @@ fn mihomo_command(xray: &Path, config: &Path, dir: &Path) -> Command {
         .arg(dir)
         .env(
             "SAFE_PATHS",
-            dir.parent().unwrap_or(dir).join("acme/config"),
+            std::env::join_paths(["acme/config", "tls-live"].map(|sub| dir.parent().unwrap_or(dir).join(sub)))
+                .unwrap_or_else(|_| dir.parent().unwrap_or(dir).join("acme/config").into_os_string()),
         )
         .kill_on_drop(true);
     cmd
@@ -397,16 +400,10 @@ impl ManagedXray {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    pub async fn open(binary: PathBuf, dir: PathBuf) -> Result<Self> {
-        let active = if dir.join("active.json").exists() {
-            Some(serde_json::from_slice::<Desired>(&std::fs::read(
-                dir.join("active.json"),
-            )?)?)
-        } else {
-            None
-        };
+    pub fn new(binary: PathBuf, dir: PathBuf) -> Result<Self> {
+        let dir = dir.canonicalize()?;
         let traffic = crate::gateway::Book::open(&dir)?;
-        let mut x = Self {
+        Ok(Self {
             binary,
             dir,
             child: None,
@@ -415,10 +412,19 @@ impl ManagedXray {
             active: None,
             traffic,
             gateway: None,
+        })
+    }
+    pub fn saved_config(&self) -> Result<Option<Desired>> {
+        let bytes = match std::fs::read(self.dir.join("active.json")) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
-        if let Some(config) = active {
-            x.apply(&config).await?;
-        }
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+    pub async fn open(binary: PathBuf, dir: PathBuf) -> Result<Self> {
+        let mut x = Self::new(binary, dir)?;
+        if let Some(saved) = x.saved_config()? { x.apply(&saved).await?; }
         Ok(x)
     }
     pub fn running(&mut self) -> bool {
@@ -472,7 +478,7 @@ impl ManagedXray {
                 && matches!(spec.protocol, Protocol::Vless | Protocol::Hysteria2)
                 && spec.tls.mode == "auto"
             {
-                let live = crate::acme::paths(&self.dir.join("acme/config"), &spec.tls.domain);
+                let live = crate::website::core_cert_dir(&self.dir, &spec.tls.domain);
                 let inbound = value["inbounds"]
                     .as_array_mut()
                     .context("缺少入站配置")?
@@ -508,7 +514,7 @@ impl ManagedXray {
             {
                 continue;
             }
-            let live = crate::acme::paths(&self.dir.join("acme/config"), &spec.tls.domain);
+            let live = crate::website::core_cert_dir(&self.dir, &spec.tls.domain);
             let listener = value["listeners"]
                 .as_array_mut()
                 .context("缺少 QUIC 入口")?
@@ -590,49 +596,16 @@ impl ManagedXray {
                 .collect();
             bail!("代理内核启动失败：{}", logs.join("\n"));
         }
-        if let Some(child) = &self.mihomo {
-            let pid = child.id().context("Mihomo 已退出")?;
-            #[cfg(target_os = "linux")]
-            let sockets: std::collections::BTreeSet<_> =
-                std::fs::read_dir(format!("/proc/{pid}/fd"))?
-                    .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-                    .collect();
-            let log = std::fs::read_to_string(self.dir.join("mihomo/mihomo.log"))?;
-            ensure!(!log.contains("listen err:"), "Mihomo 监听启动失败：{log}");
-            for listener in config["_mihomo"]["listeners"].as_array().unwrap() {
-                let table = if matches!(listener["type"].as_str(), Some("tuic" | "hysteria2")) {
-                    "udp"
-                } else {
-                    "tcp"
-                };
-                #[cfg(target_os = "linux")]
-                let address = format!("0100007F:{:04X}", listener["port"].as_u64().unwrap());
-                #[cfg(target_os = "linux")]
-                let bound = std::fs::read_to_string(format!("/proc/{pid}/net/{table}"))?
-                    .lines()
-                    .skip(1)
-                    .any(|line| {
-                        let fields: Vec<_> = line.split_whitespace().collect();
-                        fields.get(1) == Some(&address.as_str())
-                            && fields.get(9).is_some_and(|inode| {
-                                sockets.contains(&PathBuf::from(format!("socket:[{inode}]")))
-                            })
-                            && (table == "udp" || fields.get(3) == Some(&"0A"))
-                    });
-                #[cfg(target_os = "macos")]
-                let bound = {
-                    let mut command = Command::new("/usr/sbin/lsof");
-                    command.args(["-nP", "-a", "-p", &pid.to_string(), "-i", "-FfpnPT"]).kill_on_drop(true);
-                    let result = tokio::time::timeout(Duration::from_secs(5), command.output()).await??;
-                    ensure!(result.status.success(), "无法检测 Mihomo 监听端口归属");
-                    lsof_listener(&String::from_utf8_lossy(&result.stdout), table, listener["port"].as_u64().unwrap() as u16)
-                };
-                ensure!(
-                    bound,
-                    "Mihomo 监听未就绪：{} {}",
-                    listener["name"],
-                    listener["port"]
-                );
+        if self.mihomo.is_some() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let child = self.mihomo.as_mut().unwrap();
+                ensure!(child.try_wait()?.is_none(), "Mihomo 在监听就绪前退出");
+                match Self::mihomo_listeners(child, config).await {
+                    Ok(()) => break,
+                    Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
             }
         }
         self.gateway = Some(
@@ -644,6 +617,85 @@ impl ManagedXray {
             .await?,
         );
         self.apply_ingress(config).await?;
+        Ok(())
+    }
+    async fn mihomo_listeners(child: &Child, config: &Value) -> Result<()> {
+        let listeners = config["_mihomo"]["listeners"]
+            .as_array()
+            .context("缺少 Mihomo 监听配置")?;
+        if listeners.is_empty() {
+            return Ok(());
+        }
+        let mut expected = Vec::new();
+        for listener in listeners {
+            let tables: &[&str] = if matches!(listener["type"].as_str(), Some("tuic" | "hysteria2"))
+            {
+                &["udp"]
+            } else if listener["udp"] == true {
+                &["tcp", "udp"]
+            } else {
+                &["tcp"]
+            };
+            let port = listener["port"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .context("Mihomo 监听端口无效")?;
+            expected.extend(tables.iter().map(|&table| (&listener["name"], table, port)));
+        }
+        let pid = child.id().context("Mihomo 已退出")?;
+        #[cfg(target_os = "linux")]
+        let bound = {
+            let sockets: std::collections::BTreeSet<_> =
+                std::fs::read_dir(format!("/proc/{pid}/fd"))?
+                    .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                    .collect();
+            let mut bound = std::collections::BTreeSet::new();
+            for table in expected
+                .iter()
+                .map(|(_, table, _)| *table)
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                for line in std::fs::read_to_string(format!("/proc/{pid}/net/{table}"))?
+                    .lines()
+                    .skip(1)
+                {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    let Some(port) = fields
+                        .get(1)
+                        .and_then(|address| address.strip_prefix("0100007F:"))
+                        .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+                    else {
+                        continue;
+                    };
+                    if fields.get(2) == Some(&"00000000:0000")
+                        && fields.get(3) == Some(&if table == "udp" { "07" } else { "0A" })
+                        && fields.get(9).is_some_and(|i| {
+                            sockets.contains(&PathBuf::from(format!("socket:[{i}]")))
+                        })
+                    {
+                        bound.insert((table, port));
+                    }
+                }
+            }
+            bound
+        };
+        #[cfg(target_os = "macos")]
+        let listing = {
+            let mut command = Command::new("/usr/sbin/lsof");
+            command
+                .args(["-nP", "-a", "-p", &pid.to_string(), "-i", "-FfpnPT"])
+                .kill_on_drop(true);
+            let result = tokio::time::timeout(Duration::from_secs(5), command.output()).await??;
+            ensure!(result.status.success(), "无法检测 Mihomo 监听端口归属");
+            String::from_utf8_lossy(&result.stdout).into_owned()
+        };
+        for (name, table, port) in expected {
+            #[cfg(target_os = "linux")]
+            let ready = bound.contains(&(table, port));
+            #[cfg(target_os = "macos")]
+            let ready = lsof_listener(&listing, table, port);
+            ensure!(ready, "Mihomo 监听未就绪：{name} {table}/{port}");
+        }
         Ok(())
     }
     pub async fn apply(&mut self, desired: &Desired) -> Result<()> {
@@ -665,7 +717,7 @@ impl ManagedXray {
             .and_then(|d| crate::gateway::specs(&d.config).ok())
             .is_some_and(|s| {
                 s.iter()
-                    .any(|s| s.tls.mode == "auto" || s.kind == Kind::Website && s.port == 80)
+                    .any(|s| s.kind == Kind::Website && s.port == 80)
             });
         // Native TLS/QUIC listeners need certificates before core validation.
         let native_tls = specs.iter().any(|s| {
@@ -1013,6 +1065,54 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires CHAIN_TEST_XRAY, CHAIN_MIHOMO_BIN and isolated loopback ports"]
+    async fn mihomo_readiness_uses_current_tcp_and_udp_ownership_with_or_without_logs() -> Result<()>
+    {
+        let binary = PathBuf::from(std::env::var("CHAIN_TEST_XRAY")?);
+        let dir = tempfile::tempdir()?;
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let address = udp.local_addr()?;
+        let config = Desired {
+            revision: id(),
+            config: json!({
+                "inbounds":[], "outbounds":[{"protocol":"freedom"}],
+                "_mihomo":{"mode":"rule","log-level":"warning","rules":["MATCH,DIRECT"],
+                    "listeners":[{"name":"owned","listen":"127.0.0.1","port":address.port(),"type":"socks","udp":true,"proxy":"DIRECT"}]}
+            }),
+        };
+        std::fs::write(dir.path().join("logging-disabled"), b"disabled")?;
+        let mut runtime = ManagedXray::new(binary.clone(), dir.path().into())?;
+        let error = runtime
+            .apply(&config)
+            .await
+            .expect_err("a different process owns the UDP port");
+        assert!(error.to_string().contains("Mihomo"), "{error:#}");
+        assert!(!runtime.running() && runtime.active.is_none());
+        assert!(!dir.path().join("mihomo/mihomo.log").exists());
+        drop(udp);
+        runtime.apply(&config).await?;
+        async fn greeting(address: std::net::SocketAddr) -> Result<()> {
+            let mut client = tokio::net::TcpStream::connect(address).await?;
+            client.write_all(&[5, 1, 0]).await?;
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).await?;
+            ensure!(reply == [5, 0], "SOCKS 握手失败");
+            Ok(())
+        }
+        greeting(address).await?;
+        runtime.close().await;
+        drop(runtime);
+        std::fs::remove_file(dir.path().join("logging-disabled"))?;
+        std::fs::write(
+            dir.path().join("mihomo/mihomo.log"),
+            b"previous process: listen err:\n",
+        )?;
+        let mut restored = ManagedXray::open(binary, dir.path().into()).await?;
+        greeting(address).await?;
+        restored.close().await;
+        Ok(())
+    }
+    #[tokio::test]
     #[ignore = "requires CHAIN_TEST_XRAY and isolated loopback ports"]
     async fn http_probe_follows_redirects_but_rejects_loops_and_http_errors() -> Result<()> {
         let binary = PathBuf::from(std::env::var("CHAIN_TEST_XRAY")?);
@@ -1242,7 +1342,7 @@ mod tests {
         });
         let cert = dir
             .path()
-            .join("acme/config/live/cert.example.com/fullchain.pem");
+            .join("tls-live/cert.example.com/fullchain.pem");
         let legacy = runtime.xray_config(&config).unwrap();
         assert_eq!(
             legacy["inbounds"][0]["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"],

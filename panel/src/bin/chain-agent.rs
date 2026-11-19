@@ -1,3 +1,5 @@
+#[path = "../agent_sync.rs"]
+mod agent_sync;
 use anyhow::{Context, Result, bail, ensure};
 use chain_panel::{model::*, runtime::*};
 use std::os::unix::fs::PermissionsExt;
@@ -60,10 +62,10 @@ async fn run() -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let diagnostic_binary = binary.clone();
-    let mut runtime = ManagedXray::open(binary, dir.clone()).await?;
+    let mut runtime = ManagedXray::new(binary, dir.clone())?;
     *runtime.traffic.resources.write().unwrap() = Some(chain_panel::resources::Client::open(
         &dir, format!("{}/api/agent/{}/resources",panel.trim_end_matches('/'),node), token.trim().into())?);
-    chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "Agent 已启动")?;
+    if let Err(e) = chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "Agent 已启动") { eprintln!("诊断日志写入失败: {e}"); }
     let clock = std::sync::Arc::new(std::sync::Mutex::new(serde_json::json!({"verified":false,"detail":"正在检查系统时间"})));
     let clock_value = clock.clone();
     let cleanup_dir = dir.clone();
@@ -139,18 +141,11 @@ async fn run() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
-    let mut report = Report {
-        revision: runtime
-            .active
-            .as_ref()
-            .map(|d| d.revision.clone())
-            .unwrap_or_default(),
-        applied: true,
-        running: runtime.running(),
-        error: String::new(),
-        ..Default::default()
-    };
-    let url = format!("{}/api/agent/{}/sync", panel.trim_end_matches('/'), node);
+    let mut report = Report::default();
+    let sync = std::sync::Arc::new(agent_sync::Sync::new(client.clone(),
+        format!("{}/api/agent/{}", panel.trim_end_matches('/'), node), token.trim().into(), runtime.traffic.clone()));
+    let statistics = tokio::spawn(sync.clone().statistics());
+    let mut restore_at = Some(tokio::time::Instant::now());
     eprintln!(
         "Agent 已启动，数据目录 {}，仅管理自己启动的 Xray",
         dir.display()
@@ -170,25 +165,13 @@ async fn run() -> Result<()> {
             report.error =
                 "代理内核或网关异常退出；Agent 将退出，由服务管理器恢复最后已应用配置".into();
             runtime.close().await;
-            report.traffic = runtime.traffic.snapshot();
-            // Keep this failure outside `step`: its errors are logged and retried in place.
-            // The installed service restarts failures after 5s; active.json remains authoritative.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                client
-                    .post(&url)
-                    .bearer_auth(token.trim())
-                    .json(&report)
-                    .send(),
-            )
-            .await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), sync.report(&mut report)).await;
             bail!("{}", report.error);
         }
         let step = async {
             report.running = runtime.running();
-            report.traffic = runtime.traffic.snapshot();
-            runtime.traffic.save()?;
             report.system = chain_panel::gateway::system_metrics();
+            report.system["max_proxy_connections"] = serde_json::json!(chain_panel::rules::MAX_PROXY_CONNECTIONS);
             if now().saturating_sub(certificate_checked) >= 300 {
                 if let Some(active) = &runtime.active {
                     if let Ok(specs) = chain_panel::gateway::specs(&active.config) {
@@ -216,60 +199,61 @@ async fn run() -> Result<()> {
                     report.system["certificate"] = status;
                 }
             }
-            let response = client
-                .post(&url)
-                .bearer_auth(token.trim())
-                .json(&report)
-                .send()
-                .await?
-                .error_for_status()?;
-            let desired = response.json::<Option<Desired>>().await?;
-            if let Some(desired) = desired {
-                if desired.revision != report.revision {
-                    let traffic = runtime.traffic.clone();
-                    let application = runtime.apply(&desired);
-                    tokio::pin!(application);
-                    let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
-                    let outcome = loop {
-                        tokio::select! {
-                            result=&mut application=>break result,
-                            _=heartbeat.tick()=>{
-                                report.traffic=traffic.snapshot();let _=traffic.save();
-                                let _=client.post(&url).bearer_auth(token.trim()).json(&report).send().await;
-                            }
+            let saved = if restore_at.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                restore_at = None;
+                match runtime.saved_config() {
+                    Ok(saved) => {
+                        if saved.is_none() && runtime.active.is_none() {
+                            report.applied = true;
+                            report.error.clear();
                         }
-                    };
-                    drop(application);
-                    let applied = outcome.is_ok();
-                    let _ = chain_panel::diagnostics::append(&dir.join("diagnostics.log"), &match &outcome {Ok(_)=>format!("配置 {} 应用成功",desired.revision),Err(e)=>format!("配置 {} 应用失败: {e:#}",desired.revision)});
-                    report = Report {
-                        revision: desired.revision.clone(),
-                        applied: outcome.is_ok(),
-                        error: outcome.err().map(|e| format!("{e:#}")).unwrap_or_default(),
-                        running: applied,
-                        traffic: traffic.snapshot(),
-                        system: chain_panel::gateway::system_metrics(),
-                    };
-                    report.system["diagnostics_version"] = serde_json::json!(1);
-                    report.system["reality_candidates_version"] = serde_json::json!(1);
-                    report.system["reality_preflight_version"] = serde_json::json!(1);
-                    report.system["cores"] = core_versions.clone();
-                    report.system["clock"] = clock.lock().unwrap().clone();
-                    // Acknowledge immediately; do not report a saved config as running before application.
-                    client
-                        .post(&url)
-                        .bearer_auth(token.trim())
-                        .json(&report)
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                        saved
+                    }
+                    Err(e) => {
+                        report.applied = false;
+                        report.error = format!("读取已保存配置失败: {e:#}");
+                        restore_at = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+                        None
+                    }
                 }
+            } else { None };
+            let restoring = saved.is_some();
+            let desired = match saved {
+                Some(saved) => Some(saved),
+                None => sync.report(&mut report).await?.filter(|d| d.revision != report.revision),
+            };
+            if let Some(desired) = desired {
+                let outcome = tokio::select! {
+                    result = runtime.apply(&desired) => result,
+                    _ = async {
+                        loop {
+                            let _ = sync.report(&mut report).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    } => unreachable!(),
+                };
+                report.applied = outcome.is_ok();
+                report.running = runtime.running();
+                report.revision = desired.revision;
+                report.error = outcome.err().map(|e| format!("{e:#}")).unwrap_or_default();
+                if report.applied {
+                    restore_at = None;
+                    certificate_checked = 0;
+                } else if restoring {
+                    restore_at = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+                }
+                let message = if report.applied { format!("配置 {} 应用成功", report.revision) }
+                    else { format!("配置 {} 应用失败: {}", report.revision, report.error) };
+                let _ = chain_panel::diagnostics::append(&dir.join("diagnostics.log"), &message);
+                sync.report(&mut report).await?;
             }
             Ok::<(), anyhow::Error>(())
         };
         tokio::select! { _=&mut shutdown=>break, result=step=>{if let Err(e)=result {eprintln!("同步失败: {e}"); let _=chain_panel::diagnostics::append(&dir.join("diagnostics.log"), &format!("同步失败: {e}"));}} }
         tokio::select! {_=&mut shutdown=>break,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
     }
+    statistics.abort();
+    let _ = statistics.await;
     clock_task.abort();
     let _ = clock_task.await;
     diagnostics.abort();

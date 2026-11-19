@@ -30,23 +30,21 @@ pub async fn serve(
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", spec.port)).await?;
+    let address = listener.local_addr()?;
+    let mut listener = crate::gateway::Listener::new(listener, address, lane.book.clone(), format!("{} meter {address}", lane.id));
     Ok(tokio::spawn(async move {
         let mut children = JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => break,
                 Some(_) = children.join_next(), if !children.is_empty() => {},
-                accepted = listener.accept() => {
-                    let (stream, _) = match accepted {
-                        Ok(value) => value,
-                        Err(error) => {
-                            eprintln!("Meter TCP listener stopped: line={} port={} error={} errno={:?}", lane.id, spec.port, error, error.raw_os_error());
-                            break;
-                        }
-                    };
-                    if children.len() >= 1024 || !lane.available() { continue }
+                (stream, _) = listener.accept() => {
+                    if children.len() >= lane.transport_limit() || !lane.available() { continue }
+                    let Ok(slot) = lane.book.proxy_capacity.meter.clone().try_acquire_owned() else { continue };
                     let (spec, user, lane) = (spec.clone(), user.clone(), lane.clone());
                     children.spawn(async move {
+                        let _slot = slot;
                         let stopped = lane.cancellation();
                         tokio::select! {
                             _ = stopped.cancelled() => {},

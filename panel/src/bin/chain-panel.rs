@@ -9,6 +9,7 @@ use axum::{
 };
 use chain_panel::{compiler::*, model::*, runtime::*};
 use chain_panel::security::{Actor, Role, Session};
+use chain_panel::traffic_sync::{self, Heartbeat, Incoming, Page};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -72,6 +73,7 @@ fn install_state_write_guard(conn: &Connection) -> Result<()> {
 }
 #[derive(Clone)]
 struct App {
+    traffic_uploads: Arc<Mutex<BTreeMap<String, Incoming>>>,
     diagnostics: Arc<diagnostics_api::Broker>,
     store: Arc<Mutex<Store>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
@@ -636,6 +638,7 @@ async fn remove_node(State(app): State<App>, Path(id): Path<String>) -> ApiResul
         d.nodes.retain(|n| n.id != id);
         Ok(())
     })?;
+    app.traffic_uploads.lock().unwrap().remove(&id);
     Ok(Json(json!({"ok":true})))
 }
 async fn rotate_node(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -1146,14 +1149,17 @@ async fn publish(State(app): State<App>, Extension(actor): Extension<Actor>, _in
                     node.name
                 );
             }
-            if configs[&node.id]["_chain"]
-                .as_array()
-                .is_some_and(|s| !s.is_empty())
-            {
-                if configs[&node.id]["_chain"].as_array().unwrap().iter().any(|s| s["resource_ids"].as_array().is_some_and(|ids| ids.iter().any(|id| id.as_str().is_some_and(chain_panel::plans::is_budget)))) {
+            if let Some(specs) = configs[&node.id]["_chain"].as_array().filter(|s| !s.is_empty()) {
+                for spec in specs {
+                    chain_panel::rules::check_agent_connection_limit(
+                        spec["access_policy"]["policy"]["max_connections"].as_u64(),
+                        &node.report.system,
+                    )?;
+                }
+                if specs.iter().any(|s| s["resource_ids"].as_array().is_some_and(|ids| ids.iter().any(|id| id.as_str().is_some_and(chain_panel::plans::is_budget)))) {
                     ensure!(node.report.system["customer_plan_version"] == 1, "{} 的 Agent 不支持客户共享套餐，请先升级并等待心跳", node.name);
                 }
-                if configs[&node.id]["_chain"].as_array().unwrap().iter().any(|s|s["multiplier"].as_u64().unwrap_or(1)>1 || s["resource_ids"].as_array().is_some_and(|p|!p.is_empty()) || chain_panel::rules::requires_capability(&s["access_policy"]["policy"])) {
+                if specs.iter().any(|s|s["multiplier"].as_u64().unwrap_or(1)>1 || s["resource_ids"].as_array().is_some_and(|p|!p.is_empty()) || chain_panel::rules::requires_capability(&s["access_policy"]["policy"])) {
                     ensure!(node.report.system["sharing_version"]==1,"请先升级 Agent 以支持倍率和访问控制");
                 }
                 ensure!(
@@ -1359,30 +1365,80 @@ async fn run_publish(app: App, job: Job, recovery: bool) {
         let _ = chain_panel::diagnostics::append(&app.token_file.parent().unwrap().join("diagnostics.log"), &format!("保存发布结果失败: {e}"));
     }
 }
-async fn sync(
-    State(app): State<App>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(mut report): Json<Report>,
-) -> ApiResult<Json<Option<Desired>>> {
+fn reporting_node(doc: &Document, id: &str, headers: &HeaderMap) -> ApiResult<usize> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
+    doc.nodes
+        .iter()
+        .position(|n| n.id == id && equal(&digest(token), &n.token_hash))
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "节点身份无效"))
+}
+
+async fn traffic_page(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(page): Json<Page>,
+) -> ApiResult<StatusCode> {
     let mut s = app.store.lock().unwrap();
-    let n = s
-        .doc
-        .nodes
-        .iter_mut()
-        .find(|n| n.id == id)
-        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "节点身份无效"))?;
-    if !equal(&digest(token), &n.token_hash) {
-        return Err(error(StatusCode::UNAUTHORIZED, "节点身份无效"));
+    let node = reporting_node(&s.doc, &id, &headers)?;
+    let mut uploads = app.traffic_uploads.lock().unwrap();
+    let upload = uploads
+        .get_mut(&id)
+        .ok_or_else(|| error(StatusCode::CONFLICT, "请先发送节点心跳"))?;
+    let rows = upload
+        .receive(page)
+        .map_err(|e| error(StatusCode::CONFLICT, &e.to_string()))?;
+    if let Some(rows) = rows {
+        let old = std::mem::replace(&mut s.doc.nodes[node].report.traffic, rows);
+        if let Err(e) = s.save() {
+            s.doc.nodes[node].report.traffic = old;
+            upload.discard();
+            return Err(error(StatusCode::SERVICE_UNAVAILABLE, &format!("保存流量快照失败: {e}")));
+        }
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn heartbeat(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Heartbeat<Report>>,
+) -> ApiResult<Json<Option<Desired>>> {
+    record_report(&app, id, headers, input.report, Some(input.session))
+}
+async fn sync(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(report): Json<Report>,
+) -> ApiResult<Json<Option<Desired>>> {
+    record_report(&app, id, headers, report, None)
+}
+
+fn record_report(app: &App, id: String, headers: HeaderMap, mut report: Report, session: Option<uuid::Uuid>) -> ApiResult<Json<Option<Desired>>> {
+    let mut s = app.store.lock().unwrap();
+    let node = reporting_node(&s.doc, &id, &headers)?;
+    let n = &mut s.doc.nodes[node];
     report.error = report.error.chars().take(2000).collect();
     report.revision = report.revision.chars().take(180).collect();
-    let mut persist = report != n.report;
+    let mut persist = if let Some(session) = session {
+        if !report.traffic.is_empty() { return Err(error(StatusCode::BAD_REQUEST, "请通过流量分页上报统计")); }
+        let mut uploads = app.traffic_uploads.lock().unwrap();
+        let slot = uploads.entry(id).or_insert_with(|| Incoming::new(session));
+        if slot.session != session { *slot = Incoming::new(session); }
+        report.traffic = std::mem::take(&mut n.report.traffic);
+        report.revision != n.report.revision || report.applied != n.report.applied
+            || report.running != n.report.running || report.error != n.report.error
+            || report.system["agent_version"] != n.report.system["agent_version"]
+    } else {
+        app.traffic_uploads.lock().unwrap().remove(&id);
+        report != n.report
+    };
     n.report = report;
     n.seen = now();
     let desired = n.desired.clone();
@@ -1769,6 +1825,7 @@ async fn run() -> Result<()> {
     };
     chain_panel::rules::seed_presets(&mut doc.rule_sources);
     let app = App {
+        traffic_uploads: Default::default(),
         diagnostics: Arc::new(diagnostics_api::Broker::default()),
         store: Arc::new(Mutex::new(Store { conn, doc })),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1891,6 +1948,8 @@ async fn run() -> Result<()> {
         .route("/api/preview", post(preview))
         .route("/api/publish", post(publish))
         .route("/api/agent/{id}/sync", post(sync))
+        .route("/api/agent/{id}/heartbeat", post(heartbeat))
+        .route("/api/agent/{id}/traffic", post(traffic_page).layer(DefaultBodyLimit::max(traffic_sync::PAGE_BYTES)))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app.clone());
@@ -1902,6 +1961,7 @@ async fn run() -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
+            local_app.traffic_uploads.lock().unwrap().values_mut().for_each(Incoming::expire);
             let _ = chain_panel::diagnostics::maintain(local_app.token_file.parent().unwrap());
             if let Err(error) = local_app
                 .local_agent

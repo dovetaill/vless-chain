@@ -87,7 +87,7 @@ export function AccessPolicyEditor({line,close,saved,request=api}:{line:Line;clo
       <Field label="禁止目标端口（逗号或空格分隔）"><Input name="denied" defaultValue={policy.denied_ports.join(', ')} placeholder="例如 25, 465, 587"/></Field>
       <Field label="UDP 策略"><select className="select" value={policy.udp||'allow'} onChange={e=>setPolicy({...policy,udp:e.target.value})}><option value="allow">允许（仍受网站和禁用端口限制）</option><option value="deny">全部禁止</option><option value="ports">仅允许指定目标端口</option></select></Field>
       <Field label="UDP 允许端口"><Input name="udp_ports" defaultValue={policy.udp_ports.join(', ')} placeholder="例如 53, 443, 123, 3478"/></Field>
-      <Field label="并发业务连接 / UDP 关联上限" hint="留空沿用 1024 的资源保护上限；这不是设备数量"><Input name="connections" type="number" min={1} max={1024} defaultValue={policy.max_connections??''}/></Field>
+      <Field label="并发业务连接 / UDP 关联上限" hint="新版 Agent 留空默认 4,096，最多可填 20,480。各线路共享节点资源，同一设备可占多个名额。"><Input name="connections" type="number" min={1} max={20480} defaultValue={policy.max_connections??''}/></Field>
     </>}
   </Modal>;
 }

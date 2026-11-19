@@ -107,6 +107,18 @@ fn local_conditions(doc: &mut Document, policy: &Policy) {
             policy,
             true,
         );
+        let system = &n.report.system;
+        for (field, title) in [("traffic_error", "流量账本"), ("traffic_sync_error", "流量快照同步")] {
+            if let Some(detail) = system.get(field) {
+                let reason = detail.as_str().unwrap_or_default();
+                observe(doc, format!("{field}:{}", n.id), !reason.is_empty(), format!("{}：{title} {reason}", n.name), policy, false);
+            }
+        }
+        if let Some(count) = system["listener_error_count"].as_u64() {
+            let detail = system["listener_errors"].as_object().and_then(|errors| errors.iter().next())
+                .map(|(endpoint, error)| format!(" {endpoint} {}", error.as_str().unwrap_or_default())).unwrap_or_default();
+            observe(doc, format!("listeners:{}", n.id), count > 0, format!("{}：{count} 个监听异常{detail}", n.name), policy, false);
+        }
         let clock = &n.report.system["clock"];
         let sample = clock["checked_at"].as_u64().unwrap_or(0);
         let key = format!("clock:{}", n.id);
@@ -811,6 +823,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)").unwrap();
         let app = App {
+            traffic_uploads: Default::default(),
             diagnostics: Arc::new(diagnostics_api::Broker::default()),
             store: Arc::new(Mutex::new(Store { conn, doc: doc.clone() })),
             sessions: Default::default(), tickets: Default::default(), delegated_sessions: Default::default(),

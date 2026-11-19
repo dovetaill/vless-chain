@@ -6,6 +6,9 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
+pub const DEFAULT_PROXY_CONNECTIONS: usize = 4096;
+pub const MAX_PROXY_CONNECTIONS: usize = 20_480;
+
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(default)]
 pub struct Policy {
@@ -17,6 +20,7 @@ pub struct Policy {
     pub udp_ports: Vec<u16>,
     pub max_connections: Option<usize>,
 }
+
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(default)]
 pub struct CompiledPolicy {
@@ -52,6 +56,15 @@ pub fn requires_capability(policy: &serde_json::Value) -> bool {
         || policy["max_connections"].is_number()
         || policy["denied_ports"].as_array().is_some_and(|ports| !ports.is_empty())
         || matches!(policy["udp"].as_str(), Some("deny" | "ports"))
+}
+
+pub fn check_agent_connection_limit(limit: Option<u64>, system: &serde_json::Value) -> Result<()> {
+    let supported = system["max_proxy_connections"].as_u64().unwrap_or(1024);
+    ensure!(
+        limit.is_none_or(|n| n <= supported),
+        "当前 Agent 的线路并发上限为 {supported}，请先升级该 Agent 并等待新心跳"
+    );
+    Ok(())
 }
 
 pub fn domain(text: &str) -> Result<String> {
@@ -125,8 +138,8 @@ pub fn compile(doc: &crate::model::Document, id: &str) -> Result<CompiledPolicy>
         "UDP 策略无效"
     );
     ensure!(
-        policy.max_connections.is_none_or(|n| n > 0 && n <= 1024),
-        "连接上限须为 1–1024"
+        policy.max_connections.is_none_or(|n| (1..=MAX_PROXY_CONNECTIONS).contains(&n)),
+        "连接上限须为 1–{MAX_PROXY_CONNECTIONS}"
     );
     ensure!(
         policy
@@ -388,6 +401,22 @@ pub fn presets() -> Vec<Source> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_limits_validate_the_policy_and_the_target_agent() {
+        let mut doc = crate::model::Document::default();
+        for (value, valid) in [(None, true), (Some(1), true), (Some(1024), true),
+            (Some(20_480), true), (Some(0), false), (Some(20_481), false)] {
+            doc.access_policies.entry("line".into()).or_default().max_connections = value;
+            assert_eq!(compile(&doc, "line").is_ok(), valid);
+        }
+        let old = serde_json::json!({"sharing_version": 1});
+        let current = serde_json::json!({"max_proxy_connections": MAX_PROXY_CONNECTIONS});
+        assert!(check_agent_connection_limit(None, &old).is_ok());
+        assert!(check_agent_connection_limit(Some(1024), &old).is_ok());
+        assert!(check_agent_connection_limit(Some(1025), &old).is_err());
+        assert!(check_agent_connection_limit(Some(20_480), &current).is_ok());
+    }
     #[test]
     fn strict_rules_do_not_accept_keywords_or_processes() {
         let r=parse("payload:\n - DOMAIN-SUFFIX,example.com\n - DOMAIN,login.example.net\n - DOMAIN-KEYWORD,openai\n - PROCESS-NAME,ChatGPT\n - IP-CIDR,1.1.1.0/24\n").unwrap();

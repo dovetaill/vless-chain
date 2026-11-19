@@ -53,6 +53,10 @@ fn schedule_inner(doc: &mut Document) -> Result<()> {
             };
             let pools = resources::pools(&active, line);
             let policy = rules::compile(&active, &line.id)?;
+            let limit = policy.policy.max_connections.map(|n| n as u64);
+            if limit != spec["access_policy"]["policy"]["max_connections"].as_u64() {
+                rules::check_agent_connection_limit(limit, &node.report.system)?;
+            }
             spec["resource_ids"] = json!(pools);
             spec["access_policy"] = json!(policy);
             spec["multiplier"] = json!(resources::multiplier(&active, line)?);
@@ -522,6 +526,36 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_limit_update_keeps_old_revision_until_agent_supports_it() {
+        let mut doc = Document::default();
+        doc.applied_lines.push(serde_json::from_value(json!({
+            "id":"line", "name":"线路", "kind":"vless",
+            "hops":[{"node_id":"node", "port":20001, "uuid":"test"}]
+        })).unwrap());
+        doc.nodes.push(serde_json::from_value(json!({
+            "id":"node", "name":"入口", "host":"127.0.0.1", "token_hash":"test",
+            "reality":{"target":"", "server_name":"", "private_key":"", "public_key":"", "short_id":""},
+            "report":{"system":{"sharing_version":1}},
+            "desired":{"revision":"old", "config":{"_chain":[{"id":"line"}]}}
+        })).unwrap());
+        let limit = rules::MAX_PROXY_CONNECTIONS;
+        doc.access_policies.entry("line".into()).or_default().max_connections = Some(limit);
+        assert!(schedule(&mut doc).is_err());
+        let desired = doc.nodes[0].desired.as_ref().unwrap();
+        assert_eq!(desired.revision, "old");
+        assert_eq!(desired.config["_chain"], json!([{"id":"line"}]));
+
+        doc.nodes[0].report.system["max_proxy_connections"] = json!(limit);
+        schedule(&mut doc).unwrap();
+        let desired = doc.nodes[0].desired.as_ref().unwrap();
+        assert_eq!(desired.config["_chain"][0]["access_policy"]["policy"]["max_connections"], limit);
+        let revision = desired.revision.clone();
+        assert_ne!(revision, "old");
+        schedule(&mut doc).unwrap();
+        assert_eq!(doc.nodes[0].desired.as_ref().unwrap().revision, revision);
+    }
 
     #[test]
     fn failed_grant_save_restores_customer_resource_ledgers_and_notices() {

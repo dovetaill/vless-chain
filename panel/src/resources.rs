@@ -294,7 +294,6 @@ pub struct Client {
     database: Mutex<rusqlite::Connection>,
     epoch: String,
     grants: Mutex<BTreeMap<String, (Grant, Instant)>>,
-    refresh: tokio::sync::Mutex<()>,
     budgets: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     http: reqwest::Client,
     endpoint: String,
@@ -317,7 +316,6 @@ impl Client {
             database: Mutex::new(db),
             epoch,
             grants: Mutex::new(BTreeMap::new()),
-            refresh: tokio::sync::Mutex::new(()),
             budgets: Mutex::new(BTreeMap::new()),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
@@ -341,8 +339,17 @@ impl Client {
             .optional()?
             .unwrap_or_default())
     }
+    pub(crate) fn cached_rate(&self, resources: &[String]) -> Option<f64> {
+        if resources.is_empty() { return None; }
+        let grants = self.grants.lock().unwrap();
+        resources.iter().filter_map(|id| match grants.get(id) {
+            Some((grant, expiry)) if *expiry > Instant::now() => grant.rate,
+            // Use a small first block until we learn the shared rate from the panel.
+            _ => Some(0.001),
+        }).reduce(f64::min)
+    }
     async fn grant(&self, resource: &str, need: u64) -> Result<Grant> {
-        let _refresh = self.refresh.lock().await;
+        // charge_weighted already holds the budget locks for the requested resources.
         let (cycle, used) = self.used(resource)?;
         if let Some((grant, expiry)) = self.grants.lock().unwrap().get(resource) {
             if *expiry > Instant::now()
@@ -446,10 +453,14 @@ impl Client {
                 break;
             }
             if window < 0.01 {
-                self.grants
-                    .lock()
-                    .unwrap()
-                    .retain(|_, (g, _)| g.rate.is_none());
+                let mut cached = self.grants.lock().unwrap();
+                for (resource, _, _) in &grants {
+                    if cached.get(*resource).is_some_and(|(g, expiry)| {
+                        g.rate.is_some() && expiry.saturating_duration_since(Instant::now()) < Duration::from_millis(10)
+                    }) {
+                        cached.remove(*resource);
+                    }
+                }
                 continue;
             }
             let duration = (remaining / rate).min(window);
@@ -491,6 +502,44 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn delayed_grant_does_not_block_a_cached_unrelated_resource() {
+        use axum::{Json, Router, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = {
+            let (waiting, release, calls) = (waiting.clone(), release.clone(), calls.clone());
+            move |Json(request): Json<Request>| {
+                let (waiting, release, calls) = (waiting.clone(), release.clone(), calls.clone());
+                async move {
+                    if request.resource == "slow" {
+                        waiting.notify_one();
+                        release.notified().await;
+                    } else {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Json(Grant { cycle: 1, end: now()+120, cap: 1000, rate: None, valid_for: 60 })
+                }
+            }
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, Router::new().route("/", post(handler))).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::open(dir.path(), format!("http://{address}/"), "test".into()).unwrap();
+        client.charge(&["cached".into()], 7, true).await.unwrap();
+        let other = client.clone();
+        let slow = tokio::spawn(async move { other.charge(&["slow".into()], 5, true).await });
+        tokio::time::timeout(Duration::from_secs(2), waiting.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), client.charge(&["cached".into()], 9, false)).await.unwrap().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        release.notify_one();
+        slow.await.unwrap().unwrap();
+        assert_eq!((client.used("cached").unwrap().1, client.used("slow").unwrap().1), (16, 5));
+        server.abort();
+        let _ = server.await;
+    }
     #[tokio::test]
     async fn customer_debits_use_current_multiplier_and_commit_all_budgets_together() {
         use axum::{Json, Router, routing::post};

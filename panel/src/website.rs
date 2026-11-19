@@ -122,68 +122,119 @@ async fn challenge(path: &str, dir: &Path) -> Option<Response> {
 
 /// Obtain certificates before switching the running configuration. Never kill a port owner.
 pub async fn prepare(specs: &[Spec], dir: &Path, existing_challenge: bool) -> Result<()> {
-    let automatic: Vec<_> = specs.iter().filter(|s| s.tls.mode == "auto").collect();
-    if automatic.is_empty() {
-        return Ok(());
-    }
-    for sub in ["config", "web"] {
-        std::fs::create_dir_all(dir.join("acme").join(sub))?;
-    }
-    let shared_webroot = std::env::var_os("CHAIN_ACME_WEBROOT").map(PathBuf::from);
-    let webroot = shared_webroot
-        .clone()
-        .unwrap_or_else(|| dir.join("acme/web"));
-    std::fs::create_dir_all(&webroot)?;
-    let temporary = if !existing_challenge && shared_webroot.is_none() {
-        Some(
-            challenge_server(dir.to_path_buf(), CancellationToken::new())
-                .await
-                .context("无法监听证书验证端口 TCP 80（权限不足或端口占用），请使用手动证书")?,
+    for spec in specs.iter().filter(|s| s.tls.mode == "auto") {
+        ensure_certificate(
+            &spec.tls,
+            dir,
+            existing_challenge,
+            false,
+            core_certificate(spec),
         )
-    } else {
-        None
-    };
-    let result = async {
-        for spec in automatic {
-            let tls = &spec.tls;
-            crate::acme::obtain(&dir.join("acme/config"), &tls.domain, &tls.domain, &webroot)
-                .await.with_context(|| format!("域名 {} 的证书申请失败", tls.domain))?;
-            load_tls(tls, dir)?;
-        }
-        Ok::<(), anyhow::Error>(())
+        .await
+        .with_context(|| format!("域名 {} 的证书准备失败", spec.tls.domain))?;
     }
-    .await;
-    if let Some((cancel, mut task)) = temporary {
-        cancel.cancel();
-        if tokio::time::timeout(Duration::from_secs(3), &mut task)
-            .await
-            .is_err()
-        {
-            task.abort();
-            let _ = task.await;
-        }
-    }
-    result
+    Ok(())
 }
-async fn challenge_server(
-    dir: PathBuf,
-    cancel: CancellationToken,
-) -> Result<(CancellationToken, JoinHandle<()>)> {
-    let listener = TcpListener::bind("0.0.0.0:80").await?;
-    let app = Router::new()
-        .fallback(any(|State(dir): State<PathBuf>, req: Request| async move {
-            challenge(req.uri().path(), &dir)
+
+fn core_certificate(spec: &Spec) -> bool {
+    spec.kind == Kind::Vless
+        && matches!(
+            spec.protocol,
+            crate::model::Protocol::Vless
+                | crate::model::Protocol::Hysteria2
+                | crate::model::Protocol::Tuic
+        )
+}
+
+pub(crate) fn core_cert_dir(dir: &Path, name: &str) -> PathBuf {
+    dir.join("tls-live").join(name)
+}
+
+fn use_certificate(tls: &Tls, dir: &Path, core: bool) -> Result<()> {
+    load_tls(tls, dir)?;
+    if core {
+        // Both native renewals and imported Certbot certificates can switch generations.
+        let config = dir.canonicalize()?.join("acme/config");
+        let source = crate::acme::paths(&config, &tls.domain);
+        let link = core_cert_dir(dir, &tls.domain);
+        if let Ok(previous) = std::fs::read_link(&link) {
+            ensure!(
+                [
+                    config.join("live").join(&tls.domain),
+                    config.join("rust/live").join(&tls.domain)
+                ]
+                .contains(&previous),
+                "证书运行链接指向其他目录"
+            );
+            if previous == source {
+                return Ok(());
+            }
+        }
+        let parent = link.parent().unwrap();
+        std::fs::create_dir_all(parent)?;
+        ensure!(
+            !std::fs::symlink_metadata(parent)?.file_type().is_symlink(),
+            "证书运行目录包含链接"
+        );
+        match std::fs::symlink_metadata(&link) {
+            Ok(meta) => ensure!(meta.is_symlink(), "证书运行路径已有其他文件"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let temp = tempfile::tempdir_in(parent)?;
+        let next = temp.path().join("next");
+        std::os::unix::fs::symlink(source, &next)?;
+        std::fs::rename(next, link)?;
+    }
+    Ok(())
+}
+
+async fn ensure_certificate(
+    tls: &Tls,
+    dir: &Path,
+    existing_challenge: bool,
+    renew: bool,
+    core: bool,
+) -> Result<()> {
+    let config = dir.join("acme/config");
+    let usable = || -> Result<bool> {
+        let lifetime = crate::acme::remaining(&config, &tls.domain, &tls.domain)?;
+        Ok(lifetime.is_some_and(|seconds| seconds > if renew { 30 * 86400 } else { 0 }))
+    };
+    if usable()? {
+        return use_certificate(tls, dir, core);
+    }
+    // Renewal and a concurrent publish may need the same HTTP challenge port and certificate.
+    static ISSUING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = ISSUING.lock().await;
+    if !usable()? {
+        let shared = std::env::var_os("CHAIN_ACME_WEBROOT").map(PathBuf::from);
+        let webroot = shared.clone().unwrap_or_else(|| dir.join("acme/web"));
+        std::fs::create_dir_all(&webroot)?;
+        let issue = crate::acme::obtain(&config, &tls.domain, &tls.domain, &webroot);
+        if existing_challenge || shared.is_some() {
+            issue.await?;
+        } else {
+            let listener = TcpListener::bind("0.0.0.0:80")
                 .await
-                .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
-        }))
-        .with_state(dir);
-    let stop = cancel.clone();
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(stop.cancelled_owned())
-            .await;
-    });
-    Ok((cancel, task))
+                .context("无法监听证书验证端口 TCP 80")?;
+            let app = Router::new()
+                .fallback(any(|State(dir): State<PathBuf>, req: Request| async move {
+                    challenge(req.uri().path(), &dir)
+                        .await
+                        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+                }))
+                .with_state(dir.to_path_buf());
+            tokio::select! {
+                result = issue => { result?; }
+                result = axum::serve(listener, app).into_future() => {
+                    result?;
+                    anyhow::bail!("证书验证监听提前退出");
+                }
+            }
+        }
+    }
+    use_certificate(tls, dir, core)
 }
 
 #[derive(Clone)]
@@ -403,23 +454,12 @@ pub async fn serve(
         .connect_timeout(Duration::from_secs(10))
         .build()?;
     let needs_challenge = specs.iter().any(|s| s.tls.mode == "auto");
-    let challenge_listener = if needs_challenge
-        && std::env::var_os("CHAIN_ACME_WEBROOT").is_none()
-        && !specs
-            .iter()
-            .any(|s| s.kind == Kind::Website && s.port == 80)
-    {
-        Some(
-            TcpListener::bind("0.0.0.0:80")
-                .await
-                .context("证书续期需要独立 TCP 80 入口")?,
-        )
-    } else {
-        None
-    };
+    let existing_challenge = specs.iter().any(|s| s.kind == Kind::Website && s.port == 80);
     let mut tasks = vec![];
     let upgrades = TaskTracker::new();
     for (listener, sites) in listeners {
+        let address = listener.local_addr()?;
+        let mut listener = crate::gateway::Listener::new(listener, address, lanes[&sites[0].id].book.clone(), format!("HTTP {address}"));
         let tls = sites
             .iter()
             .any(|s| matches!(s.tls.mode.as_str(), "manual" | "auto"));
@@ -448,8 +488,8 @@ pub async fn serve(
             loop {tokio::select!{
                 _=cancel.cancelled()=>break,
                 Some(_)=children.join_next(),if !children.is_empty()=>{},
-                accepted=listener.accept()=>{
-                    let Ok((stream,_))=accepted else {break};if children.len()>=1024 {continue;}
+                (stream,_)=listener.accept()=>{
+                    if children.len()>=1024 {continue;}
                     let app=app.clone();let sites=sites.clone();let dir=dir.clone();
                     children.spawn(async move {
                         let builder=Builder::new(TokioExecutor::new());let service=TowerToHyperService::new(app);
@@ -462,21 +502,6 @@ pub async fn serve(
             children.abort_all();while children.join_next().await.is_some(){}
         }));
     }
-    if let Some(listener) = challenge_listener {
-        let app = Router::new()
-            .fallback(any(|State(dir): State<PathBuf>, req: Request| async move {
-                challenge(req.uri().path(), &dir)
-                    .await
-                    .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
-            }))
-            .with_state(dir.to_path_buf());
-        let cancel = cancel.clone();
-        tasks.push(tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(cancel.cancelled_owned())
-                .await;
-        }));
-    }
     if specs.iter().any(|s| s.kind == Kind::Website) {
         let stop = cancel.clone();
         tasks.push(tokio::spawn(async move {
@@ -486,16 +511,109 @@ pub async fn serve(
         }));
     }
     if needs_challenge {
-        let specs = specs.to_vec();
+        let mut domains = BTreeMap::new();
+        for spec in specs.iter().filter(|s| s.tls.mode == "auto") {
+            let (_, core) = domains.entry(spec.tls.domain.clone()).or_insert((spec.tls.clone(), false));
+            *core |= core_certificate(spec);
+        }
         let dir = dir.to_path_buf();
         tasks.push(tokio::spawn(async move {
-            loop {tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(43200))=>{}};
-                tokio::select!{_=cancel.cancelled()=>break,result=prepare(&specs,&dir,true)=>{
-                    let status=serde_json::json!({"at":crate::model::now(),"ok":result.is_ok(),"error":result.err().map(|e|e.to_string())});
-                    let _=atomic_write(&dir.join("certificate-status.json"),&serde_json::to_vec(&status).unwrap_or_default());
-                }}
+            loop {
+                let mut errors = Vec::new();
+                for (domain, (tls, core)) in &domains {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        result = ensure_certificate(tls, &dir, existing_challenge, true, *core) => {
+                            if let Err(e) = result { errors.push(format!("{domain}: {e:#}")); }
+                        }
+                    }
+                }
+                let retry = !errors.is_empty();
+                let status = serde_json::json!({"at":crate::model::now(),"ok":!retry,"error":retry.then(|| errors.join("\n"))});
+                if let Err(e) = atomic_write(&dir.join("certificate-status.json"), &serde_json::to_vec(&status).unwrap()) {
+                    eprintln!("证书续期状态写入失败: {e}");
+                }
+                let delay = Duration::from_secs(if retry { 3600 } else { 43200 });
+                tokio::select! { _ = cancel.cancelled() => return, _ = tokio::time::sleep(delay) => {} }
             }
         }));
     }
     Ok(tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::{
+        asn1::{Asn1Integer, Asn1Time},
+        bn::BigNum,
+        hash::MessageDigest,
+        pkey::PKey,
+        rsa::Rsa,
+        x509::{X509, X509NameBuilder, extension::SubjectAlternativeName},
+    };
+
+    fn install_pair(dir: &Path, domain: &str, days: u32) -> Vec<u8> {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut dn = X509NameBuilder::new().unwrap();
+        dn.append_entry_by_text("CN", domain).unwrap();
+        let dn = dn.build();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_serial_number(&Asn1Integer::from_bn(&BigNum::from_u32(days).unwrap()).unwrap())
+            .unwrap();
+        cert.set_subject_name(&dn).unwrap();
+        cert.set_issuer_name(&dn).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(days).unwrap())
+            .unwrap();
+        let san = SubjectAlternativeName::new()
+            .dns(domain)
+            .build(&cert.x509v3_context(None, None))
+            .unwrap();
+        cert.append_extension(san).unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        let pem = cert.build().to_pem().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("fullchain.pem"), &pem).unwrap();
+        std::fs::write(
+            dir.join("privkey.pem"),
+            key.private_key_to_pem_pkcs8().unwrap(),
+        )
+        .unwrap();
+        pem
+    }
+
+    #[tokio::test]
+    async fn valid_imported_certificate_starts_offline_and_core_path_follows_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = "renewal.test";
+        let tls = Tls {
+            mode: "auto".into(),
+            domain: domain.into(),
+            ..Default::default()
+        };
+        let legacy = dir.path().join("acme/config/live").join(domain);
+        let native = dir.path().join("acme/config/rust/live").join(domain);
+        let cert = core_cert_dir(dir.path(), domain).join("fullchain.pem");
+        let old = install_pair(&legacy, domain, 15);
+        ensure_certificate(&tls, dir.path(), false, false, true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&cert).unwrap(), old);
+        let renewed = install_pair(&native, domain, 90);
+        ensure_certificate(&tls, dir.path(), false, true, true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&cert).unwrap(), renewed);
+        assert_eq!(std::fs::read(legacy.join("fullchain.pem")).unwrap(), old);
+        install_pair(&native, "wrong.test", 90);
+        assert!(
+            ensure_certificate(&tls, dir.path(), false, false, true)
+                .await
+                .is_err()
+        );
+    }
 }

@@ -1251,6 +1251,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)")
             .unwrap();
         App {
+            traffic_uploads: Default::default(),
             diagnostics: Arc::new(diagnostics_api::Broker::default()),
             store: Arc::new(Mutex::new(Store {
                 conn,
