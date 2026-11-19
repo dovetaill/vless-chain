@@ -62,6 +62,10 @@ exit "${TEST_NATIVE_EXIT:-0}"
         entry.size = len(body)
         entry.mode = 0o755
         archive.addfile(entry, io.BytesIO(body))
+        payload = os.urandom(2 * 1024 * 1024)
+        data_entry = tarfile.TarInfo('share/fixture')
+        data_entry.size = len(payload)
+        archive.addfile(data_entry, io.BytesIO(payload))
     sums = packages / 'SHA256SUMS'
     sums.write_text(hashlib.sha256(bundle.read_bytes()).hexdigest() + '  ' + bundle.name + '\n')
     native_tmp = root / 'native-tmp'
@@ -102,15 +106,19 @@ exit "${TEST_NATIVE_EXIT:-0}"
     assert bundled.returncode == 98, 'default bundled executor changed'
     (root / 'bin/chainctl').unlink()
     download_mock = """#!/bin/sh
-previous= output= url=
+previous= output= url= limit=
 for arg in "$@"; do
   [ "$previous" != -o ] || output=$arg
+  [ "$previous" != --max-filesize ] || limit=$arg
   case "$arg" in https://*) url=$arg;; esac
   previous=$arg
 done
 case "$url" in
   */releases/latest) printf '%s' 'https://github.com/dovetaill/vless-chain/releases/tag/v0.2.70';;
-  *) cp "$TEST_PACKAGE_DIR/${url##*/}" "$output";;
+  *) file="$TEST_PACKAGE_DIR/${url##*/}"
+     [ -f "$file" ] || exit 22
+     [ "$(wc -c < "$file")" -le "$limit" ] || exit 63
+     cp "$file" "$output";;
 esac
 """
     curl.write_text(download_mock)
@@ -146,23 +154,24 @@ esac
     assert forwarded[:3] == ['update', '--non-interactive', '--package']
     assert Path(forwarded[3]).name == bundle.name
 
-    for available in ['83968', '3145727', 'error', 'invalid']:
+    for available in ['512', '1536', 'error', 'invalid']:
         env['TEST_TMP_KIB'] = available
         result = call([])
         assert result.returncode == 0, result.stderr
         assert result.stdout.splitlines()[0] == 'setup'
         assert Path(native_tmp.read_text().strip()).parent == fallback
         assert str(fallback) in result.stderr
-    env['TEST_TMP_KIB'] = '3145728'
-    assert call([]).returncode == 0
-    assert Path(native_tmp.read_text().strip()).parent == root
+    for available in ['83968', '222716', '3145727']:
+        env['TEST_TMP_KIB'] = available
+        assert call([]).returncode == 0
+        assert Path(native_tmp.read_text().strip()).parent == root
 
-    env['TEST_TMP_KIB'] = '83968'
-    for available in ['83968', 'error', 'invalid']:
+    env['TEST_TMP_KIB'] = '512'
+    for available in ['512', 'error', 'invalid']:
         env['TEST_FALLBACK_KIB'] = available
         curl.write_text('#!/bin/sh\necho unexpected-network >&2\nexit 99\n')
         result = call([])
-        assert result.returncode != 0 and '3 GiB' in result.stderr
+        assert result.returncode != 0 and '安装临时空间不足或不可用' in result.stderr
         assert not native_tmp.exists(), 'installer ran without enough space'
     del env['TEST_FALLBACK_KIB']
     curl.write_text(download_mock)

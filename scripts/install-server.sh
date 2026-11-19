@@ -46,86 +46,100 @@ if [ -z "$local_package" ] || [ -n "$package_url" ]; then
 fi
 command -v tar >/dev/null || { echo '请先安装 tar' >&2; exit 1; }
 bootstrap_dir=
-for bootstrap_parent in "${TMPDIR:-/tmp}" /var/tmp; do
-  [ -d "$bootstrap_parent" ] && [ -w "$bootstrap_parent" ] || continue
-  bootstrap_space=$(LC_ALL=C df -Pk "$bootstrap_parent" 2>/dev/null) || continue
-  # Budget for the 512 MiB archive, 1 GiB stage, bootstrap binary and headroom.
-  printf '%s\n' "$bootstrap_space" | awk 'NR == 2 && $4 ~ /^[0-9]+$/ && $4 >= 3145728 { enough=1 } END { exit !enough }' || continue
-  bootstrap_dir=$(mktemp -d "$bootstrap_parent/chain-bootstrap-XXXXXXXX") && break
-done
-[ -n "$bootstrap_dir" ] || {
-  printf '未找到可用的安装临时目录（已检查 %s、/var/tmp；需至少 3 GiB 可用空间），请释放空间或将 TMPDIR 指向其他磁盘目录。\n' "${TMPDIR:-/tmp}" >&2
-  exit 1
-}
 bootstrap_pid=
 cleanup() {
   if [ -n "$bootstrap_pid" ]; then
     kill -TERM "$bootstrap_pid" 2>/dev/null || true
     wait "$bootstrap_pid" 2>/dev/null || true
   fi
-  rm -rf -- "$bootstrap_dir"
+  [ -z "$bootstrap_dir" ] || rm -rf -- "$bootstrap_dir"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [ "$bootstrap_parent" != "${TMPDIR:-/tmp}" ]; then
-  printf '原临时目录空间不足或不可用，已改用 %s；安装结束后自动清理。\n' "$bootstrap_parent" >&2
-fi
-TMPDIR=$bootstrap_dir
-export TMPDIR
+
+free_kib() {
+  LC_ALL=C df -Pk "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ {print $4; found=1} END {exit !found}'
+}
+requested_package=$local_package
+archive=
 if [ -n "$package_url" ]; then
   archive=${package_url##*/}
   case "$archive" in chain-panel-*-$platform-$arch.tar.gz) ;; *) echo '发行包名称或平台架构不匹配' >&2; exit 1;; esac
-  for name in SHA256SUMS "$archive"; do
-    curl --proto '=https' --proto-redir '=https' -fSL --max-time 180 --max-filesize 536870912 "${package_url%/*}/$name" -o "$bootstrap_dir/$name"
-  done
-  local_package=$bootstrap_dir/$archive
-  # Replace only the package argument; chainctl receives the verified local download.
-  remaining=$#
-  expect_package=false
-  while [ "$remaining" -gt 0 ]; do
-    arg=$1; shift
-    if [ "$expect_package" = true ]; then arg=$local_package; expect_package=false
-    elif [ "$arg" = --package ]; then expect_package=true
-    fi
-    set -- "$@" "$arg"
-    remaining=$((remaining - 1))
-  done
 elif [ -n "$local_package" ]; then
   [ -f "$local_package" ] || { echo '本地发行包不存在' >&2; exit 1; }
   package_parent=$(CDPATH= cd -- "$(dirname -- "$local_package")" && pwd)
   archive=$(basename -- "$local_package")
   [ -f "$package_parent/SHA256SUMS" ] || { echo '请将 SHA256SUMS 与发行包放在同一目录' >&2; exit 1; }
-  cp "$local_package" "$bootstrap_dir/$archive"
-  cp "$package_parent/SHA256SUMS" "$bootstrap_dir/SHA256SUMS"
-else
-repo=https://github.com/dovetaill/vless-chain
-latest=$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
-tag=${latest##*/}
-version=${tag#v}
-case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo '正式版本信息无效' >&2; exit 1;; esac
-case "$version" in *[!0-9.]*|*..*|.*|*.) echo '版本号无效' >&2; exit 1;; esac
-[ "$(printf '%s' "$version" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ] || exit 1
-archive=chain-panel-$version-$platform-$arch.tar.gz
-for name in SHA256SUMS "$archive"; do
-  curl --proto '=https' --proto-redir '=https' -fSL --max-time 180 --max-filesize 536870912 "$repo/releases/download/$tag/$name" -o "$bootstrap_dir/$name"
+fi
+for bootstrap_parent in "${TMPDIR:-/tmp}" /var/tmp; do
+  [ -d "$bootstrap_parent" ] && [ -w "$bootstrap_parent" ] || continue
+  available=$(free_kib "$bootstrap_parent") || continue
+  # Leave room for the checksum, filesystem metadata and error reporting.
+  [ "$available" -gt 1024 ] || continue
+  limit=$(((available - 1024) * 1024))
+  [ "$limit" -le 536870912 ] || limit=536870912
+  bootstrap_dir=$(mktemp -d "$bootstrap_parent/chain-bootstrap-XXXXXXXX") || continue
+  if [ -z "$archive" ]; then
+    repo=https://github.com/dovetaill/vless-chain
+    latest=$(curl --proto '=https' --proto-redir '=https' -fsSL --max-time 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
+    tag=${latest##*/}; version=${tag#v}
+    case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo '正式版本信息无效' >&2; exit 1;; esac
+    case "$version" in *[!0-9.]*|*..*|.*|*.) echo '版本号无效' >&2; exit 1;; esac
+    [ "$(printf '%s' "$version" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ] || exit 1
+    archive=chain-panel-$version-$platform-$arch.tar.gz
+    package_url=$repo/releases/download/$tag/$archive
+  fi
+  if [ -n "$package_url" ]; then
+    curl --proto '=https' --proto-redir '=https' -fSL --max-time 30 --max-filesize 65536 "${package_url%/*}/SHA256SUMS" -o "$bootstrap_dir/SHA256SUMS"
+    if curl --proto '=https' --proto-redir '=https' -fSL --max-time 180 --max-filesize "$limit" "$package_url" -o "$bootstrap_dir/$archive"; then :
+    else
+      code=$?
+      # curl 63 is its size limit, 23 is a local write failure.
+      case "$code" in 23|63) rm -rf -- "$bootstrap_dir"; bootstrap_dir=; continue;; *) exit "$code";; esac
+    fi
+  else
+    bytes=$(wc -c < "$local_package")
+    if [ "$bytes" -gt "$limit" ]; then rm -rf -- "$bootstrap_dir"; bootstrap_dir=; continue; fi
+    cp "$local_package" "$bootstrap_dir/$archive"
+    cp "$package_parent/SHA256SUMS" "$bootstrap_dir/SHA256SUMS"
+  fi
+  expected=$(awk -v name="$archive" '$2 == name { print $1; count++ } END { if (count != 1) exit 1 }' "$bootstrap_dir/SHA256SUMS")
+  case "$expected" in *[!0-9a-f]*|'') echo 'SHA256 清单无效' >&2; exit 1;; esac
+  [ "${#expected}" = 64 ] || { echo 'SHA256 清单无效' >&2; exit 1; }
+  if command -v sha256sum >/dev/null; then actual=$(sha256sum "$bootstrap_dir/$archive")
+  else actual=$(shasum -a 256 "$bootstrap_dir/$archive"); fi
+  [ "${actual%% *}" = "$expected" ] || { echo '发行包校验失败' >&2; exit 1; }
+  # Only the verified chainctl member is expanded here. Native installation stages on the release filesystem.
+  bytes=$(tar -xOzf "$bootstrap_dir/$archive" bin/chainctl | wc -c)
+  [ "$bytes" -gt 0 ] || { echo '发行包缺少原生 chainctl' >&2; exit 1; }
+  available=$(free_kib "$bootstrap_parent") || available=0
+  if [ "$available" -lt $(((bytes + 1023) / 1024 + 1024)) ]; then
+    rm -rf -- "$bootstrap_dir"; bootstrap_dir=; continue
+  fi
+  tar -xOzf "$bootstrap_dir/$archive" bin/chainctl > "$bootstrap_dir/chainctl"
+  [ "$(wc -c < "$bootstrap_dir/chainctl")" -eq "$bytes" ] || exit 1
+  chmod 700 "$bootstrap_dir/chainctl"
+  break
 done
-fi
-expected=$(awk -v name="$archive" '$2 == name { print $1; count++ } END { if (count != 1) exit 1 }' "$bootstrap_dir/SHA256SUMS")
-case "$expected" in *[!0-9a-f]*|'') echo 'SHA256 清单无效' >&2; exit 1;; esac
-[ "${#expected}" = 64 ] || exit 1
-if command -v sha256sum >/dev/null; then
-  actual=$(sha256sum "$bootstrap_dir/$archive"); actual=${actual%% *}
-else
-  actual=$(shasum -a 256 "$bootstrap_dir/$archive"); actual=${actual%% *}
-fi
-[ "$actual" = "$expected" ] || { echo '发行包校验失败' >&2; exit 1; }
-# Extract one file as bytes, never apply archive paths, symlinks or ownership on the host.
-tar -xOzf "$bootstrap_dir/$archive" bin/chainctl > "$bootstrap_dir/chainctl" || {
-  echo '此正式版本尚未提供原生 chainctl，请等待包含 Rust 接管的发行版。' >&2; exit 1;
+[ -n "$bootstrap_dir" ] || {
+  printf '安装临时空间不足或不可用（已检查 %s、/var/tmp）；需要容纳本次压缩包和 chainctl。\n' "${TMPDIR:-/tmp}" >&2
+  exit 1
 }
-[ -s "$bootstrap_dir/chainctl" ] || exit 1
-chmod 700 "$bootstrap_dir/chainctl"
+if [ "$bootstrap_parent" != "${TMPDIR:-/tmp}" ]; then
+  printf '原临时目录空间不足或不可用，已改用 %s；安装结束后自动清理。\n' "$bootstrap_parent" >&2
+fi
+TMPDIR=$bootstrap_dir
+export TMPDIR
+if [ -n "$package_url" ] && [ -n "$requested_package" ]; then
+  remaining=$#; expect_package=false
+  while [ "$remaining" -gt 0 ]; do
+    arg=$1; shift
+    if [ "$expect_package" = true ]; then arg=$bootstrap_dir/$archive; expect_package=false
+    elif [ "$arg" = --package ]; then expect_package=true; fi
+    set -- "$@" "$arg"; remaining=$((remaining - 1))
+  done
+fi
 if [ "${1:-}" = bootstrap-native ]; then
   [ "$#" = 2 ] && [ ! -e "$2" ] && [ ! -L "$2" ] || { echo '原生工具输出路径必须不存在' >&2; exit 1; }
   cp "$bootstrap_dir/chainctl" "$2"

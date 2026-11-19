@@ -814,6 +814,13 @@ pub fn handoff(manager: &Manager) -> Result<()> {
     fs::rename(tmp.path().join("chainctl"), &wrapper)?;
     Ok(())
 }
+pub async fn finish_update(manager: &Manager) -> Result<()> {
+    let _lock = manager.lock()?;
+    handoff(manager)?;
+    maintenance(manager).await?;
+    manager.prune_locked().await
+}
+
 pub async fn maintenance(manager: &Manager) -> Result<()> {
     if manager.kind() == "launchd" || !manager.state()?["roles"]["panel"].is_object() {
         return Ok(());

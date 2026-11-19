@@ -145,6 +145,7 @@ impl Args {
                     | "internal-nginx-reload"
                     | "internal-cert-renew"
                     | "internal-adopt"
+                    | "internal-prune"
                     | "internal-render-site"
                     | "internal-render-acme"
                     | "update"
@@ -250,6 +251,13 @@ async fn run() -> Result<()> {
         return ctl::lifecycle::maintenance_handoff(&args[0]).await;
     }
     let mut args = Args::parse(std::env::args().skip(1))?;
+    if args.action == "internal-prune" {
+        ctl::upgrade::Manager::open(&args.root)?.prune().await?;
+        if args.non_interactive {
+            return Ok(());
+        }
+        args.action = "menu".into();
+    }
     use std::io::IsTerminal;
     if args.action == "menu" && !std::io::stdin().is_terminal() {
         args.action = "help".into();
@@ -312,7 +320,42 @@ async fn run() -> Result<()> {
     }
 }
 
-async fn dispatch(mut args: Args, menu: bool) -> Result<()> {
+async fn dispatch(args: Args, menu: bool) -> Result<()> {
+    let changing_release = matches!(args.action.as_str(), "setup" | "install" | "update");
+    let root = args.root.clone();
+    dispatch_action(args, menu).await?;
+    if !changing_release {
+        return Ok(());
+    }
+    let releases = root.canonicalize()?.join("opt/chain/releases");
+    let running = std::env::current_exe()?;
+    if !running.starts_with(&releases) {
+        return Ok(());
+    }
+    let state = ctl::upgrade::Manager::open(&root)?.state()?;
+    let roles = state["roles"].as_object().context("安装状态缺少组件")?;
+    let mut successor = None;
+    for role in roles.values() {
+        let binary = releases.join(role["current"].as_str().unwrap()).join("bin/chainctl");
+        if binary == running {
+            return Ok(());
+        }
+        if ctl::package::version(role["version"].as_str().unwrap())? >= [0, 2, 78] {
+            successor = Some(binary);
+        }
+    }
+    let Some(binary) = successor else { return Ok(()) };
+    // Release the old CLI executable after all temporary directories have dropped.
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(binary);
+    command.arg("internal-prune").arg("--root").arg(root);
+    if !menu {
+        command.arg("--non-interactive");
+    }
+    Err(command.exec().into())
+}
+
+async fn dispatch_action(mut args: Args, menu: bool) -> Result<()> {
     args.validate_install()?;
     if args.action == "maintenance" {
         return ctl::maintenance::serve().await;
@@ -440,6 +483,7 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             .tempdir_in(parent)?;
         let executable = std::env::current_exe()?;
         let bundled = executable.parent().and_then(|p| p.parent());
+        let installed_archive;
         let stage = if args.package.is_none()
             && bundled.is_some_and(|p| p.join("release.json").is_file())
         {
@@ -451,9 +495,8 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
                 Some(p) => p.canonicalize()?,
                 None => ctl::package::download(temporary.path(), None).await?.0,
             };
-            let stage = temporary.path().join("stage");
-            ctl::package::extract(&archive, &stage)?;
-            stage
+            installed_archive = manager.install_archive(&archive)?;
+            installed_archive.0.clone()
         };
         let local_host = match args.local_host {
             Some(host) => host,
@@ -542,8 +585,7 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             let owners = ctl::migration::discover(std::path::Path::new("/proc")).await?;
             ctl::migration::handover(&manager, owners).await?;
         }
-        ctl::lifecycle::handoff(&manager)?;
-        ctl::lifecycle::maintenance(&manager).await?;
+        ctl::lifecycle::finish_update(&manager).await?;
         if manager.live() {
             if let Err(e) = ctl::https::proxy_acme(&manager).await {
                 eprintln!("代理 HTTP-01 路由未启用：{e:#}");
@@ -630,6 +672,7 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
     let state = manager.state()?;
     let roles = manager.roles(&state, args.component.as_deref())?;
     if args.action == "update" {
+        manager.prune_before_update().await?;
         ctl::time::prepare(&manager).await;
         let parent = args.work_parent.unwrap_or_else(|| manager.path("/var/tmp"));
         // Only a private task directory receives downloads and extracted files.
@@ -642,19 +685,9 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             let (package, version) = ctl::package::download(temporary.path(), None).await?;
             (package, Some(version))
         };
-        let source = temporary.path().join("stage");
-        let manifest = ctl::package::extract(&archive, &source)?;
-        ensure!(
-            requested.is_none_or(|v| v == manifest.version),
-            "下载包版本与发行信息不一致"
-        );
-        if args.latest_xray {
-            ctl::package::latest_xray(&source, temporary.path()).await?;
-        }
-        manager.update(&source, args.component.as_deref()).await?;
-        ctl::lifecycle::handoff(&manager)?;
-        ctl::lifecycle::maintenance(&manager).await?;
-        manager.prune().await?;
+        manager.update_archive(&archive, requested.as_deref(),
+            args.latest_xray.then_some(temporary.path()), args.component.as_deref()).await?;
+        ctl::lifecycle::finish_update(&manager).await?;
         return Ok(());
     }
     if matches!(args.action.as_str(), "access" | "token") {

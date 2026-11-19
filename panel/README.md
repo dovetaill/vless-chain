@@ -160,7 +160,9 @@ sudo chainctl ingress-enable
 
 发行包默认使用官方 Xray `26.10.21`、Mihomo `1.19.33`；目标版本统一记录在 `src/core-versions.json`。下载核对官方仓库、准确标签、架构附件与 SHA256。面板与 Agent 独立报告版本；内核升级不重新生成 UUID、REALITY 静态 X25519 密钥、端口或 VLESS 链接参数。新 REALITY 握手要求可能使旧客户端软件无法连接，不能把保留密钥误认为兼容所有旧 TLS 握手；优先更新客户端并重新使用原链接。
 
-程序升级保留此前独立更新的 Xray、Mihomo，未独立更新的内核采用发行包版本。本机和多机总控均支持独立更新内核，默认选择官方最新正式版；准确版本、预发布和回退设置位于高级选项。预发布需主动允许，历史回退只替换对应内核，不回退业务数据库。旧 VPS 需先更新维护组件；CLI 的旧 `--xray-channel latest` 显式覆盖方式保留。
+程序升级保留此前独立更新的 Xray、Mihomo，其余内核采用发行包版本。本机和多机总控均支持独立更新内核，默认选择官方最新正式版；高级选项可指定准确版本及是否允许预发布。切换失败时按本次任务的安全条件恢复。任务结束后要更换内核版本，可指定所需版本重新下载。CLI 的 `--xray-channel latest` 显式覆盖方式保留。
+
+从 v0.2.78 起，首次安装、CLI、设置页和多机总控共用发行目录管理。同机 Panel 与 Agent 使用相同程序构建时共用一套文件，Xray 和 Mihomo 各存一份。升级只在切换期间保留仍需使用的旧文件，任务结束后清理已退出的程序和旧内核。同机显式安装不同程序版本时，各自的现用目录仍需保留。安装脚本按压缩包和执行器的实际大小选择临时目录，整包直接解到发行目录所在分区。旧维护程序已经报空间不足时，可通过最新独立安装脚本执行一次 `update --non-interactive` 接管，再使用网页升级。
 
 独立安装脚本默认从 GitHub 最新正式发行版启动。需要使用服务器上已有的发行包时，将包和对应 `SHA256SUMS` 放在同一目录，运行 `sh install-server.sh update --package /path/chain-panel-VERSION-linux-x86_64.tar.gz --non-interactive`；脚本校验包后直接运行该包内的 `chainctl`，不查询或下载 GitHub，也不使用旁边已有的旧 `chainctl`。`--package` 也接受 HTTPS 发行包地址：自动下载该包和同目录的 `SHA256SUMS`，校验后升级，无需预先上传包到 VPS。例如 `curl -fsSL https://chain.bareai.io/install-server.sh | sh -s -- update --package https://chain.bareai.io/releases/v0.2.71/chain-panel-0.2.71-linux-x86_64.tar.gz --non-interactive`。
 

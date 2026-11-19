@@ -14,6 +14,7 @@ use std::{
 };
 
 pub const OWNER: &str = "chain-panel-installer-v1";
+const STAGE_OWNER: &str = "chain-private-release-stage-v1";
 
 pub fn atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().context("缺少父目录")?)?;
@@ -73,6 +74,15 @@ pub fn release_name(name: &str) -> Result<()> {
 pub struct Manager {
     pub root: PathBuf,
     pub base: PathBuf,
+}
+
+enum UpdateSource<'a> {
+    Directory(&'a Path),
+    Archive {
+        path: &'a Path,
+        version: Option<&'a str>,
+        latest_xray_work: Option<&'a Path>,
+    },
 }
 
 impl Manager {
@@ -158,8 +168,63 @@ impl Manager {
             .collect())
     }
     pub async fn update(&self, source: &Path, component: Option<&str>) -> Result<()> {
-        self.update_checked(source, component, |role| self.healthy(role))
+        self.update_checked(UpdateSource::Directory(source), component, |role| self.healthy(role))
             .await
+    }
+    pub async fn update_archive(
+        &self,
+        path: &Path,
+        version: Option<&str>,
+        latest_xray_work: Option<&Path>,
+        component: Option<&str>,
+    ) -> Result<()> {
+        let source = UpdateSource::Archive { path, version, latest_xray_work };
+        self.update_checked(source, component, |role| self.healthy(role)).await
+    }
+    pub(super) fn release_stage(&self) -> Result<tempfile::TempDir> {
+        let releases = self.base.join("releases");
+        ordinary(&releases)?;
+        let stage = tempfile::Builder::new().prefix(".install-").tempdir_in(releases)?;
+        fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700))?;
+        fs::write(stage.path().join(".chain-owner"), STAGE_OWNER)?;
+        Ok(stage)
+    }
+    pub(super) fn publish_stage(
+        &self,
+        source: &Path,
+        manifest: &package::Manifest,
+    ) -> Result<(String, PathBuf)> {
+        let digest = package::digest(&source.join("release.json"))?;
+        let id = format!("{}-{}-{}-{}", manifest.version, manifest.os, manifest.arch, &digest[..12]);
+        let releases = self.base.join("releases");
+        let destination = releases.join(&id);
+        ordinary(&destination)?;
+        if destination.exists() {
+            package::verify(&destination, true)?;
+            ensure!(
+                fs::read(destination.join("release.json"))? == fs::read(source.join("release.json"))?,
+                "同名发行目录内容冲突"
+            );
+        } else {
+            fs::rename(source, &destination)?;
+            File::open(&releases)?.sync_all()?;
+        }
+        Ok((id, destination))
+    }
+
+    pub fn install_archive(&self, archive: &Path) -> Result<(PathBuf, File)> {
+        let _lock = self.lock()?;
+        super::install::shared_dir(&self.base.join("releases"))?;
+        let temporary = self.release_stage()?;
+        let stage = temporary.path().join("release");
+        let manifest = package::extract(archive, &stage)?;
+        package::compatible(&manifest)?;
+        package::install_modes(&stage, &manifest)?;
+        super::cores::preserve(self, &stage)?;
+        let (_, path) = self.publish_stage(&stage, &manifest)?;
+        // Both component installs use this tree; keep it in use across the two role locks.
+        let lease = File::open(&path)?;
+        Ok((path, lease))
     }
     pub async fn adopt(&self) -> Result<()> {
         let state = self.state()?;
@@ -179,7 +244,7 @@ impl Manager {
     }
     async fn update_checked<F, Fut>(
         &self,
-        source: &Path,
+        input: UpdateSource<'_>,
         component: Option<&str>,
         check: F,
     ) -> Result<()>
@@ -187,8 +252,6 @@ impl Manager {
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let manifest = package::verify(source, true)?;
-        package::compatible(&manifest)?;
         let _lock = self.lock()?;
         let journal = self.base.join(".update-pending.json");
         ensure!(
@@ -200,6 +263,25 @@ impl Manager {
             !self.base.join(".core-pending.json").exists(),
             "请先完成待验证的内核升级任务"
         );
+        let temporary = self.release_stage()?;
+        let stage = temporary.path().join("release");
+        let manifest = match input {
+            UpdateSource::Directory(source) => {
+                let manifest = package::verify(source, true)?;
+                package::copy(source, &stage, &manifest)?;
+                manifest
+            }
+            UpdateSource::Archive { path, version, latest_xray_work } => {
+                let manifest = package::extract(path, &stage)?;
+                ensure!(version.is_none_or(|v| v == manifest.version), "目标版本与安装包不一致");
+                package::install_modes(&stage, &manifest)?;
+                if let Some(work) = latest_xray_work {
+                    package::latest_xray(&stage, work).await?;
+                }
+                manifest
+            }
+        };
+        package::compatible(&manifest)?;
         let roles = self.roles(&old, component)?;
         let mut running = Vec::new();
         for role in &roles {
@@ -232,41 +314,10 @@ impl Manager {
             running.push(self.active(role).await?);
         }
         let services = super::lifecycle::ServiceMigration::prepare(self, &roles)?;
-        let temporary = tempfile::Builder::new()
-            .prefix(".update-core-")
-            .tempdir_in(&self.base)?;
-        let stage = temporary.path().join("stage");
-        package::copy(source, &stage, &manifest)?;
         super::cores::preserve(self, &stage)?;
         let source = stage.as_path();
         let manifest = package::verify(source, true)?;
-        let id = format!(
-            "{}-{}-{}-{}",
-            manifest.version,
-            manifest.os,
-            manifest.arch,
-            &package::digest(&source.join("release.json"))?[..12]
-        );
-        let releases = self.base.join("releases");
-        ordinary(&releases)?;
-        let destination = releases.join(&id);
-        ordinary(&destination)?;
-        if destination.exists() {
-            package::verify(&destination, true)?;
-            ensure!(
-                fs::read(destination.join("release.json"))?
-                    == fs::read(source.join("release.json"))?,
-                "同名发行目录内容冲突"
-            );
-        } else {
-            let temporary = tempfile::Builder::new()
-                .prefix(".install-")
-                .tempdir_in(&releases)?;
-            let staging = temporary.path().join("release");
-            package::copy(source, &staging, &manifest)?;
-            fs::rename(staging, &destination)?;
-            File::open(&releases)?.sync_all()?;
-        }
+        let (id, _) = self.publish_stage(source, &manifest)?;
         let state_path = self.base.join(".chain-install.json");
         let old_bytes = fs::read(&state_path)?;
         let metadata = fs::metadata(&state_path)?;
@@ -595,21 +646,24 @@ impl Manager {
     }
     pub async fn prune(&self) -> Result<()> {
         let _lock = self.lock()?;
+        self.prune_locked().await
+    }
+    pub async fn prune_before_update(&self) -> Result<()> {
+        let _lock = self.lock()?;
+        if self.base.join(".update-pending.json").exists() || self.base.join(".core-pending.json").exists() {
+            return Ok(());
+        }
+        self.prune_locked().await
+    }
+    pub(super) async fn prune_locked(&self) -> Result<()> {
         ensure!(
             !self.base.join(".update-pending.json").exists(),
             "升级尚未完成，未清理历史版本"
         );
-        let state = self.state()?;
+        let mut state = self.state()?;
         let mut keep = BTreeSet::new();
         for item in state["roles"].as_object().unwrap().values() {
             keep.insert(item["current"].as_str().unwrap().to_string());
-        }
-        if let Some(history) = state["core_history"].as_object() {
-            for item in history.values() {
-                let release = item["release"].as_str().context("内核回退记录无效")?;
-                release_name(release)?;
-                keep.insert(release.into());
-            }
         }
         ensure!(
             !self.base.join(".core-pending.json").exists(),
@@ -642,18 +696,18 @@ impl Manager {
                     info.is_dir() && info.uid() == fs::metadata(&self.base)?.uid(),
                     "目录属主或类型不匹配"
                 );
-                let manifest = package::verify(&directory, false)?;
-                let expected = format!(
-                    "{}-{}-{}-{}",
-                    manifest.version,
-                    manifest.os,
-                    manifest.arch,
-                    &package::digest(&directory.join("release.json"))?[..12]
-                );
-                ensure!(
-                    entry.file_name() == std::ffi::OsStr::new(&expected),
-                    "发行目录名称与清单不匹配"
-                );
+                if entry.file_name().as_encoded_bytes().starts_with(b".install-") {
+                    let marker = directory.join(".chain-owner");
+                    let owner = fs::symlink_metadata(&marker)?;
+                    ensure!(info.mode() & 0o777 == 0o700 && owner.is_file() && owner.uid() == info.uid()
+                        && owner.len() == STAGE_OWNER.len() as u64 && fs::read(marker)? == STAGE_OWNER.as_bytes(),
+                        "未确认临时目录归属");
+                } else {
+                    let manifest = package::verify(&directory, false)?;
+                    let expected = format!("{}-{}-{}-{}", manifest.version, manifest.os, manifest.arch,
+                        &package::digest(&directory.join("release.json"))?[..12]);
+                    ensure!(entry.file_name() == std::ffi::OsStr::new(&expected), "发行目录名称与清单不匹配");
+                }
                 ensure!(
                     !in_use(&directory).await?,
                     "目录仍被进程使用，或不能确认占用情况"
@@ -675,6 +729,16 @@ impl Manager {
             .await;
             if let Err(error) = result {
                 eprintln!("保留 {}：{error:#}", directory.display());
+            }
+        }
+        // Free space before rewriting legacy rollback records on an already full disk.
+        if let Some(history) = state["core_history"].as_object_mut() {
+            let before = history.len();
+            history.retain(|_, item| item["safe"] == true
+                && item["release"].as_str().is_some_and(|id| keep.contains(id)));
+            if history.len() != before {
+                let path = self.base.join(".chain-install.json");
+                atomic(&path, &serde_json::to_vec_pretty(&state)?, fs::metadata(&path)?.mode() & 0o777)?;
             }
         }
         Ok(())
@@ -920,7 +984,7 @@ mod tests {
             let mut state = manager.state().unwrap();
             state["core_blocked"] = json!({"core":"xray","task_id":"blocked"});
             fs::write(manager.base.join(".chain-install.json"), serde_json::to_vec(&state).unwrap()).unwrap();
-            let result = manager.update_checked(&source, None, |role| async move {
+            let result = manager.update_checked(UpdateSource::Directory(&source), None, |role| async move {
                 assert_eq!(role, "panel", "blocked Agent must not be started or health checked");
                 ensure!(!fail, "panel failure");
                 Ok(())
@@ -959,7 +1023,7 @@ mod tests {
             let info = fs::metadata(&unit).unwrap();
             let agent = fs::read_to_string(manager.unit_path("agent")).unwrap();
             let result = manager
-                .update_checked(&source, None, |role| async move {
+                .update_checked(UpdateSource::Directory(&source), None, |role| async move {
                     ensure!(!fail || role != "agent", "injected failure");
                     Ok(())
                 })
@@ -1006,7 +1070,7 @@ mod tests {
         fixture(&source);
         let before = fs::read(manager.base.join(".chain-install.json")).unwrap();
         let result = manager
-            .update_checked(&source, None, |role| async move {
+            .update_checked(UpdateSource::Directory(&source), None, |role| async move {
                 ensure!(role != "agent", "injected agent failure");
                 Ok(())
             })

@@ -192,6 +192,20 @@ pub fn checksum(archive: &Path) -> Result<()> {
 
 pub fn extract(archive: &Path, destination: &Path) -> Result<Manifest> {
     checksum(archive)?;
+    let parent = destination.parent().context("缺少解包父目录")?;
+    let available = crate::task::workspace::free_space(parent)?;
+    if available < MAX_EXPANDED + 1024 * 1024 {
+        let mut bundle = tar::Archive::new(flate2::read::GzDecoder::new(File::open(archive)?));
+        let mut needed = 1024 * 1024u64;
+        for (index, entry) in bundle.entries()?.enumerate() {
+            let entry = entry?;
+            ensure!(index < 300 && entry.header().entry_type().is_file() && entry.size() <= MAX_EXPANDED, "发行包条目无效");
+            needed = needed.checked_add(entry.size().div_ceil(4096) * 4096).context("发行包展开体积溢出")?;
+            ensure!(needed <= MAX_EXPANDED + 300 * 4096 + 1024 * 1024, "发行包展开体积超过 1 GiB");
+        }
+        ensure!(available >= needed, "{} 所在分区解包需要约 {} MiB，当前可用 {} MiB；尚未切换服务",
+            parent.display(), needed.div_ceil(1024 * 1024), available / (1024 * 1024));
+    }
     fs::create_dir(destination)?;
     let result = (|| {
         let decoder = flate2::read::GzDecoder::new(File::open(archive)?);
@@ -224,7 +238,7 @@ pub fn extract(archive: &Path, destination: &Path) -> Result<Manifest> {
             let written = std::io::copy(&mut entry, &mut file)?;
             ensure!(written == entry.size(), "发行文件截断");
         }
-        // This temporary tree is verified, then copied before installation; it need not be durable.
+        // The caller publishes only a fully verified tree.
         verify(destination, true)
     })();
     if result.is_err() {
@@ -234,8 +248,29 @@ pub fn extract(archive: &Path, destination: &Path) -> Result<Manifest> {
 }
 
 pub fn copy(source: &Path, destination: &Path, manifest: &Manifest) -> Result<()> {
+    copy_release(source, destination, manifest, false)
+}
+
+pub(super) fn copy_file(source: &Path, destination: &Path, mode: u32, share: bool) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if share {
+        let info = fs::symlink_metadata(source)?;
+        if info.is_file()
+            && info.uid() == unsafe { libc::geteuid() }
+            && info.gid() == unsafe { libc::getegid() }
+            && info.mode() & 0o7777 == mode
+            && fs::hard_link(source, destination).is_ok()
+        {
+            return Ok(());
+        }
+    }
+    fs::copy(source, destination)?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+pub(super) fn copy_release(source: &Path, destination: &Path, manifest: &Manifest, share: bool) -> Result<()> {
     fs::create_dir(destination)?;
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o755))?;
     for name in manifest
         .files
         .keys()
@@ -244,6 +279,17 @@ pub fn copy(source: &Path, destination: &Path, manifest: &Manifest) -> Result<()
     {
         let path = destination.join(relative(name)?);
         fs::create_dir_all(path.parent().unwrap())?;
+        let mode = manifest.files.get(name).map_or(0o644, |entry| entry.mode);
+        copy_file(&source.join(name), &path, mode, share && name != "release.json")?;
+    }
+    install_modes(destination, manifest)?;
+    verify(destination, true)?;
+    Ok(())
+}
+
+pub(super) fn install_modes(destination: &Path, manifest: &Manifest) -> Result<()> {
+    for name in manifest.files.keys().map(String::as_str).chain(["release.json"]) {
+        let path = destination.join(relative(name)?);
         for directory in path
             .parent()
             .unwrap()
@@ -252,13 +298,11 @@ pub fn copy(source: &Path, destination: &Path, manifest: &Manifest) -> Result<()
         {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
         }
-        fs::copy(source.join(name), &path)?;
-        fs::set_permissions(
-            path,
-            fs::Permissions::from_mode(manifest.files.get(name).map_or(0o644, |v| v.mode)),
-        )?;
+        let mode = manifest.files.get(name).map_or(0o644, |v| v.mode);
+        if fs::metadata(&path)?.permissions().mode() & 0o7777 != mode {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
     }
-    verify(destination, true)?;
     Ok(())
 }
 

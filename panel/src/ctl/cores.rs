@@ -182,8 +182,12 @@ pub fn replace(stage: &Path, core: &str, source: &Path, meta: &Value) -> Result<
         (format!("share/{license}"), 0o644),
     ] {
         fs::create_dir_all(stage.join(&name).parent().unwrap())?;
-        fs::copy(source.join(&name), stage.join(&name))?;
-        fs::set_permissions(stage.join(&name), fs::Permissions::from_mode(mode))?;
+        // The private candidate may have hard links to the running release.
+        let path = stage.join(&name);
+        if path.try_exists()? {
+            fs::remove_file(&path)?;
+        }
+        package::copy_file(&source.join(&name), &path, mode, true)?;
         manifest["files"][&name] =
             json!({"sha256":package::digest(&stage.join(&name))?,"mode":mode});
     }
@@ -215,6 +219,13 @@ pub fn preserve(manager: &Manager, stage: &Path) -> Result<()> {
     if let Some(id) = state["roles"]["agent"]["current"].as_str() {
         super::upgrade::release_name(id)?;
         let source = manager.base.join("releases").join(id);
+        if !source.try_exists()? {
+            let manifest = package::verify(stage, true)?;
+            let digest = package::digest(&stage.join("release.json"))?;
+            let exact = format!("{}-{}-{}-{}", manifest.version, manifest.os, manifest.arch, &digest[..12]);
+            ensure!(id == exact, "现用发行目录 {id} 缺失，须先恢复对应发行包及此前独立更新的内核");
+            return Ok(());
+        }
         package::verify(&source, false)?;
         let old: Value = serde_json::from_slice(&fs::read(source.join("release.json"))?)?;
         for core in ["xray", "mihomo"] {
@@ -332,6 +343,72 @@ fn save(manager: &Manager, state: &Value) -> Result<()> {
         &serde_json::to_vec_pretty(state)?,
         0o600,
     )
+}
+
+// A core-only switch may share the installed release only if every non-core file is identical.
+async fn share_panel(
+    manager: &Manager,
+    state: &mut Value,
+    journal: &Path,
+    task: &mut Value,
+) -> Result<()> {
+    let Some(panel) = state["roles"]["panel"]["current"].as_str().map(str::to_owned) else {
+        return Ok(());
+    };
+    let agent = state["roles"]["agent"]["current"].as_str().context("Agent 版本缺失")?.to_owned();
+    if panel == agent || state["roles"]["panel"]["version"] != state["roles"]["agent"]["version"] {
+        return Ok(());
+    }
+    let releases = manager.base.join("releases");
+    let program = |id: &str| -> Result<Value> {
+        let root = releases.join(id);
+        package::verify(&root, true)?;
+        let mut m: Value = serde_json::from_slice(&fs::read(root.join("release.json"))?)?;
+        let files = m["files"].as_object_mut().context("发行清单缺少文件")?;
+        for name in [
+            "bin/xray", "bin/mihomo", "share/Xray-LICENSE", "share/Mihomo-LICENSE",
+            "share/Xray-PATCHES.txt",
+        ] {
+            files.remove(name);
+        }
+        Ok(json!([m["version"], m["os"], m["arch"], m["commit"], m["files"]]))
+    };
+    if program(&panel)? != program(&agent)? {
+        return Ok(());
+    }
+    let linked = manager.base.join("current-panel").canonicalize()?;
+    ensure!(
+        linked == releases.join(&panel) || (task["panel_before"] == panel && linked == releases.join(&agent)),
+        "面板当前链接与安装状态不一致"
+    );
+    if task["panel_before"].is_null() {
+        task["panel_before"] = json!(panel);
+        task["panel_running"] = json!(manager.active("panel").await?);
+        atomic(journal, &serde_json::to_vec(task)?, 0o600)?;
+    }
+    ensure!(task["panel_before"] == panel, "待验收任务的面板版本已变化");
+    let running = task["panel_running"] == true;
+    let before = state.clone();
+    manager.link("panel", &agent)?;
+    let result: Result<()> = async {
+        if running {
+            manager.service("restart", "panel").await?;
+            manager.healthy("panel".into()).await?;
+        }
+        state["roles"]["panel"]["current"] = json!(agent);
+        state["roles"]["panel"]["previous"] = Value::Null;
+        save(manager, state)
+    }.await;
+    if let Err(error) = result {
+        manager.link("panel", &panel)?;
+        save(manager, &before)?;
+        if running {
+            manager.service("restart", "panel").await?;
+            manager.healthy("panel".into()).await?;
+        }
+        return Err(error.context("面板共用内核失败，已恢复原面板目录，Agent 继续运行"));
+    }
+    Ok(())
 }
 async fn recover(manager: &Manager, j: &Value) -> Result<String> {
     let mut state = manager.state()?;
@@ -825,7 +902,7 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         let mut original: Value = serde_json::from_slice(&fs::read(&receipt)?)?;
         ensure!(original["id"] == job["task_id"] && original["core"] == core
             && matches!(original["action"].as_str(), Some("core-upgrade" | "core-rollback")), "原内核回执不匹配");
-        let j: Value = serde_json::from_slice(&fs::read(&journal)?)?;
+        let mut j: Value = serde_json::from_slice(&fs::read(&journal)?)?;
         ensure!(
             j["task_id"] == job["task_id"] && j["core"] == core,
             "待确认任务不匹配"
@@ -849,6 +926,7 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
             && (original["state"] == "awaiting_verification" || original["verification_failed"] == true);
         ensure!(job["keep_agent_on_failure"] != true || verification_failed, "原任务未处于连接验收阶段，请核对原任务");
         let detail = if verification_failed {
+            share_panel(manager, &mut state, &journal, &mut j).await?;
             // A rollback approved for an earlier upgrade cannot authorize undoing this one.
             if let Some(history) = state["core_history"].as_object_mut() && history.remove(core).is_some() {
                 save(manager, &state)?;
@@ -867,7 +945,8 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
                 "配置已变化，未确认旧检查结果"
             );
             manager.healthy("agent".into()).await?;
-            state["core_history"][core] = json!({"release":j["before"]["current"],"version":j["previous_version"],"safe":j["rollback_allowed"]});
+            share_panel(manager, &mut state, &journal, &mut j).await?;
+            if let Some(history) = state["core_history"].as_object_mut() { history.remove(core); }
             state.as_object_mut().unwrap().remove("core_blocked");
             save(manager, &state)?;
             "内核及实际连接已确认；原配置保持不变".into()
@@ -880,9 +959,13 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         original["detail"] = json!(detail);
         atomic(&receipt, &serde_json::to_vec(&original)?, 0o600)?;
         if verification_failed || action == "core-confirm" { fs::remove_file(&journal)?; }
+        if let Err(error) = manager.prune_locked().await {
+            eprintln!("已记录内核验收结果，旧目录清理延后：{error:#}");
+        }
         return Ok(json!({"state":"succeeded","detail":detail}));
     }
     ensure!(!journal.exists(), "请先确认或恢复上次内核升级");
+    if action == "core-upgrade" { manager.prune_locked().await?; }
     let mut state = manager.state()?;
     let before = state["roles"]["agent"].clone();
     let id = before["current"].as_str().context("本机尚未安装 Agent")?;
@@ -915,31 +998,16 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
             job["id"].as_str().context("缺少任务 ID")?
         ))
         .tempdir_in(directory)?;
-    let stage = work.path().join("stage");
-    package::copy(&source, &stage, &manifest)?;
+    let candidate = manager.release_stage()?;
+    let stage = candidate.path().join("release");
+    package::copy_release(&source, &stage, &manifest, true)?;
     let preparation:Result<Value>=async{
   let (download,meta)=if action=="core-rollback"{ensure!(state["core_blocked"].is_null(),"停用后必须明确选择安全版本");let history=&state["core_history"][core];ensure!(history["safe"]==true,"没有确认安全的上一版");let id=history["release"].as_str().context("缺少回退记录")?;super::upgrade::release_name(id)?;let path=manager.base.join("releases").join(id);package::verify(&path,true)?;let m:Value=serde_json::from_slice(&fs::read(path.join("release.json"))?)?;(path,json!({"version":m[core],"source":m[format!("{core}_source")],"archive_sha256":m[format!("{core}_archive_sha256")],"prerelease":m[format!("{core}_prerelease")]}))}else{let path=work.path().join("download");fs::create_dir(&path)?;let meta=download(core,job["version"].as_str().unwrap(),&path,job["prerelease"]==true).await?;(path,meta)};
   preflight(manager,&env,core,&download.join(format!("bin/{core}")),meta["version"].as_str().context("缺少候选版本")?).await?;ensure!(snapshot(&env,core)?==baseline,"预检期间配置已变化");replace(&stage,core,&download,&meta)?;Ok(meta)
  }.await;
     // Preparation has not switched kernels; preserve the existing service and any prior block.
     let meta = preparation.context("内核准备失败，未切换内核，原服务及停用状态保持不变")?;
-    let release = format!(
-        "{}-{}-{}-{}",
-        manifest.version,
-        manifest.os,
-        manifest.arch,
-        &package::digest(&stage.join("release.json"))?[..12]
-    );
-    let destination = manager.base.join("releases").join(&release);
-    if destination.exists() {
-        ensure!(
-            fs::read(destination.join("release.json"))? == fs::read(stage.join("release.json"))?,
-            "目标发行目录冲突"
-        );
-        package::verify(&destination, true)?;
-    } else {
-        package::copy(&stage, &destination, &package::verify(&stage, true)?)?;
-    }
+    let (release, _) = manager.publish_stage(&stage, &manifest)?;
     let j = json!({"task_id":job["id"],"core":core,"before":before,"target":release,"env":env,"config_snapshot":baseline,"previous_version":old[core],"rollback_allowed":allowed&&state["core_blocked"].is_null(),"was_running":manager.active("agent").await?});
     let services = super::lifecycle::ServiceMigration::prepare(manager, &["agent".into()])?;
     atomic(&journal, &serde_json::to_vec(&j)?, 0o600)?;
@@ -1135,6 +1203,46 @@ mod tests {
             assert!(!m.base.join(".core-pending.json").exists());
         }
     }
+    #[tokio::test]
+    async fn core_update_shares_only_identical_programs_and_keeps_the_old_kernel_intact() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _) = installed(root.path());
+        let old = manager.base.join("releases/old");
+        let manifest = package::verify(&old, true).unwrap();
+        package::install_modes(&old, &manifest).unwrap();
+        let stage = manager.release_stage().unwrap();
+        let next = stage.path().join("release");
+        package::copy_release(&old, &next, &manifest, true).unwrap();
+        let inode = |path: &Path| fs::metadata(path).unwrap().ino();
+        assert_eq!(inode(&next.join("bin/chain-panel")), inode(&old.join("bin/chain-panel")));
+        let download = root.path().join("download");
+        fs::create_dir_all(download.join("bin")).unwrap();
+        fs::create_dir_all(download.join("share")).unwrap();
+        fs::write(download.join("bin/xray"), "new xray").unwrap();
+        fs::write(download.join("share/Xray-LICENSE"), "licence").unwrap();
+        replace(&next, "xray", &download, &json!({"version":"26.11.9"})).unwrap();
+        assert_eq!(fs::read(old.join("bin/xray")).unwrap(), b"xray");
+        let (id, _) = manager.publish_stage(&next, &manifest).unwrap();
+        let mut state = manager.state().unwrap();
+        state["roles"]["panel"] = state["roles"]["agent"].clone();
+        state["roles"]["agent"]["current"] = json!(id);
+        manager.link("agent", &id).unwrap();
+        manager.link("panel", "old").unwrap();
+        let journal = manager.base.join(".core-pending.json");
+        let mut job = json!({});
+        state["roles"]["panel"]["version"] = json!("0.2.76");
+        share_panel(&manager, &mut state, &journal, &mut job).await.unwrap();
+        assert_eq!(state["roles"]["panel"]["current"], "old");
+        state["roles"]["panel"]["version"] = state["roles"]["agent"]["version"].clone();
+        for _ in 0..2 {
+            share_panel(&manager, &mut state, &journal, &mut job).await.unwrap();
+        }
+        assert_eq!(manager.state().unwrap()["roles"]["panel"]["current"], id);
+        assert_eq!(manager.base.join("current-panel").canonicalize().unwrap(),
+            manager.base.join("current-agent").canonicalize().unwrap());
+    }
+
     #[test]
     fn selected_kernel_survives_application_update() {
         let root = tempfile::tempdir().unwrap();

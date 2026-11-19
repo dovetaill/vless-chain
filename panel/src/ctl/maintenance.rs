@@ -289,17 +289,13 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
                 "不允许自动降级组件或数据库"
             );
         }
+        manager.prune_before_update().await?;
         let temporary = tempfile::Builder::new()
             .prefix(&format!("work-{}-", job["id"].as_str().unwrap()))
             .tempdir_in(directory)?;
         let (archive, _) = package::download(temporary.path(), Some(&version)).await?;
-        let stage = temporary.path().join("stage");
-        let manifest = package::extract(&archive, &stage)?;
-        ensure!(manifest.version == version, "目标版本与安装包不一致");
-        if job["xray_channel"] == "latest" {
-            package::latest_xray(&stage, temporary.path()).await?;
-        }
-        manager.update(&stage, None).await?;
+        manager.update_archive(&archive, Some(&version),
+            (job["xray_channel"] == "latest").then_some(temporary.path()), None).await?;
         if let Some(service) = https {
             super::platform::related(manager, "restart", service).await?;
         }
@@ -307,9 +303,7 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
         for role in before.as_object().unwrap().keys() {
             ensure!(after[role] == version, "{role} 版本未达到目标");
         }
-        super::lifecycle::handoff(manager)?;
-        super::lifecycle::maintenance(manager).await?;
-        manager.prune().await?;
+        super::lifecycle::finish_update(manager).await?;
         if !manager.state()?["core_blocked"].is_null() {
             job["detail"] = json!("程序已更新；代理仍安全停用，请继续更新安全内核并验证原链接。");
         }
@@ -444,6 +438,11 @@ pub async fn serve() -> Result<()> {
     ensure!(!user.is_null(), "缺少 chain-panel 服务账户");
     let panel_uid = unsafe { (*user).pw_uid };
     ensure!(panel_uid != 0, "chain-panel 不能是 root 账户");
+    if !manager.base.join(".update-pending.json").exists() && !manager.base.join(".core-pending.json").exists() {
+        // Reclaim the previous worker only after it has exited. An installer doing the handoff
+        // holds the install lock and performs this cleanup itself.
+        if let Err(error) = manager.prune().await { eprintln!("旧发行目录清理延后：{error:#}"); }
+    }
     let _listener_lock;
     let listener = if manager.kind() == "openrc" {
         use std::os::{
@@ -560,7 +559,10 @@ pub async fn serve() -> Result<()> {
                     {
                         eprintln!("维护结果写入失败：{error:#}");
                     }
-                    if request.action == "upgrade" {
+                    let moved = matches!(request.action.as_str(), "core-confirm" | "core-reject") && work["state"] == "succeeded"
+                        && std::env::current_exe().ok().zip(manager.base.join("current-panel/bin/chainctl").canonicalize().ok())
+                            .is_some_and(|(running, installed)| running != installed);
+                    if request.action == "upgrade" || moved {
                         let _ = finished.send(()).await;
                     }
                 });
