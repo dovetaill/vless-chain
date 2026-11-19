@@ -42,7 +42,7 @@ export function CoreSelector({ value, onChange, disabled }: { value: CoreChoice;
     <label className="flex items-start gap-2"><input type="checkbox" checked={value.security_update} onChange={e => onChange({ ...value, security_update: e.target.checked, rollback_safe: false })} />包含安全修复，禁止回退未确认安全的版本</label>
     {value.security_update && <label className="flex items-start gap-2"><input type="checkbox" checked={value.rollback_safe} onChange={e => onChange({ ...value, rollback_safe: e.target.checked })} />已根据官方公告核实原版本不受此次漏洞影响，可用于回退</label>}
     </details>
-    <p className="muted">版本在提交时锁定。UUID、密钥和原 VLESS 链接保留；重启会中断本机代理连接。下载或预检失败不会停止现有服务。{value.security_update && !value.rollback_safe ? "切换后失败且无安全回退版本时，停止本机代理，保留管理面板。" : "切换后失败时恢复原内核。"}</p>
+    <p className="muted">版本在提交时锁定。切换内核时代理连接会短暂中断，UUID、密钥和原链接保留。后台自动验证原链接，链接验证失败时 Agent 继续运行。{value.security_update && !value.rollback_safe ? "内核切换失败且无安全回退版本时，隔离代理内核。" : "内核切换失败时尝试安全回退。"}</p>
     {error && <p role="alert" className="text-amber-700">版本列表获取失败：{error}。可输入准确的官方版本号，下载时仍会核对官方附件。</p>}
   </fieldset>;
 }

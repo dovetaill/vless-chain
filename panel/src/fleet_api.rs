@@ -1,6 +1,8 @@
 use super::*;
 use chain_panel::management::{self, Policy, Remote};
 use futures_util::StreamExt;
+#[path = "core_verification.rs"]
+pub(super) mod core_verification;
 
 pub fn routes(router: Router<App>) -> Router<App> {
     router
@@ -310,6 +312,7 @@ async fn remote_state(State(app): State<App>) -> Json<Value> {
     }
     value["renewal_contact"] = json!("");
     let s = app.store.lock().unwrap();
+    value["published_legacy_enabled"] = json!(s.doc.applied_legacy_configs.iter().any(|profile| profile.enabled));
     value["monitoring"] = json!({"effective":s.doc.monitoring.policy(),"override":s.doc.monitoring.override_policy,
         "checks":s.doc.monitoring.checks,"conditions":s.doc.monitoring.conditions,
         "notices":s.doc.monitoring.notices.iter().rev().take(100).collect::<Vec<_>>()});
@@ -531,31 +534,61 @@ async fn task_status(
     axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
     let mut value = maintenance(json!({"action":"status","id":query.get("id")})).await?;
-    value["last_requested_by"] = json!(app.store.lock().unwrap().doc.operator_audit.iter().rev()
+    let store = app.store.lock().unwrap();
+    if value["action"] == "core-upgrade" && let Some(check) = query.get("id").and_then(|id| store.doc.fleet.local_core_checks.get(id)) {
+        if value["state"] == "awaiting_verification" || value["state"] == check.state {
+            value["verification"] = core_verification::summary(check);
+        } else if value["state"] == "succeeded" && check.state == "confirming" {
+            value["verification"] = json!({"state":"succeeded","detail":format!("原升级任务已验收通过。{}",check.detail)});
+        } else if value["verification_failed"] == true && check.state == "rejecting" {
+            value["verification"] = json!({"state":"failed","detail":format!("{}。{}",check.detail,value["detail"].as_str().unwrap_or(""))});
+        }
+    }
+    value["last_requested_by"] = json!(store.doc.operator_audit.iter().rev()
         .find(|a| a.path == "/api/federation/task" && a.target.as_ref() == query.get("id")).map(|a| &a.actor));
     Ok(Json(value))
 }
-async fn task_submit(State(app): State<App>, Extension(actor): Extension<Actor>, audit: Option<Extension<AuditContext>>, Json(value): Json<Value>) -> ApiResult<Json<Value>> {
-    if actor.role == Role::Ops && !matches!(value["action"].as_str(), Some("upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "core-upgrade" | "core-rollback" | "core-confirm" | "core-reject" | "core-status")) {
-        return Err(error(StatusCode::FORBIDDEN, "运维成员仅能执行升级或重启"));
-    }
-    if value["action"] == "core-confirm"
+async fn confirmation_guard(app: &App, value: &Value) -> ApiResult<Option<Value>> {
+    if (value["action"] == "core-confirm" || value["action"] == "core-reject" && value["keep_agent_on_failure"] == true)
         && maintenance(json!({"id":value["id"],"action":"status"})).await?["state"] == "not_found" {
+        chain_panel::ctl::cores::validate(value)?;
         let task = maintenance(json!({"id":value["task_id"],"action":"status"})).await?;
-        if task["state"] != "awaiting_verification" || task["core"] != value["core"] {
-            return Err(error(StatusCode::CONFLICT, "没有对应的待验证内核任务"));
+        if task["core"] != value["core"] || task["id"] != value["task_id"] ||
+            !matches!(task["action"].as_str(), Some("core-upgrade" | "core-rollback")) {
+            return Err(error(StatusCode::CONFLICT, "原升级任务不存在或内核类型不匹配"));
         }
+        if value["action"] == "core-confirm" && task["state"] == "succeeded"
+            || value["action"] == "core-reject" && task["state"] == "failed" && task["verification_failed"] == true {
+            return Ok(Some(task));
+        }
+        if task["state"] != "awaiting_verification" {
+            return Err(error(StatusCode::CONFLICT, match task["state"].as_str() {
+                Some("queued" | "running") => "内核仍在切换，请等待原任务进入验收阶段",
+                Some("succeeded") => "原升级任务已验收通过",
+                Some("failed") => "原升级任务已失败，请查看原任务结果",
+                _ => "原任务结果待核对",
+            }));
+        }
+        if value["action"] == "core-reject" { return Ok(None); }
         let local = chain_panel::local_agent::node_id(app.token_file.parent().unwrap()).context("本机 Agent 身份未知")?;
         let s = app.store.lock().unwrap();
         let node = s.doc.nodes.iter().find(|n| n.id == local).context("本机 Agent 未接入")?;
         let core = value["core"].as_str().context("内核无效")?;
-        if !(now().saturating_sub(node.seen) <= 30 && node.seen >= task["started"].as_u64().unwrap_or(u64::MAX)
+        if !(now().saturating_sub(node.seen) <= 30 && node.seen > task["finished"].as_u64().unwrap_or(u64::MAX)
             && node.report.applied && node.report.error.is_empty()
+            && node.desired.as_ref().map_or("", |d| d.revision.as_str()) == node.report.revision
             && (node.report.running || node.desired.is_none())
             && node.report.system["cores"][core] == task["core_version"]) {
             return Err(error(StatusCode::CONFLICT, "Agent 尚未确认目标内核正常运行，不能标记成功"));
         }
     }
+    Ok(None)
+}
+async fn task_submit(State(app): State<App>, Extension(actor): Extension<Actor>, audit: Option<Extension<AuditContext>>, Json(mut value): Json<Value>) -> ApiResult<Json<Value>> {
+    if actor.role == Role::Ops && !matches!(value["action"].as_str(), Some("upgrade" | "restart-all" | "restart-panel" | "restart-agent" | "core-upgrade" | "core-rollback" | "core-confirm" | "core-reject" | "core-status")) {
+        return Err(error(StatusCode::FORBIDDEN, "运维成员仅能执行升级或重启"));
+    }
+    let interactive = audit.is_some();
     if let Some(Extension(audit)) = audit {
         let target = value["id"].as_str().context("维护任务标识无效")?;
         uuid::Uuid::parse_str(target).context("维护任务标识无效")?;
@@ -567,7 +600,19 @@ async fn task_submit(State(app): State<App>, Extension(actor): Extension<Actor>,
             return Err(e.into());
         }
     }
-    let mut result = maintenance(value).await?;
+    if interactive && value["action"] == "core-upgrade" {
+        chain_panel::ctl::cores::validate(&value)?;
+        let id = value["id"].as_str().context("缺少任务 ID")?;
+        core_verification::register_local(&app, id).await
+            .map_err(|e| error(StatusCode::CONFLICT, &format!("未提交内核升级：{e:#}")))?;
+        if app.store.lock().unwrap().doc.fleet.local_core_checks.contains_key(id) {
+            value["keep_agent_on_failure"] = json!(true);
+        }
+    }
+    let mut result = match confirmation_guard(&app, &value).await? {
+        Some(original) => original,
+        None => maintenance(value).await?,
+    };
     result["last_requested_by"] = json!(actor);
     Ok(Json(result))
 }
@@ -636,6 +681,13 @@ async fn resume_batch(State(app): State<App>, Path(id): Path<String>) -> ApiResu
         let core = job["action"] == "core-upgrade";
         for target in job["targets"].as_array_mut().context("任务无效")? {
             target.as_object_mut().unwrap().remove("unreachable_since");
+            if core && target["auto_verify"] == true {
+                if !target["core_check"].is_null() && target["state"] != "succeeded" {
+                    target["state"] = json!("running");
+                    target["query_only"] = json!(true);
+                }
+                continue;
+            }
             let succeeded = if core { target["state"] == "succeeded" } else { maintenance_succeeded(target) };
             target["state"] = json!(if succeeded { "succeeded" } else { "pending" });
         }
@@ -719,7 +771,10 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
                     || d.fleet.remotes.iter().any(|r| &r.id == id)),
             "VPS 不存在"
         );
-        if !matches!(input.action.as_str(), "enable" | "disable") {
+        if input.action == "core-upgrade" {
+            ensure!(input.targets.iter().any(|id| d.fleet.remotes.iter().any(|r| &r.id == id && supports_core(r))),
+                "所选 VPS 尚不支持独立内核升级，请先更新维护组件");
+        } else if !matches!(input.action.as_str(), "enable" | "disable") {
             ensure!(
                 input.targets.iter().filter(|id| id.as_str() != "local").all(|id| d
                     .fleet
@@ -729,12 +784,6 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
                     .is_some_and(|r| r.snapshot["maintenance"] == true)),
                 "所选 VPS 尚未确认支持 systemd 维护；请先手工更新并等待状态同步"
             );
-            if input.action == "core-upgrade" {
-                ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter().find(|r| &r.id == id)
-                    .is_some_and(|r| r.snapshot["maintenance_actions"].as_array()
-                        .is_some_and(|actions| actions.iter().any(|a| a == "core-upgrade")))),
-                    "所选 VPS 尚不支持独立内核升级，请先更新维护组件");
-            }
             if input.action == "restart-all" {
                 ensure!(input.targets.iter().all(|id| d.fleet.remotes.iter()
                     .find(|r| &r.id == id).is_some_and(|r| r.snapshot["maintenance_actions"]
@@ -768,7 +817,17 @@ async fn batch(State(app): State<App>, Json(input): Json<Batch>) -> ApiResult<Js
         let targets: Vec<_> = input
             .targets
             .iter()
-            .map(|id| json!({"id":id,"task_id":crate::id(),"state":"pending"}))
+            .map(|id| {
+                let mut target = json!({"id":id,"task_id":crate::id(),"state":"pending"});
+                if input.action == "core-upgrade" {
+                    target["auto_verify"] = json!(true);
+                    if !d.fleet.remotes.iter().any(|r| &r.id == id && supports_core(r)) {
+                        target["state"] = json!("failed");
+                        target["error"] = json!("未下发内核升级：请先更新该 VPS 的维护组件");
+                    }
+                }
+                target
+            })
             .collect();
         d.fleet.receipts.insert(
             input.id.clone(),
@@ -800,8 +859,31 @@ fn maintenance_succeeded(target: &Value) -> bool {
             .is_some_and(|e| e.starts_with("组件维护已完成，但整链验证失败"))
 }
 
+const CORE_CONCURRENCY: usize = 10;
+
+fn supports_core(remote: &Remote) -> bool {
+    remote.snapshot["maintenance"] == true && remote.snapshot["maintenance_actions"].as_array()
+        .is_some_and(|actions| actions.iter().any(|action| action == "core-upgrade"))
+}
+
+fn core_manual(target: &Value) -> bool {
+    target["state"] == "awaiting_verification" && matches!(target["result"]["verification"]["state"].as_str(), Some("manual" | "reconciling"))
+}
+
+fn core_active(target: &Value) -> bool {
+    matches!(target["state"].as_str(), Some("pending" | "queued" | "running" | "awaiting_verification"))
+        && !core_manual(target)
+}
+
 fn finish_batch(job: &mut Value) {
     let targets = job["targets"].as_array().unwrap();
+    if job["action"] == "core-upgrade" && targets.iter().all(|t| t["auto_verify"] == true) {
+        job["state"] = json!(if targets.iter().any(core_active) { "running" }
+            else if targets.iter().any(core_manual) { "paused" }
+            else if targets.iter().all(|t| t["state"] == "succeeded") { "succeeded" }
+            else { "completed" });
+        return;
+    }
     if job["action"] == "core-upgrade" && targets.iter().any(|t| matches!(t["state"].as_str(), Some("failed" | "unknown"))) {
         job["state"] = json!("paused");
         return;
@@ -828,6 +910,50 @@ pub async fn work_batch(app: &App) -> Result<()> {
     };
     let targets = job["targets"].as_array().unwrap();
     if job["action"] == "core-upgrade" {
+        if targets.iter().all(|t| t["auto_verify"] == true) {
+            // Resume accepted requests before dispatching new ones after a panel restart.
+            let indices: Vec<_> = targets.iter().enumerate().filter(|(_, t)| core_active(t) && t["state"] != "pending")
+                .chain(targets.iter().enumerate().filter(|(_, t)| t["state"] == "pending"))
+                .map(|(i, _)| i).collect();
+            if indices.is_empty() {
+                let mut s = app.store.lock().unwrap();
+                finish_batch(s.doc.fleet.receipts.get_mut(job["id"].as_str().unwrap()).context("任务不存在")?);
+                return s.save();
+            }
+            let mut workers = futures_util::stream::iter(indices).map(|index| {
+                let job = &job;
+                async move {
+                    loop {
+                        if let Err(e) = work_target(app, job, index).await {
+                            let mut s = app.store.lock().unwrap();
+                            let current = s.doc.fleet.receipts.get_mut(job["id"].as_str().unwrap()).context("任务不存在")?;
+                            let row = &mut current["targets"][index];
+                            if row["state"] == "pending" && row["core_check"].is_null() {
+                                row["state"] = json!("failed");
+                                row["error"] = json!(format!("未下发内核升级：{e:#}"));
+                            } else {
+                                row["state"] = json!("unknown");
+                                row["error"] = json!(format!("{e:#}"));
+                            }
+                            finish_batch(current);
+                            return s.save();
+                        }
+                        let active = {
+                            let s = app.store.lock().unwrap();
+                            let current = &s.doc.fleet.receipts[job["id"].as_str().unwrap()];
+                            current["state"] == "running" && core_active(&current["targets"][index])
+                        };
+                        if !active { return Ok::<(), anyhow::Error>(()); }
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            }).buffer_unordered(CORE_CONCURRENCY);
+            let mut result = Ok(());
+            while let Some(done) = workers.next().await {
+                if let Err(e) = done { result = Err(e); }
+            }
+            return result;
+        }
         if let Some(index) = targets.iter().position(|t| t["state"] != "succeeded") {
             if matches!(targets[index]["state"].as_str(), Some("pending" | "queued" | "running" | "awaiting_verification")) {
                 work_target(app, &job, index).await?;
@@ -854,16 +980,23 @@ pub async fn work_batch(app: &App) -> Result<()> {
 }
 
 async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
-    let mut target = job["targets"][index].clone();
+    let mut target = app.store.lock().unwrap().doc.fleet.receipts[job["id"].as_str().unwrap()]["targets"][index].clone();
     let action = job["action"].as_str().unwrap().to_string();
     let lines = matches!(action.as_str(), "enable" | "disable");
     let dispatch_lines = lines && target["dispatched"] != true;
-    target["state"] = json!("running");
+    let starting = target["state"] == "pending";
+    if action == "core-upgrade" && target["auto_verify"] == true && target["core_check"].is_null() {
+        let remote = remote(app, target["id"].as_str().context("目标 VPS 缺少 ID")?)?;
+        check_maintenance_version(&remote.snapshot, &json!({"action":"core-upgrade"}))?;
+        target["core_check"] = serde_json::to_value(core_verification::prepare(app, Some(&remote)).await?)?;
+        target["started"] = json!(now());
+    }
+    if target["state"] == "pending" || target["auto_verify"] != true { target["state"] = json!("running"); }
     if dispatch_lines {
         target["dispatched"] = json!(true);
         target["started"] = json!(now());
     }
-    {
+    if starting || target["auto_verify"] != true {
         let mut s = app.store.lock().unwrap();
         s.doc
             .fleet
@@ -879,6 +1012,16 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
                 "congestion_control":job["congestion_control"],"qdisc":job["qdisc"]})).await;
         }
         let remote = remote(app, target["id"].as_str().unwrap())?;
+        if action == "core-upgrade" && target["auto_verify"] == true && (!starting || target["result"]["id"] == target["task_id"]) {
+            let receipt = request(&remote, "POST", "/api/federation/task", Some(json!({"action":"status","id":target["task_id"]}))).await?;
+            ensure!(receipt["id"] == target["task_id"], "远端回执与原升级任务不一致");
+            if receipt["state"] != "not_found" { return Ok(receipt); }
+            if target["query_only"] == true {
+                return Ok(json!({"id":target["task_id"],"action":action,"core":job["core"],"version":job["version"],
+                    "state":"unknown","error":"远端没有原升级回执，本次核对已结束"}));
+            }
+            ensure!(target["result"]["id"] != target["task_id"], "远端已受理的原升级任务回执缺失");
+        }
         if lines {
         if dispatch_lines {
             request(&remote, "POST", "/api/lines/operate", Some(json!({"action":action,"line_ids":job["lines"][&remote.id]}))).await
@@ -901,6 +1044,7 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
         if job["xray_channel"] == "latest" { payload["xray_channel"] = json!("latest"); }
         if action == "core-upgrade" {
             for key in ["core", "security_update", "rollback_safe", "prerelease"] { payload[key] = job[key].clone(); }
+            if target["auto_verify"] == true { payload["keep_agent_on_failure"] = json!(true); }
         }
         if action == "network-tune" {
             payload["congestion_control"] = job["congestion_control"].clone();
@@ -919,7 +1063,27 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
         Ok(mut result) => {
             target.as_object_mut().unwrap().remove("error");
             target.as_object_mut().unwrap().remove("unreachable_since");
-            if action == "core-upgrade" {
+            if action == "core-upgrade" && target["auto_verify"] == true {
+                let remote = remote(app, target["id"].as_str().context("目标 VPS 缺少 ID")?)?;
+                let mut check = serde_json::from_value(target["core_check"].clone())?;
+                if result["id"] == target["task_id"] && result["action"] == action && result["core"] == job["core"] && result["version"] == job["version"]
+                    && matches!(result["state"].as_str(), Some("queued" | "running" | "awaiting_verification" | "succeeded" | "failed" | "unknown")) {
+                    if matches!(result["state"].as_str(), Some("queued" | "running")) &&
+                        now().saturating_sub(target["started"].as_u64().unwrap_or_else(now)) > 1800 {
+                        result["state"] = json!("unknown");
+                        result["error"] = json!("半小时内未收到升级结果，可按原任务 ID 查询");
+                    } else {
+                        core_verification::update(app, Some(&remote), &result, &mut check).await;
+                    }
+                } else {
+                    result["state"] = json!("unknown");
+                    result["error"] = json!("远端升级回执与原任务不符");
+                }
+                result["verification"] = if result["state"] == "failed" && result["core_version"].is_null() {
+                    Value::Null
+                } else { core_verification::summary(&check) };
+                target["core_check"] = serde_json::to_value(check)?;
+            } else if action == "core-upgrade" {
                 result["verification"] = target["result"]["verification"].clone();
                 if result["state"] == "succeeded" {
                     result["verification"] = json!({"state":"succeeded","detail":"已确认目标内核与原链接实际传输","checked_at":now()});
@@ -939,10 +1103,10 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
                                     s.doc.fleet.receipts.get_mut(job["id"].as_str().unwrap()).context("任务不存在")?["targets"][index] = target.clone();
                                     s.save()?;
                                 }
-                                let recovery = request(&remote, "POST", "/api/federation/task", Some(json!({"id":reject_id,"action":"core-reject","task_id":target["task_id"],"core":job["core"]}))).await;
+                                let recovery = request(&remote, "POST", "/api/federation/task", Some(json!({"id":reject_id,"action":"core-reject","keep_agent_on_failure":true,"task_id":target["task_id"],"core":job["core"]}))).await;
                                 result["verification"] = json!({"state":"failed","detail":chain_panel::diagnostics::redact(&format!("{e:#}"))});
                                 result["state"] = json!("unknown");
-                                result["detail"] = json!(if recovery.is_ok() { "连接检测失败，已请求恢复或停用代理；请核对远端处理结果" } else { "连接检测失败，恢复请求尚未确认；请核对远端状态" });
+                                result["detail"] = json!(if recovery.is_ok() { "连接检测失败，已提交验收失败记录，请核对远端结果" } else { "连接检测失败，远端尚未确认记录，请核对原任务和维护程序版本" });
                                 if let Ok(receipt) = request(&remote, "POST", "/api/federation/task", Some(rejection)).await {
                                     if receipt["state"] == "failed" { result["state"] = json!("failed"); result["detail"] = receipt["detail"].clone(); }
                                 }
@@ -986,6 +1150,38 @@ async fn work_target(app: &App, job: &Value, index: usize) -> Result<()> {
     current["targets"][index] = target;
     finish_batch(current);
     s.save()?;
+    Ok(())
+}
+
+pub(super) async fn reconcile_manual_cores(app: &App) -> Result<()> {
+    let pending: Vec<_> = {
+        let s = app.store.lock().unwrap();
+        s.doc.fleet.receipts.iter().filter(|(_, job)| job["action"] == "core-upgrade" && job["archived"] != true)
+            .flat_map(|(id, job)| job["targets"].as_array().into_iter().flatten().enumerate()
+                .filter(|(_, t)| t["auto_verify"] == true && core_manual(t))
+                .map(|(i, t)| (id.clone(), i, t.clone()))).collect()
+    };
+    let mut queries = futures_util::stream::iter(pending).map(|(id, index, target)| async move {
+        let remote = remote(app, target["id"].as_str()?).ok()?;
+        let result = request(&remote, "POST", "/api/federation/task",
+            Some(json!({"id":target["task_id"],"action":"status"}))).await.ok()?;
+        (result["id"] == target["task_id"] && result["action"] == "core-upgrade" &&
+            matches!(result["state"].as_str(), Some("succeeded" | "failed")))
+            .then_some((id, index, result))
+    }).buffer_unordered(CORE_CONCURRENCY);
+    while let Some(done) = queries.next().await {
+        let Some((id, index, mut result)) = done else { continue };
+        let mut s = app.store.lock().unwrap();
+        let Some(job) = s.doc.fleet.receipts.get_mut(&id) else { continue };
+        if job["archived"] == true || job["core"] != result["core"] || job["version"] != result["version"] { continue; }
+        let target = &mut job["targets"][index];
+        if target["task_id"] != result["id"] || !core_manual(target) { continue; }
+        result["verification"] = json!({"state":result["state"],"detail":result["detail"]});
+        target["state"] = result["state"].clone();
+        target["result"] = result;
+        finish_batch(job);
+        s.save()?;
+    }
     Ok(())
 }
 
@@ -1232,6 +1428,152 @@ mod tests {
         assert!(!agents_ready(&configured));
         configured["nodes"][0]["report"]["running"] = json!(true);
         assert!(agents_ready(&configured));
+    }
+
+    #[tokio::test]
+    async fn automatic_core_rejection_records_a_repeated_failure_without_recovery() -> Result<()> {
+        let task = json!({"id":id(),"action":"core-upgrade","core":"mihomo","version":"1.19.34",
+            "core_version":"1.19.34","state":"awaiting_verification","finished":now()-5});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let decisions = Arc::new(Mutex::new(Vec::new()));
+        let observed = decisions.clone();
+        let original = task.clone();
+        let router = Router::new()
+            .route("/api/federation/state",get(|| async {Json(json!({"time":now(),"local_node_id":"node",
+                "legacy_configs":[],"nodes":[{"id":"node","seen":now(),"online":true,"report":{"error":"配置未应用","applied":false,
+                "system":{"cores":{"mihomo":"1.19.34"}}}}]}))}))
+            .route("/api/federation/document",get(|| async { Json(json!(Document::default())) }))
+            .route("/api/federation/task",post(move |Json(mut body):Json<Value>| {
+                let (original, observed) = (original.clone(), observed.clone());
+                async move { Json(match body["action"].as_str() {
+                    Some("core-status") => json!({"verification_failure_keeps_agent":true}),
+                    Some("status") if body["id"] == original["id"] => original,
+                    Some("status") => json!({"id":body["id"],"state":"not_found"}),
+                    Some("core-reject") => {
+                        observed.lock().unwrap().push(body.clone());
+                        body["state"] = json!("queued");
+                        body
+                    }
+                    _ => panic!("意外的维护操作 {body}"),
+                }) }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener,router).await.unwrap() });
+        let directory = tempfile::tempdir()?;
+        let app = app(directory.path());
+        let remote = Remote {id:id(),name:"fixture".into(),url:format!("http://{addr}"),token:"fixture".into(),
+            seen:now(),error:String::new(),policy_error:String::new(),snapshot:Value::Null};
+        let mut check = core_verification::prepare(&app,Some(&remote)).await?;
+        core_verification::update(&app,Some(&remote),&task,&mut check).await;
+        assert!(decisions.lock().unwrap().is_empty());
+        check.waiting_since = Some(now()-181);
+        core_verification::update(&app,Some(&remote),&task,&mut check).await;
+        server.abort(); let _ = server.await;
+        let _released = std::net::TcpListener::bind(addr)?;
+        assert_eq!(check.state,"rejecting");
+        assert_eq!(*decisions.lock().unwrap(),vec![json!({"action":"core-reject","id":check.confirm_id,
+            "core":task["core"],"task_id":task["id"],"keep_agent_on_failure":true})]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hundred_core_upgrades_verify_ten_in_parallel_and_isolate_exceptions() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        #[derive(Default)]
+        struct Observed {
+            receipts: Mutex<BTreeMap<String, Value>>,
+            installs: AtomicUsize,
+            confirms: AtomicUsize,
+            active: AtomicUsize,
+            peak: AtomicUsize,
+            verifying: AtomicUsize,
+            verifying_peak: AtomicUsize,
+        }
+        let seen = Arc::new(Observed::default());
+        let first_ten = Arc::new(tokio::sync::Barrier::new(10));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let fixture = seen.clone();
+        let router = Router::new()
+            .route("/{n}/api/federation/state", get(|Path(n): Path<usize>| async move {
+                Json(json!({"time":now(),"local_node_id":"local","nodes":[{"id":"local","seen":now(),"online":true,
+                    "desired_revision":null,"report":{"applied":true,"running":false,"error":"","revision":"","system":{"cores":{"mihomo":"1.19.34"}}}}],
+                    "legacy_configs":if n == 11 {json!([{"enabled":true}])} else {json!([])}}))
+            }))
+            .route("/{n}/api/federation/document", get(|| async { Json(json!(Document::default())) }))
+            .route("/{n}/api/federation/task", post(move |Path(n): Path<usize>, Json(mut body): Json<Value>| {
+                let (seen, barrier) = (fixture.clone(), first_ten.clone());
+                async move {
+                    let id = body["id"].as_str().unwrap().to_owned();
+                    match body["action"].as_str() {
+                        Some("core-status") => Json(if n == 99 { json!({"supported":true}) }
+                            else { json!({"supported":true,"verification_failure_keeps_agent":true}) }).into_response(),
+                        Some("status") => {
+                            let stored = seen.receipts.lock().unwrap().get(&id).cloned();
+                            Json(stored.unwrap_or_else(|| json!({"id":id,"state":"not_found"}))).into_response()
+                        }
+                        Some("core-upgrade") => {
+                            seen.installs.fetch_add(1, SeqCst);
+                            if n != 10 && n != 11 {
+                                seen.peak.fetch_max(seen.active.fetch_add(1, SeqCst) + 1, SeqCst);
+                            }
+                            body["state"] = json!(if n == 10 { "failed" } else { "awaiting_verification" });
+                            body["finished"] = json!(now()-5);
+                            body["core_version"] = body["version"].clone();
+                            assert!(seen.receipts.lock().unwrap().insert(id, body.clone()).is_none());
+                            if n == 12 { (StatusCode::BAD_GATEWAY, "lost upgrade response").into_response() }
+                            else { Json(body).into_response() }
+                        }
+                        Some("core-confirm") => {
+                            seen.confirms.fetch_add(1, SeqCst);
+                            seen.verifying_peak.fetch_max(seen.verifying.fetch_add(1, SeqCst) + 1, SeqCst);
+                            if n < 10 { barrier.wait().await; }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            seen.verifying.fetch_sub(1, SeqCst);
+                            seen.active.fetch_sub(1, SeqCst);
+                            body["state"] = json!("succeeded");
+                            let mut receipts = seen.receipts.lock().unwrap();
+                            receipts.get_mut(body["task_id"].as_str().unwrap()).unwrap()["state"] = json!("succeeded");
+                            assert!(receipts.insert(id, body.clone()).is_none());
+                            if n == 0 { (StatusCode::BAD_GATEWAY, "lost confirmation response").into_response() }
+                            else { Json(body).into_response() }
+                        }
+                        _ => panic!("unexpected request {body}"),
+                    }
+                }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let directory = tempfile::tempdir()?;
+        let app = app(directory.path());
+        let job = id();
+        let remotes: Vec<_> = (0..100).map(|_| id()).collect();
+        {
+            let mut s = app.store.lock().unwrap();
+            for (i, id) in remotes.iter().enumerate() {
+                s.doc.fleet.remotes.push(Remote { id:id.clone(),name:id.clone(),url:format!("http://{address}/{i}"),token:"fixture".into(),
+                    seen:now(),error:String::new(),policy_error:String::new(),snapshot:json!({"maintenance":true,"maintenance_actions":["core-upgrade"]}) });
+            }
+        }
+        let input = serde_json::from_value(json!({"id":job,"action":"core-upgrade","core":"mihomo","version":"1.19.34",
+            "security_update":true,"rollback_safe":false,"targets":remotes}))?;
+        let _ = batch(State(app.clone()), Json(input)).await.map_err(|e| anyhow::anyhow!("{}",e.1))?;
+        let result = tokio::time::timeout(Duration::from_secs(110), work_batch(&app)).await;
+        server.abort(); let _ = server.await;
+        let _released = std::net::TcpListener::bind(address)?;
+        result??;
+        let saved = &app.store.lock().unwrap().doc.fleet.receipts[&job];
+        let targets = saved["targets"].as_array().unwrap();
+        assert_eq!(saved["state"], "paused");
+        assert_eq!(targets[10]["state"], "failed");
+        assert!(core_manual(&targets[11]));
+        assert_eq!(targets[99]["state"], "failed");
+        assert!(targets[99]["error"].as_str().unwrap().contains("未下发"));
+        assert_eq!(targets.iter().filter(|t| t["state"] == "succeeded" && t["result"]["verification"]["state"] == "succeeded").count(),97);
+        assert_eq!(seen.installs.load(SeqCst),99);
+        assert_eq!(seen.confirms.load(SeqCst),97);
+        assert_eq!(seen.peak.load(SeqCst),10);
+        assert_eq!(seen.verifying_peak.load(SeqCst),10);
+        Ok(())
     }
     #[test]
     fn formal_release_tag_is_validated() {

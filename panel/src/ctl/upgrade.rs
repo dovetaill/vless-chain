@@ -283,7 +283,7 @@ impl Manager {
         )?;
         let mut attempted = 0;
         let result: Result<()> = async {
-            for role in &roles {
+            for (role, was_running) in roles.iter().zip(&running) {
                 attempted += 1;
                 self.service("stop", role).await?;
                 let baseline = if role == "agent" {
@@ -295,6 +295,11 @@ impl Manager {
                 self.link(role, &id)?;
                 services.write(self, role, true).await?;
                 if role == "agent" && !old["core_blocked"].is_null() {
+                    if *was_running {
+                        self.require_proxy_block()?;
+                        self.service("start", role).await?;
+                        check(role.clone()).await?;
+                    }
                     continue;
                 }
                 if role == "agent" {
@@ -333,6 +338,10 @@ impl Manager {
                     self.link(role, old["roles"][role]["current"].as_str().unwrap())?;
                     services.write(self, role, false).await?;
                     if role == "agent" && !old["core_blocked"].is_null() {
+                        if *was_running {
+                            self.require_proxy_block()?;
+                            self.service("start", role).await?;
+                        }
                         return Ok(());
                     }
                     if role == "agent" {
@@ -425,6 +434,14 @@ impl Manager {
         }
         Ok(())
     }
+    fn require_proxy_block(&self) -> Result<()> {
+        let env = self.environment("agent")?;
+        let marker = Path::new(env.get("CHAIN_AGENT_DIR").context("缺少 CHAIN_AGENT_DIR")?).join(".core-upgrade-blocked");
+        ordinary(&marker)?;
+        let block: Value = serde_json::from_slice(&fs::read(marker)?)?;
+        ensure!(block["owner"] == "chain-core-upgrade-v1" && block["task_id"] == self.state()?["core_blocked"]["task_id"], "代理隔离标记与安装状态不一致");
+        Ok(())
+    }
     pub async fn active(&self, role: &str) -> Result<bool> {
         if !self.live() {
             return Ok(false);
@@ -505,6 +522,7 @@ impl Manager {
         };
         let mut process = None;
         let mut active_count = 0;
+        let mut waiting_for_env = false;
         for _ in 0..60 {
             if self.active(&role).await? {
                 if self.kind() != "launchd" {
@@ -520,20 +538,20 @@ impl Manager {
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             continue;
                         }
-                        process = Some(pid);
                         if role == "agent" {
                             let variables = fs::read(format!("/proc/{pid}/environ"))?;
                             let expected = format!(
                                 "CHAIN_AGENT_DIR={}",
                                 env.get("CHAIN_AGENT_DIR").context("缺少 CHAIN_AGENT_DIR")?
                             );
-                            ensure!(
-                                variables
-                                    .split(|c| *c == 0)
-                                    .any(|v| v == expected.as_bytes()),
-                                "Agent 环境文件未生效"
-                            );
+                            waiting_for_env = !variables.split(|c| *c == 0).any(|v| v == expected.as_bytes());
+                            if waiting_for_env {
+                                active_count = 0;
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
                         }
+                        process = Some(pid);
                     } else {
                         active_count = 0;
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -570,6 +588,7 @@ impl Manager {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        ensure!(!waiting_for_env, "Agent 启动检查超时：环境文件未生效（CHAIN_AGENT_DIR）");
         bail!(
             "chain-{role} 启动检查未通过，请查看该组件服务日志；Agent 存活检查不代表代理整链已通过"
         )

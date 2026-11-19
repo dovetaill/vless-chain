@@ -257,6 +257,17 @@ pub struct Fleet {
     pub invitation_expires: u64,
     pub policy: Option<Policy>,
     pub receipts: BTreeMap<String, Value>,
+    pub local_core_checks: BTreeMap<String, CoreVerification>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CoreVerification {
+    pub confirm_id: String,
+    pub baseline: Option<String>,
+    pub state: String,
+    pub detail: String,
+    pub created: u64,
+    pub waiting_since: Option<u64>,
 }
 
 pub fn panel_url(value: &str) -> Result<String> {

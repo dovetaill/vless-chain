@@ -442,16 +442,13 @@ pub async fn run(args: &Options) -> Result<()> {
         for (core, version) in [("xray", "26.10.31"), ("mihomo", "1.19.33")] {
             let job = core_task(&client, &base, &mut cookie,
                 json!({"action":"core-upgrade","core":core,"version":version,"prerelease":false,"security_update":true,"rollback_safe":false})).await?;
-            ensure!(job["state"] == "awaiting_verification", "真实 Web 内核更新失败：{job}");
+            ensure!(job["state"] == "succeeded" && job["verification"]["state"] == "succeeded", "真实 Web 内核自动验收失败：{job}");
             wait("新内核心跳", async || {
                 let state = api(&client, &base, "state", None, &mut cookie).await?;
                 Ok(state["agent_version"] == after["roles"]["agent"]["version"]
                     && state["core_maintenance"]["versions"][core] == version
                     && state["agent_seen"].as_u64().unwrap_or(0) >= job["started"].as_u64().unwrap_or(u64::MAX))
             }).await?;
-            let confirmed = core_task(&client, &base, &mut cookie,
-                json!({"action":"core-confirm","core":core,"task_id":job["id"]})).await?;
-            ensure!(confirmed["state"] == "succeeded", "内核确认失败：{confirmed}");
         }
         let controller_data = work.root.join("controller-data");
         let controller = work.spawn(&work.root, &strings(&["/controller/chain-panel"]), &map(&[
@@ -473,20 +470,14 @@ pub async fn run(args: &Options) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(12)).await;
             api(&client, controller_base, "fleet/batch", Some(&json!({"id":id,"action":"core-upgrade","targets":[remote],"core":core,"version":version,"security_update":true,"rollback_safe":false})), &mut controller_cookie).await?;
             let deadline = std::time::Instant::now() + Duration::from_secs(180);
-            let job = loop {
+            loop {
                 let task = api(&client, controller_base, "fleet", None, &mut controller_cookie).await?["tasks"][&id].clone();
                 let target = &task["targets"][0];
-                if target["state"] == "awaiting_verification" { break target.clone(); }
+                if target["state"] == "succeeded" && target["result"]["verification"]["state"] == "succeeded" { break; }
                 ensure!(!matches!(target["state"].as_str(), Some("failed" | "unknown")), "总控内核升级失败：{task}");
                 ensure!(std::time::Instant::now() < deadline, "总控内核升级超时：{task}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
-            };
-            tokio::time::sleep(Duration::from_secs(12)).await;
-            api(&client, controller_base, &format!("fleet/{}/forward", remote.as_str().unwrap()), Some(&json!({"method":"POST","path":"/federation/task","body":{"id":uuid::Uuid::new_v4().to_string(),"action":"core-confirm","core":core,"task_id":job["task_id"]}})), &mut controller_cookie).await?;
-            wait("总控内核确认", async || {
-                let task = api(&client, controller_base, "fleet", None, &mut controller_cookie).await?["tasks"][&id].clone();
-                Ok(task["targets"][0]["state"] == "succeeded")
-            }).await?;
+            }
         }
         work.stop(controller).await?;
         ensure!(fs::read("/etc/chain-agent/token")? == token && fs::read("/var/lib/chain-panel/local-system-node")? == node, "恢复改变了节点身份");
@@ -638,7 +629,9 @@ async fn core_task(client: &reqwest::Client, base: &str, cookie: &mut String, mu
             }
             Err(error) => return Err(error),
         };
-        if !matches!(job["state"].as_str(), Some("queued" | "running")) { return Ok(job); }
+        let verifying = value["action"] == "core-upgrade" && (job["state"] == "awaiting_verification"
+            && job["verification"]["state"] != "manual" || job["state"] == "succeeded" && job["verification"]["state"] != "succeeded");
+        if !matches!(job["state"].as_str(), Some("queued" | "running")) && !verifying { return Ok(job); }
         ensure!(std::time::Instant::now() < deadline, "内核维护任务超时：{job}");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

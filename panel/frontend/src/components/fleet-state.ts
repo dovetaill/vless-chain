@@ -29,6 +29,7 @@ export type Task = {
   targets: {
     id: string;
     task_id?: string;
+    auto_verify?: boolean;
     state: string;
     error?: string;
     result?: {
@@ -82,6 +83,19 @@ export function requestId() {
   b[8] = (b[8] & 63) | 128;
   const h = Array.from(b, (v) => v.toString(16).padStart(2, "0")).join("");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+export function coreDecisionId(task: string, action: string) {
+  const key = `chain-maintenance-${action}`;
+  const [previous, id] = (localStorage.getItem(key) || "").split("/");
+  if (previous === task && id) return id;
+  const next = requestId();
+  localStorage.setItem(key, `${task}/${next}`);
+  return next;
+}
+export function forgetFailedDecision(result: { id: string; action?: string; state: string }) {
+  if (result.state !== "failed" || !["core-confirm", "core-reject"].includes(result.action || "")) return;
+  const key = `chain-maintenance-${result.action}`;
+  if (localStorage.getItem(key)?.endsWith(`/${result.id}`)) localStorage.removeItem(key);
 }
 export const PAGE_SIZE = 20;
 export function recent(at: number | undefined, now: number) {

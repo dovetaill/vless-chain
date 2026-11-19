@@ -55,6 +55,8 @@ import {
   taskNeedsAttention,
   taskStatus,
   requestId,
+  coreDecisionId,
+  forgetFailedDecision,
   type Remote,
   type Task,
 } from "./fleet-state";
@@ -668,9 +670,9 @@ export function Fleet({ state }: { state: PanelState }) {
     setModal(
       <Modal
         title={`确认${actions[action]}`}
-        description={action === "core-upgrade" ? `${targets.length} 台 VPS · ${coreChoice.core} ${version}。请先完成一台试点。按所选顺序逐台升级，每台实际连接确认后继续；失败即停止后续节点。UUID、密钥及原链接保留。${coreChoice.security_update && !coreChoice.rollback_safe ? "下载或预检失败保持现有服务；切换后失败且无法安全回退时停用代理并保留面板。" : "失败时恢复原内核。"}` : `${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，保留独立选择的内核版本，升级后自动重启相关服务` : ""}。最多同时处理 5 台，单台失败不阻塞其他机器；操作可能中断对应机器的连接。`}
+        description={action === "core-upgrade" ? `${targets.length} 台 VPS · ${coreChoice.core} ${version}。最多 10 台并行升级和自动验收，完成一台即补下一台。异常仅暂停该 VPS。UUID、密钥及原链接保留。${coreChoice.security_update && !coreChoice.rollback_safe ? "切换失败且无法安全回退时隔离代理内核，Agent 保留心跳。" : "切换失败时尝试安全回退。链接验收失败时 Agent 继续运行。"}` : `${targets.length} 台 VPS${isLines ? ` / ${chosenLines.length} 条代理` : ""}${action === "upgrade" ? ` · 目标 ${version}，保留独立选择的内核版本，升级后自动重启相关服务` : ""}。最多同时处理 5 台，单台失败不阻塞其他机器；操作可能中断对应机器的连接。`}
         submit={
-          blocked.length || (action === "upgrade" && !release)
+          (action === "core-upgrade" ? blocked.length === targets.length : blocked.length > 0) || (action === "upgrade" && !release)
             ? undefined
             : "确认执行"
         }
@@ -711,7 +713,7 @@ export function Fleet({ state }: { state: PanelState }) {
         </ul>
         {blocked.length > 0 && (
           <p role="alert" className="text-amber-700">
-            无法执行：
+            {action === "core-upgrade" && blocked.length < targets.length ? "以下 VPS 将独立记录处理结果，其余继续执行：" : "无法执行："}
             {blocked
               .map(
                 (r) =>
@@ -1131,7 +1133,7 @@ export function Fleet({ state }: { state: PanelState }) {
                   </div>}
                   {maintenanceTab === "core" && <>
                   <CoreSelector value={coreChoice} onChange={setCoreChoice} disabled={busy || running.some(t => t.state === "running")} />
-                  <Button disabled={busy || running.some(t => t.state === "running") || !/^\d+\.\d+\.\d+$/.test(coreChoice.version)} onClick={() => batch("core-upgrade")}>逐台升级所选 VPS 的 {coreChoice.core}</Button>
+                  <Button disabled={busy || running.some(t => t.state === "running") || !/^\d+\.\d+\.\d+$/.test(coreChoice.version)} onClick={() => batch("core-upgrade")}>并行升级所选 VPS 的 {coreChoice.core}</Button>
                   </>}
                   {maintenanceTab === "more" && <div className="text-sm">
                     <div className="mt-3 space-y-3 border-t pt-3">
@@ -1783,25 +1785,36 @@ export function Fleet({ state }: { state: PanelState }) {
                 return <section key={t.id} className="min-w-0 space-y-3 rounded-xl border p-4" aria-label={`VPS 任务：${targetName}`}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h4 className="font-semibold break-all">{targetName}</h4>
-                    <Status tone={verifyFailed || verifyPending ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? activeTask.action === "core-upgrade" ? "连接未通过 · 后续已暂停" : activeTask.archived ? "维护完成 · 验证未通过" : "维护完成 · 自动复查中" : verifyPending ? "维护完成 · 等待连接验证" : statuses[t.state] || t.state}</Status>
+                    <Status tone={verifyFailed || verifyPending ? "warn" : t.state === "failed" ? "bad" : t.state === "succeeded" ? "good" : "muted"}>{verifyFailed ? activeTask.action === "core-upgrade" ? t.auto_verify ? "此 VPS 验收未通过" : "连接未通过 · 后续已暂停" : activeTask.archived ? "维护完成 · 验证未通过" : "维护完成 · 自动复查中" : verifyPending ? "维护完成 · 等待连接验证" : statuses[t.state] || t.state}</Status>
                   </div>
                   <div className="grid gap-2 rounded-lg bg-muted/30 p-3 text-sm sm:grid-cols-2">
                     <p>组件维护：<span className={maintenanceDone ? "text-emerald-700" : ""}>{maintenanceDone ? "已完成" : statuses[t.result?.maintenance_state || t.state] || t.state}</span></p>
-                    <p>后续验证：{t.id === "local" ? "请查看本机网络设置结果" : verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" ? "已通过" : activeTask.action === "core-upgrade" ? "等待原链接验证" : "等待自动验证"}</p>
+                    <p>后续验证：{t.id === "local" ? "请查看本机网络设置结果" : verifyFailed ? "未通过" : t.result?.verification?.state === "succeeded" ? "已通过" : activeTask.action === "core-upgrade" ? t.result?.verification?.state === "manual" ? "需人工核对" : "等待原链接验证" : "等待自动验证"}</p>
                   </div>
                   {t.result?.after && <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">{Object.entries(t.result.after).map(([key, value]) => <span key={key}>{({panel:"控制台",agent:"Agent",chainctl:"管理命令"} as Record<string,string>)[key] || key} <strong>{value}</strong></span>)}</div>}
                   {t.result?.network && <div className="space-y-1 text-sm"><p>系统默认：{t.result.network.after.congestion_control} + {t.result.network.after.qdisc}</p><p>网卡实际队列：{t.result.network.after.interfaces.map(q => `${q.dev} / ${q.parent}: ${q.kind}`).join("；") || "未知"}</p><p>{t.result.network.after.warning || "未重启服务器或服务；现有连接与监听器不会自动切换 TCP 算法。"}</p></div>}
-                  {remote && activeTask.action === "core-upgrade" && t.state === "awaiting_verification" && <div className="space-y-2">
+                  {remote && activeTask.action === "core-upgrade" && t.state === "awaiting_verification" && t.auto_verify && t.result?.verification?.state !== "manual" &&
+                    <p className="text-sm">自动验收中 · {t.result?.verification?.detail || "等待原任务回执"}</p>}
+                  {remote && activeTask.action === "core-upgrade" && t.state === "awaiting_verification" && (!t.auto_verify || t.result?.verification?.state === "manual") && <div className="space-y-2">
                     <p className="text-sm">{t.result?.verification?.detail || "请用原链接确认实际连接、旧客户端及需要的 UDP 功能。"}</p>
                     <div className="flex flex-wrap gap-2">
                       {(["core-confirm", "core-reject"] as const).map(action => <Button key={action} variant={action === "core-confirm" ? "primary" : "outline"} disabled={busy}
-                        onClick={() => { if (window.confirm(action === "core-confirm" ? "确认已使用升级前的原链接完成实际传输验证？确认后继续下一台。" : "报告连接失败并停止后续升级？普通升级恢复旧版；没有安全回退版本时停止本机代理。")) void run(async () => {
-                          await remoteApi(remote.id)("/federation/task", "POST", { id: requestId(), action, task_id: t.task_id, core: activeTask.core });
+                        onClick={() => { if (window.confirm(action === "core-confirm" ? "确认已使用升级前的原链接完成实际传输验证？" : "将这台 VPS 的链接验收记为失败？Agent 和现有服务继续运行。")) void run(async () => {
+                          const request = remoteApi(remote.id);
+                          try {
+                            const receipt = await request<{id: string; action?: string; state: string; error?: string}>("/federation/task", "POST", { id: coreDecisionId(t.task_id!, action), action, task_id: t.task_id, core: activeTask.core, ...(action === "core-reject" ? { keep_agent_on_failure: true } : {}) });
+                            forgetFailedDecision(receipt);
+                            if (receipt.state === "failed") throw new Error(receipt.error || "内核处理失败");
+                            if (["queued", "running"].includes(receipt.state)) setMessage(`${remote.name}：请求已受理，正在查询原任务。`);
+                          } catch (error) {
+                            const original = await request<{state: string}>("/federation/task", "POST", { action: "status", id: t.task_id }).catch(() => undefined);
+                            if (original?.state !== (action === "core-confirm" ? "succeeded" : "failed")) throw error;
+                          }
                           await refresh();
-                        }); }}>{action === "core-confirm" ? "原链接已验证，继续" : "失败，恢复或停用"}</Button>)}
+                        }); }}>{action === "core-confirm" ? "原链接已验证，继续" : "报告链接验证失败"}</Button>)}
                     </div>
                   </div>}
-                  {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? activeTask.action === "core-upgrade" ? "内核验证失败，批次已暂停" : "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && !activeTask.archived && activeTask.action !== "core-upgrade" && <p className="mt-2">系统会自动复查连接，不会重复升级，也不阻塞其他 VPS。{t.result?.verification?.retry_at ? `下次复查：${stamp(t.result.verification.retry_at)}` : ""}</p>}</div> : (t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail) && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail}</p>}
+                  {issue ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><p className="font-medium">{verifyFailed ? activeTask.action === "core-upgrade" ? t.auto_verify ? "此 VPS 内核验证失败" : "内核验证失败，批次已暂停" : "组件维护成功，后续连接检查未通过" : "操作未完成"}</p><p className="mt-1 whitespace-pre-wrap break-words">{issue}</p>{verifyFailed && !activeTask.archived && activeTask.action !== "core-upgrade" && <p className="mt-2">系统会自动复查连接，不会重复升级，也不阻塞其他 VPS。{t.result?.verification?.retry_at ? `下次复查：${stamp(t.result.verification.retry_at)}` : ""}</p>}</div> : (t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail) && <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{t.result?.verification?.state === "succeeded" ? t.result.verification.detail : t.result?.detail}</p>}
                   {remote && maintenanceDone && !["enable", "disable", "core-upgrade"].includes(activeTask.action) && !activeTask.archived && <Button type="button" variant="outline" disabled={busy || verifyPending} onClick={() => void run(async () => {
                     await api(`/fleet/batch/${activeTask.id}/verify/${t.id}`, "POST", {});
                     await refresh();
@@ -1816,7 +1829,7 @@ export function Fleet({ state }: { state: PanelState }) {
               </div>
               {!activeTask.archived && ["paused", "completed"].includes(activeTask.state) && (
                 <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
-                  <p className="font-medium">{activeTask.state === "paused" ? "旧版暂停任务：未执行的 VPS 仍等待继续" : "维护已结束，请查看各 VPS 的独立结果"}</p>
+                  <p className="font-medium">{activeTask.state === "paused" ? activeTask.targets.some(t => t.auto_verify) ? "部分 VPS 等待验收结果" : "批次已暂停，未执行的 VPS 仍等待继续" : "维护已结束，请查看各 VPS 的独立结果"}</p>
                   <p>{activeTask.targets.some(verificationFailed)
                     ? "已完成的维护不会重做，连接会自动复查；继续任务只处理未完成的 VPS。"
                     : activeTask.targets.some(t => t.state === "failed")
@@ -1834,7 +1847,7 @@ export function Fleet({ state }: { state: PanelState }) {
                     variant="outline"
                     onClick={() => {
                       const ids = activeTask.targets
-                        .filter((t) => ["failed", "pending"].includes(t.state) && !verificationFailed(t))
+                        .filter((t) => ["failed", "pending"].includes(t.state) && (t.auto_verify || !verificationFailed(t)))
                         .map((t) => t.id);
                       if (["enable", "disable"].includes(activeTask.action)) {
                         setSelectedLines(

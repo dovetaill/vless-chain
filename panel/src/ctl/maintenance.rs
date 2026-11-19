@@ -29,6 +29,8 @@ struct Request {
     rollback_safe: Option<bool>,
     prerelease: Option<bool>,
     task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_agent_on_failure: Option<bool>,
 }
 impl Request {
     fn parse(value: Value) -> Result<Self> {
@@ -52,6 +54,7 @@ impl Request {
             );
         }
         let request: Self = serde_json::from_value(value)?;
+        ensure!(request.keep_agent_on_failure.is_none() || (matches!(request.action.as_str(), "core-upgrade" | "core-reject") && request.keep_agent_on_failure == Some(true)), "仅内核升级或验收失败可指定 keep_agent_on_failure");
         ensure!(
             uuid::Uuid::parse_str(&request.id)?.to_string() == request.id,
             "任务 ID 无效"
@@ -125,6 +128,7 @@ impl Request {
             && self.rollback_safe == job["rollback_safe"].as_bool()
             && self.prerelease == job["prerelease"].as_bool()
             && self.task_id.as_deref() == job["task_id"].as_str()
+            && self.keep_agent_on_failure == job["keep_agent_on_failure"].as_bool()
     }
 }
 fn now() -> u64 {
@@ -177,6 +181,12 @@ fn receipt(directory: &Path, request: &Request) -> Result<(Value, bool)> {
     if request.action == "status" {
         return Ok((json!({"id":request.id,"state":"not_found"}), false));
     }
+    if matches!(request.action.as_str(), "core-confirm" | "core-reject") {
+        if let Some((_, job)) = existing.iter().find(|(_, job)| request.same(job)
+            && matches!(job["state"].as_str(), Some("queued" | "running" | "succeeded"))) {
+            return Ok((job.clone(), false));
+        }
+    }
     ensure!(
         !existing
             .iter()
@@ -198,6 +208,7 @@ fn receipt(directory: &Path, request: &Request) -> Result<(Value, bool)> {
         "rollback_safe",
         "prerelease",
         "task_id",
+        "keep_agent_on_failure",
     ] {
         if !fields[key].is_null() {
             job[key] = fields[key].clone();
@@ -568,6 +579,21 @@ pub async fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_verification_reuses_the_accepted_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = uuid::Uuid::new_v4().to_string();
+        let first = json!({"id":uuid::Uuid::new_v4().to_string(),"action":"core-reject","core":"mihomo","task_id":original,"keep_agent_on_failure":true});
+        let (receipt1, start) = receipt(directory.path(), &Request::parse(first.clone()).unwrap()).unwrap();
+        assert!(start);
+        let mut repeated = first;
+        repeated["id"] = json!(uuid::Uuid::new_v4().to_string());
+        let (receipt2, start) = receipt(directory.path(), &Request::parse(repeated.clone()).unwrap()).unwrap();
+        assert!(!start);
+        assert_eq!(receipt1, receipt2);
+        repeated["action"] = json!("core-confirm");
+        assert!(Request::parse(repeated).is_err());
+    }
     #[test]
     fn network_tuning_validates_choices_and_receipt_identity() {
         let directory = tempfile::tempdir().unwrap();

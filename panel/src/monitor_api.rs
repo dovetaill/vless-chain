@@ -569,7 +569,16 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
         if now() >= next_verification && verification_task.is_none() {
             let app = app.clone();
             verification_task = Some(tokio::spawn(async move {
-                if let Err(e) = fleet_api::verify_batches(&app).await {
+                let (local, manual, batches) = tokio::join!(
+                    fleet_api::core_verification::work_local(&app),
+                    fleet_api::reconcile_manual_cores(&app),
+                    fleet_api::verify_batches(&app)
+                );
+                if let Err(e) = local {
+                    eprintln!("本机内核自动验收：{e}");
+                }
+                if let Err(e) = manual { eprintln!("核对人工处理结果：{e}"); }
+                if let Err(e) = batches {
                     eprintln!("维护后自动验证：{e}");
                 }
             }));

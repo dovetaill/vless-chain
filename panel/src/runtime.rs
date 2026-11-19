@@ -842,11 +842,54 @@ pub async fn probe(
     local_node: Option<&str>,
 ) -> Result<Value> {
     let label = probe_label(line, doc, request, local_node)?;
-    let mut result = probe_inner(binary, line, doc, request, local_node)
+    let mut result = probe_inner(binary, line, doc, request, local_node, None)
         .await
         .map_err(|e| anyhow::anyhow!("{label}\n{}", crate::diagnostics::redact(&format!("{e:#}"))))?;
     result["detail"] = json!(format!("{label}\n{}", result["detail"].as_str().unwrap_or("")));
     Ok(result)
+}
+
+/// Exercise the published address, including its public port and SNI, even on the local panel.
+pub async fn probe_core_link(binary: &Path, line: &Line, doc: &Document, url: &str, udp: bool) -> Result<Value> {
+    let request = ProbeRequest { mode: "http".into(), url: url.into() };
+    probe_inner(binary, line, doc, &request, None, Some(udp)).await
+        .map_err(|e| anyhow::anyhow!("{}：{}", line.name, crate::diagnostics::redact(&format!("{e:#}"))))
+}
+
+async fn received_http(response: &mut reqwest::Response) -> Result<()> {
+    if response.status() != reqwest::StatusCode::NO_CONTENT && response.content_length() != Some(0) {
+        let first = response.chunk().await?;
+        ensure!(first.is_some_and(|bytes| !bytes.is_empty()), "HTTP 探测响应缺少内容");
+    }
+    Ok(())
+}
+
+async fn probe_udp_dns(port: u16, resolver: std::net::SocketAddrV4) -> Result<()> {
+    let mut control = TcpStream::connect(("127.0.0.1", port)).await?;
+    control.write_all(&[5, 1, 0]).await?;
+    let mut auth = [0; 2];
+    control.read_exact(&mut auth).await?;
+    ensure!(auth == [5, 0], "SOCKS5 握手失败");
+    control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    let mut relay = [0; 10];
+    control.read_exact(&mut relay).await?;
+    ensure!(relay[..4] == [5, 0, 0, 1], "SOCKS5 UDP 关联失败");
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    socket.connect(("127.0.0.1", u16::from_be_bytes([relay[8], relay[9]]))).await?;
+    let mut packet = vec![0, 0, 0, 1];
+    packet.extend(resolver.ip().octets());
+    packet.extend(resolver.port().to_be_bytes());
+    let tx: [u8; 2] = rand::random();
+    packet.extend(tx);
+    // One recursive DNS question for the root NS records.
+    packet.extend([1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1]);
+    socket.send(&packet).await?;
+    let mut reply = [0; 2048];
+    let n = socket.recv(&mut reply).await?;
+    ensure!(n > packet.len() && reply[..12] == packet[..12] && reply[12] & 0xfa == 0x80
+        && reply[13] & 15 == 0 && reply[14..16] == [0, 1] && reply[16..18] != [0, 0]
+        && reply[22..27] == packet[22..], "未收到匹配的 UDP DNS 应答");
+    Ok(())
 }
 
 fn probe_label(line: &Line, doc: &Document, request: &ProbeRequest, local_node: Option<&str>) -> Result<String> {
@@ -877,7 +920,9 @@ async fn probe_inner(
     doc: &Document,
     request: &ProbeRequest,
     local_node: Option<&str>,
+    core_check: Option<bool>,
 ) -> Result<Value> {
+    let verify_udp = core_check == Some(true);
     let start = std::time::Instant::now();
     ensure!(line.enabled, "线路已停用");
     let entry = line.hops.first().context("无入口")?;
@@ -944,7 +989,7 @@ async fn probe_inner(
                 "{scheme}://{}/",
                 compiler::address(&line.access.tls.domain, entry.port)
             );
-            let response = reqwest::Client::builder()
+            let mut response = reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(12))
                 .build()?
@@ -956,6 +1001,7 @@ async fn probe_inner(
                 "网站返回 HTTP {}",
                 response.status()
             );
+            if core_check.is_some() { received_http(&mut response).await?; }
             format!("网站入口返回 HTTP {}", response.status())
         }
         "http" => {
@@ -986,12 +1032,13 @@ async fn probe_inner(
                 json!({"tag":"probe","protocol":"freedom","settings":{"redirect":endpoint}})
             };
             let sidecar = compiler::needs_mihomo(&outbound);
-            let config = if sidecar {
+            let mut config = if sidecar {
                 let proxy = crate::external::mihomo(&share, "probe")?;
                 json!({"listeners":[{"name":"probe-in","type":"socks","listen":"127.0.0.1","port":port,"proxy":"probe"}],"proxies":[proxy],"mode":"rule","rules":["MATCH,REJECT"],"log-level":"warning"})
             } else {
-                json!({"log":{"loglevel":"debug"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[outbound]})
+                json!({"log":{"loglevel":"debug"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth","udp":verify_udp}}],"outbounds":[outbound]})
             };
+            if sidecar && verify_udp { config["listeners"][0]["udp"] = json!(true); }
             let file = temp.path().join("probe.json");
             atomic_write(&file, &serde_json::to_vec(&config)?)?;
             let mut child = Some(if sidecar {
@@ -1020,13 +1067,40 @@ async fn probe_inner(
                     .timeout(Duration::from_secs(12))
                     .redirect(reqwest::redirect::Policy::limited(5))
                     .build()?;
-                let response = client.get(url).send().await?;
+                let mut response = match client.get(url).send().await {
+                    Ok(response) => response,
+                    Err(error) if core_check.is_some() => {
+                        return Ok((format!("原链接 HTTP 传输失败：{error}"), Some("http")));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if core_check.is_some() && !response.status().is_success() {
+                    return Ok((format!("探测目标返回 HTTP {}", response.status()), Some("target")));
+                }
                 ensure!(
                     response.status().is_success(),
                     "已收到响应，但 HTTP 状态为 {}",
                     response.status()
                 );
-                Ok::<_, anyhow::Error>(format!(
+                if core_check.is_some() {
+                    if let Err(error) = received_http(&mut response).await {
+                        return Ok((format!("原链接 HTTP 响应未完成：{error:#}"), Some("http")));
+                    }
+                }
+                if verify_udp {
+                    let dns = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(1, 1, 1, 1), 53);
+                    let udp = tokio::time::timeout(Duration::from_secs(6), probe_udp_dns(port, dns)).await;
+                    let error = match udp {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(format!("UDP DNS 探测失败：{e:#}")),
+                        Err(_) => Some("UDP DNS 探测超时".to_owned()),
+                    };
+                    if let Some(error) = error {
+                        return Ok((format!("HTTP {}，{error}（{dns}）", response.status()), Some("udp")));
+                    }
+                    return Ok((format!("HTTP {}，UDP DNS {dns} 应答通过", response.status()), None));
+                }
+                Ok::<_, anyhow::Error>((format!(
                     "{} → 完整线路 → 探测目标，HTTP {}（不代表 UDP 已验证）",
                     if local {
                         "本机入口"
@@ -1034,11 +1108,11 @@ async fn probe_inner(
                         "实际入口"
                     },
                     response.status().as_u16()
-                ))
+                ), None))
             }
             .await;
             stop(&mut child).await;
-            result.map_err(|e| {
+            let (detail, incomplete) = result.map_err(|e| {
                 let log =
                     std::fs::read_to_string(temp.path().join("probe.log")).unwrap_or_default();
                 anyhow::anyhow!(
@@ -1051,7 +1125,11 @@ async fn probe_inner(
                         .rev()
                         .collect::<String>()
                 )
-            })?
+            })?;
+            if let Some(stage) = incomplete {
+                return Ok(json!({"ok":false,"stage":stage,"detail":crate::diagnostics::redact(&detail)}));
+            }
+            detail
         }
         _ => bail!("未知探测模式"),
     };
@@ -1063,6 +1141,45 @@ async fn probe_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CHAIN_TEST_XRAY and isolated loopback ports"]
+    async fn core_verification_uses_real_socks_udp_and_rejects_wrong_dns_answers() -> Result<()> {
+        let binary = PathBuf::from(std::env::var("CHAIN_TEST_XRAY")?);
+        let dir = tempfile::tempdir()?;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let config = dir.path().join("socks.json");
+        atomic_write(&config, &serde_json::to_vec(&json!({"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks",
+            "settings":{"auth":"noauth","udp":true}}],"outbounds":[{"protocol":"freedom"}]}))?)?;
+        let dns = UdpSocket::bind("127.0.0.1:0").await?;
+        let std::net::SocketAddr::V4(address) = dns.local_addr()? else { unreachable!() };
+        let mut child = Some(spawn_xray(&binary,&config,&dir.path().join("core.log"))?);
+        let server = tokio::spawn(async move {
+            for valid in [true, false] {
+                let mut buf = [0u8;512];
+                let (n, client) = dns.recv_from(&mut buf).await?;
+                ensure!(n == 17 && buf[12..n] == [0,0,2,0,1],"unexpected DNS question");
+                let mut reply = buf[..n].to_vec();
+                reply[2..4].copy_from_slice(&[0x81,0x80]);
+                reply[7]=1;
+                reply.extend([0xc0,0x0c,0,2,0,1,0,0,0,5,0,1,0]);
+                if !valid {reply[0] ^= 1;}
+                dns.send_to(&reply,client).await?;
+            }
+            Ok::<_,anyhow::Error>(())
+        });
+        let result = tokio::time::timeout(Duration::from_secs(12),async {
+            while TcpStream::connect(("127.0.0.1",port)).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            probe_udp_dns(port,address).await?;
+            ensure!(probe_udp_dns(port,address).await.is_err(),"错误 DNS 事务不能通过验收");
+            Ok::<_,anyhow::Error>(())
+        }).await;
+        server.abort(); let _ = server.await;
+        stop(&mut child).await;
+        result?
+    }
 
     #[tokio::test]
     #[ignore = "requires CHAIN_TEST_XRAY, CHAIN_MIHOMO_BIN and isolated loopback ports"]

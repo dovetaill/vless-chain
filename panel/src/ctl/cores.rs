@@ -297,7 +297,7 @@ pub fn status(manager: &Manager) -> Result<Value> {
         Value::Null
     };
     Ok(
-        json!({"supported":true,"versions":{"xray":m["xray"],"mihomo":m["mihomo"]},"recommended":serde_json::from_str::<Value>(include_str!("../core-versions.json"))?,"history":state["core_history"],"blocked":state["core_blocked"],"pending":pending}),
+        json!({"supported":true,"verification_failure_keeps_agent":true,"versions":{"xray":m["xray"],"mihomo":m["mihomo"]},"recommended":serde_json::from_str::<Value>(include_str!("../core-versions.json"))?,"history":state["core_history"],"blocked":state["core_blocked"],"pending":pending}),
     )
 }
 async fn block(
@@ -323,7 +323,8 @@ async fn block(
     )?;
     state["core_blocked"] = json!({"core":core,"task_id":id});
     save(manager, state)?;
-    manager.service("stop", "agent").await
+    manager.service("start", "agent").await?;
+    manager.healthy("agent".into()).await
 }
 fn save(manager: &Manager, state: &Value) -> Result<()> {
     atomic(
@@ -364,7 +365,7 @@ async fn recover(manager: &Manager, j: &Value) -> Result<String> {
             &env,
         )
         .await?;
-        "已停止本机代理；未确认安全回退版本，请安装安全内核"
+        "代理内核已隔离，Agent 保持管理和心跳；请安装安全内核"
     };
     fs::remove_file(manager.base.join(".core-pending.json"))?;
     Ok(detail.into())
@@ -819,6 +820,11 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
     ordinary(&journal)?;
     let _lock = manager.lock()?;
     if matches!(action, "core-confirm" | "core-reject") {
+        let receipt = directory.join(format!("{}.json", job["task_id"].as_str().unwrap()));
+        ordinary(&receipt)?;
+        let mut original: Value = serde_json::from_slice(&fs::read(&receipt)?)?;
+        ensure!(original["id"] == job["task_id"] && original["core"] == core
+            && matches!(original["action"].as_str(), Some("core-upgrade" | "core-rollback")), "原内核回执不匹配");
         let j: Value = serde_json::from_slice(&fs::read(&journal)?)?;
         ensure!(
             j["task_id"] == job["task_id"] && j["core"] == core,
@@ -839,9 +845,23 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
             "Agent 链接与状态不一致"
         );
         let env = serde_json::from_value(j["env"].clone())?;
-        let detail = if action == "core-reject" {
+        let verification_failed = action == "core-reject" && current == &j["target"]
+            && (original["state"] == "awaiting_verification" || original["verification_failed"] == true);
+        ensure!(job["keep_agent_on_failure"] != true || verification_failed, "原任务未处于连接验收阶段，请核对原任务");
+        let detail = if verification_failed {
+            // A rollback approved for an earlier upgrade cannot authorize undoing this one.
+            if let Some(history) = state["core_history"].as_object_mut() && history.remove(core).is_some() {
+                save(manager, &state)?;
+            }
+            original["verification_failed"] = json!(true);
+            "原链接验收未通过，Agent 和现有服务继续运行。可修复线路或提交新的内核升级。".into()
+        } else if action == "core-reject" {
+            ensure!(matches!(original["state"].as_str(), Some("failed" | "unknown"))
+                || (original["state"] == "awaiting_verification" && current == &j["before"]["current"] && j["rollback_allowed"] == true),
+                "原任务未处于中断恢复阶段");
             recover(manager, &j).await?
         } else {
+            ensure!(original["state"] == "awaiting_verification" || original["state"] == "succeeded", "原任务尚未完成切换");
             ensure!(
                 snapshot(&env, core)? == j["config_snapshot"],
                 "配置已变化，未确认旧检查结果"
@@ -850,12 +870,8 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
             state["core_history"][core] = json!({"release":j["before"]["current"],"version":j["previous_version"],"safe":j["rollback_allowed"]});
             state.as_object_mut().unwrap().remove("core_blocked");
             save(manager, &state)?;
-            fs::remove_file(&journal)?;
             "内核及实际连接已确认；原配置保持不变".into()
         };
-        let receipt = directory.join(format!("{}.json", job["task_id"].as_str().unwrap()));
-        ordinary(&receipt)?;
-        let mut original: Value = serde_json::from_slice(&fs::read(&receipt)?)?;
         original["state"] = json!(if action == "core-confirm" {
             "succeeded"
         } else {
@@ -863,6 +879,7 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         });
         original["detail"] = json!(detail);
         atomic(&receipt, &serde_json::to_vec(&original)?, 0o600)?;
+        if verification_failed || action == "core-confirm" { fs::remove_file(&journal)?; }
         return Ok(json!({"state":"succeeded","detail":detail}));
     }
     ensure!(!journal.exists(), "请先确认或恢复上次内核升级");
@@ -956,7 +973,7 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         anyhow::bail!("内核切换失败：{e:#}；{detail}");
     }
     Ok(
-        json!({"state":"awaiting_verification","core_version":meta["version"],"detail":"内核版本和配置预检通过；请用原链接验证实际传输，确认前不继续下一台"}),
+        json!({"state":"awaiting_verification","core_version":meta["version"],"detail":"内核已切换，等待验收目标版本、配置和原链接的实际传输"}),
     )
 }
 #[cfg(test)]
@@ -1048,6 +1065,30 @@ mod tests {
             assert_eq!(fs::read_link(m.base.join("current-agent")).unwrap(), std::path::PathBuf::from("releases/old"));
             assert!(!m.base.join(".core-pending.json").exists());
         }
+    }
+    #[tokio::test]
+    async fn failed_link_verification_closes_only_the_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let (m, env) = installed(root.path());
+        let original = uuid::Uuid::new_v4().to_string();
+        let record = root.path().join(format!("{original}.json"));
+        let journal = m.base.join(".core-pending.json");
+        let task = json!({"id":original,"action":"core-upgrade","core":"mihomo","state":"awaiting_verification","core_version":"1.19.34"});
+        fs::write(&record, serde_json::to_vec(&task).unwrap()).unwrap();
+        fs::write(&journal, serde_json::to_vec(&json!({"task_id":original,"core":"mihomo","target":"old","rollback_allowed":false,"env":env})).unwrap()).unwrap();
+        let mut expected = m.state().unwrap();
+        expected["core_history"] = json!({"mihomo":{"safe":true,"release":"obsolete"},"xray":{"safe":true,"release":"old"}});
+        save(&m,&expected).unwrap();
+        let reject = json!({"id":uuid::Uuid::new_v4().to_string(),"action":"core-reject","task_id":original,"core":"mihomo","keep_agent_on_failure":true});
+        assert_eq!(operate(&m, &reject, root.path()).await.unwrap()["state"], "succeeded");
+        let receipt: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert_eq!(receipt["state"], "failed");
+        assert_eq!(receipt["verification_failed"], true);
+        expected["core_history"].as_object_mut().unwrap().remove("mihomo");
+        assert_eq!(m.state().unwrap(), expected);
+        assert!(!journal.exists());
+        assert!(!Path::new(&env["CHAIN_AGENT_DIR"]).join(".core-upgrade-blocked").exists());
+        assert_eq!(fs::read_link(m.base.join("current-agent")).unwrap(), Path::new("releases/old"));
     }
     #[tokio::test]
     async fn recovery_restores_safe_binary_but_never_changed_customer_config() {

@@ -1,6 +1,6 @@
 #[path = "../agent_sync.rs"]
 mod agent_sync;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use chain_panel::{model::*, runtime::*};
 use std::os::unix::fs::PermissionsExt;
 use std::{path::PathBuf, time::Duration};
@@ -17,7 +17,9 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let dir =
         PathBuf::from(std::env::var("CHAIN_AGENT_DIR").unwrap_or_else(|_| "agent-data".into()));
-    ensure!(!dir.join(".core-upgrade-blocked").exists(), "安全更新失败后代理已停用，请通过维护入口安装安全内核；未启动代理");
+    // The installer changes this marker only while the Agent is stopped.
+    let blocked = dir.join(".core-upgrade-blocked").symlink_metadata().map(|_| true)
+        .unwrap_or_else(|e| e.kind() != std::io::ErrorKind::NotFound);
     private_dir(&dir, "chain-agent")?;
     let _lock = lock_dir(&dir)?;
     let panel = std::env::var("CHAIN_PANEL_URL").context("缺少 CHAIN_PANEL_URL")?;
@@ -92,6 +94,8 @@ async fn run() -> Result<()> {
                         if let Some(id) = value["id"].as_str() {
                             let task = &value["request"];
                             let result = match task["operation"].as_str() {
+                                Some("path" | "reality" | "reality-preflight") if blocked =>
+                                    Err(anyhow::anyhow!("代理内核已隔离，请通过维护入口修复")),
                                 Some("logs") => {
                                     match serde_json::from_value::<chain_panel::diagnostics::LogRequest>(task["request"].clone()) {
                                         Ok(request) if request.source != "panel" => {
@@ -162,11 +166,11 @@ async fn run() -> Result<()> {
         if runtime.active.is_some() && !runtime.running() {
             report.running = false;
             report.applied = false;
-            report.error =
-                "代理内核或网关异常退出；Agent 将退出，由服务管理器恢复最后已应用配置".into();
+            report.error = "代理内核或网关异常退出，Agent 将重试最近应用的配置".into();
             runtime.close().await;
+            runtime.active = None;
+            restore_at = Some(tokio::time::Instant::now() + Duration::from_secs(5));
             let _ = tokio::time::timeout(Duration::from_secs(2), sync.report(&mut report)).await;
-            bail!("{}", report.error);
         }
         let step = async {
             report.running = runtime.running();
@@ -198,6 +202,13 @@ async fn run() -> Result<()> {
                 if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     report.system["certificate"] = status;
                 }
+            }
+            if blocked {
+                report.applied = false;
+                report.running = false;
+                report.error = "代理内核已隔离，Agent 在线，请通过维护入口安装安全内核".into();
+                sync.report(&mut report).await?;
+                return Ok(());
             }
             let saved = if restore_at.is_some_and(|at| at <= tokio::time::Instant::now()) {
                 restore_at = None;
