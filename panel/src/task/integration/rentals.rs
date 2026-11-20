@@ -271,6 +271,7 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     h.remember(other.local_addr()?.port())?;
     let (control, relay) = socks(main, udp.local_addr()?.port(), 3, None).await?;
     h.remember(relay.port())?;
+    rejected(&other, &packet, relay).await?;
     let transfer = async || -> Result<()> {
         udp.send_to(&packet, relay).await?;
         let mut response = [0; 1024];

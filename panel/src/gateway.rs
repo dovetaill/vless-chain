@@ -1230,6 +1230,7 @@ async fn copy_tcp<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite +
 struct SocksUdp {
     public: UdpSocket,
     backend: UdpSocket,
+    client_port: u16,
 }
 async fn socks_handshake<A: AsyncRead + AsyncWrite + Unpin>(
     client: &mut A,
@@ -1279,12 +1280,21 @@ async fn socks_handshake<A: AsyncRead + AsyncWrite + Unpin>(
         client.flush().await?;
         return Err(io::ErrorKind::WouldBlock.into());
     }
-    backend.write_all(&req).await?;
-    backend.write_all(&address).await?;
+    let udp_backend = if req[..3] == [5, 3, 0] {
+        // Xray validates the source port of the loopback socket that sends the datagrams.
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).await?;
+        backend.write_all(&[5, 3, 0, 1, 127, 0, 0, 1]).await?;
+        backend.write_all(&socket.local_addr()?.port().to_be_bytes()).await?;
+        Some(socket)
+    } else {
+        backend.write_all(&req).await?;
+        backend.write_all(&address).await?;
+        None
+    };
     let mut reply = [0u8; 4];
     backend.read_exact(&mut reply).await?;
     let addr = read_socks_address(backend, reply[3]).await?;
-    if req[1] == 3 && reply[1] == 0 {
+    if let Some(udp_backend) = udp_backend.filter(|_| reply[1] == 0) {
         let port = u16::from_be_bytes(addr[addr.len() - 2..].try_into().unwrap());
         if port == 0 {
             return Err(io::ErrorKind::InvalidData.into());
@@ -1296,7 +1306,6 @@ async fn socks_handshake<A: AsyncRead + AsyncWrite + Unpin>(
             bind = ([0, 0, 0, 0], 0).into();
         }
         let public = UdpSocket::bind(bind).await?;
-        let udp_backend = UdpSocket::bind(("127.0.0.1", 0)).await?;
         udp_backend.connect(("127.0.0.1", port)).await?;
         match bind.ip() {
             std::net::IpAddr::V4(ip) => {
@@ -1314,6 +1323,7 @@ async fn socks_handshake<A: AsyncRead + AsyncWrite + Unpin>(
         Ok(Some(SocksUdp {
             public,
             backend: udp_backend,
+            client_port: u16::from_be_bytes(address[address.len() - 2..].try_into().unwrap()),
         }))
     } else {
         client.write_all(&reply).await?;
@@ -1357,7 +1367,9 @@ async fn socks_udp<A: AsyncRead + Unpin>(
                 _ = backend.read(&mut backend_control) => return Ok(()),
                 received = relay.public.recv_from(&mut input) => {
                     let (n, address) = received?;
-                    if address.ip().to_canonical() != peer.to_canonical() || source.is_some_and(|p| p != address)
+                    if address.ip().to_canonical() != peer.to_canonical()
+                        || (relay.client_port != 0 && address.port() != relay.client_port)
+                        || source.is_some_and(|p| p != address)
                         || crate::meter::payload_size(&input[..n]).is_err() { continue }
                     source = Some(address);
                     activity.mark_progress();

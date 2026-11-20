@@ -355,7 +355,7 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
                 == before["total_download"].as_u64().unwrap() + delivered / 2,
         "定期刷盘后 SIGKILL 丢失已确认载荷计量：before={before} durable={saved} confirmed={delivered}"
     );
-    let mut results = json!({"agent_sigkill_accounting":{"sigterm_immediate_flush_bytes":term_delivered,"client_confirmed_payload_bytes":delivered,"expected_lifetime_bytes":total(&before)+delivered,"last_durable_lifetime_bytes":total(&saved),"lost_bytes":0,"durable_source":"traffic.db WAL synchronous=NORMAL periodic+shutdown flush","scope":"SIGTERM immediate flush + periodic WAL flush before SIGKILL"}});
+    let mut results = json!({"agent_sigkill_accounting":{"sigterm_immediate_flush_bytes":term_delivered,"client_confirmed_payload_bytes":delivered,"expected_lifetime_bytes":total(&before)+delivered,"last_durable_lifetime_bytes":total(&saved),"lost_bytes":0,"durable_source":"traffic.db WAL synchronous=FULL periodic+shutdown flush","scope":"SIGTERM immediate flush + periodic WAL flush before SIGKILL"}});
     agent = restart_agent(&h, &agent_env, main, 1).await?;
     let restored = metered(&h, main, total(&saved)).await?;
     ensure!(restored["epoch"] == saved["epoch"], "恢复改变计量 epoch");
@@ -446,7 +446,7 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     drop((c, s));
     operate(&h, &[cycling.clone()], "enable", json!({})).await?;
     h.synced(&[cycling.clone()]).await?;
-    results["core_sigkill"] = json!({"agent_failed_for_supervisor":true,"supervisor_restart_delay_seconds":5,"active_revision_preserved":true,"rights_preserved":true});
+    results["core_sigkill"] = json!({"agent_failed_for_supervisor":false,"agent_recovered_core":true,"active_revision_preserved":true,"rights_preserved":true});
     let request = json!({"line_ids":[main["id"]],"term":"quarterly","amounts":{main["id"].as_str().unwrap():3000},"request_id":"persisted-renewal","note":"SIGKILL后重试同一收款"});
     let payment = h
         .request("/api/rentals/renew", "POST", Some(&request), 200)
@@ -678,7 +678,7 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     h.close().await?;
     println!("RESULT {}", serde_json::to_string(&results)?);
     println!(
-        "PASS Agent/核心/面板 SIGKILL、零已确认载荷计量丢失、并发收款幂等、离线跨周期与租期断开"
+        "PASS Agent/核心/面板 SIGKILL、已刷盘载荷计量恢复、并发收款幂等、离线跨周期与租期断开"
     );
     Ok(())
 }
@@ -787,7 +787,7 @@ fn install_boundaries(
     for l in [cycling, exhausted] {
         let id = l["id"].as_str().unwrap();
         let value = &mut book[id];
-        value.as_object_mut().unwrap().extend(json!({"cycle_start":previous.timestamp(),"cycle_end":boundary,"upload":64,"download":0,"total_upload":64,"total_download":0,"upload_bps":0,"download_bps":0,"connections":0,"days":{previous.format("%Y-%m-%d").to_string():[64,0]}}).as_object().unwrap().clone());
+        value.as_object_mut().unwrap().extend(json!({"cycle_start":previous.timestamp(),"cycle_end":boundary,"charged":64,"upload":64,"download":0,"total_upload":64,"total_download":0,"upload_bps":0,"download_bps":0,"connections":0,"days":{previous.format("%Y-%m-%d").to_string():[64,0]}}).as_object().unwrap().clone());
         ledger.execute("INSERT INTO traffic(line_id,body) VALUES(?1,?2) ON CONFLICT(line_id) DO UPDATE SET body=excluded.body",rusqlite::params![id,serde_json::to_string(value)?])?;
     }
     fs::write(path, serde_json::to_vec(&book)?)?;
