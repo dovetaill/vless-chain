@@ -44,6 +44,12 @@ struct Store {
     conn: Connection,
     doc: Document,
 }
+fn open_panel_database(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY,body TEXT NOT NULL);")?;
+    install_state_write_guard(&conn)?;
+    Ok(conn)
+}
 impl Store {
     fn save(&self) -> Result<()> {
         self.conn.execute("INSERT INTO state(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body",[serde_json::to_string(&self.doc)?])?;
@@ -55,17 +61,33 @@ const PROTECTED_STATE_FIELDS: [&str; 7] = [
     "customer_query_tokens", "operator_members", "operator_audit",
 ];
 fn install_state_write_guard(conn: &Connection) -> Result<()> {
-    let keys = PROTECTED_STATE_FIELDS.map(|key| format!("'{key}'")).join(",");
+    let any_present = |expr: &str| {
+        PROTECTED_STATE_FIELDS
+            .map(|key| format!("json_type({expr}, '$.{key}') IS NOT NULL"))
+            .join(" OR ")
+    };
+    let any_missing = PROTECTED_STATE_FIELDS
+        .map(|key| format!("json_type(NEW.body, '$.{key}') IS NULL"))
+        .join(" OR ");
     // Persist the boundary in SQLite so a previous binary cannot silently discard new fields.
-    for (name, event, previous) in [
-        ("insert", "INSERT", "(SELECT body FROM state WHERE id=NEW.id)"),
-        ("update", "UPDATE OF body", "OLD.body"),
+    for (name, event, has_previous) in [
+        (
+            "insert",
+            "INSERT",
+            format!("COALESCE((SELECT ({}) FROM state WHERE id=NEW.id), 0)", any_present("body")),
+        ),
+        (
+            "update",
+            "UPDATE OF body",
+            format!("({})", any_present("OLD.body")),
+        ),
     ] {
         conn.execute_batch(&format!(
-            "CREATE TRIGGER IF NOT EXISTS state_preserve_operations_{name}
+            "DROP TRIGGER IF EXISTS state_preserve_operations_{name};
+             CREATE TRIGGER state_preserve_operations_{name}
              BEFORE {event} ON state
-             WHEN EXISTS (SELECT 1 FROM json_each({previous}) WHERE key IN ({keys}))
-              AND (SELECT count(DISTINCT key) FROM json_each(NEW.body) WHERE key IN ({keys})) != 7
+             WHEN {has_previous}
+              AND ({any_missing})
              BEGIN SELECT RAISE(ABORT, '数据库含新版业务字段，拒绝旧程序覆盖；请恢复兼容版本，勿回退数据库'); END;"
         ))?;
     }
@@ -1377,6 +1399,21 @@ fn reporting_node(doc: &Document, id: &str, headers: &HeaderMap) -> ApiResult<us
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "节点身份无效"))
 }
 
+fn durable_traffic_changed(old: &BTreeMap<String, Traffic>, new: &BTreeMap<String, Traffic>) -> bool {
+    old.len() != new.len()
+        || new.iter().any(|(k, b)| {
+            old.get(k).is_none_or(|a| {
+                a.total_upload != b.total_upload
+                    || a.total_download != b.total_download
+                    || a.charged != b.charged
+                    || a.cycle_start != b.cycle_start
+                    || a.cycle_end != b.cycle_end
+                    || a.blocked != b.blocked
+                    || a.epoch != b.epoch
+            })
+        })
+}
+
 async fn traffic_page(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -1393,11 +1430,18 @@ async fn traffic_page(
         .receive(page)
         .map_err(|e| error(StatusCode::CONFLICT, &e.to_string()))?;
     if let Some(rows) = rows {
+        let changed = durable_traffic_changed(&s.doc.nodes[node].report.traffic, &rows);
         let old = std::mem::replace(&mut s.doc.nodes[node].report.traffic, rows);
-        if let Err(e) = s.save() {
-            s.doc.nodes[node].report.traffic = old;
-            upload.discard();
-            return Err(error(StatusCode::SERVICE_UNAVAILABLE, &format!("保存流量快照失败: {e}")));
+        if !upload.first_persisted {
+            if let Err(e) = s.save() {
+                s.doc.nodes[node].report.traffic = old;
+                upload.discard();
+                return Err(error(StatusCode::SERVICE_UNAVAILABLE, &format!("保存流量快照失败: {e}")));
+            }
+            upload.first_persisted = true;
+            upload.dirty = false;
+        } else if changed {
+            upload.dirty = true;
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1639,6 +1683,13 @@ mod web_tests {
     }
 
     #[test]
+    fn business_storage_syncs_the_wal_at_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_panel_database(&dir.path().join("panel.db")).unwrap();
+        assert_eq!(conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
+    }
+    #[test]
     fn state_write_guard_preserves_new_data_against_previous_writers() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)").unwrap();
@@ -1813,9 +1864,7 @@ async fn run() -> Result<()> {
     }
     let token = std::fs::read_to_string(&token_file)?;
     ensure!(token.trim().len() >= 32, "管理令牌至少需要 32 个字符");
-    let conn = Connection::open(dir.join("panel.db"))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY,body TEXT NOT NULL);")?;
-    install_state_write_guard(&conn)?;
+    let conn = open_panel_database(&dir.join("panel.db"))?;
     let mut doc: Document = match conn.query_row("SELECT body FROM state WHERE id=1", [], |r| {
         r.get::<_, String>(0)
     }) {
@@ -1959,9 +2008,14 @@ async fn run() -> Result<()> {
     let monitor_task = tokio::spawn(monitor_api::run(app.clone(), monitor_stop.clone()));
     let local_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut ticks = 0u64;
         loop {
             interval.tick().await;
+            ticks = ticks.wrapping_add(1);
             local_app.traffic_uploads.lock().unwrap().values_mut().for_each(Incoming::expire);
+            if ticks % 6 == 0 {
+                flush_traffic_if_dirty(&local_app);
+            }
             let _ = chain_panel::diagnostics::maintain(local_app.token_file.parent().unwrap());
             if let Err(error) = local_app
                 .local_agent
@@ -1999,6 +2053,24 @@ async fn run() -> Result<()> {
     let _ = monitor_task.await;
     let _ = rules_task.await;
     app.local_agent.lock().await.stop().await;
+    flush_traffic_if_dirty(&app);
+    let _ = app.store.lock().unwrap().conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     result?;
     Ok(())
+}
+
+fn flush_traffic_if_dirty(app: &App) {
+    if !app.traffic_uploads.lock().unwrap().values().any(|u| u.dirty) {
+        return;
+    }
+    let s = app.store.lock().unwrap();
+    let mut uploads = app.traffic_uploads.lock().unwrap();
+    if !uploads.values().any(|u| u.dirty) {
+        return;
+    }
+    if let Err(e) = s.save() {
+        eprintln!("定期保存流量快照失败: {e}");
+    } else {
+        uploads.values_mut().for_each(|u| u.dirty = false);
+    }
 }

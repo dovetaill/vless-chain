@@ -789,9 +789,9 @@ impl ManagedXray {
         self.active = Some(desired.clone());
         Ok(())
     }
-    pub async fn close(&mut self) {
+    pub async fn close(&mut self) -> Result<()> {
         self.stop_all().await;
-        let _ = self.traffic.save();
+        self.traffic.finish()
     }
     async fn stop_all(&mut self) {
         if let Some(mut gateway) = self.gateway.take() {
@@ -1217,7 +1217,7 @@ mod tests {
             Ok(())
         }
         greeting(address).await?;
-        runtime.close().await;
+        runtime.close().await?;
         drop(runtime);
         std::fs::remove_file(dir.path().join("logging-disabled"))?;
         std::fs::write(
@@ -1226,7 +1226,7 @@ mod tests {
         )?;
         let mut restored = ManagedXray::open(binary, dir.path().into()).await?;
         greeting(address).await?;
-        restored.close().await;
+        restored.close().await?;
         Ok(())
     }
     #[tokio::test]
@@ -1361,7 +1361,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        runtime.close().await;
+        runtime.close().await?;
         let reopened = if result.is_ok() {
             Some(ManagedXray::open(binary, dir.path().into()).await)
         } else {
@@ -1370,7 +1370,7 @@ mod tests {
         let restart_result = match reopened {
             Some(Ok(mut runtime)) => {
                 let running = runtime.running();
-                runtime.close().await;
+                runtime.close().await?;
                 ensure!(running, "重启未恢复迁移配置");
                 Ok(())
             }

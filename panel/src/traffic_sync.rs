@@ -69,6 +69,8 @@ pub fn pages(session: Uuid, sequence: u64, rows: Rows) -> impl Iterator<Item = R
 
 pub struct Incoming {
     pub session: Uuid,
+    pub dirty: bool,
+    pub first_persisted: bool,
     sequence: u64,
     next: u32,
     complete: bool,
@@ -81,6 +83,8 @@ impl Incoming {
     pub fn new(session: Uuid) -> Self {
         Self {
             session,
+            dirty: false,
+            first_persisted: false,
             sequence: 0,
             next: 0,
             complete: false,

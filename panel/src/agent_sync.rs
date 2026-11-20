@@ -99,41 +99,100 @@ impl Sync {
     }
 
     pub async fn statistics(self: Arc<Self>) {
+        type StateFp = std::collections::BTreeMap<String, (u64, u64, bool, String)>;
+        type FullFp =
+            std::collections::BTreeMap<String, (u64, u64, Option<u64>, u64, u64, bool, u64, String)>;
         let mut sequence = 0;
+        let mut last_saved_fp: Option<FullFp> = None;
+        let mut last_saved_state: Option<StateFp> = None;
+        let mut last_saved_at: Option<Instant> = None;
+        let mut last_acked_fp: Option<FullFp> = None;
+        let mut last_acked_had_rate = false;
+        let mut last_acked_at: Option<Instant> = None;
         loop {
             let paged = self.paged.load(Ordering::Acquire);
-            let book = self.book.clone();
+            if !paged {
+                last_acked_fp = None;
+                last_acked_at = None;
+            }
             let result = async {
-                let (saved, rows) = tokio::task::spawn_blocking(move || {
-                    (book.save(), paged.then(|| book.snapshot()))
-                })
-                .await?;
-                if let Some(rows) = rows {
-                    sequence += 1;
-                    for page in pages(self.session, sequence, rows) {
-                        let page = page?;
-                        let send = || self.post("traffic").json(&page).send();
-                        let response = match send().await {
-                            Ok(response) if !response.status().is_server_error() => response,
-                            _ => send().await?,
-                        };
-                        let status = response.status();
-                        if status != StatusCode::NO_CONTENT {
-                            let message = response
-                                .json::<serde_json::Value>()
-                                .await
-                                .ok()
-                                .and_then(|v| {
-                                    v["error"]
-                                        .as_str()
-                                        .map(|s| s.chars().take(256).collect::<String>())
-                                })
-                                .unwrap_or_default();
-                            bail!(
-                                "流量快照第 {} 页未确认，HTTP {status} {message}",
-                                page.part + 1
-                            );
+                let rows = self.book.snapshot();
+                let state_fp: StateFp = rows
+                    .iter()
+                    .map(|(k, v)| (k.clone(), (v.cycle_start, v.cycle_end, v.blocked, v.epoch.clone())))
+                    .collect();
+                let full_fp: FullFp = rows
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            (
+                                v.total_upload,
+                                v.total_download,
+                                v.charged,
+                                v.cycle_start,
+                                v.cycle_end,
+                                v.blocked,
+                                v.connections,
+                                v.epoch.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+                let state_changed = last_saved_state.as_ref() != Some(&state_fp);
+                let save_due = last_saved_fp.as_ref() != Some(&full_fp)
+                    && (state_changed
+                        || last_saved_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)));
+                let saved = if save_due {
+                    let book = self.book.clone();
+                    let res = tokio::task::spawn_blocking(move || book.save()).await?;
+                    if res.is_ok() {
+                        last_saved_fp = Some(full_fp.clone());
+                        last_saved_state = Some(state_fp);
+                        last_saved_at = Some(Instant::now());
+                    }
+                    res
+                } else {
+                    self.book.check_ledger()
+                };
+                if paged {
+                    let has_rate = rows
+                        .values()
+                        .any(|v| v.upload_bps > 0.0 || v.download_bps > 0.0);
+                    let upload_due = last_acked_fp.as_ref() != Some(&full_fp)
+                        || has_rate
+                        || last_acked_had_rate
+                        || last_acked_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(15));
+                    if upload_due {
+                        sequence += 1;
+                        for page in pages(self.session, sequence, rows) {
+                            let page = page?;
+                            let send = || self.post("traffic").json(&page).send();
+                            let response = match send().await {
+                                Ok(response) if !response.status().is_server_error() => response,
+                                _ => send().await?,
+                            };
+                            let status = response.status();
+                            if status != StatusCode::NO_CONTENT {
+                                let message = response
+                                    .json::<serde_json::Value>()
+                                    .await
+                                    .ok()
+                                    .and_then(|v| {
+                                        v["error"]
+                                            .as_str()
+                                            .map(|s| s.chars().take(256).collect::<String>())
+                                    })
+                                    .unwrap_or_default();
+                                bail!(
+                                    "流量快照第 {} 页未确认，HTTP {status} {message}",
+                                    page.part + 1
+                                );
+                            }
                         }
+                        last_acked_fp = Some(full_fp);
+                        last_acked_had_rate = has_rate;
+                        last_acked_at = Some(Instant::now());
                     }
                 }
                 saved

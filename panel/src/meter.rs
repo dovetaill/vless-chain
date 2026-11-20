@@ -1,11 +1,11 @@
 //! Authenticated, per-line SOCKS bridge between the ingress core and its existing egress route.
-use crate::gateway::{Lane, relay};
+use crate::gateway::{Lane, TcpActivity, relay_tcp};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -41,7 +41,7 @@ pub async fn serve(
                 Some(_) = children.join_next(), if !children.is_empty() => {},
                 (stream, _) = listener.accept() => {
                     if children.len() >= lane.transport_limit() || !lane.available() { continue }
-                    let Ok(slot) = lane.book.proxy_capacity.meter.clone().try_acquire_owned() else { continue };
+                    let Some(slot) = lane.book.proxy_capacity.acquire_meter(&lane.id) else { continue };
                     let (spec, user, lane) = (spec.clone(), user.clone(), lane.clone());
                     children.spawn(async move {
                         let _slot = slot;
@@ -198,6 +198,27 @@ pub(crate) fn payload_size(packet: &[u8]) -> io::Result<usize> {
         .ok_or_else(|| io::ErrorKind::InvalidData.into())
 }
 
+const MAX_UDP_BATCH_PACKETS: usize = 32;
+const MAX_UDP_BATCH_BYTES: usize = 65536;
+const UDP_BATCH_HEADROOM: usize = 131_072;
+
+async fn encode_uplink_datagram(
+    raw: &[u8],
+    policy: &crate::rules::CompiledPolicy,
+) -> Option<(usize, Vec<u8>)> {
+    let size = payload_size(raw).ok()?;
+    let address_end = raw.len() - size;
+    let (kind, destination) = policy
+        .destination(raw[3], &raw[4..address_end], true)
+        .await
+        .ok()?;
+    let mut packet = Vec::with_capacity(4 + destination.len() + size);
+    packet.extend_from_slice(&[0, 0, 0, kind]);
+    packet.extend_from_slice(&destination);
+    packet.extend_from_slice(&raw[address_end..]);
+    Some((size, packet))
+}
+
 async fn connection(mut client: TcpStream, spec: &Spec, user: &str, lane: Arc<Lane>) -> Result<()> {
     client.set_nodelay(true)?;
     let _admission = lane.admit()?;
@@ -205,44 +226,147 @@ async fn connection(mut client: TcpStream, spec: &Spec, user: &str, lane: Arc<La
     let session =
         tokio::time::timeout(Duration::from_secs(15), handshake(&mut client, spec, user, &policy)).await??;
     match session {
-        Session::Tcp(backend) => relay(client, backend, lane).await?,
+        Session::Tcp(backend) => relay_tcp(client, backend, lane).await?,
         Session::Udp {
             mut control,
             socket,
             backend,
         } => {
             let _connection = lane.connection();
-            let mut peer = None;
-            let mut input = vec![0; 65536];
-            let mut output = vec![0; 65536];
+            let socket = Arc::new(socket);
+            let backend = Arc::new(backend);
+            let peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+            let activity = TcpActivity::new();
             let mut client_control = [0];
             let mut backend_control = [0];
-            loop {
-                tokio::select! {
-                    _ = client.read(&mut client_control) => break,
-                    _ = control.read(&mut backend_control) => break,
-                    received = socket.recv_from(&mut input) => {
-                        let (n, source) = received?;
-                        if !source.ip().is_loopback() || peer.is_some_and(|p| p != source) { continue }
-                        let Ok(size) = payload_size(&input[..n]) else { continue };
-                        let address_end=n-size;
-                        let Ok((kind,destination))=policy.destination(input[3],&input[4..address_end],true).await else {continue};
-                        let mut packet=vec![0,0,0,kind];
-                        packet.extend(destination);packet.extend_from_slice(&input[address_end..n]);
-                        peer = Some(source);
-                        let transfer = lane.transfer(size, true, true).await?;
-                        backend.send(&packet).await?;
-                        drop(transfer);
-                    },
-                    received = backend.recv(&mut output) => {
-                        let n = received?;
-                        let Some(peer) = peer else { continue };
-                        let Ok(size) = payload_size(&output[..n]) else { continue };
-                        let transfer = lane.transfer(size, false, true).await?;
-                        socket.send_to(&output[..n], peer).await?;
-                        drop(transfer);
-                    },
+
+            let uplink = {
+                let socket = socket.clone();
+                let backend = backend.clone();
+                let peer = peer.clone();
+                let lane = lane.clone();
+                let activity = &activity;
+                let policy = &policy;
+                async move {
+                    let mut input = vec![0u8; 65536];
+                    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_UDP_BATCH_PACKETS);
+                    loop {
+                        let (n, source) = socket.recv_from(&mut input).await?;
+                        if !source.ip().is_loopback() {
+                            continue;
+                        }
+                        {
+                            let mut locked = peer.lock().unwrap();
+                            if locked.is_some_and(|p| p != source) {
+                                continue;
+                            }
+                            *locked = Some(source);
+                        }
+                        let Some((mut total_size, first_packet)) =
+                            encode_uplink_datagram(&input[..n], policy).await
+                        else {
+                            continue;
+                        };
+                        if lane.has_headroom(UDP_BATCH_HEADROOM) {
+                            batch.clear();
+                            batch.push(first_packet);
+                            while batch.len() < MAX_UDP_BATCH_PACKETS
+                                && total_size < MAX_UDP_BATCH_BYTES
+                            {
+                                let Ok((m, next_source)) = socket.try_recv_from(&mut input) else {
+                                    break;
+                                };
+                                if next_source != source {
+                                    continue;
+                                }
+                                if let Some((sz, pkt)) =
+                                    encode_uplink_datagram(&input[..m], policy).await
+                                {
+                                    total_size += sz;
+                                    batch.push(pkt);
+                                }
+                            }
+                            let transfer = lane
+                                .transfer_active(total_size, true, true, Some(activity))
+                                .await?;
+                            activity.mark_progress();
+                            for pkt in &batch {
+                                backend.send(pkt).await?;
+                            }
+                            drop(transfer);
+                        } else {
+                            let transfer = lane
+                                .transfer_active(total_size, true, true, Some(activity))
+                                .await?;
+                            activity.mark_progress();
+                            backend.send(&first_packet).await?;
+                            drop(transfer);
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), io::Error>(())
                 }
+            };
+
+            let downlink = {
+                let socket = socket.clone();
+                let backend = backend.clone();
+                let peer = peer.clone();
+                let lane = lane.clone();
+                let activity = &activity;
+                async move {
+                    let mut output = vec![0u8; 65536];
+                    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_UDP_BATCH_PACKETS);
+                    loop {
+                        let n = backend.recv(&mut output).await?;
+                        let Some(target_peer) = *peer.lock().unwrap() else {
+                            continue;
+                        };
+                        let Ok(mut total_size) = payload_size(&output[..n]) else {
+                            continue;
+                        };
+                        if lane.has_headroom(UDP_BATCH_HEADROOM) {
+                            batch.clear();
+                            batch.push(output[..n].to_vec());
+                            while batch.len() < MAX_UDP_BATCH_PACKETS
+                                && total_size < MAX_UDP_BATCH_BYTES
+                            {
+                                let Ok(m) = backend.try_recv(&mut output) else {
+                                    break;
+                                };
+                                if let Ok(sz) = payload_size(&output[..m]) {
+                                    total_size += sz;
+                                    batch.push(output[..m].to_vec());
+                                }
+                            }
+                            let transfer = lane
+                                .transfer_active(total_size, false, true, Some(activity))
+                                .await?;
+                            activity.mark_progress();
+                            for pkt in &batch {
+                                socket.send_to(pkt, target_peer).await?;
+                            }
+                            drop(transfer);
+                        } else {
+                            let transfer = lane
+                                .transfer_active(total_size, false, true, Some(activity))
+                                .await?;
+                            activity.mark_progress();
+                            socket.send_to(&output[..n], target_peer).await?;
+                            drop(transfer);
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), io::Error>(())
+                }
+            };
+
+            tokio::select! {
+                biased;
+                _ = client.read(&mut client_control) => {}
+                _ = control.read(&mut backend_control) => {}
+                result = async { tokio::try_join!(uplink, downlink) } => { result?; }
+                result = activity.idle() => { result?; }
             }
         }
     }

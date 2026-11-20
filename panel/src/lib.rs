@@ -5,6 +5,7 @@ pub mod task;
 pub mod compiler;
 pub mod external;
 pub mod gateway;
+mod quota;
 pub mod traffic_sync;
 pub mod legacy;
 pub mod legacy_config;

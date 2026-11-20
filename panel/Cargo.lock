@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "chain-panel"
-version = "0.2.78"
+version = "0.2.79"
 dependencies = [
  "anyhow",
  "axum",
@@ -309,6 +309,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "socket2",
  "subtle",
  "tar",
  "tempfile",

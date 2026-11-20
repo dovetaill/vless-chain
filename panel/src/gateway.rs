@@ -11,23 +11,30 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc as std_mpsc,
     },
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tokio_util::io::{InspectReader, InspectWriter};
 
-mod capacity;
+pub mod capacity;
 use capacity::ProxyCapacity;
 
 const TCP_IDLE: Duration = Duration::from_secs(300);
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const PACE_COALESCE: Duration = Duration::from_millis(2);
+const PACE_IDLE_RESET: Duration = Duration::from_millis(20);
+const INITIAL_TCP_BUF: usize = 8192;
+const MAX_TCP_BUF: usize = 65536;
+const GATEWAY_COPY_BUF: usize = 32768;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Spec {
@@ -92,155 +99,150 @@ async fn proxy_peer(stream: &mut TcpStream) -> Result<std::net::IpAddr> {
 pub struct Book {
     pub resources: RwLock<Option<Arc<crate::resources::Client>>>,
     pub listener_errors: Mutex<BTreeMap<String, String>>,
-    pub(crate) proxy_capacity: ProxyCapacity,
+    pub proxy_capacity: ProxyCapacity,
     path: PathBuf,
+    quota: Arc<crate::quota::Journal>,
     ledger: Arc<Mutex<Ledger>>,
     sample: Mutex<(Instant, BTreeMap<String, [u64; 2]>)>,
     snapshot_write: Mutex<()>,
-    commits: Option<mpsc::Sender<LedgerWrite>>,
+    flusher: Option<std_mpsc::Sender<FlushRequest>>,
     writer: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Default)]
 struct Ledger {
     items: BTreeMap<String, Traffic>,
-    // The durable row and number of queued writes exist only while a line has reservations.
-    pending: BTreeMap<String, (Traffic, usize)>,
+    dirty: BTreeMap<String, u64>,
+    seq: u64,
+    day_cache: Option<(i64, String, String)>,
     error: Option<String>,
-    checking: bool,
-}
-
-fn with_live_state(mut counters: Traffic, live: &Traffic) -> Traffic {
-    counters.connections = live.connections;
-    counters.blocked = live.blocked;
-    counters.upload_bps = live.upload_bps;
-    counters.download_bps = live.download_bps;
-    counters.sampled_at = live.sampled_at;
-    counters
 }
 
 impl Ledger {
-    fn confirmed(&self) -> BTreeMap<String, Traffic> {
-        let mut rows = self.items.clone();
-        for (id, (durable, _)) in &self.pending {
-            rows.insert(
-                id.clone(),
-                with_live_state(durable.clone(), &self.items[id]),
-            );
+    fn billing_row(&mut self, id: &str, lease: Option<&LeasePolicy>, at: u64, month: &str,
+        quota: &crate::quota::Journal) -> (&mut Traffic, bool) {
+        let row = self.items.get_mut(id).unwrap();
+        let rolled = rollover(row, lease, at, month);
+        let floor = if rolled { quota.ceiling(id, row.cycle_start) } else { quota.recovered(id, row.cycle_start) };
+        let recovered = floor > row.used();
+        if recovered {
+            row.charged = Some(floor);
         }
-        rows
+        (row, rolled || recovered)
+    }
+
+    fn day_labels(&mut self, at: u64) -> (String, String) {
+        let utc8_secs = (at as i64).saturating_add(8 * 3600);
+        let bucket = utc8_secs.div_euclid(86400);
+        if let Some((cached, day, month)) = &self.day_cache {
+            if *cached == bucket {
+                return (day.clone(), month.clone());
+            }
+        }
+        let local = Utc
+            .timestamp_opt(at as i64, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
+        let day = local.format("%Y-%m-%d").to_string();
+        let month = local.format("%Y-%m").to_string();
+        self.day_cache = Some((bucket, day.clone(), month.clone()));
+        (day, month)
+    }
+
+    fn mark_dirty(&mut self, id: &str) {
+        self.seq = self.seq.wrapping_add(1);
+        self.dirty.insert(id.to_owned(), self.seq);
+    }
+
+    fn confirmed(&self) -> BTreeMap<String, Traffic> {
+        self.items.clone()
     }
 }
 
-enum LedgerWrite {
-    Usage(Commit),
-    Recover,
+enum FlushRequest {
+    Notify,
+    Sync(std_mpsc::SyncSender<io::Result<()>>),
 }
-struct Commit {
-    id: String,
-    row: Traffic,
-    done: oneshot::Sender<io::Result<()>>,
-}
+
 const WRITE_USAGE: &str = "INSERT INTO traffic(line_id,body) VALUES(?1,?2) ON CONFLICT(line_id) DO UPDATE SET body=excluded.body";
 
-fn recover_ledger(
+fn flush_ledger_rows(
     database: &mut Database,
-    failed: &BTreeMap<String, Traffic>,
-) -> Result<BTreeMap<String, Traffic>> {
-    use rusqlite::OptionalExtension;
-    let tx = database.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut restored = BTreeMap::new();
-    for (id, before) in failed {
-        let stored: Option<String> = tx
-            .query_row("SELECT body FROM traffic WHERE line_id=?1", [id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        let row = match stored {
-            Some(body) => serde_json::from_str(&body)?,
-            None => before.clone(),
-        };
-        tx.execute(WRITE_USAGE, (id, serde_json::to_string(&row)?))?;
-        restored.insert(id.clone(), row);
+    ledger: &Mutex<Ledger>,
+    truncate: bool,
+) -> io::Result<()> {
+    let pending: Vec<(String, u64, Traffic)> = {
+        let state = ledger.lock().unwrap();
+        state
+            .dirty
+            .iter()
+            .filter_map(|(id, seq)| state.items.get(id).map(|row| (id.clone(), *seq, row.clone())))
+            .collect()
+    };
+    if pending.is_empty() && ledger.lock().unwrap().error.is_none() {
+        if truncate {
+            let _ = database.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        return Ok(());
     }
-    tx.commit()?;
-    Ok(restored)
+    let outcome = (|| -> Result<()> {
+        let tx = database.transaction()?;
+        {
+            let mut write = tx.prepare_cached(WRITE_USAGE)?;
+            for (id, _, row) in &pending {
+                write.execute((id, serde_json::to_string(row)?))?;
+            }
+        }
+        tx.commit()?;
+        let mode = if truncate { "TRUNCATE" } else { "PASSIVE" };
+        let _ = database.execute_batch(&format!("PRAGMA wal_checkpoint({mode});"));
+        Ok(())
+    })();
+    let mut state = ledger.lock().unwrap();
+    match outcome {
+        Ok(()) => {
+            state.error = None;
+            for (id, seq, _) in pending {
+                if state.dirty.get(&id).copied() == Some(seq) {
+                    state.dirty.remove(&id);
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("流量账本刷盘失败: {e:#}");
+            state.error = Some(msg.clone());
+            Err(io::Error::other(msg))
+        }
+    }
 }
 
-fn commit_batches(
+fn flush_loop(
     mut database: Database,
-    mut commits: mpsc::Receiver<LedgerWrite>,
+    requests: std_mpsc::Receiver<FlushRequest>,
     ledger: Arc<Mutex<Ledger>>,
 ) {
-    let mut failed = BTreeMap::new();
-    while let Some(message) = commits.blocking_recv() {
-        let first = match message {
-            LedgerWrite::Recover => {
-                let result = recover_ledger(&mut database, &failed);
-                let mut state = ledger.lock().unwrap();
-                state.checking = false;
-                match result {
-                    Ok(rows) => {
-                        for (id, row) in rows {
-                            let live = state.items.get_mut(&id).unwrap();
-                            *live = with_live_state(row, live);
-                        }
-                        failed.clear();
-                        state.error = None;
+    loop {
+        match requests.recv_timeout(FLUSH_INTERVAL) {
+            Ok(FlushRequest::Notify) => {
+                while let Ok(msg) = requests.try_recv() {
+                    if let FlushRequest::Sync(done) = msg {
+                        let _ = done.send(flush_ledger_rows(&mut database, &ledger, false));
                     }
-                    Err(e) => state.error = Some(format!("流量账本恢复失败: {e:#}")),
                 }
-                continue;
+                let _ = flush_ledger_rows(&mut database, &ledger, false);
             }
-            LedgerWrite::Usage(commit) => commit,
-        };
-        if let Some(error) = ledger.lock().unwrap().error.as_ref() {
-            let _ = first.done.send(Err(io::Error::other(error.clone())));
-            continue;
-        }
-        let mut batch = vec![first];
-        while batch.len() < 256 {
-            match commits.try_recv() {
-                Ok(LedgerWrite::Usage(commit)) => batch.push(commit),
-                Ok(LedgerWrite::Recover) => unreachable!("only a failed ledger schedules recovery"),
-                Err(_) => break,
+            Ok(FlushRequest::Sync(done)) => {
+                let _ = done.send(flush_ledger_rows(&mut database, &ledger, false));
             }
-        }
-        let result = (|| -> Result<()> {
-            let tx = database.transaction()?;
-            {
-                let mut write = tx.prepare_cached(WRITE_USAGE)?;
-                let newest: BTreeMap<_, _> = batch.iter().map(|c| (&c.id, &c.row)).collect();
-                for (id, row) in newest {
-                    write.execute((id, serde_json::to_string(row)?))?;
-                }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                let _ = flush_ledger_rows(&mut database, &ledger, false);
             }
-            tx.commit()?;
-            Ok(())
-        })();
-        let mut state = ledger.lock().unwrap();
-        if let Err(e) = result {
-            state.error = Some(format!("流量账本提交失败: {e:#}"));
-            for (id, (durable, _)) in std::mem::take(&mut state.pending) {
-                let live = state.items.get_mut(&id).unwrap();
-                *live = with_live_state(durable.clone(), live);
-                failed.insert(id, durable);
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = flush_ledger_rows(&mut database, &ledger, true);
+                break;
             }
-        }
-        for commit in batch {
-            let ack = if let Some(error) = &state.error {
-                Err(io::Error::other(error.clone()))
-            } else {
-                let (base, count) = state.pending.get_mut(&commit.id).unwrap();
-                *count -= 1;
-                if *count == 0 {
-                    state.pending.remove(&commit.id);
-                } else {
-                    *base = commit.row;
-                }
-                Ok(())
-            };
-            let _ = commit.done.send(ack);
         }
     }
 }
@@ -251,7 +253,7 @@ impl Book {
         let mut database = Database::open(dir.join("traffic.db"))?;
         database.busy_timeout(Duration::from_secs(5))?;
         database.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=0; \
              CREATE TABLE IF NOT EXISTS traffic(line_id TEXT PRIMARY KEY,body TEXT NOT NULL); \
              CREATE TABLE IF NOT EXISTS meta(name TEXT PRIMARY KEY,value INTEGER NOT NULL);",
         )?;
@@ -294,40 +296,72 @@ impl Book {
             v.upload_bps = 0.0;
             v.download_bps = 0.0;
         }
+        let quota = crate::quota::Journal::open(&dir.join("line-quota.db"));
         let ledger = Arc::new(Mutex::new(Ledger { items, ..Default::default() }));
-        let (commits, receiver) = mpsc::channel(256);
+        let (flusher, receiver) = std_mpsc::channel();
         let writer_ledger = ledger.clone();
         let writer = std::thread::Builder::new()
             .name("chain-traffic".into())
-            .spawn(move || commit_batches(database, receiver, writer_ledger))?;
+            .spawn(move || flush_loop(database, receiver, writer_ledger))?;
         Ok(Arc::new(Self {
             resources: RwLock::new(None),
             listener_errors: Mutex::default(),
             proxy_capacity: ProxyCapacity::for_node(),
             path,
+            quota,
             ledger,
             sample: Mutex::new((Instant::now(), BTreeMap::new())),
             snapshot_write: Mutex::new(()),
-            commits: Some(commits),
+            flusher: Some(flusher),
             writer: Some(writer),
         }))
     }
+    pub(crate) fn notify_flush(&self) {
+        if let Some(flusher) = &self.flusher {
+            let _ = flusher.send(FlushRequest::Notify);
+        }
+    }
+    pub fn flush(&self) -> Result<()> {
+        if let Some(resources) = self.resources.read().unwrap().clone() {
+            resources.flush()?;
+        }
+        if let Some(flusher) = &self.flusher {
+            let (tx, rx) = std_mpsc::sync_channel(1);
+            flusher
+                .send(FlushRequest::Sync(tx))
+                .map_err(|_| anyhow::anyhow!("流量账本写入器已停止"))?;
+            rx.recv()
+                .map_err(|_| anyhow::anyhow!("流量账本写入器未确认刷盘"))??;
+        }
+        Ok(())
+    }
     pub fn check_ledger(&self) -> Result<()> {
-        let mut state = self.ledger.lock().unwrap();
-        if let Some(error) = state.error.clone() {
-            if !state.checking {
-                state.checking = self.commits.as_ref().unwrap().try_send(LedgerWrite::Recover).is_ok();
-            }
+        let error = self.ledger.lock().unwrap().error.clone();
+        if let Some(error) = error {
+            self.notify_flush();
             anyhow::bail!("{error}");
         }
         Ok(())
     }
     pub fn save(&self) -> Result<()> {
-        self.check_ledger()?;
+        self.flush()?;
         let _writer = self.snapshot_write.lock().unwrap();
         let rows = self.ledger.lock().unwrap().confirmed();
         let bytes = serde_json::to_vec(&rows)?;
         atomic_write(&self.path, &bytes)
+    }
+    fn settle_quota(&self) -> Result<()> {
+        let rows = self.ledger.lock().unwrap().items.iter()
+            .map(|(id, row)| (id.clone(), row.cycle_start, row.used())).collect();
+        self.quota.settle(rows)
+    }
+    pub(crate) fn finish(&self) -> Result<()> {
+        self.save()?;
+        self.settle_quota()?;
+        if let Some(client) = self.resources.read().unwrap().clone() {
+            client.settle_quota()?;
+        }
+        Ok(())
     }
     pub fn snapshot(&self) -> BTreeMap<String, Traffic> {
         let mut sample = self.sample.lock().unwrap();
@@ -360,19 +394,22 @@ impl Book {
 }
 impl Drop for Book {
     fn drop(&mut self) {
-        self.commits.take();
+        if let Err(e) = self.flush().and_then(|()| self.settle_quota()) {
+            eprintln!("流量账本退出结算失败，保留已预留额度: {e:#}");
+        }
+        self.flusher.take();
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
         }
     }
 }
-fn rollover(t: &mut Traffic, lease: Option<&LeasePolicy>, at: u64) {
-    let local = Utc
-        .timestamp_opt(at as i64, 0)
-        .single()
-        .unwrap()
-        .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
+fn rollover(t: &mut Traffic, lease: Option<&LeasePolicy>, at: u64, month: &str) -> bool {
     let anchor = lease.map(|p| p.cycle_anchor).unwrap_or_else(|| {
+        let local = Utc
+            .timestamp_opt(at as i64, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
         local
             .timezone()
             .with_ymd_and_hms(local.year(), local.month(), 1, 0, 0, 0)
@@ -385,19 +422,25 @@ fn rollover(t: &mut Traffic, lease: Option<&LeasePolicy>, at: u64) {
     } else {
         crate::rental::cycle(anchor, at)
     };
+    let mut rolled = false;
     if t.cycle_start != start {
         t.cycle_start = start;
         t.upload = 0;
         t.download = 0;
         t.charged = Some(0);
         t.blocked = false;
+        rolled = true;
     }
     t.cycle_end = end;
-    t.month = local.format("%Y-%m").to_string();
+    if t.month != month {
+        t.month.clear();
+        t.month.push_str(month);
+    }
     while t.days.len() > 35 {
         let key = t.days.keys().next().unwrap().clone();
         t.days.remove(&key);
     }
+    rolled
 }
 
 #[derive(Clone)]
@@ -423,7 +466,7 @@ pub struct Lane {
     pub id: String,
     pub book: Arc<Book>,
     policy: RwLock<Policy>,
-    directions: [tokio::sync::Mutex<()>; 2],
+    directions: [tokio::sync::Mutex<Option<tokio::time::Instant>>; 2],
     customer_charge: tokio::sync::Mutex<()>,
     rates: tokio::sync::watch::Sender<[Option<f64>; 2]>,
     stopped: Mutex<CancellationToken>,
@@ -437,7 +480,8 @@ impl Lane {
     pub fn new(spec: &Spec, book: Arc<Book>) -> Arc<Self> {
         book.ledger
             .lock()
-            .unwrap().items
+            .unwrap()
+            .items
             .entry(spec.id.clone())
             .or_insert_with(|| Traffic {
                 epoch: id(),
@@ -454,7 +498,7 @@ impl Lane {
                 lease: spec.lease.clone(),
                 limits: spec.limits.clone(),
             }),
-            directions: [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())],
+            directions: [tokio::sync::Mutex::new(None), tokio::sync::Mutex::new(None)],
             customer_charge: tokio::sync::Mutex::new(()),
             rates: tokio::sync::watch::channel([
                 spec.limits.upload_mbps,
@@ -492,6 +536,22 @@ impl Lane {
     pub fn available(&self) -> bool {
         self.available_at(now())
     }
+    pub(crate) fn has_headroom(&self, min_bytes: usize) -> bool {
+        let policy = self.policy.read().unwrap();
+        let Some(limit_gib) = policy.limits.monthly_gib else {
+            return policy.resource_ids.is_empty();
+        };
+        if !policy.resource_ids.is_empty() {
+            return false;
+        }
+        let state = self.book.ledger.lock().unwrap();
+        let Some(t) = state.items.get(&self.id) else {
+            return false;
+        };
+        let left = ((limit_gib * 1073741824.0) as u64).saturating_sub(t.used())
+            / policy.multiplier.max(1) as u64;
+        left >= min_bytes as u64
+    }
     fn should_stop(&self, forced: bool, exhausted: bool) -> bool {
         let mut deadline = self.quota_deadline.lock().unwrap();
         if forced || !exhausted || self.transferring.load(Ordering::Acquire) == 0 {
@@ -510,36 +570,64 @@ impl Lane {
     }
     fn available_at(&self, at: u64) -> bool {
         let policy = self.policy.read().unwrap();
-        let mut state = self.book.ledger.lock().unwrap();
-        let forced = state.error.is_some() || !policy.open(at);
-        let t = state.items.get_mut(&self.id).unwrap();
-        rollover(t, policy.lease.as_ref(), at);
-        let exhausted = policy
-            .limits
-            .monthly_gib
-            .is_some_and(|q| t.used() >= (q * 1073741824.0) as u64 || ((q * 1073741824.0) as u64).saturating_sub(t.used()) < policy.multiplier as u64);
-        t.blocked = forced || exhausted;
+        let mut flush_now = false;
+        let (forced, exhausted, blocked) = {
+            let mut state = self.book.ledger.lock().unwrap();
+            let forced = !policy.open(at);
+            let (_, month) = state.day_labels(at);
+            let (t, rolled) = state.billing_row(&self.id, policy.lease.as_ref(), at, &month, &self.book.quota);
+            let exhausted = policy.limits.monthly_gib.is_some_and(|q| {
+                t.used() >= (q * 1073741824.0) as u64
+                    || ((q * 1073741824.0) as u64).saturating_sub(t.used())
+                        < policy.multiplier as u64
+            });
+            let blocked = forced || exhausted;
+            let newly_blocked = !t.blocked && blocked;
+            t.blocked = blocked;
+            if rolled || newly_blocked {
+                state.mark_dirty(&self.id);
+                flush_now = true;
+            }
+            (forced, exhausted, blocked)
+        };
+        if flush_now {
+            self.book.notify_flush();
+        }
         if self.should_stop(forced, exhausted) {
             self.stopped.lock().unwrap().cancel();
         }
-        !t.blocked
+        !blocked
     }
     pub fn cancellation(&self) -> CancellationToken {
         let at = now();
         let policy = self.policy.read().unwrap();
-        let mut state = self.book.ledger.lock().unwrap();
-        let forced = state.error.is_some() || !policy.open(at);
-        let t = state.items.get_mut(&self.id).unwrap();
-        rollover(t, policy.lease.as_ref(), at);
-        let exhausted = policy
-            .limits
-            .monthly_gib
-            .is_some_and(|q| t.used() >= (q * 1073741824.0) as u64 || ((q * 1073741824.0) as u64).saturating_sub(t.used()) < policy.multiplier as u64);
-        t.blocked = forced || exhausted;
+        let mut flush_now = false;
+        let (forced, exhausted, blocked) = {
+            let mut state = self.book.ledger.lock().unwrap();
+            let forced = !policy.open(at);
+            let (_, month) = state.day_labels(at);
+            let (t, rolled) = state.billing_row(&self.id, policy.lease.as_ref(), at, &month, &self.book.quota);
+            let exhausted = policy.limits.monthly_gib.is_some_and(|q| {
+                t.used() >= (q * 1073741824.0) as u64
+                    || ((q * 1073741824.0) as u64).saturating_sub(t.used())
+                        < policy.multiplier as u64
+            });
+            let blocked = forced || exhausted;
+            let newly_blocked = !t.blocked && blocked;
+            t.blocked = blocked;
+            if rolled || newly_blocked {
+                state.mark_dirty(&self.id);
+                flush_now = true;
+            }
+            (forced, exhausted, blocked)
+        };
+        if flush_now {
+            self.book.notify_flush();
+        }
         let mut stopped = self.stopped.lock().unwrap();
         if self.should_stop(forced, exhausted) {
             stopped.cancel();
-        } else if !t.blocked && stopped.is_cancelled() {
+        } else if !blocked && stopped.is_cancelled() {
             *stopped = CancellationToken::new();
         }
         stopped.clone()
@@ -609,8 +697,12 @@ impl Lane {
         self.transfer_active(amount, upload, datagram, None).await
     }
 
-    async fn transfer_active(
-        self: &Arc<Self>, amount: usize, upload: bool, datagram: bool, activity: Option<&TcpActivity>,
+    pub(crate) async fn transfer_active(
+        self: &Arc<Self>,
+        amount: usize,
+        upload: bool,
+        datagram: bool,
+        activity: Option<&TcpActivity>,
     ) -> io::Result<Transfer> {
         let mut transfer = Transfer {
             amount: 0,
@@ -619,6 +711,9 @@ impl Lane {
         };
         if amount == 0 {
             return Ok(transfer);
+        }
+        if self.policy.read().unwrap().limits.monthly_gib.is_some() {
+            self.book.quota.ready().await.map_err(io::Error::other)?;
         }
         if !self.available() {
             self.drain_transfers().await;
@@ -629,160 +724,216 @@ impl Lane {
         }
         let index = if upload { 0 } else { 1 };
         let stopped = self.cancellation();
-        // Serialize each direction through its wait. Cancellation leaves no future
-        // reservations behind, so reopening a lane never inherits abandoned debt.
         let pacing = activity.map(TcpActivity::waiting);
-        let _direction = tokio::select! {
-            _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
-            permit = self.directions[index].lock() => permit,
-        };
-        let mut rates = self.rates.subscribe();
-        loop {
-            let rate = rates.borrow_and_update()[index];
-            let Some(rate) = rate else { break };
-            tokio::select! {
+        // Fast-skip the per-direction async Mutex completely when no rate limit is configured.
+        let _direction = if self.rates.borrow()[index].is_some() {
+            let mut next_ready = tokio::select! {
                 _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
-                _ = rates.changed() => continue,
-                _ = tokio::time::sleep(Duration::from_secs_f64(amount as f64 / (rate * 125000.0))) => break,
+                permit = self.directions[index].lock() => permit,
+            };
+            let mut rates = self.rates.subscribe();
+            let mut unpaced = amount as f64;
+            while unpaced > 0.0 {
+                let Some(rate) = rates.borrow_and_update()[index] else {
+                    *next_ready = None;
+                    break;
+                };
+                let bps = rate * 125000.0;
+                let now = tokio::time::Instant::now();
+                let base = next_ready
+                    .filter(|prev| *prev >= now || now.duration_since(*prev) <= PACE_IDLE_RESET)
+                    .unwrap_or(now);
+                let target = base + Duration::from_secs_f64(unpaced / bps);
+                if target.saturating_duration_since(now) < PACE_COALESCE {
+                    *next_ready = Some(target);
+                    break;
+                }
+                tokio::select! {
+                    _ = stopped.cancelled() => {
+                        // Leave no future reservations behind on cancellation.
+                        *next_ready = None;
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    _ = rates.changed() => {
+                        let elapsed = tokio::time::Instant::now()
+                            .saturating_duration_since(base)
+                            .as_secs_f64();
+                        unpaced = (unpaced - elapsed * bps).max(0.0);
+                        *next_ready = None;
+                        continue;
+                    }
+                    _ = tokio::time::sleep_until(target) => {
+                        *next_ready = Some(target);
+                        break;
+                    }
+                }
             }
-        }
-        let customer_budget = self.policy.read().unwrap().resource_ids.iter().any(|id| crate::plans::is_budget(id));
-        // Both directions must agree on the local remainder before charging the shared customer ledger.
-        let customer_permit = if customer_budget { Some(tokio::select! {
-            _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
-            permit = self.customer_charge.lock() => permit,
-        }) } else { None };
-        let (resource_ids, multiplier, quota_left) = {
+            Some(next_ready)
+        } else {
+            None
+        };
+        let (has_resources, customer_budget, local_limit) = {
             let p = self.policy.read().unwrap();
-            let mut state = self.book.ledger.lock().unwrap();
-            let t = state.items.get_mut(&self.id).unwrap();
-            if customer_budget { rollover(t, p.lease.as_ref(), now()); }
-            (p.resource_ids.clone(), p.multiplier, p.limits.monthly_gib.map(|q| ((q * 1073741824.0) as u64).saturating_sub(t.used()) / p.multiplier as u64).unwrap_or(u64::MAX))
+            (!p.resource_ids.is_empty(), p.resource_ids.iter().any(|id| crate::plans::is_budget(id)),
+                p.limits.monthly_gib.is_some())
         };
-        if datagram && amount as u64 > quota_left {
-            drop(customer_permit);
-            drop(_direction);
-            self.drain_transfers().await;
-            return Err(io::ErrorKind::PermissionDenied.into());
-        }
-        let amount = amount.min(quota_left.min(usize::MAX as u64) as usize);
-        if amount == 0 {
-            drop(customer_permit);
-            drop(_direction);
-            self.drain_transfers().await;
-            return Err(io::ErrorKind::PermissionDenied.into());
-        }
-        if !resource_ids.is_empty() {
-            // shortcut: admission debits precede local durability; use reservation/settlement before promising delivered-byte billing.
-            let client = self.book.resources.read().unwrap().clone().ok_or_else(|| io::Error::other("Agent 尚未连接资源额度服务"))?;
-            tokio::select! {
-                _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
-                result = client.charge_weighted(&resource_ids, amount, multiplier) => result.map_err(io::Error::other)?,
+        let (customer_permit, mut effective_amount, cached_multiplier) = if has_resources || local_limit {
+            // Both directions must agree on the local remainder before charging the shared customer ledger.
+            let customer_permit = if customer_budget || local_limit {
+                Some(tokio::select! {
+                    _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
+                    permit = self.customer_charge.lock() => permit,
+                })
+            } else {
+                None
+            };
+            let (resource_ids, multiplier, used, cycle, limit, flush_rollover) = {
+                let p = self.policy.read().unwrap();
+                let mut state = self.book.ledger.lock().unwrap();
+                let at = now();
+                let (_, month) = state.day_labels(at);
+                let (row, rolled) = state.billing_row(&self.id, p.lease.as_ref(), at, &month, &self.book.quota);
+                let (used, cycle) = (row.used(), row.cycle_start);
+                if rolled {
+                    state.mark_dirty(&self.id);
+                }
+                (
+                    p.resource_ids.clone(),
+                    p.multiplier,
+                    used, cycle, p.limits.monthly_gib.map(|q| (q * 1073741824.0) as u64),
+                    rolled,
+                )
+            };
+            if flush_rollover {
+                self.book.notify_flush();
             }
-        }
-        drop(pacing);
-        let permit = tokio::select! {
-            _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
-            permit = self.book.commits.as_ref().unwrap().reserve() => {
-                permit.map_err(|_| io::Error::other("流量账本写入器已停止"))?
-            },
+            let quota_left = limit.map(|cap| cap.saturating_sub(used) / multiplier as u64)
+                .unwrap_or(u64::MAX);
+            if datagram && amount as u64 > quota_left {
+                drop(customer_permit);
+                drop(_direction);
+                self.drain_transfers().await;
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let capped = amount.min(quota_left.min(usize::MAX as u64) as usize);
+            if capped == 0 {
+                drop(customer_permit);
+                drop(_direction);
+                self.drain_transfers().await;
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if let Some(cap) = limit {
+                self.book.quota.ready().await.map_err(io::Error::other)?;
+                let end = used + capped as u64 * multiplier as u64;
+                if used < self.book.quota.recovered(&self.id, cycle) {
+                    return Err(io::Error::other("线路账本刚刚恢复，需重新核对余额"));
+                }
+                self.book.quota.cover(&[(&self.id, cycle, end, cap)]).await.map_err(io::Error::other)?;
+            }
+            if !resource_ids.is_empty() {
+                let client = self
+                    .book
+                    .resources
+                    .read()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| io::Error::other("Agent 尚未连接资源额度服务"))?;
+                tokio::select! {
+                    _ = stopped.cancelled() => return Err(io::ErrorKind::PermissionDenied.into()),
+                    result = client.charge_weighted(&resource_ids, capped, multiplier) => result.map_err(io::Error::other)?,
+                }
+            }
+            (customer_permit, capped, customer_budget.then_some(multiplier))
+        } else {
+            (None, amount, None)
         };
-        let reserved: io::Result<_> = (|| {
+        drop(pacing);
+        let mut flush_now = false;
+        let reserved: io::Result<()> = (|| {
             let policy = self.policy.read().unwrap();
-            let billing_multiplier = if customer_budget { multiplier } else { policy.multiplier };
+            let billing_multiplier = cached_multiplier.unwrap_or(policy.multiplier);
             let at = now();
             if stopped.is_cancelled() || !policy.open(at) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             let limits = &policy.limits;
             let mut state = self.book.ledger.lock().unwrap();
-            if let Some(error) = &state.error { return Err(io::Error::other(error.clone())); }
-            let Ledger { items, pending, .. } = &mut *state;
-            let t = items.get_mut(&self.id).unwrap();
-            rollover(t, policy.lease.as_ref(), at);
+            let (day_key, month_key) = state.day_labels(at);
+            let (t, rolled) = state.billing_row(&self.id, policy.lease.as_ref(), at, &month_key, &self.book.quota);
             let left = limits
                 .monthly_gib
-                .map(|q| {
-                    ((q * 1073741824.0) as u64).saturating_sub(t.used())
-                })
+                .map(|q| ((q * 1073741824.0) as u64).saturating_sub(t.used()))
                 .unwrap_or(u64::MAX);
-            let allowed = amount.min((left / billing_multiplier as u64).min(usize::MAX as u64) as usize);
-            if allowed == 0 || datagram && allowed < amount {
+            effective_amount = effective_amount
+                .min((left / billing_multiplier as u64).min(usize::MAX as u64) as usize);
+            if effective_amount == 0 || datagram && effective_amount < amount {
+                let was_blocked = t.blocked;
                 t.blocked = left < policy.multiplier as u64;
                 if t.blocked {
                     self.changed.notify_one();
+                }
+                if rolled || (!was_blocked && t.blocked) {
+                    state.mark_dirty(&self.id);
+                    flush_now = true;
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "本月线路额度不足",
                 ));
             }
-            pending.entry(self.id.clone()).or_insert_with(|| (t.clone(), 0)).1 += 1;
-            t.charged = Some(t.used().saturating_add((allowed as u64).saturating_mul(billing_multiplier as u64)));
-            let day = t
-                .days
-                .entry(
-                    Utc.timestamp_opt(at as i64, 0)
-                        .single()
-                        .unwrap()
-                        .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
-                        .format("%Y-%m-%d")
-                        .to_string(),
-                )
-                .or_default();
-            if upload {
-                t.upload = t.upload.saturating_add(allowed as u64);
-                t.total_upload = t.total_upload.saturating_add(allowed as u64);
-                day[0] = day[0].saturating_add(allowed as u64);
-            } else {
-                t.download = t.download.saturating_add(allowed as u64);
-                t.total_download = t.total_download.saturating_add(allowed as u64);
-                day[1] = day[1].saturating_add(allowed as u64);
+            let debit_end = t.used().saturating_add((effective_amount as u64).saturating_mul(billing_multiplier as u64));
+            if limits.monthly_gib.is_some() && self.book.quota.ceiling(&self.id, t.cycle_start) < debit_end {
+                return Err(io::Error::other("线路额度或账期已切换，需重新预留"));
             }
-            t.blocked = limits
-                .monthly_gib
-                .is_some_and(|q| t.used() >= (q * 1073741824.0) as u64 || ((q * 1073741824.0) as u64).saturating_sub(t.used()) < policy.multiplier as u64);
+            t.charged = Some(debit_end);
+            let day = t.days.entry(day_key).or_default();
+            if upload {
+                t.upload = t.upload.saturating_add(effective_amount as u64);
+                t.total_upload = t.total_upload.saturating_add(effective_amount as u64);
+                day[0] = day[0].saturating_add(effective_amount as u64);
+            } else {
+                t.download = t.download.saturating_add(effective_amount as u64);
+                t.total_download = t.total_download.saturating_add(effective_amount as u64);
+                day[1] = day[1].saturating_add(effective_amount as u64);
+            }
+            let was_blocked = t.blocked;
+            t.blocked = limits.monthly_gib.is_some_and(|q| {
+                t.used() >= (q * 1073741824.0) as u64
+                    || ((q * 1073741824.0) as u64).saturating_sub(t.used())
+                        < policy.multiplier as u64
+            });
             if t.blocked {
                 self.changed.notify_one();
             }
-            let (done, committed) = oneshot::channel();
+            let now_blocked = t.blocked;
+            state.mark_dirty(&self.id);
+            if rolled || (!was_blocked && now_blocked) {
+                flush_now = true;
+            }
             self.transferring.fetch_add(1, Ordering::AcqRel);
             transfer.counted = true;
-            transfer.amount = allowed;
-            permit.send(LedgerWrite::Usage(Commit {
-                id: self.id.clone(),
-                row: t.clone(),
-                done,
-            }));
-            Ok(committed)
+            transfer.amount = effective_amount;
+            Ok(())
         })();
-        // Rate reservations stay ordered; durability waits must allow the next
-        // same-direction payload to join a shared transaction.
         drop(customer_permit);
         drop(_direction);
-        let committed = match reserved {
-            Ok(committed) => committed,
-            Err(error) => {
-                drop(transfer);
-                // Returning a quota error from one pump must not make try_join!
-                // discard an already admitted block in the opposite direction.
-                self.drain_transfers().await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = committed
-            .await
-            .map_err(|_| io::Error::other("流量账本写入器未确认提交"))
-            .and_then(|result| result)
-        {
-            self.available();
-            self.changed.notify_one();
+        if flush_now {
+            self.book.notify_flush();
+        }
+        if let Err(error) = reserved {
+            drop(transfer);
+            self.drain_transfers().await;
             return Err(error);
         }
         Ok(transfer)
     }
     fn connection_limit(&self) -> usize {
-        self.policy.read().unwrap().access_policy.policy.max_connections
+        self.policy
+            .read()
+            .unwrap()
+            .access_policy
+            .policy
+            .max_connections
             .unwrap_or(crate::rules::DEFAULT_PROXY_CONNECTIONS)
             .min(crate::rules::MAX_PROXY_CONNECTIONS)
     }
@@ -792,9 +943,24 @@ impl Lane {
     }
     pub fn admit(self: &Arc<Self>) -> io::Result<Admission> {
         let limit = self.connection_limit();
-        self.admissions.fetch_update(Ordering::AcqRel,Ordering::Acquire,|n|(n<limit).then_some(n+1))
-            .map_err(|_|io::Error::new(io::ErrorKind::PermissionDenied,"代理并发连接达到上限"))?;
-        Ok(Admission(self.clone()))
+        let mut current = self.admissions.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "代理并发连接达到上限",
+                ));
+            }
+            match self.admissions.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Admission(self.clone())),
+                Err(actual) => current = actual,
+            }
+        }
     }
     pub fn access_policy(&self) -> crate::rules::CompiledPolicy { self.policy.read().unwrap().access_policy.clone() }
     pub fn connection(self: &Arc<Self>) -> Connection {
@@ -832,30 +998,50 @@ impl Drop for Connection {
     }
 }
 
-struct TcpActivity(Mutex<(tokio::time::Instant, usize)>);
-struct Pacing<'a>(&'a TcpActivity);
+pub(crate) struct TcpActivity {
+    epoch: tokio::time::Instant,
+    last_ms: AtomicU64,
+    waiting: AtomicUsize,
+}
+pub(crate) struct Pacing<'a>(&'a TcpActivity);
 
 impl TcpActivity {
-    fn progress(&self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.0.lock().unwrap().0 = tokio::time::Instant::now();
+    pub(crate) fn new() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            last_ms: AtomicU64::new(0),
+            waiting: AtomicUsize::new(0),
         }
     }
-    fn waiting(&self) -> Pacing<'_> {
-        self.0.lock().unwrap().1 += 1;
+    pub(crate) fn mark_progress(&self) {
+        let ms = tokio::time::Instant::now()
+            .saturating_duration_since(self.epoch)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.last_ms.store(ms, Ordering::Release);
+    }
+    fn progress(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.mark_progress();
+        }
+    }
+    pub(crate) fn waiting(&self) -> Pacing<'_> {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
         Pacing(self)
     }
-    async fn idle(&self) -> io::Result<()> {
+    pub(crate) async fn idle(&self) -> io::Result<()> {
         loop {
-            let (last, waiting) = *self.0.lock().unwrap();
+            let waiting = self.waiting.load(Ordering::Acquire);
+            let last = self.epoch + Duration::from_millis(self.last_ms.load(Ordering::Acquire));
             let deadline = if waiting > 0 {
-                tokio::time::Instant::now()
+                tokio::time::Instant::now() + TCP_IDLE
             } else {
-                last
-            } + TCP_IDLE;
+                last + TCP_IDLE
+            };
             tokio::time::sleep_until(deadline).await;
-            let (last, waiting) = *self.0.lock().unwrap();
-            if waiting == 0 && last.elapsed() >= TCP_IDLE {
+            let waiting = self.waiting.load(Ordering::Acquire);
+            let last = self.epoch + Duration::from_millis(self.last_ms.load(Ordering::Acquire));
+            if waiting == 0 && tokio::time::Instant::now().saturating_duration_since(last) >= TCP_IDLE {
                 return Err(io::ErrorKind::TimedOut.into());
             }
         }
@@ -863,9 +1049,33 @@ impl TcpActivity {
 }
 impl Drop for Pacing<'_> {
     fn drop(&mut self) {
-        let mut state = self.0.0.lock().unwrap();
-        state.1 -= 1;
-        state.0 = tokio::time::Instant::now();
+        self.0.mark_progress();
+        self.0.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn configure_tcp_keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let enable: libc::c_int = 1;
+    let idle: libc::c_int = 60;
+    let interval: libc::c_int = 15;
+    let count: libc::c_int = 4;
+    let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe {
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, (&enable as *const libc::c_int).cast(), size);
+        #[cfg(target_os = "linux")]
+        {
+            let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, (&idle as *const libc::c_int).cast(), size);
+            let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, (&interval as *const libc::c_int).cast(), size);
+            let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, (&count as *const libc::c_int).cast(), size);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, (&idle as *const libc::c_int).cast(), size);
+            let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, (&interval as *const libc::c_int).cast(), size);
+            let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, (&count as *const libc::c_int).cast(), size);
+        }
     }
 }
 
@@ -885,27 +1095,35 @@ async fn pump_tcp<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     upload: bool,
     activity: Option<&TcpActivity>,
 ) -> io::Result<()> {
-    let mut buf = [0; 16384];
+    // Start with a compact 8 KiB buffer for idle/interactive connections and expand to 64 KiB
+    // as soon as a bulk stream fills the initial read buffer.
+    let mut buf = vec![0u8; INITIAL_TCP_BUF];
     loop {
         let n = r.read(&mut buf).await?;
         if n == 0 {
             return w.shutdown().await;
         }
-        let mut pending = &buf[..n];
-        while !pending.is_empty() {
-            let mut quantum = pending.len();
-            let index = usize::from(!upload);
-            let rate = lane.rates.borrow()[index];
-            let shared_rate = {
-                let policy = lane.policy.read().unwrap();
+        let filled = n == buf.len() && buf.len() < MAX_TCP_BUF;
+        let index = usize::from(!upload);
+        let rate = lane.rates.borrow()[index];
+        let shared_rate = {
+            let policy = lane.policy.read().unwrap();
+            if policy.resource_ids.is_empty() {
+                None
+            } else {
                 lane.book
                     .resources
                     .read()
                     .unwrap()
                     .as_ref()
                     .and_then(|client| client.cached_rate(&policy.resource_ids))
-            };
-            if let Some(rate) = rate.into_iter().chain(shared_rate).reduce(f64::min) {
+            }
+        };
+        let combined_rate = rate.into_iter().chain(shared_rate).reduce(f64::min);
+        let mut offset = 0;
+        while offset < n {
+            let mut quantum = n - offset;
+            if let Some(rate) = combined_rate {
                 // At low rates share roughly one second of budget across the active streams.
                 let streams = lane.book.ledger.lock().unwrap().items[&lane.id]
                     .connections
@@ -917,8 +1135,8 @@ async fn pump_tcp<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let transfer = lane
                 .transfer_active(quantum, upload, false, activity)
                 .await?;
-            w.write_all(&pending[..transfer.amount]).await?;
-            pending = &pending[transfer.amount..];
+            w.write_all(&buf[offset..offset + transfer.amount]).await?;
+            offset += transfer.amount;
             let truncated = transfer.amount < quantum;
             drop(transfer);
             if truncated {
@@ -929,6 +1147,39 @@ async fn pump_tcp<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 ));
             }
         }
+        if filled {
+            buf.resize(MAX_TCP_BUF, 0);
+        }
+    }
+}
+
+pub async fn relay_tcp(a: TcpStream, b: TcpStream, lane: Arc<Lane>) -> io::Result<()> {
+    let stopped = lane.cancellation();
+    let _connection = lane.connection();
+    let activity = TcpActivity::new();
+    let progress = |bytes: &[u8]| activity.progress(bytes);
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+    let ar = InspectReader::new(ar, progress);
+    let aw = InspectWriter::new(aw, progress);
+    let br = InspectReader::new(br, progress);
+    let bw = InspectWriter::new(bw, progress);
+    let copying = async {
+        tokio::try_join!(
+            pump_tcp(ar, bw, lane.clone(), true, Some(&activity)),
+            pump_tcp(br, aw, lane, false, Some(&activity))
+        )?;
+        Ok(())
+    };
+    tokio::select! {
+        _ = stopped.cancelled() => Err(io::ErrorKind::PermissionDenied.into()),
+        result = async {
+            tokio::select! {
+                biased;
+                res = copying => res,
+                res = activity.idle() => res,
+            }
+        } => result,
     }
 }
 
@@ -946,9 +1197,11 @@ pub async fn relay<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite 
 }
 
 async fn copy_tcp<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite + Unpin>(
-    a: A, b: B, meter: Option<Arc<Lane>>,
+    a: A,
+    b: B,
+    meter: Option<Arc<Lane>>,
 ) -> io::Result<()> {
-    let activity = TcpActivity(Mutex::new((tokio::time::Instant::now(), 0)));
+    let activity = TcpActivity::new();
     let progress = |bytes: &[u8]| activity.progress(bytes);
     let mut a = InspectWriter::new(InspectReader::new(a, progress), progress);
     let mut b = InspectWriter::new(InspectReader::new(b, progress), progress);
@@ -956,9 +1209,12 @@ async fn copy_tcp<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite +
         if let Some(lane) = meter {
             let (ar, aw) = tokio::io::split(a);
             let (br, bw) = tokio::io::split(b);
-            tokio::try_join!(pump_tcp(ar, bw, lane.clone(), true, Some(&activity)), pump_tcp(br, aw, lane, false, Some(&activity)))?;
+            tokio::try_join!(
+                pump_tcp(ar, bw, lane.clone(), true, Some(&activity)),
+                pump_tcp(br, aw, lane, false, Some(&activity))
+            )?;
         } else {
-            tokio::io::copy_bidirectional(&mut a, &mut b).await?;
+            tokio::io::copy_bidirectional_with_sizes(&mut a, &mut b, GATEWAY_COPY_BUF, GATEWAY_COPY_BUF).await?;
         }
         Ok(())
     };
@@ -978,6 +1234,8 @@ struct SocksUdp {
 async fn socks_handshake<A: AsyncRead + AsyncWrite + Unpin>(
     client: &mut A,
     backend: &mut TcpStream,
+    local: std::net::SocketAddr,
+    metered_lane: Option<&Lane>,
 ) -> io::Result<Option<SocksUdp>> {
     let mut head = [0u8; 2];
     client.read_exact(&mut head).await?;
@@ -1011,8 +1269,17 @@ async fn socks_handshake<A: AsyncRead + AsyncWrite + Unpin>(
     }
     let mut req = [0u8; 4];
     client.read_exact(&mut req).await?;
-    backend.write_all(&req).await?;
     let address = read_socks_address(client, req[3]).await?;
+    // Xray acknowledges CONNECT before dialing the meter. Keep its atomic admission at the meter.
+    if req[..3] == [5, 1, 0] && metered_lane.is_some_and(|lane| {
+        lane.admissions.load(Ordering::Acquire) >= lane.connection_limit()
+            || lane.book.proxy_capacity.meter.available_permits() == 0
+    }) {
+        client.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        client.flush().await?;
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+    backend.write_all(&req).await?;
     backend.write_all(&address).await?;
     let mut reply = [0u8; 4];
     backend.read_exact(&mut reply).await?;
@@ -1022,10 +1289,25 @@ async fn socks_handshake<A: AsyncRead + AsyncWrite + Unpin>(
         if port == 0 {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        let public = UdpSocket::bind(("0.0.0.0", 0)).await?;
+        let mut bind = local;
+        bind.set_port(0);
+        if local.ip().to_canonical().is_ipv4() {
+            // Retain the IPv4 wildcard reply for clients reaching the server through NAT.
+            bind = ([0, 0, 0, 0], 0).into();
+        }
+        let public = UdpSocket::bind(bind).await?;
         let udp_backend = UdpSocket::bind(("127.0.0.1", 0)).await?;
         udp_backend.connect(("127.0.0.1", port)).await?;
-        client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0]).await?;
+        match bind.ip() {
+            std::net::IpAddr::V4(ip) => {
+                client.write_all(&[5, 0, 0, 1]).await?;
+                client.write_all(&ip.octets()).await?;
+            }
+            std::net::IpAddr::V6(ip) => {
+                client.write_all(&[5, 0, 0, 4]).await?;
+                client.write_all(&ip.octets()).await?;
+            }
+        }
         client
             .write_all(&public.local_addr()?.port().to_be_bytes())
             .await?;
@@ -1062,29 +1344,39 @@ async fn socks_udp<A: AsyncRead + Unpin>(
     relay: SocksUdp,
     peer: std::net::IpAddr,
 ) -> io::Result<()> {
+    let activity = TcpActivity::new();
     let mut source = None;
     let mut input = vec![0; 65536];
     let mut output = vec![0; 65536];
     let mut client_control = [0];
     let mut backend_control = [0];
-    loop {
-        tokio::select! {
-            _ = client.read(&mut client_control) => return Ok(()),
-            _ = backend.read(&mut backend_control) => return Ok(()),
-            received = relay.public.recv_from(&mut input) => {
-                let (n, address) = received?;
-                if address.ip() != peer || source.is_some_and(|p| p != address)
-                    || crate::meter::payload_size(&input[..n]).is_err() { continue }
-                source = Some(address);
-                relay.backend.send(&input[..n]).await?;
-            },
-            received = relay.backend.recv(&mut output) => {
-                let n = received?;
-                if let Some(address) = source {
-                    relay.public.send_to(&output[..n], address).await?;
-                }
-            },
+    let pumping = async {
+        loop {
+            tokio::select! {
+                _ = client.read(&mut client_control) => return Ok(()),
+                _ = backend.read(&mut backend_control) => return Ok(()),
+                received = relay.public.recv_from(&mut input) => {
+                    let (n, address) = received?;
+                    if address.ip().to_canonical() != peer.to_canonical() || source.is_some_and(|p| p != address)
+                        || crate::meter::payload_size(&input[..n]).is_err() { continue }
+                    source = Some(address);
+                    activity.mark_progress();
+                    relay.backend.send(&input[..n]).await?;
+                },
+                received = relay.backend.recv(&mut output) => {
+                    let n = received?;
+                    if let Some(address) = source {
+                        activity.mark_progress();
+                        relay.public.send_to(&output[..n], address).await?;
+                    }
+                },
+            }
         }
+    };
+    tokio::select! {
+        biased;
+        res = pumping => res,
+        res = activity.idle() => res,
     }
 }
 async fn connection<A: AsyncRead + AsyncWrite + Unpin>(
@@ -1092,6 +1384,7 @@ async fn connection<A: AsyncRead + AsyncWrite + Unpin>(
     spec: Spec,
     lane: Arc<Lane>,
     peer: std::net::IpAddr,
+    local: std::net::SocketAddr,
 ) -> Result<()> {
     if !lane.available() {
         return Ok(());
@@ -1105,7 +1398,12 @@ async fn connection<A: AsyncRead + AsyncWrite + Unpin>(
     if spec.protocol == Protocol::Socks && spec.kind == Kind::Vless {
         if let Some(relay) = tokio::time::timeout(
             Duration::from_secs(15),
-            socks_handshake(&mut stream, &mut backend),
+            socks_handshake(
+                &mut stream,
+                &mut backend,
+                local,
+                spec.meter.as_ref().map(|_| lane.as_ref()),
+            ),
         )
         .await??
         {
@@ -1113,7 +1411,13 @@ async fn connection<A: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     if spec.kind == Kind::Vless {
-        copy_tcp(stream, backend, None).await?;
+        if let Err(error) = copy_tcp(stream, &mut backend, None).await {
+            if error.kind() == io::ErrorKind::ConnectionReset {
+                // A reset client cannot consume a delayed reply. Pass the abort to the local core.
+                let _ = backend.set_zero_linger();
+            }
+            return Err(error.into());
+        }
     } else {
         relay(stream, backend, lane).await?;
     }
@@ -1191,6 +1495,44 @@ impl<S> Drop for Listener<S> {
             .remove(&self.label);
     }
 }
+fn wildcard_socket(port: u16, kind: socket2::Type) -> io::Result<socket2::Socket> {
+    use socket2::{Domain, Socket, Type};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    let bind = |domain, address: SocketAddr| -> io::Result<Socket> {
+        let socket = Socket::new(domain, kind, None)?;
+        if domain == Domain::IPV6 {
+            socket.set_only_v6(false)?;
+        }
+        if kind == Type::STREAM {
+            socket.set_reuse_address(true)?;
+        }
+        socket.set_nonblocking(true)?;
+        socket.bind(&address.into())?;
+        if kind == Type::STREAM {
+            socket.listen(1024)?;
+        }
+        Ok(socket)
+    };
+    match bind(Domain::IPV6, (Ipv6Addr::UNSPECIFIED, port).into()) {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::EADDRNOTAVAIL | libc::ENOPROTOOPT)) =>
+            bind(Domain::IPV4, (Ipv4Addr::UNSPECIFIED, port).into()),
+        result => result,
+    }
+}
+async fn bind_tcp(host: &str, port: u16) -> io::Result<TcpListener> {
+    if matches!(host, "::" | "0.0.0.0") {
+        TcpListener::from_std(wildcard_socket(port, socket2::Type::STREAM)?.into())
+    } else {
+        TcpListener::bind((host, port)).await
+    }
+}
+async fn bind_udp(host: &str, port: u16) -> io::Result<UdpSocket> {
+    if matches!(host, "::" | "0.0.0.0") {
+        UdpSocket::from_std(wildcard_socket(port, socket2::Type::DGRAM)?.into())
+    } else {
+        UdpSocket::bind((host, port)).await
+    }
+}
 impl Listener<TcpListener> {
     pub(crate) async fn accept(&mut self) -> (TcpStream, std::net::SocketAddr) {
         loop {
@@ -1204,7 +1546,7 @@ impl Listener<TcpListener> {
                     Err(e) => self.failure(e),
                 }
             } else {
-                match TcpListener::bind(self.address).await {
+                match bind_tcp(&self.address.ip().to_string(), self.address.port()).await {
                     Ok(socket) => {
                         self.socket = Some(socket);
                         self.recovered();
@@ -1228,7 +1570,7 @@ impl Listener<Arc<UdpSocket>> {
                     Err(e) => self.failure(e),
                 }
             } else {
-                match UdpSocket::bind(self.address).await {
+                match bind_udp(&self.address.ip().to_string(), self.address.port()).await {
                     Ok(socket) => {
                         self.socket = Some(Arc::new(socket));
                         self.recovered();
@@ -1282,7 +1624,7 @@ impl Gateway {
         for spec in specs.iter().filter(|s| s.kind != Kind::Website) {
             let lane = self.lanes[&spec.id].clone();
             if spec.network.contains("tcp") {
-                let listener = TcpListener::bind((spec.listen.as_str(), spec.port))
+                let listener = bind_tcp(&spec.listen, spec.port)
                     .await
                     .with_context(|| format!("入口 TCP {} 已占用", spec.port))?;
                 let address = listener.local_addr()?;
@@ -1299,23 +1641,25 @@ impl Gateway {
                         Some(_)=children.join_next(),if !children.is_empty()=>{},
                         (stream,peer)=listener.accept()=>{
                             if children.len() >= lane.transport_limit() { continue; }
-                            let Ok(slot) = lane.book.proxy_capacity.ingress.clone().try_acquire_owned() else { continue };
+                            let Some(slot) = lane.book.proxy_capacity.acquire_ingress(&spec.id) else { continue };
                             let spec=spec.clone();let lane=lane.clone();let dir=dir.clone();
                             children.spawn(async move {
                                 let _slot = slot;
                                 let stopped = lane.cancellation();
                                 let transfer = async {
                                 let mut stream=stream;
+                                let Ok(local) = stream.local_addr() else { return; };
                                 let _=stream.set_nodelay(true);
+                                configure_tcp_keepalive(&stream);
                                 let peer = if spec.proxy_protocol {
                                     let Ok(Ok(peer)) = tokio::time::timeout(Duration::from_secs(3),proxy_peer(&mut stream)).await else { return; };
                                     peer
                                 } else { peer.ip() };
                                 if matches!(spec.tls.mode.as_str(),"manual"|"auto") && spec.protocol != Protocol::Vless {
                                     if let Ok(config)=crate::website::load_tls(&spec.tls,&dir) {
-                                        if let Ok(Ok(tls))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=connection(tls,spec,lane,peer).await;}
+                                        if let Ok(Ok(tls))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=connection(tls,spec,lane,peer,local).await;}
                                     }
-                                } else {let _=connection(stream,spec,lane,peer).await;}
+                                } else {let _=connection(stream,spec,lane,peer,local).await;}
                                 };
                                 tokio::select! {_=stopped.cancelled()=>{},_=transfer=>{}}
                             });
@@ -1328,7 +1672,7 @@ impl Gateway {
                 && !(spec.kind == Kind::Vless && spec.protocol == Protocol::Socks)
             {
                 let socket = Arc::new(
-                    UdpSocket::bind(("0.0.0.0", spec.port))
+                    bind_udp(&spec.listen, spec.port)
                         .await
                         .with_context(|| format!("入口 UDP {} 已占用", spec.port))?,
                 );
@@ -1337,7 +1681,7 @@ impl Gateway {
                 let spec = spec.clone();
                 let cancel = self.cancel.clone();
                 self.tasks.push(tokio::spawn(async move {
-                    let mut sessions:BTreeMap<std::net::SocketAddr,mpsc::Sender<Vec<u8>>>=BTreeMap::new();
+                    let mut sessions:BTreeMap<std::net::SocketAddr,mpsc::Sender<bytes::Bytes>>=BTreeMap::new();
                     let mut children=JoinSet::new();let mut buf=vec![0u8;65536];
                     loop {tokio::select!{
                         _=cancel.cancelled()=>break,
@@ -1347,8 +1691,8 @@ impl Gateway {
                             if sessions.get(&peer).is_some_and(|tx|tx.is_closed()) {sessions.remove(&peer);}
                             if !sessions.contains_key(&peer) {
                                 if sessions.len() >= lane.transport_limit() { continue; }
-                                let Ok(slot) = lane.book.proxy_capacity.ingress.clone().try_acquire_owned() else { continue };
-                                let (tx,mut rx)=mpsc::channel::<Vec<u8>>(8);sessions.insert(peer,tx);
+                                let Some(slot) = lane.book.proxy_capacity.acquire_ingress(&spec.id) else { continue };
+                                let (tx,mut rx)=mpsc::channel::<bytes::Bytes>(512);sessions.insert(peer,tx);
                                 let socket=socket.clone();let lane=lane.clone();let backend_port=spec.backend;
                                 let account=spec.kind != Kind::Vless;
                                 children.spawn(async move {
@@ -1370,7 +1714,7 @@ impl Gateway {
                                     };tokio::select! {_=stopped.cancelled()=>{},_=result=>{}}
                                 });
                             }
-                            let _=sessions[&peer].try_send(buf[..n].to_vec());
+                            let _=sessions[&peer].try_send(bytes::Bytes::copy_from_slice(&buf[..n]));
                         }
                     }}
                     children.abort_all();while children.join_next().await.is_some() {}
@@ -1772,6 +2116,7 @@ mod tests {
         let (a,b)=tokio::join!(lane.charge(10,true,false),lane.charge(10,false,false));
         assert_eq!(a.unwrap_or(0)+b.unwrap_or(0),10);
         assert_eq!(book.snapshot()[&spec.id].used(),20);
+        book.flush().unwrap();
         let db=Database::open_with_flags(dir.path().join("resources.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(db.query_row("SELECT used FROM consumption WHERE resource='plan:customer'",[],|row| row.get::<_,u64>(0)).unwrap(),20);
         drop(db); drop(lane); drop(book);
@@ -1985,7 +2330,78 @@ mod tests {
             assert_eq!(tokio::time::timeout(Duration::from_secs(2), closed.read(&mut [0])).await.unwrap().unwrap(), 0);
             assert_eq!(book.proxy_capacity.ingress.available_permits(), 1);
         }
+        let mut aborted = TcpStream::connect(addresses[0]).await.unwrap();
+        let (mut server, _) = backend.accept().await.unwrap();
+        aborted.write_u8(42).await.unwrap();
+        assert_eq!(server.read_u8().await.unwrap(), 42);
+        aborted.set_zero_linger().unwrap();
+        drop(aborted);
+        let end = tokio::time::timeout(Duration::from_secs(2), server.read(&mut [0])).await.unwrap();
+        assert_eq!(end.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
         gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn socks_connect_reports_full_meter_after_authentication_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut book = Book::open(dir.path()).unwrap();
+        Arc::get_mut(&mut book).unwrap().proxy_capacity = ProxyCapacity::new(1);
+        let mut s = spec(Limits::default());
+        s.access_policy.policy.max_connections = Some(1);
+        let lane = Lane::new(&s, book.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let request = [5, 1, 0, 1, 127, 0, 0, 1, 0, 80];
+        for (line_full, node_full, valid_auth) in [
+            (true, false, false), (true, false, true), (false, true, true), (false, false, true),
+        ] {
+            let _admission = line_full.then(|| lane.admit().unwrap());
+            let _slot = node_full.then(|| book.proxy_capacity.acquire_meter(&s.id).unwrap());
+            let (mut client, mut gateway) = tokio::io::duplex(64);
+            let mut backend = TcpStream::connect(local).await.unwrap();
+            let (mut core, _) = listener.accept().await.unwrap();
+            let full = line_full || node_full;
+            let proxy = async {
+                let result = socks_handshake(&mut gateway, &mut backend, local, Some(&lane)).await;
+                drop(backend);
+                match (valid_auth, full) {
+                    (false, _) => assert_eq!(result.err().unwrap().kind(), io::ErrorKind::PermissionDenied),
+                    (true, true) => assert_eq!(result.err().unwrap().kind(), io::ErrorKind::WouldBlock),
+                    (true, false) => assert!(result.unwrap().is_none()),
+                }
+            };
+            let server = async {
+                let mut method = [0; 3];
+                core.read_exact(&mut method).await.unwrap();
+                assert_eq!(method, [5, 1, 2]);
+                core.write_all(&[5, 2]).await.unwrap();
+                let mut auth = [0; 5];
+                core.read_exact(&mut auth).await.unwrap();
+                assert_eq!(auth, [1, 1, b'u', 1, b'p']);
+                core.write_all(&[1, u8::from(!valid_auth)]).await.unwrap();
+                if valid_auth && !full {
+                    let mut received = [0; 10];
+                    core.read_exact(&mut received).await.unwrap();
+                    assert_eq!(received, request);
+                    core.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                } else {
+                    assert_eq!(core.read(&mut [0]).await.unwrap(), 0);
+                }
+            };
+            let user = async {
+                client.write_all(&[5, 1, 2, 1, 1, b'u', 1, b'p']).await.unwrap();
+                let mut auth = [0; 4];
+                client.read_exact(&mut auth).await.unwrap();
+                assert_eq!(auth, [5, 2, 1, u8::from(!valid_auth)]);
+                if valid_auth {
+                    client.write_all(&request).await.unwrap();
+                    let mut reply = [0; 10];
+                    client.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(reply, [5, u8::from(full), 0, 1, 0, 0, 0, 0, 0, 0]);
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(proxy, server, user); }).await.unwrap();
+        }
     }
 
     #[test]
@@ -2122,6 +2538,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_and_current_public_wildcards_accept_both_families() {
+        // IPv4-only kernels still exercise the fallback and IPv4 exchange.
+        let ipv6 = TcpListener::bind("[::1]:0").await.is_ok();
+        for host in ["0.0.0.0", "::"] {
+            let tcp = bind_tcp(host, 0).await.unwrap();
+            let udp = bind_udp(host, 0).await.unwrap();
+            for ip in ["127.0.0.1", "::1"].into_iter().filter(|ip| *ip != "::1" || ipv6) {
+                let stream = TcpStream::connect((ip, tcp.local_addr().unwrap().port())).await.unwrap();
+                let (_, peer) = tcp.accept().await.unwrap();
+                assert_eq!(peer.ip().to_canonical(), stream.local_addr().unwrap().ip());
+                let client = UdpSocket::bind((ip, 0)).await.unwrap();
+                client.send_to(b"dual", (ip, udp.local_addr().unwrap().port())).await.unwrap();
+                let mut buf = [0;4];
+                let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                udp.send_to(&buf[..n], peer).await.unwrap();
+                assert_eq!(client.recv(&mut buf).await.unwrap(), 4);
+                assert_eq!(&buf,b"dual");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn unavailable_quota_storage_only_stops_debits_needing_a_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("line-quota.db");
+        std::fs::create_dir(&journal).unwrap();
+        let book = Book::open(dir.path()).unwrap();
+        let paid = Lane::new(&spec(Limits {monthly_gib:Some(1.0), ..Default::default()}),book.clone());
+        let free = Lane::new(&spec(Limits::default()),book);
+        assert!(paid.charge(32,true,false).await.is_err());
+        assert_eq!(free.charge(32,true,false).await.unwrap(),32);
+        std::fs::remove_dir(journal).unwrap();
+        assert_eq!(paid.charge(32,true,false).await.unwrap(),32);
+    }
+    #[tokio::test]
+    async fn abrupt_restart_enforces_monthly_quota_before_statistics_flush() {
+        const CASE: &str = "CHAIN_TEST_LINE_CRASH_DIR";
+        let mut s = spec(Limits { monthly_gib: Some(128.0 / 1073741824.0), ..Default::default() });
+        s.id = "restart-line".into();
+        if let Some(dir) = std::env::var_os(CASE) {
+            let dir = std::path::Path::new(&dir);
+            let book = Book::open(dir).unwrap();
+            let lane = Lane::new(&s, book);
+            let locked = Database::open(dir.join("traffic.db")).unwrap();
+            locked.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert_eq!(lane.charge(80, true, false).await.unwrap(), 80);
+            unsafe { libc::_exit(73) }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","gateway::tests::abrupt_restart_enforces_monthly_quota_before_statistics_flush"])
+            .env(CASE, dir.path()).status().unwrap();
+        assert_eq!(status.code(), Some(73));
+        let book = Book::open(dir.path()).unwrap();
+        let lane = Lane::new(&s, book.clone());
+        assert!(lane.available());
+        assert_eq!(book.snapshot()[&s.id].used(), 82);
+        assert_eq!(book.snapshot()[&s.id].total_upload, 0);
+        assert_eq!(lane.charge(80, false, false).await.unwrap(), 46);
+        assert!(!lane.available());
+    }
+    #[tokio::test]
     async fn quota_is_shared_between_directions_and_survives_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let book = Book::open(temp.path()).unwrap();
@@ -2141,20 +2618,20 @@ mod tests {
         assert_eq!(reopened.snapshot()[&s.id].total_download, 30);
     }
     #[tokio::test]
-    async fn quota_drains_final_payload_after_commit_before_closing_both_directions() {
+    async fn quota_drains_final_payload_before_closing_both_directions() {
         let temp = tempfile::tempdir().unwrap();
         let s = spec(Limits {
             monthly_gib: Some(10.0 / 1073741824.0),
             ..Default::default()
         });
         let lane = Lane::new(&s, Book::open(temp.path()).unwrap());
-        let database = Database::open(temp.path().join("traffic.db")).unwrap();
-        database.execute_batch("BEGIN IMMEDIATE;").unwrap();
         let stop = CancellationToken::new();
         let monitor = tokio::spawn(lane.clone().supervise(stop.clone()));
         let token = lane.cancellation();
         let (mut client, inbound) = tokio::io::duplex(64);
-        let (outbound, mut target) = tokio::io::duplex(64);
+        // A 1-byte outbound buffer holds the admitted 10-byte write in `transferring == 1`
+        // until the target reads, verifying reverse traffic is denied before closing.
+        let (outbound, mut target) = tokio::io::duplex(1);
         let job = tokio::spawn(relay(inbound, outbound, lane.clone()));
         client.write_all(b"0123456789").await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2166,10 +2643,9 @@ mod tests {
         .unwrap();
         assert!(!lane.available());
         assert!(!token.is_cancelled());
-        target.write_all(b"denied reverse traffic").await.unwrap();
+        // One byte fits the duplex buffer even while the denied reverse pump is draining.
+        target.write_all(b"x").await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!job.is_finished());
-        database.execute_batch("COMMIT;").unwrap();
         let mut received = [0; 10];
         tokio::time::timeout(Duration::from_secs(1), target.read_exact(&mut received))
             .await
@@ -2192,13 +2668,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_direction_payloads_queue_together_without_forwarding_before_commit() {
+    async fn locked_sqlite_never_stalls_forwarding_and_flushes_exact_quota_once_unlocked() {
         let temp = tempfile::tempdir().unwrap();
         let s = spec(Limits {
             monthly_gib: Some(100.0 / 1073741824.0),
             ..Default::default()
         });
-        let lane = Lane::new(&s, Book::open(temp.path()).unwrap());
+        let book = Book::open(temp.path()).unwrap();
+        let lane = Lane::new(&s, book.clone());
         let database = Database::open(temp.path().join("traffic.db")).unwrap();
         database.execute_batch("BEGIN IMMEDIATE;").unwrap();
         let stop = CancellationToken::new();
@@ -2211,45 +2688,36 @@ mod tests {
             let (outbound, target) = tokio::io::duplex(64);
             jobs.spawn(relay(inbound, outbound, lane.clone()));
             client.write_all(&[1; 23]).await.unwrap();
+            client.shutdown().await.unwrap();
             clients.push(client);
             targets.push(target);
         }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while lane.transferring.load(Ordering::Acquire) != 5 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("same-direction payloads must all queue while SQLite is busy");
-        assert_eq!(lane.book.ledger.lock().unwrap().items[&s.id].upload, 100, "the quota is reserved");
-        assert_eq!(lane.book.snapshot()[&s.id].upload, 0, "only confirmed usage is published");
-        for target in &mut targets {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(10), target.read(&mut [0; 23]))
-                    .await
-                    .is_err(),
-                "payload forwarded before its ledger commit"
-            );
-        }
-        database.execute_batch("COMMIT;").unwrap();
+        // Payloads forward immediately at memory speed even while SQLite holds a write lock.
         let mut received = 0;
         for target in &mut targets {
             let mut bytes = Vec::new();
             received +=
-                tokio::time::timeout(Duration::from_secs(1), target.read_to_end(&mut bytes))
+                tokio::time::timeout(Duration::from_millis(500), target.read_to_end(&mut bytes))
                     .await
-                    .unwrap()
+                    .expect("forwarding must not block on SQLite lock")
                     .unwrap();
+            drop(target.shutdown().await);
         }
         assert_eq!(received, 100);
-        while let Some(result) = jobs.join_next().await {
-            assert!(result.unwrap().is_err());
-        }
+        assert_eq!(book.snapshot()[&s.id].upload, 100);
+        assert!(!lane.available());
+        database.execute_batch("COMMIT;").unwrap();
+        drop(database);
+        while jobs.join_next().await.is_some() {}
+        drop(clients);
+        drop(targets);
+        stop.cancel();
+        monitor.await.unwrap();
+        drop(lane);
+        drop(book);
         let reopened = Book::open(temp.path()).unwrap();
         assert_eq!(reopened.snapshot()[&s.id].total_upload, 100);
         assert_eq!(reopened.snapshot()[&s.id].total_download, 0);
-        stop.cancel();
-        monitor.await.unwrap();
     }
 
     #[tokio::test]
@@ -2351,51 +2819,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_ledger_commit_rejects_payload_and_preserves_prior_durable_usage() {
+    async fn failed_ledger_flush_keeps_live_forwarding_reports_error_and_recovers_all_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let s = spec(Limits::default());
         let book = Book::open(temp.path()).unwrap();
         let lane = Lane::new(&s, book.clone());
-        let admitted = lane.transfer(7, true, false).await.unwrap();
-        let token = lane.cancellation();
+        lane.charge(7, true, false).await.unwrap();
+        book.flush().unwrap();
         let database = Database::open(temp.path().join("traffic.db")).unwrap();
-        database.execute_batch("CREATE TRIGGER fail_write BEFORE INSERT ON traffic BEGIN SELECT RAISE(FAIL,'injected storage failure'); END;").unwrap();
+        database.execute_batch("CREATE TRIGGER fail_write BEFORE UPDATE ON traffic BEGIN SELECT RAISE(FAIL,'injected storage failure'); END;").unwrap();
         let (mut client, inbound) = tokio::io::duplex(64);
         let (outbound, mut target) = tokio::io::duplex(64);
         let job = tokio::spawn(relay(inbound, outbound, lane.clone()));
-        client.write_all(b"must-not-forward").await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), job)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
-        assert_eq!(target.read(&mut [0; 64]).await.unwrap(), 0);
-        assert!(token.is_cancelled());
-        drop(admitted);
-        assert!(!lane.available());
-        assert!(lane.charge(1, false, true).await.is_err());
+        client.write_all(b"still-forwarding").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = [0; 16];
+        tokio::time::timeout(Duration::from_secs(1), target.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received, b"still-forwarding");
+        target.shutdown().await.unwrap();
+        job.await.unwrap().unwrap();
+        // Flush fails and surfaces through check_ledger/save, while live traffic stays online.
         assert!(book.save().is_err());
-        assert_eq!(book.snapshot()[&s.id].total_upload, 7);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !book.ledger.lock().unwrap().error.as_deref().is_some_and(|e| e.contains("恢复失败")) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.unwrap();
-        assert!(!lane.available());
-        database.execute_batch("DROP TRIGGER fail_write;").unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while book.check_ledger().is_err() { tokio::time::sleep(Duration::from_millis(5)).await; }
-        }).await.unwrap();
+        assert!(book.check_ledger().is_err());
         assert!(lane.available());
-        assert!(!lane.cancellation().is_cancelled());
+        assert_eq!(book.snapshot()[&s.id].total_upload, 23);
+        database.execute_batch("DROP TRIGGER fail_write;").unwrap();
+        drop(database);
+        book.flush().unwrap();
+        assert!(book.check_ledger().is_ok());
         assert_eq!(lane.charge(3, false, true).await.unwrap(), 3);
         drop(lane);
         drop(book);
         let book = Book::open(temp.path()).unwrap();
-        assert_eq!(book.snapshot()[&s.id].total_upload, 7);
+        assert_eq!(book.snapshot()[&s.id].total_upload, 23);
         assert_eq!(book.snapshot()[&s.id].total_download, 3);
+    }
+
+    #[tokio::test]
+    async fn high_bandwidth_rate_limit_exceeds_old_131mbps_timer_ceiling_accurately() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = Book::open(temp.path()).unwrap();
+        let lane = Lane::new(
+            &spec(Limits {
+                download_mbps: Some(500.0), // 500 Mbps = 62.5 MB/s
+                ..Default::default()
+            }),
+            book,
+        );
+        let started = Instant::now();
+        for _ in 0..400 {
+            lane.charge(65_536, false, false).await.unwrap();
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let mbps = (400.0 * 65_536.0 * 8.0) / elapsed / 1e6;
+        assert!(
+            (380.0..=560.0).contains(&mbps),
+            "500 Mbps 本地限速不准确: {mbps:.1} Mbps ({elapsed:.3}s)"
+        );
     }
     #[tokio::test]
     async fn udp_is_never_partially_forwarded_and_new_month_resets_only_period_usage() {
@@ -2409,15 +2892,10 @@ mod tests {
         assert!(lane.charge(11, true, true).await.is_err());
         assert_eq!(book.snapshot()[&s.id].total_upload, 0);
         lane.charge(10, true, true).await.unwrap();
-        book.ledger
-            .lock()
-            .unwrap().items
-            .get_mut(&s.id)
-            .unwrap()
-            .cycle_start = 1;
-        assert!(lane.available());
+        assert!(lane.available_at(now() + 32 * 86400));
         assert_eq!(book.snapshot()[&s.id].upload, 0);
         assert_eq!(book.snapshot()[&s.id].total_upload, 10);
+        assert!(!lane.available(), "revisiting the spent period must not reopen the quota");
     }
 
     #[tokio::test]
@@ -2441,6 +2919,9 @@ mod tests {
         assert_eq!(charged, 100);
         let t = &book.snapshot()[&s.id];
         assert_eq!(t.upload + t.download, 100);
+        // This assertion compares exact directional statistics at a confirmed checkpoint.
+        // The abrupt-restart test above checks the separate hard bound before that checkpoint.
+        book.flush().unwrap();
         let reopened = Book::open(temp.path()).unwrap();
         let durable = &reopened.snapshot()[&s.id];
         assert_eq!(durable.upload + durable.download, 100);

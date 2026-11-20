@@ -181,7 +181,7 @@ mod tests {
         let at = 1_800_000_000;
         doc.rentals.insert(plan.key(), Rental { customer_id:"c".into(), started_at:at-1, expires_at:at+100, ..Default::default() });
         doc.customer_plans.push(plan.clone());
-        let mut request = resources::Request { customer_plan_version:1, resource:plan.key(), epoch:id(), cycle:0, used:0, want:16*1024*1024 };
+        let mut request = resources::Request { customer_plan_version:1, resource:plan.key(), epoch:id(), cycle:0, used:0, want:16*1024*1024, preferred_want:None };
         let first = resources::allocate(&mut doc,"a",&request,at).unwrap();
         request.epoch = id();
         let second = resources::allocate(&mut doc,"b",&request,at).unwrap();

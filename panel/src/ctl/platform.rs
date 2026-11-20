@@ -60,7 +60,7 @@ pub fn definition(
             ));
         }
         if name == "chain-agent" {
-            text.push_str("capabilities=\"^cap_net_bind_service\"\nrc_ulimit=\"-n 65536\"\n");
+            text.push_str("capabilities=\"^cap_net_bind_service\"\nrc_ulimit=\"-n 262144\"\n");
         }
         for (k, v) in env {
             ensure!(
@@ -86,6 +86,9 @@ pub fn definition(
             xml(user),
             xml(user)
         ));
+    }
+    if name == "chain-agent" {
+        text.push_str("<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>");
     }
     text.push_str("<key>EnvironmentVariables</key><dict>");
     text.push_str(&format!("<key>PATH</key><string>{PATH}</string>"));

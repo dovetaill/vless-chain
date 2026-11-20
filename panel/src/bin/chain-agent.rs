@@ -63,6 +63,7 @@ async fn run() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    chain_panel::gateway::capacity::raise_nofile_limit();
     let diagnostic_binary = binary.clone();
     let mut runtime = ManagedXray::new(binary, dir.clone())?;
     *runtime.traffic.resources.write().unwrap() = Some(chain_panel::resources::Client::open(
@@ -167,7 +168,9 @@ async fn run() -> Result<()> {
             report.running = false;
             report.applied = false;
             report.error = "代理内核或网关异常退出，Agent 将重试最近应用的配置".into();
-            runtime.close().await;
+            if let Err(e) = runtime.close().await {
+                report.error.push_str(&format!("；流量账本结算失败: {e:#}"));
+            }
             runtime.active = None;
             restore_at = Some(tokio::time::Instant::now() + Duration::from_secs(5));
             let _ = tokio::time::timeout(Duration::from_secs(2), sync.report(&mut report)).await;
@@ -176,6 +179,8 @@ async fn run() -> Result<()> {
             report.running = runtime.running();
             report.system = chain_panel::gateway::system_metrics();
             report.system["max_proxy_connections"] = serde_json::json!(chain_panel::rules::MAX_PROXY_CONNECTIONS);
+            report.system["node_connection_budget"] = serde_json::json!(runtime.traffic.proxy_capacity.limit());
+            report.system["capacity_drops"] = serde_json::json!(runtime.traffic.proxy_capacity.dropped());
             if now().saturating_sub(certificate_checked) >= 300 {
                 if let Some(active) = &runtime.active {
                     if let Ok(specs) = chain_panel::gateway::specs(&active.config) {
@@ -269,7 +274,7 @@ async fn run() -> Result<()> {
     let _ = clock_task.await;
     diagnostics.abort();
     let _ = diagnostics.await;
-    runtime.close().await;
+    runtime.close().await.context("Agent 已停止，但流量账本结算失败")?;
     let _ = chain_panel::diagnostics::append(&dir.join("diagnostics.log"), "Agent 已停止");
     eprintln!("Agent 已停止，所属 Xray 已退出");
     Ok(())

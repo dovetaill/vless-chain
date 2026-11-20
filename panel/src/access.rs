@@ -690,9 +690,33 @@ pub fn mihomo(lines: &[Line], doc: &Document) -> Result<String> {
         .collect::<Result<_>>()?;
     ensure!(!proxies.is_empty(), "没有已应用且启用的代理线路");
     let choices: Vec<_> = proxies.iter().map(|p| p["name"].clone()).collect();
-    Ok(serde_yaml_ng::to_string(
-        &json!({"mixed-port":7890,"allow-lan":false,"mode":"rule","log-level":"info","proxies":proxies,"proxy-groups":[{"name":"代理选择","type":"select","proxies":choices}],"rules":["MATCH,代理选择"]}),
-    )?)
+    let rules = vec![
+        "DOMAIN-SUFFIX,localhost,DIRECT",
+        "DOMAIN-SUFFIX,local,DIRECT",
+        "DOMAIN-SUFFIX,lan,DIRECT",
+        "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
+        "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
+        "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+        "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+        "IP-CIDR6,::1/128,DIRECT,no-resolve",
+        "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
+        "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+        "MATCH,代理选择",
+    ];
+    Ok(serde_yaml_ng::to_string(&json!({
+        "mixed-port": 7890,
+        "allow-lan": false,
+        "mode": "rule",
+        "log-level": "info",
+        "unified-delay": true,
+        "tcp-concurrent": true,
+        "keep-alive-interval": 30,
+        "proxies": proxies,
+        "proxy-groups": [{"name": "代理选择", "type": "select", "proxies": choices}],
+        "rules": rules
+    }))?)
 }
 
 #[cfg(test)]

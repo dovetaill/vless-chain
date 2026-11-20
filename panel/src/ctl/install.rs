@@ -367,7 +367,7 @@ pub fn unit_with_env(
                 .join(format!("current-{role}/bin/chain-{role}"))
         )?,
         if role == "agent" {
-            "LimitNOFILE=65536\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
+            "LimitNOFILE=262144\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
         } else {
             ""
         },
@@ -705,8 +705,8 @@ mod tests {
                 assert!(unit.contains("<key>GroupName</key><string>chain-agent</string>"));
                 assert!(unit.contains(&format!("<key>CHAIN_NODE_ID</key><string>{node}</string>")));
             }
-            "openrc" => assert!(unit.contains("rc_ulimit=\"-n 65536\"")),
-            _ => assert!(unit.contains("LimitNOFILE=65536")),
+            "openrc" => assert!(unit.contains("rc_ulimit=\"-n 262144\"")),
+            _ => assert!(unit.contains("LimitNOFILE=262144")),
         }
         let path = manager.path("/etc/chain-agent/token");
         let before = fs::metadata(&path).unwrap();

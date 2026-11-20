@@ -203,7 +203,31 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
     Ok(u.to_string())
 }
 pub fn empty_config() -> Value {
-    json!({"log":{"loglevel":log_level()}, "inbounds":[], "outbounds":[{"tag":"blocked","protocol":"blackhole"}], "routing":{"rules":[]}})
+    // Give a half-closed peer time to finish its reply without pinning a metered slot for five minutes.
+    json!({
+        "log": {"loglevel": log_level()},
+        "policy": {"levels": {"0": {"handshake": 8, "connIdle": 300, "uplinkOnly": 30, "downlinkOnly": 30}}},
+        "inbounds": [],
+        "outbounds": [{"tag": "blocked", "protocol": "blackhole"}],
+        "routing": {"rules": []}
+    })
+}
+fn apply_outbound_keepalive(outbound: &mut Value) {
+    if matches!(
+        outbound["protocol"].as_str(),
+        Some("vless" | "vmess" | "trojan" | "shadowsocks" | "socks" | "http")
+    ) && outbound["streamSettings"]["network"] != "hysteria"
+    {
+        if !outbound["streamSettings"].is_object() {
+            outbound["streamSettings"] = json!({});
+        }
+        if !outbound["streamSettings"]["sockopt"].is_object() {
+            outbound["streamSettings"]["sockopt"] = json!({});
+        }
+        let sockopt = outbound["streamSettings"]["sockopt"].as_object_mut().unwrap();
+        sockopt.entry("tcpKeepAliveInterval").or_insert_with(|| json!(30));
+        sockopt.entry("tcpNoDelay").or_insert_with(|| json!(true));
+    }
 }
 fn vless_in(node: &Node, hop: &Hop, tag: &str) -> Value {
     json!({"tag":tag,"listen":"0.0.0.0","port":hop.port,"protocol":"vless", "settings":{"clients":[{"id":hop.uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
@@ -235,10 +259,12 @@ pub fn guard_reality(config: &mut Value, inbound: &mut Value, port: u16) -> Resu
     Ok(())
 }
 fn vless_out(node: &Node, hop: &Hop, tag: &str) -> Value {
-    json!({"tag":tag,"protocol":"vless","settings":{"vnext":[{"address":node.host,"port":hop.port,
+    let mut out = json!({"tag":tag,"protocol":"vless","settings":{"vnext":[{"address":node.host,"port":hop.port,
         "users":[{"id":hop.uuid,"encryption":"none","flow":"xtls-rprx-vision"}]}]},
         "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":node.reality.server_name,
-            "publicKey":node.reality.public_key,"shortId":node.reality.short_id,"fingerprint":"chrome"}}})
+            "publicKey":node.reality.public_key,"shortId":node.reality.short_id,"fingerprint":"chrome"}}});
+    apply_outbound_keepalive(&mut out);
+    out
 }
 fn backend_port(reserved: &mut BTreeSet<(String, u16)>, node: &Node) -> Result<u16> {
     let range = &node.report.system["ephemeral_port_range"];
@@ -258,7 +284,17 @@ fn backend_port(reserved: &mut BTreeSet<(String, u16)>, node: &Node) -> Result<u
     Ok(port)
 }
 fn mihomo_config(config: &mut Value) -> &mut Value {
-    config.as_object_mut().unwrap().entry("_mihomo").or_insert_with(|| json!({"mode":"rule","log-level":"warning","listeners":[],"proxies":[],"rules":["MATCH,REJECT"]}))
+    config.as_object_mut().unwrap().entry("_mihomo").or_insert_with(|| {
+        json!({
+            "mode": "rule",
+            "log-level": "warning",
+            "tcp-concurrent": true,
+            "keep-alive-interval": 30,
+            "listeners": [],
+            "proxies": [],
+            "rules": ["MATCH,REJECT"]
+        })
+    })
 }
 pub fn needs_mihomo(outbound: &Value) -> bool {
     // Keep SS handshakes, QUIC sessions and nested HTTPS TLS in the same core.
@@ -477,6 +513,11 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         }
         udp_supported(line, doc)?;
         let sidecar_chain = external.iter().any(needs_mihomo);
+        if !sidecar_chain {
+            for outbound in &mut external {
+                apply_outbound_keepalive(outbound);
+            }
+        }
         crate::access::validate_line(line)?;
         if !line.enabled && line.kind != Kind::Vless {
             continue;
@@ -636,7 +677,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 }
                 config["_chain"].as_array_mut().unwrap().push(json!({
                     "id":line.id,"port":port,"backend":backend,"kind":line.kind,
-                    "listen":if line.access.shared_port {"127.0.0.1"} else {"0.0.0.0"},
+                    "listen":if line.access.shared_port {"127.0.0.1"} else if line.kind == Kind::Website {"0.0.0.0"} else {"::"},
                     "proxy_protocol":line.access.shared_port,
                     "fallback_port":fallback_port,"fallback_target":line.access.fallback,
                     "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
@@ -1063,6 +1104,12 @@ mod tests {
             out[1]["streamSettings"]["sockopt"]["dialerProxy"],
             out[2]["tag"]
         );
+        assert_eq!(out[1]["streamSettings"]["sockopt"]["tcpKeepAliveInterval"], 30);
+        assert_eq!(out[1]["streamSettings"]["sockopt"]["tcpNoDelay"], true);
+        assert_eq!(out[2]["streamSettings"]["sockopt"]["tcpKeepAliveInterval"], 30);
+        assert_eq!(c["a"]["policy"]["levels"]["0"], json!({
+            "handshake": 8, "connIdle": 300, "uplinkOnly": 30, "downlinkOnly": 30
+        }));
         d.lines[0].chain = vec![format!("line:{}", d.lines[0].id)];
         assert!(compile(&d).unwrap_err().to_string().contains("循环"));
         d.lines[0].chain = vec!["external:one".into(), "external:one".into()];

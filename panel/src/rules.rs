@@ -2,12 +2,16 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 pub const DEFAULT_PROXY_CONNECTIONS: usize = 4096;
 pub const MAX_PROXY_CONNECTIONS: usize = 20_480;
+const DNS_CACHE_TTL: Duration = Duration::from_secs(30);
+const DNS_CACHE_MAX: usize = 4096;
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(default)]
@@ -21,12 +25,20 @@ pub struct Policy {
     pub max_connections: Option<usize>,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct CompiledPolicy {
     pub policy: Policy,
     pub exact: BTreeSet<String>,
     pub suffix: BTreeSet<String>,
+    #[serde(skip)]
+    dns_cache: Arc<Mutex<BTreeMap<String, (IpAddr, Instant)>>>,
+}
+
+impl PartialEq for CompiledPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.policy == other.policy && self.exact == other.exact && self.suffix == other.suffix
+    }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -203,12 +215,34 @@ impl CompiledPolicy {
         ensure!(self.allows_domain(&d), "目标不在允许的网站中");
         // Pass the resolved numeric address through every proxy hop. A client-supplied IP
         // and a spoofed SNI can never select an unrelated destination through this path.
-        let addresses: Vec<_> = tokio::net::lookup_host((d.as_str(), port)).await?.collect();
-        ensure!(
-            !addresses.is_empty() && addresses.iter().all(|a| public_ip(a.ip())),
-            "白名单目标未解析到公网地址"
-        );
-        let ip = addresses[0].ip();
+        // Cache short-lived public resolutions so QUIC/UDP bursts neither spawn blocking
+        // getaddrinfo per packet nor flip target IPs mid-connection on round-robin DNS.
+        let now = Instant::now();
+        let ip = if let Some(ip) = self
+            .dns_cache
+            .lock()
+            .unwrap()
+            .get(&d)
+            .and_then(|(ip, expires)| (*expires > now).then_some(*ip))
+        {
+            ip
+        } else {
+            let addresses: Vec<_> = tokio::net::lookup_host((d.as_str(), port)).await?.collect();
+            ensure!(
+                !addresses.is_empty() && addresses.iter().all(|a| public_ip(a.ip())),
+                "白名单目标未解析到公网地址"
+            );
+            let ip = addresses[0].ip();
+            let mut cache = self.dns_cache.lock().unwrap();
+            if cache.len() >= DNS_CACHE_MAX {
+                cache.retain(|_, (_, expires)| *expires > now);
+                if cache.len() >= DNS_CACHE_MAX {
+                    cache.clear();
+                }
+            }
+            cache.insert(d, (ip, now + DNS_CACHE_TTL));
+            ip
+        };
         let (kind, mut bytes) = match ip {
             IpAddr::V4(ip) => (1, ip.octets().to_vec()),
             IpAddr::V6(ip) => (4, ip.octets().to_vec()),
@@ -503,5 +537,23 @@ mod tests {
         p.policy.udp_ports = vec![53];
         assert!(p.destination(1, &[1, 1, 1, 1, 0, 53], true).await.is_ok());
         assert!(p.destination(1, &[1, 1, 1, 1, 1, 187], true).await.is_err());
+
+        let mut cached = CompiledPolicy::default();
+        cached.policy.restricted = true;
+        cached.exact.insert("cached.example.com".into());
+        let clean = cached.clone();
+        cached.dns_cache.lock().unwrap().insert(
+            "cached.example.com".into(),
+            ("93.184.216.34".parse().unwrap(), Instant::now() + Duration::from_secs(30)),
+        );
+        assert_eq!(cached, clean, "DNS 缓存不应触发配置变更重下发");
+        let host = b"cached.example.com";
+        let mut req = vec![host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(
+            cached.destination(3, &req, true).await.unwrap(),
+            (1, vec![93, 184, 216, 34, 1, 187])
+        );
     }
 }

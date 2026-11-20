@@ -309,8 +309,26 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
         Ok(total(&disk(&h, main)?) >= 2 * b"durable-baseline".len() as u64)
     })
     .await?;
-    let before = durable(&h, main)?;
+    let before_term = durable(&h, main)?;
     let payload = b"crash-accounting-".repeat(16384);
+    let (mut term_stream, _) = socks(main, target, 1, None).await?;
+    for _ in 0..4 {
+        exchange(&mut term_stream, &payload).await?;
+    }
+    drop(term_stream);
+    let term_delivered = 8 * payload.len() as u64;
+    work.stop(agent).await?;
+    let term_saved = durable(&h, main)?;
+    ensure!(
+        total(&term_saved) == total(&before_term) + term_delivered
+            && term_saved["total_upload"].as_u64().unwrap()
+                == before_term["total_upload"].as_u64().unwrap() + term_delivered / 2
+            && term_saved["total_download"].as_u64().unwrap()
+                == before_term["total_download"].as_u64().unwrap() + term_delivered / 2,
+        "优雅退出未立即同步刷盘：before={before_term} durable={term_saved} confirmed={term_delivered}"
+    );
+    agent = restart_agent(&h, &agent_env, main, 0).await?;
+    let before = durable(&h, main)?;
     let cores = reaper.register(&h, agent)?;
     ensure!(!cores.is_empty(), "未登记核心");
     let (mut stream, _) = socks(main, target, 1, None).await?;
@@ -318,6 +336,10 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
         exchange(&mut stream, &payload).await?;
     }
     let delivered = 16 * payload.len() as u64;
+    wait("定期异步 WAL 刷盘完成", async || {
+        Ok(total(&durable(&h, main)?) == total(&before) + delivered)
+    })
+    .await?;
     kill(&h, agent).await?;
     closed(&mut stream).await?;
     wait("Agent 死亡回收全部核心", async || {
@@ -331,9 +353,9 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
                 == before["total_upload"].as_u64().unwrap() + delivered / 2
             && saved["total_download"].as_u64().unwrap()
                 == before["total_download"].as_u64().unwrap() + delivered / 2,
-        "SIGKILL 丢失已确认载荷计量：before={before} durable={saved} confirmed={delivered}"
+        "定期刷盘后 SIGKILL 丢失已确认载荷计量：before={before} durable={saved} confirmed={delivered}"
     );
-    let mut results = json!({"agent_sigkill_accounting":{"client_confirmed_payload_bytes":delivered,"expected_lifetime_bytes":total(&before)+delivered,"last_durable_lifetime_bytes":total(&saved),"lost_bytes":0,"durable_source":"traffic.db WAL synchronous=FULL","scope":"SIGKILL process crash; does not emulate hardware power loss"}});
+    let mut results = json!({"agent_sigkill_accounting":{"sigterm_immediate_flush_bytes":term_delivered,"client_confirmed_payload_bytes":delivered,"expected_lifetime_bytes":total(&before)+delivered,"last_durable_lifetime_bytes":total(&saved),"lost_bytes":0,"durable_source":"traffic.db WAL synchronous=NORMAL periodic+shutdown flush","scope":"SIGTERM immediate flush + periodic WAL flush before SIGKILL"}});
     agent = restart_agent(&h, &agent_env, main, 1).await?;
     let restored = metered(&h, main, total(&saved)).await?;
     ensure!(restored["epoch"] == saved["epoch"], "恢复改变计量 epoch");
@@ -393,17 +415,18 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     udp_closed(relay).await?;
     drop(udp_control);
     drop(socket);
-    wait("核心失败令 Agent 非零退出", async || {
-        Ok(work.poll(agent)?.is_some())
+    wait("回收故障核心", async || Ok(reaper.reap(&cores))).await?;
+    ensure!(work.poll(agent)?.is_none(), "核心失败不应杀死在线自恢复 Agent");
+    wait("Agent 自动恢复入口监听", async || {
+        Ok(TcpStream::connect((
+            "127.0.0.1",
+            main["hops"][0]["port"].as_u64().unwrap() as u16,
+        ))
+        .await
+        .is_ok())
     })
     .await?;
-    ensure!(
-        !work.poll(agent)?.unwrap().success(),
-        "核心失败 Agent 未失败"
-    );
-    wait("回收故障核心", async || Ok(reaper.reap(&cores))).await?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    agent = restart_agent(&h, &agent_env, main, 2).await?;
+    h.synced(&[main.clone()]).await?;
     ensure!(
         read(&h.root.join("agent-0/active.json"))? == active,
         "监督重启改变配置"
