@@ -35,45 +35,50 @@ export function ProbeEditor({
       }}
     >
       <PathView line={line} state={state} />
-      <Field label="检查方式">
-        <select
-          className="select"
-          value={mode}
-          onChange={(e) => {
-            setMode(e.target.value);
-            setResult(null);
-          }}
-        >
-          <option value="tcp">代理端口连通</option>
-          <option value="http">HTTP / HTTPS 响应</option>
-        </select>
-      </Field>
-      {mode === "http" && line.kind !== "website" && (
-        <Field label="检查网址">
-          <Input
-            name="url"
-            defaultValue={line.kind === "vless" ? "https://example.com" : ""}
-            placeholder="http://目标网站/"
-            required
-          />
+      <div className="grid gap-3.5 sm:grid-cols-2">
+        <Field label="检查方式">
+          <select
+            className="select"
+            value={mode}
+            onChange={(e) => {
+              setMode(e.target.value);
+              setResult(null);
+            }}
+          >
+            <option value="tcp">TCP 端口连通性</option>
+            <option value="http">HTTP / HTTPS 完整链路</option>
+          </select>
         </Field>
-      )}
-      <p className="muted">
-        TCP 连通只说明端口可连接。HTTP
-        检查会验证实际请求。
-      </p>
+        {mode === "http" && line.kind !== "website" && (
+          <Field label="检查网址">
+            <Input
+              name="url"
+              defaultValue={line.kind === "vless" ? "https://example.com" : ""}
+              placeholder="https://example.com"
+              required
+            />
+          </Field>
+        )}
+      </div>
+
       {result && (
         <div
           role="status"
-          className={`rounded-lg border p-4 text-sm leading-6 ${result.ok ? "border-green-200 bg-green-50 text-green-800" : "border-red-200 bg-red-50 text-red-800"}`}
+          className={`rounded-lg border p-3.5 text-xs leading-relaxed ${
+            result.ok
+              ? "border-emerald-500/30 bg-emerald-500/10 text-foreground"
+              : "border-destructive/30 bg-destructive/10 text-foreground"
+          }`}
         >
-          <strong>{result.ok ? "检查通过" : "检查未通过"}</strong>
-          <p className="mt-2 break-all">{result.detail}</p>
+          <strong className="font-semibold">
+            {result.ok ? "检查通过" : "检查未通过"}
+          </strong>
           {result.latency_ms != null && (
-            <p className="mt-1 text-xs">
-              整个检查耗时 {result.latency_ms} ms（含检查程序开销）
-            </p>
+            <span className="ml-2 text-muted-foreground tabular-nums">
+              耗时 {result.latency_ms} ms
+            </span>
           )}
+          <p className="mt-1.5 break-all text-muted-foreground">{result.detail}</p>
         </div>
       )}
     </Modal>

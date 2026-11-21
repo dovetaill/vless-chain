@@ -20,9 +20,17 @@ const assets = path.resolve(process.argv[2]);
     page.on('dialog', dialog => { dialogMessages.push(dialog.message()); return acceptDialog ? dialog.accept() : dialog.dismiss(); });
     page.on('pageerror', e => errors.push(e.message));
     const node = { id: 'local', name: '本机', host: '192.0.2.20', online: true, target: 'www.cloudflare.com:443', server_name: 'www.cloudflare.com', seen: 0, report: { running: true, applied: true, error: '', revision: '', traffic: {}, system: {} } };
+    const vmess = Buffer.from(JSON.stringify({ add: 'vm.example', port: '8443', id: 'private-uuid', ps: '测试' })).toString('base64');
+    const native = Buffer.from(JSON.stringify({ type: 'wireguard', 'private-key': 'private-key-marker', peers: [
+      { server: '2001:db8::1', port: 443 }, { server: 'peer.example', port: 51820 },
+    ] })).toString('base64url');
     const state = { nodes: [node], local_node_id: 'local', externals: [
       { id: 'a', name: '落地 A', url: 'vless://00000000-0000-4000-8000-000000000001@a.example:443?security=tls' },
       { id: 'b', name: '落地 B', url: 'socks5://user:password@b.example:1080' },
+      { id: 'vm', name: '编码节点', url: 'vmess://' + vmess },
+      { id: 'native', name: '多端点节点', url: 'mihomo://' + native },
+      { id: 'legacy', name: '旧格式节点', url: 'ss://' + Buffer.from('aes-128-gcm:legacy-secret@ss.example:8388').toString('base64') },
+      { id: 'invalid', name: '受损节点', url: 'vmess://broken-private-value' },
     ], lines: [], checks: {}, jobs: [], busy: false, time: 0, subscriptions: [], security: { totp_enabled: false, recovery_remaining: 0, origin: '', passkeys: [] }, alerts: [], customers: [], payments: [], renewal_contact: '' };
     await page.route('**/*', async route => {
       try {
@@ -74,7 +82,7 @@ const assets = path.resolve(process.argv[2]);
         return route.fulfill({ json: body });
       }
       const file = path.join(assets, ['/', '/admin', '/admin/'].includes(url.pathname) ? 'index.html' : url.pathname);
-      return fs.existsSync(file) ? route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' }) : route.fulfill({ status: 404 });
+      return fs.existsSync(file) ? route.fulfill({ body: fs.readFileSync(file), headers: { 'Content-Security-Policy': "script-src 'self'" }, contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' }) : route.fulfill({ status: 404 });
       } catch (error) {
         errors.push(error.message);
         await route.fulfill({ status: 500, json: { error: error.message } }).catch(() => {});
@@ -91,12 +99,37 @@ const assets = path.resolve(process.argv[2]);
       }
     };
     const save = async () => { await fillTarget(); await page.getByRole('dialog').getByRole('button', { name: '创建代理', exact: true }).click(); await page.getByRole('heading', { name: '分享代理', exact: true }).waitFor(); await close(); };
+    const appBundle = /\/assets\/index-[^/]+\.js$/;
+    await page.route(appBundle, route => route.abort());
+    await page.goto('http://chain.test/admin');
+    for (const [theme, system, expected] of [['dark', 'light', true], ['system', 'dark', true], ['system', 'light', false], ['light', 'dark', false]]) {
+      await page.evaluate(value => localStorage.setItem('chain-theme', value), theme);
+      await page.emulateMedia({ colorScheme: system });
+      await page.reload();
+      assert.deepEqual(await page.evaluate(() => [
+        document.documentElement.classList.contains('dark'), document.getElementById('root').childElementCount,
+      ]), [expected, 0], '主程序加载前须按偏好和 CSP 初始化主题');
+    }
+    await page.unroute(appBundle);
+    await page.evaluate(() => localStorage.removeItem('chain-theme'));
     state.time = 1;
-    node.report.system = { sampled_at: 1, cpu_percent: 12.5 };
+    state.jobs = Array.from({ length: 20 }, (_, i) => ({ id: String(i), state: 'applied', started: 100 - i, events: [{ at: 100 - i, message: '同步事件 ' + (i + 1) }] }));
+    node.report.system = { sampled_at: 1, cpu_percent: 12.5, memory_used: 0, memory_total: 1024 };
     state.nodes.push({ ...node, id: 'unsampled', name: '未接入节点', online: false, seen: 0, report: { ...node.report, system: null } });
     await page.goto('http://chain.test/admin');
     await page.getByRole('region', { name: '未接入节点 实时状态' }).getByText('等待采样', { exact: true }).waitFor();
     await page.getByRole('region', { name: '本机 实时状态' }).getByText('12.5%', { exact: true }).waitFor();
+    const sampled = page.getByRole('region', { name: '本机 实时状态' });
+    assert.equal(await sampled.getByRole('progressbar', { name: 'CPU' }).getAttribute('aria-valuenow'), '12.5');
+    assert.equal(await sampled.getByRole('progressbar', { name: '内存' }).getAttribute('aria-valuenow'), '0');
+    assert.equal(await sampled.getByRole('progressbar', { name: '系统磁盘' }).getAttribute('aria-valuenow'), null);
+    await button('查看告警').click();
+    const jobs = page.getByRole('dialog').locator('details');
+    assert.equal(await jobs.count(), 20);
+    await jobs.last().locator('summary').click();
+    await jobs.last().getByText('同步事件 20', { exact: false }).waitFor();
+    await page.keyboard.press('Escape');
+    state.jobs = [];
     assert.deepEqual(errors, [], '未采样节点不得使正常节点或仪表盘白屏');
     state.nodes.pop(); node.report.system = {}; state.time = 0;
     await page.goto('http://chain.test/admin#lines');
@@ -303,6 +336,23 @@ const assets = path.resolve(process.argv[2]);
     assert.equal(batch[2].access.transport.path, '/batch-path');
     assert.equal(batch[1].access.fallback, '');
     await page.locator('aside nav').getByRole('button', { name: '外部代理', exact: true }).click();
+    const searchExternal = page.getByLabel('搜索外部代理');
+    await page.getByText('vm.example:8443', { exact: true }).waitFor();
+    await page.getByText('[2001:db8::1]:443、peer.example:51820', { exact: true }).waitFor();
+    await page.getByText('ss.example:8388', { exact: true }).waitFor();
+    await page.getByText('地址未知', { exact: true }).waitFor();
+    const tableText = await page.locator('tbody').innerText();
+    for (const secret of [vmess, native, 'private-uuid', 'private-key-marker', 'legacy-secret', 'broken-private-value', 'user:password']) {
+      assert.ok(!tableText.includes(secret));
+      await searchExternal.fill(secret);
+      assert.equal(await page.locator('tbody tr').count(), 0, '凭据不可用于搜索');
+    }
+    for (const [query, name] of [['VM.EXAMPLE', '编码节点'], ['wireguard', '多端点节点'], ['51820', '多端点节点'], ['旧格式', '旧格式节点']]) {
+      await searchExternal.fill(query);
+      await page.getByRole('row').filter({ hasText: name }).waitFor();
+      assert.equal(await page.locator('tbody tr').count(), 1);
+    }
+    await searchExternal.fill('');
     assert.equal(await button('添加中转入口').count(), 0);
     await button('链接 / Mihomo').first().click();
     await page.getByLabel('分享链接').waitFor();
@@ -385,13 +435,15 @@ const assets = path.resolve(process.argv[2]);
 
     const existingData = JSON.stringify(state);
     const writesBeforeModes = writes.length;
-    const mode = page.locator('aside').getByLabel('使用模式', { exact: true });
+    await page.locator('aside nav').getByRole('button', { name: '设置', exact: true }).click();
+    const mode = page.getByLabel('使用模式', { exact: true });
     await mode.selectOption('personal');
     assert.equal(await page.locator('aside nav > button').first().getAttribute('aria-label'), '代理');
     assert.equal(await page.locator('aside nav').getByRole('button', { name: '客户与收款', exact: true }).count(), 0);
     await page.evaluate(() => { location.hash = 'customers'; });
     await page.getByRole('heading', { name: '客户与收款', exact: true }).waitFor();
     assert.equal(await page.locator('aside nav').getByRole('button', { name: '客户与收款', exact: true }).count(), 1, '自用模式旧hash仍可访问客户与收款');
+    await page.evaluate(() => { location.hash = 'settings'; });
     await page.reload();
     assert.equal(await mode.inputValue(), 'personal', '模式是本浏览器偏好');
     await mode.selectOption('business');
@@ -457,9 +509,6 @@ const assets = path.resolve(process.argv[2]);
     await navToggle.click();
     const navigation = page.getByRole('dialog', { name: '管理导航', exact: true });
     await navigation.waitFor();
-    await navigation.getByLabel('使用模式', { exact: true }).selectOption('personal');
-    assert.equal(await navigation.locator('nav > button').first().getAttribute('aria-label'), '代理');
-    await navigation.getByLabel('使用模式', { exact: true }).selectOption('small');
     for (let i = 0; i < 14; i++) {
       await page.keyboard.press('Tab');
       assert.ok(await navigation.evaluate(el => el.contains(document.activeElement)), '焦点不能穿出手机导航');
@@ -487,6 +536,15 @@ const assets = path.resolve(process.argv[2]);
       await page.getByRole('region', { name: '代理列表', exact: true }).waitFor();
       assert.match(await page.getByLabel('当前身份', { exact: true }).innerText(), new RegExp(label));
       assert.deepEqual(await page.locator('aside nav button').evaluateAll(nodes => nodes.map(node => node.getAttribute('aria-label'))), expectedNav);
+      await button('当前身份').click();
+      await page.getByRole('menuitem', { name: /导航视图/ }).press('ArrowRight');
+      await page.getByRole('menuitemradio', { name: '自用精简' }).click();
+      assert.equal(await page.evaluate(() => localStorage.getItem('chain-workspace-mode')), 'personal');
+      assert.equal(await page.locator('aside nav button').first().getAttribute('aria-label'), '代理');
+      await button('当前身份').click();
+      await page.getByRole('menuitem', { name: /导航视图/ }).press('ArrowRight');
+      await page.getByRole('menuitemradio', { name: '小型运营' }).click();
+      await page.getByRole('region', { name: '代理列表', exact: true }).waitFor();
       assert.equal(await button('新建代理').count(), 0);
       assert.equal(await button('出租信息').count(), role === 'finance' ? state.lines.filter(line => !line.customer_plan_id).length : 0);
       if (role === 'viewer') assert.equal(await button('首次本机代理 更多操作').count(), 0);
@@ -509,6 +567,11 @@ const assets = path.resolve(process.argv[2]);
       await page.getByText('当前身份无权访问此页面。', { exact: false }).waitFor();
       await page.evaluate(() => { location.hash = 'settings'; });
       if (role !== 'ops') await page.getByText('当前身份无权访问此页面。', { exact: false }).waitFor();
+      else {
+        await mode.selectOption('business');
+        assert.equal(await page.evaluate(() => localStorage.getItem('chain-workspace-mode')), 'business');
+        await mode.selectOption('small');
+      }
       await page.evaluate(() => { location.hash = 'dashboard'; });
       await page.getByRole('heading', { name: '总览', exact: true }).waitFor();
       assert.equal(await button('首次本机代理').count(), role === 'finance' ? 1 : 0);

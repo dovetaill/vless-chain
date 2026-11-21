@@ -34,13 +34,77 @@ export const terms: { id: Term; name: string; months: number }[] = [
 ];
 
 
-export function matchesLine(line: Line, state: PanelState, search: string) {
-  const customer = state.customers.find(customer => customer.id === line.rental?.customer_id);
+export const endpoint = (host: string, port: number | string) =>
+  `${host.includes(":") && !host.startsWith("[") ? `[${host}]` : host}:${port}`;
+
+export function lineEndpoint({ access, hops }: Line, nodes: PanelState["nodes"]) {
+  const entry = hops[0];
+  const tls = access.tls;
+  const host = access.host || access.public_host ||
+    (tls?.mode === "auto" || tls?.mode === "manual"
+      ? tls.domain
+      : nodes?.find(node => node.id === entry?.node_id)?.host);
+  const port = access.public_port ?? entry?.port;
+  if (!port) return host || "—";
+  return host ? endpoint(host, port) : `端口 ${port}`;
+}
+
+export function parseExternalSummary(raw: string): { protocol: string; target: string } {
+  const link = raw.trim();
+  const scheme = /^(vmess|mihomo|ss|vless|trojan|socks5?|https?|hy2|hysteria2|tuic):\/\//i.exec(link)?.[1].toLowerCase();
+  const unknown = "地址未知";
+  let protocol = scheme?.toUpperCase() || "NODE";
+  const address = (host: unknown, port: unknown) => {
+    if (typeof host !== "string" || !/^(?:[\w.-]+|\[?[\da-f:.]+\]?)$/i.test(host)) return "";
+    if (!/^\d{1,5}$/.test(String(port)) || Number(port) < 1 || Number(port) > 65535) return "";
+    return endpoint(host.replace(/^\[|\]$/g, ""), Number(port));
+  };
+  const decode = (payload: string) => new TextDecoder().decode(
+    Uint8Array.from(atob(payload.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)),
+  );
+  const nativeProtocol = (type: unknown) =>
+    typeof type === "string" && /^(vless|vmess|trojan|ss|ssr|snell|wireguard|shadowquic|http|socks5|hysteria2?|tuic|anytls)$/.test(type)
+      ? type.toUpperCase() : "MIHOMO";
+  try {
+    const payload = link.slice(link.indexOf("://") + 3);
+    if (scheme === "vmess" || scheme === "mihomo") {
+      const node = JSON.parse(decode(payload));
+      if (scheme === "vmess") return { protocol, target: address(node.add, node.port) || unknown };
+      protocol = nativeProtocol(node.type);
+      const servers: { server?: unknown; port?: unknown }[] =
+        Array.isArray(node.peers) && node.peers.length ? node.peers : [node];
+      const target = servers.map(peer => address(peer?.server, peer?.port)).filter(Boolean).join("、");
+      return { protocol, target: target || unknown };
+    }
+    if (scheme) {
+      const mainPart = payload.split(/[?#]/, 1)[0].replace(/\/$/, "");
+      const legacySS = scheme === "ss" && !mainPart.includes("@");
+      const url = new URL(legacySS ? `ss://${decode(mainPart)}` : link);
+      const port = url.port || (scheme === "http" ? 80 : /^(https|hy2|hysteria2|tuic)$/.test(scheme) ? 443 : "");
+      return { protocol, target: address(url.hostname, port) || unknown };
+    }
+    if (/^[-{]/.test(link)) {
+      protocol = nativeProtocol(link.match(/\btype["']?\s*:\s*["']?([\w-]+)/i)?.[1]);
+      const host = link.match(/\bserver["']?\s*:\s*["']?([^"',\s}]+)/i)?.[1];
+      const port = link.match(/\bport["']?\s*:\s*["']?(\d+)/i)?.[1];
+      return { protocol, target: address(host, port) || unknown };
+    }
+  } catch {}
+  return { protocol, target: unknown };
+}
+
+export function matchesLine(
+  line: Line,
+  state: Pick<PanelState, "customers" | "nodes">,
+  search: string,
+  extra = "",
+) {
+  const customer = state.customers?.find(customer => customer.id === line.rental?.customer_id);
   const nodes = line.hops.map(hop => {
-    const node = state.nodes.find(node => node.id === hop.node_id);
+    const node = state.nodes?.find(node => node.id === hop.node_id);
     return `${node?.name || ""} ${node?.host || ""} ${hop.port}`;
   });
-  const fields = [line.name, customer?.name, ...nodes, line.access.host, line.access.public_host,
+  const fields = [extra, line.name, customer?.name, ...nodes, lineEndpoint(line, state.nodes), line.access.host, line.access.public_host,
     line.access.public_port, line.access.tls?.domain].join(" ").toLowerCase();
   return search.toLowerCase().trim().split(/\s+/).every(word => fields.includes(word));
 }

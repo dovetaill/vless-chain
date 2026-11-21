@@ -1,41 +1,179 @@
 import { AccessPolicyEditor } from "./sharing";
 import { Diagnostics } from "./diagnostics";
 import { useState, type ReactNode } from "react";
-import { Download, MoreHorizontal, Plus, Search } from "lucide-react";
+import {
+  Activity,
+  Ban,
+  CheckCircle2,
+  Download,
+  FileText,
+  Gauge,
+  Infinity as InfinityIcon,
+  Link2,
+  MoreHorizontal,
+  Pencil,
+  Play,
+  Plus,
+  RefreshCw,
+  Search,
+  Share2,
+  Shield,
+  Trash2,
+} from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { api } from "../api";
 import type { Line, PanelState } from "../types";
-import { expiringSoon, lowQuota, matchesLine } from "../lib/business";
+import { expiringSoon, lineEndpoint, lowQuota, matchesLine } from "../lib/business";
 import { Button } from "./ui/button";
-import { Card, CardHeader, CardTitle } from "./ui/card";
+import { Badge } from "./ui/badge";
+import { Card, CardFooter, CardHeader, CardHeading, CardTable, CardTitle } from "./ui/card";
 import { Input } from "./ui/input";
 import { LegacyConfigs } from "./legacy-configs";
-import { CopyButton, Empty, Modal, PathView, download, errorText, protocolNames } from "./shared";
-import { LimitsDialog, QueryLinkDialog, RentalEditor, RenewalDialog } from "./rental-editor";
-import { RentalDates, RentalPrices, RentalSpeed, RentalStatusBadge, RentalUsage, SyncLabel, rentalStatusNames } from "./rental-shared";
+import {
+  CopyButton,
+  Empty,
+  Modal,
+  PathView,
+  download,
+  errorText,
+  protocolNames,
+} from "./shared";
+import {
+  LimitsDialog,
+  QueryLinkDialog,
+  RentalEditor,
+  RenewalDialog,
+} from "./rental-editor";
+import {
+  RentalDates,
+  RentalPrices,
+  RentalSpeed,
+  RentalStatusBadge,
+  RentalUsage,
+  SyncLabel,
+  rentalStatusNames,
+} from "./rental-shared";
 
-export function ExportDialog({ lines, close, requestForLine = () => api }: { lines: Line[]; close: () => void; requestForLine?: (line: Line) => typeof api }) {
-  const [result, setResult] = useState<{ links: string; yaml: string; errors: string[]; count: number } | null>(null);
-  return <Modal title={`批量导出 · ${lines.length} 条`} submit={result ? undefined : "读取已应用配置"} close={close} action={async () => {
-    const valid = lines.filter(line => line.enabled && line.published);
-    const errors = lines.filter(line => !line.enabled || !line.published).map(line => `${line.name}：尚未启用或应用，已跳过。`);
-    const exports = await Promise.allSettled(valid.map(line => requestForLine(line)<{ share: string; node: string }>(`/lines/${line.id}/export`)));
-    const links: string[] = [], nodes: string[] = [];
-    exports.forEach((value, i) => {
-      if (value.status === "fulfilled") { links.push(value.value.share); nodes.push(value.value.node.trim()); }
-      else errors.push(`${valid[i].name}：${errorText(value.reason)}`);
-    });
-    setResult({ links: links.join("\n"), yaml: `proxies:\n${nodes.map(node => node.split("\n").map(row => `  ${row}`).join("\n")).join("\n")}\n`, errors, count: nodes.length });
-  }}>
-    <p className="muted">仅导出已经启用并应用的代理。Mihomo 导出为节点列表，可合并到客户端配置中的 proxies。</p>
-    <p className="text-sm">{lines.map(line => line.name).join("、")}</p>
-    {result && <><p role="status" className="text-sm">已读取 {result.count} 条；未导出 {result.errors.length} 条。</p>{result.errors.length > 0 && <ul className="space-y-1 rounded-lg bg-amber-50 p-4 text-xs text-amber-800">{result.errors.map((error, i) => <li key={i}>{error}</li>)}</ul>}{result.count > 0 && <div className="flex flex-wrap gap-2"><CopyButton value={result.links} label="复制分享链接" /><Button type="button" variant="outline" onClick={() => download("proxy-links.txt", result.links)}><Download />下载链接</Button><Button type="button" variant="outline" onClick={() => download("proxies.yaml", result.yaml)}><Download />下载 Mihomo 节点列表</Button></div>}</>}
-  </Modal>;
+export function ExportDialog({
+  lines,
+  close,
+  requestForLine = () => api,
+}: {
+  lines: Line[];
+  close: () => void;
+  requestForLine?: (line: Line) => typeof api;
+}) {
+  const [result, setResult] = useState<{
+    links: string;
+    yaml: string;
+    errors: string[];
+    count: number;
+  } | null>(null);
+  return (
+    <Modal
+      title={`批量导出 · ${lines.length} 条`}
+      description="导出已启用且已应用的代理链接与 Mihomo 节点列表。"
+      submit={result ? undefined : "读取已应用配置"}
+      close={close}
+      action={async () => {
+        const valid = lines.filter((line) => line.enabled && line.published);
+        const errors = lines
+          .filter((line) => !line.enabled || !line.published)
+          .map((line) => `${line.name}：尚未启用或应用，已跳过。`);
+        const exports = await Promise.allSettled(
+          valid.map((line) =>
+            requestForLine(line)<{ share: string; node: string }>(
+              `/lines/${line.id}/export`,
+            ),
+          ),
+        );
+        const links: string[] = [],
+          nodes: string[] = [];
+        exports.forEach((value, i) => {
+          if (value.status === "fulfilled") {
+            links.push(value.value.share);
+            nodes.push(value.value.node.trim());
+          } else errors.push(`${valid[i].name}：${errorText(value.reason)}`);
+        });
+        setResult({
+          links: links.join("\n"),
+          yaml: `proxies:\n${nodes
+            .map((node) =>
+              node
+                .split("\n")
+                .map((row) => `  ${row}`)
+                .join("\n"),
+            )
+            .join("\n")}\n`,
+          errors,
+          count: nodes.length,
+        });
+      }}
+    >
+      <div className="flex flex-wrap gap-1.5">
+        {lines.map((line) => (
+          <Badge key={line.id} variant="secondary" appearance="light" size="sm">
+            {line.name}
+          </Badge>
+        ))}
+      </div>
+      {result && (
+        <>
+          <p role="status" className="text-xs font-medium text-foreground">
+            已读取 {result.count} 条；未导出 {result.errors.length} 条。
+          </p>
+          {result.errors.length > 0 && (
+            <ul className="space-y-1 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-foreground">
+              {result.errors.map((error, i) => (
+                <li key={i}>{error}</li>
+              ))}
+            </ul>
+          )}
+          {result.count > 0 && (
+            <div className="flex flex-wrap gap-2">
+              <CopyButton value={result.links} label="复制分享链接" />
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => download("proxy-links.txt", result.links)}
+              >
+                <Download />
+                下载链接
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => download("proxies.yaml", result.yaml)}
+              >
+                <Download />
+                下载 Mihomo 节点列表
+              </Button>
+            </div>
+          )}
+        </>
+      )}
+    </Modal>
+  );
 }
 
-export function ProxyList({ state, saved, edit, create, share, probe, apply, configureImport, remote = false }: {
-  state: PanelState; saved: () => Promise<void>; edit: (line: Line) => void; create: () => void;
-  share: (line: Line) => void; probe: (line: Line) => void; apply: (line?: Line) => void;
+export function ProxyList({
+  state,
+  saved,
+  edit,
+  create,
+  share,
+  probe,
+  apply,
+  configureImport,
+  remote = false,
+}: {
+  state: PanelState;
+  saved: () => Promise<void>;
+  edit: (line: Line) => void;
+  create: () => void;
+  share: (line: Line) => void;
+  probe: (line: Line) => void;
+  apply: (line?: Line) => void;
   configureImport: (item: { id: string; name: string }) => void;
   remote?: boolean;
 }) {
@@ -48,101 +186,726 @@ export function ProxyList({ state, saved, edit, create, share, probe, apply, con
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const close = () => setModal(null);
+
   const role = state.viewer?.role || "admin";
   const admin = role === "admin";
   const billing = (admin || role === "finance") && !remote;
   const operations = admin || role === "ops";
   const selectable = admin || billing;
-  const completed = async () => { await saved(); setSelected([]); };
-  const all = state.lines.filter(line => line.kind === "vless");
-  const lines = all.filter(line => matchesLine(line, state, search)
-    && (!protocol || line.access.protocol === protocol) && (!status || line.rental_status === status)
-    && (!attention || (attention === "expiring" ? expiringSoon(line, state.time) : lowQuota(line))));
-  const chosen = all.filter(line => selected.includes(line.id));
-  const sharedPlanSelected = chosen.some(line => line.customer_plan_id);
+  const completed = async () => {
+    await saved();
+    setSelected([]);
+  };
+
+  const all = state.lines.filter((line) => line.kind === "vless");
+  const lines = all.filter(
+    (line) =>
+      matchesLine(line, state, search) &&
+      (!protocol || line.access.protocol === protocol) &&
+      (!status || line.rental_status === status) &&
+      (!attention ||
+        (attention === "expiring"
+          ? expiringSoon(line, state.time)
+          : lowQuota(line))),
+  );
+  const chosen = all.filter((line) => selected.includes(line.id));
+  const sharedPlanSelected = chosen.some((line) => line.customer_plan_id);
   const disabled = state.busy || pending;
+
   async function operate(action: "enable" | "disable", targets: Line[]) {
     setPending(true);
     setError("");
-    try { await api("/lines/operate", "POST", { line_ids: targets.map(line => line.id), action }); await completed(); }
-    catch (error) { setError(errorText(error)); }
-    finally { setPending(false); }
+    try {
+      await api("/lines/operate", "POST", {
+        line_ids: targets.map((line) => line.id),
+        action,
+      });
+      await completed();
+    } catch (error) {
+      setError(errorText(error));
+    } finally {
+      setPending(false);
+    }
   }
+
   function remove(targets: Line[]) {
-    setModal(<Modal title={`删除代理 · ${targets.length} 条`} description="删除代理并撤销其私密查询链接。配置重新下发时，同一服务器上的连接可能短暂重连；离线服务器等待同步。" submit="确认删除并下发" close={close} action={async () => {
-      await api("/lines/operate", "POST", { line_ids: targets.map(line => line.id), action: "delete" });
-      await completed();
-      close();
-    }}><p className="text-sm">{targets.map(line => line.name).join("、")}</p></Modal>);
+    setModal(
+      <Modal
+        title={`删除代理 · ${targets.length} 条`}
+        description="删除所选代理并撤销其查询链接；同机其余代理可能短暂重连。"
+        submit="确认删除并下发"
+        close={close}
+        action={async () => {
+          await api("/lines/operate", "POST", {
+            line_ids: targets.map((line) => line.id),
+            action: "delete",
+          });
+          await completed();
+          close();
+        }}
+      >
+        <div className="flex flex-wrap gap-1.5">
+          {targets.map((line) => (
+            <Badge key={line.id} variant="destructive" appearance="light" size="sm">
+              {line.name}
+            </Badge>
+          ))}
+        </div>
+      </Modal>,
+    );
   }
+
   function unlimited(targets: Line[]) {
-    setModal(<Modal title={`设为无限期 · ${targets.length} 条`} description="取消到期限制并下发，不记录收款，不改变现有额度、限速或手动停用状态。流量仍按原周期重置。" submit="确认设为无限期并下发" close={close} action={async () => {
-      await api("/lines/operate", "POST", { line_ids: targets.map(line => line.id), action: "unlimited" });
-      await completed();
-      close();
-    }}><p className="text-sm">{targets.map(line => line.name).join("、")}</p></Modal>);
+    setModal(
+      <Modal
+        title={`设为无限期 · ${targets.length} 条`}
+        description="移除到期时间限制并同步，保持当前流量额度与限速设置。"
+        submit="确认设为无限期并下发"
+        close={close}
+        action={async () => {
+          await api("/lines/operate", "POST", {
+            line_ids: targets.map((line) => line.id),
+            action: "unlimited",
+          });
+          await completed();
+          close();
+        }}
+      >
+        <div className="flex flex-wrap gap-1.5">
+          {targets.map((line) => (
+            <Badge key={line.id} variant="primary" appearance="light" size="sm">
+              {line.name}
+            </Badge>
+          ))}
+        </div>
+      </Modal>,
+    );
   }
-  function filtersChanged(set: (value: string) => void, value: string) { set(value); setSelected([]); }
-  return <Card>
-    <CardHeader><CardTitle>我的代理 <span className="ml-2 text-sm font-normal text-slate-400">{lines.length} / {all.length}</span></CardTitle>
-    </CardHeader>
-    {admin && <LegacyConfigs state={state} saved={saved} apply={() => apply()} />}
-    {admin && (state.pending_imports || []).map(item => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
-      <div><p className="text-sm font-medium">{item.name} · 待手动配置</p><p className="mt-1 text-xs text-amber-700">{item.reason}；当前未运行。</p></div>
-      <div className="flex gap-2"><Button variant="outline" size="sm" disabled={disabled} onClick={() => configureImport(item)}>配置代理</Button>
-        <Button variant="ghost" size="sm" disabled={disabled} onClick={async () => {
-          setPending(true); setError("");
-          try { await api(`/legacy-import/${item.id}`, "DELETE"); await saved(); }
-          catch (error) { setError(errorText(error)); } finally { setPending(false); }
-        }}>移除名称</Button></div>
-    </div>)}
-    <div className="flex flex-wrap items-center gap-2.5 border-b border-border px-5 py-4" role="group" aria-label="代理搜索与筛选">
-      <div className="relative w-full min-w-0 sm:w-72"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" /><Input className="pl-9" aria-label="搜索代理名称、客户、服务器、地址或端口" placeholder="名称 / 客户 / 服务器 / 地址 / 端口" value={search} onChange={event => filtersChanged(setSearch, event.target.value)} /></div>
-      <select className="select h-8.5 w-auto min-w-0 max-w-full py-0" aria-label="筛选协议" value={protocol} onChange={event => filtersChanged(setProtocol, event.target.value)}><option value="">所有协议</option>{Object.entries(protocolNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
-      <select className="select h-8.5 w-auto min-w-0 max-w-full py-0" aria-label="筛选状态" value={status} onChange={event => filtersChanged(setStatus, event.target.value)}><option value="">所有状态</option>{Object.entries(rentalStatusNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select>
-      <select className="select h-8.5 w-auto min-w-0 max-w-full py-0" aria-label="筛选到期与余量" value={attention} onChange={event => filtersChanged(setAttention, event.target.value)}><option value="">所有到期 / 余量</option><option value="expiring">7 天内到期</option><option value="low">剩余 ≤10%</option></select>
-      {(search || protocol || status || attention) && <Button variant="ghost" size="sm" onClick={() => { setSearch(""); setProtocol(""); setStatus(""); setAttention(""); setSelected([]); }}>清除筛选</Button>}
-    </div>
-    {chosen.length > 0 && <div className="flex flex-wrap items-center gap-2 border-b border-blue-100 bg-blue-50 px-5 py-3" aria-label="批量操作"><span className="mr-2 text-sm font-medium">已选 {chosen.length} 条</span>
-      {admin && <><Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("enable", chosen)}>启用</Button><Button variant="outline" size="sm" disabled={disabled} onClick={() => void operate("disable", chosen)}>停用</Button></>}
-      {billing && !sharedPlanSelected && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RenewalDialog lines={chosen} close={close} saved={completed} />)}>收款 / 续费</Button>}
-      {billing && sharedPlanSelected && <span className="text-xs">包含共享套餐线路，请到客户与收款按套餐收款。</span>}
-      {admin && sharedPlanSelected && <span className="text-xs">套餐线路不可删除；可停用并保留历史。</span>}
-      {admin && !remote && !sharedPlanSelected && <Button variant="outline" size="sm" disabled={disabled} onClick={() => unlimited(chosen)}>设为无限期（自用）</Button>}
-      {admin && !remote && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<LimitsDialog lines={chosen} close={close} saved={completed} />)}>额度 / 限速</Button>}
-      {admin && <><Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<ExportDialog lines={chosen} close={close} />)}>导出</Button>{!sharedPlanSelected && <Button variant="outline" size="sm" disabled={disabled} onClick={() => remove(chosen)}>删除</Button>}</>}<Button variant="ghost" size="sm" onClick={() => setSelected([])}>取消选择</Button>
-    </div>}
-    {error && <p role="alert" className="m-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-    {lines.length ? <div className={`overflow-x-auto fleet-responsive proxy-responsive ${selectable ? "" : "proxy-readonly"}`} tabIndex={0} role="region" aria-label="代理列表"><table className="data-table"><thead><tr>
-      <th><input type="checkbox" aria-label="选择全部筛选结果" disabled={disabled} checked={lines.every(line => selected.includes(line.id))} ref={element => { if (element) element.indeterminate = lines.some(line => selected.includes(line.id)) && !lines.every(line => selected.includes(line.id)); }} onChange={event => setSelected(event.target.checked ? lines.map(line => line.id) : [])} /></th>
-      <th>名称 / 客户 / 路径</th><th>协议 / 入口</th><th>状态 / 同步</th><th>周期用量 / 余量</th><th>实时网速</th><th>到期 / 重置</th><th>报价</th><th className="text-right">操作</th>
-    </tr></thead><tbody>{lines.map(line => <tr key={line.id}>
-      <td data-label="选择代理"><input type="checkbox" aria-label={`选择 ${line.name}`} disabled={disabled} checked={selected.includes(line.id)} onChange={event => setSelected(old => event.target.checked ? [...old, line.id] : old.filter(id => id !== line.id))} /></td>
-      <td data-label="名称 / 客户 / 路径"><p className="mb-1 text-sm font-semibold">{line.name}</p><p className="mb-2 text-xs text-slate-500">{billing ? state.customers.find(customer => customer.id === line.rental?.customer_id)?.name || "自用" : admin ? "远端代理" : "客户信息未授权"}</p>{admin && <PathView line={line} state={state} />}</td>
-      <td data-label="协议 / 入口"><p className="text-xs font-medium">{protocolNames[line.access.protocol]}</p><p className="mono mt-2 text-xs text-slate-400">{line.access.public_host || line.access.host || state.nodes.find(node => node.id === line.hops[0]?.node_id)?.host}<br />端口 {line.access.public_port || line.hops[0]?.port}</p></td>
-      <td data-label="状态 / 同步"><RentalStatusBadge status={line.rental_status} /><p className="mt-2"><SyncLabel status={line.sync_status} /></p>{!line.published && <p className="mt-1 text-xs text-amber-600">有待应用的配置</p>}{state.checks[line.id]?.ok === false && <p className="mt-1 text-xs text-amber-600">最近连接检查未通过</p>}</td>
-      <td data-label="周期用量 / 余量"><RentalUsage line={line} /></td><td data-label="实时网速"><RentalSpeed line={line} now={state.time} /></td><td data-label="到期 / 重置">{billing || admin ? <RentalDates line={line} /> : "未授权"}</td><td data-label="报价">{billing || admin ? <RentalPrices line={line} /> : "未授权"}</td>
-      <td data-label="操作"><div className="flex flex-wrap items-center justify-start gap-1 sm:justify-end">
-        {billing && line.customer_plan_id && <Button variant="outline" size="sm" onClick={() => { location.hash = "customers"; }}>前往客户套餐</Button>}
-        {admin && line.customer_plan_id && <span className="text-xs text-slate-500">套餐线路不可删除；可停用并保留历史。</span>}
-        {billing && !line.customer_plan_id && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setModal(<RentalEditor line={line} state={state} close={close} saved={saved} />)}>出租信息</Button>}
-        {billing && !line.customer_plan_id && <Button variant="ghost" size="sm" disabled={disabled || !line.rental} onClick={() => setModal(<RenewalDialog lines={[line]} close={close} saved={saved} />)}>收款 / 续费</Button>}
-        {role !== "viewer" && <DropdownMenu.Root><DropdownMenu.Trigger className="row-menu-trigger" aria-label={`${line.name} 更多操作`} disabled={disabled}><MoreHorizontal className="size-4" /></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="row-menu-content" align="end" sideOffset={4} collisionPadding={8}>
-          {admin && <><DropdownMenu.Item onSelect={() => void operate(line.enabled ? "disable" : "enable", [line])}>{line.enabled ? "手动停用" : "解除手动停用"}</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => setModal(<LimitsDialog lines={[line]} close={close} saved={saved} />)}>调整额度 / 限速</DropdownMenu.Item>
-          {!remote && !line.customer_plan_id && <DropdownMenu.Item onSelect={() => unlimited([line])}>设为无限期（自用）</DropdownMenu.Item>}
-          <DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => share(line)}>分享配置</DropdownMenu.Item></>}
-          {billing && !line.customer_plan_id && <DropdownMenu.Item disabled={!line.rental || !line.published} onSelect={() => setModal(<QueryLinkDialog line={line} close={close} saved={saved} />)}>客户私密查询链接</DropdownMenu.Item>}
-          {admin && <><DropdownMenu.Item onSelect={()=>setModal(<AccessPolicyEditor line={line} close={close} saved={saved}/>)}>网站 / 端口 / 连接限制</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => edit(line)}>编辑代理配置</DropdownMenu.Item></>}
-          {operations && <><DropdownMenu.Item disabled={!line.published || !line.enabled} onSelect={() => probe(line)}>检查连接</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => setModal(<Diagnostics nodes={state.nodes.filter(n => line.hops.some(h => h.node_id === n.id))} lineId={line.id} canSyncTime={admin} close={close} />)}>日志与诊断</DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={() => apply(line)}>应用配置修改</DropdownMenu.Item></>}
-          {admin && !line.customer_plan_id && <DropdownMenu.Item className="text-red-600" onSelect={() => remove([line])}>删除代理</DropdownMenu.Item>}
-        </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>}
-      </div></td>
-    </tr>)}</tbody></table></div> : <Empty title={all.length ? "没有匹配结果" : "暂无代理"} action={admin && !all.length && <Button onClick={create}><Plus />新建代理</Button>}>{admin ? "新建代理后，在「出租信息」分配客户并设置报价。" : "当前没有可查看的代理。"}</Empty>}
-    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-4 text-xs text-slate-400"><span>{lines.length} 条{selectable && " · 切换筛选会清除选择"}</span>{operations && state.lines.some(line => !line.published) && <Button variant="outline" size="sm" disabled={disabled} onClick={() => apply()}>应用待处理配置修改</Button>}</div>
-    {modal}
-  </Card>;
+
+  function filtersChanged(set: (value: string) => void, value: string) {
+    set(value);
+    setSelected([]);
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardHeading className="flex items-center gap-2 space-y-0">
+          <CardTitle>我的代理</CardTitle>
+          <Badge variant="secondary" appearance="light" size="sm">
+            {lines.length} / {all.length}
+          </Badge>
+        </CardHeading>
+      </CardHeader>
+
+      {admin && <LegacyConfigs state={state} saved={saved} apply={() => apply()} />}
+
+      {admin &&
+        (state.pending_imports || []).map((item) => (
+          <div
+            key={item.id}
+            className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-amber-500/5 px-5 py-3.5"
+          >
+            <div>
+              <p className="text-xs font-semibold text-foreground">
+                {item.name} · 待补充配置
+              </p>
+              <p className="mt-0.5 text-xs text-amber-600 dark:text-amber-400">
+                {item.reason}；当前未运行。
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={disabled}
+                onClick={() => configureImport(item)}
+              >
+                配置代理
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={disabled}
+                onClick={async () => {
+                  setPending(true);
+                  setError("");
+                  try {
+                    await api(`/legacy-import/${item.id}`, "DELETE");
+                    await saved();
+                  } catch (error) {
+                    setError(errorText(error));
+                  } finally {
+                    setPending(false);
+                  }
+                }}
+              >
+                移除名称
+              </Button>
+            </div>
+          </div>
+        ))}
+
+      <div
+        className="flex flex-wrap items-center gap-2.5 border-b border-border bg-muted/15 px-5 py-4"
+        role="group"
+        aria-label="代理搜索与筛选"
+      >
+        <div className="relative w-full min-w-0 sm:w-64">
+          <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            className="pl-8.5"
+            aria-label="搜索代理名称、客户、服务器、地址或端口"
+            placeholder="搜索名称、客户、地址或端口"
+            value={search}
+            onChange={(event) => filtersChanged(setSearch, event.target.value)}
+          />
+        </div>
+        <select
+          className="select w-auto min-w-0 max-w-full"
+          aria-label="筛选协议"
+          value={protocol}
+          onChange={(event) => filtersChanged(setProtocol, event.target.value)}
+        >
+          <option value="">所有协议</option>
+          {Object.entries(protocolNames).map(([value, name]) => (
+            <option key={value} value={value}>
+              {name}
+            </option>
+          ))}
+        </select>
+        <select
+          className="select w-auto min-w-0 max-w-full"
+          aria-label="筛选状态"
+          value={status}
+          onChange={(event) => filtersChanged(setStatus, event.target.value)}
+        >
+          <option value="">所有状态</option>
+          {Object.entries(rentalStatusNames).map(([value, name]) => (
+            <option key={value} value={value}>
+              {name}
+            </option>
+          ))}
+        </select>
+        <select
+          className="select w-auto min-w-0 max-w-full"
+          aria-label="筛选到期与余量"
+          value={attention}
+          onChange={(event) => filtersChanged(setAttention, event.target.value)}
+        >
+          <option value="">到期与余量</option>
+          <option value="expiring">7 天内到期</option>
+          <option value="low">余量 ≤10%</option>
+        </select>
+        {(search || protocol || status || attention) && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setSearch("");
+              setProtocol("");
+              setStatus("");
+              setAttention("");
+              setSelected([]);
+            }}
+          >
+            清除筛选
+          </Button>
+        )}
+      </div>
+
+      {chosen.length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-2 border-b border-primary/20 bg-primary/8 px-5 py-3"
+          aria-label="批量操作"
+        >
+          <span className="mr-1 text-xs font-semibold text-primary">
+            已选 {chosen.length} 条
+          </span>
+          {admin && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={disabled}
+                onClick={() => void operate("enable", chosen)}
+              >
+                启用
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={disabled}
+                onClick={() => void operate("disable", chosen)}
+              >
+                停用
+              </Button>
+            </>
+          )}
+          {billing && !sharedPlanSelected && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={disabled}
+              onClick={() =>
+                setModal(
+                  <RenewalDialog
+                    lines={chosen}
+                    close={close}
+                    saved={completed}
+                  />,
+                )
+              }
+            >
+              收款 / 续费
+            </Button>
+          )}
+          {billing && sharedPlanSelected && (
+            <span className="text-xs text-muted-foreground">
+              包含共享套餐线路，请到客户与收款按套餐收款。
+            </span>
+          )}
+          {admin && sharedPlanSelected && (
+            <span className="text-xs text-muted-foreground">
+              套餐线路不可删除；可停用并保留历史。
+            </span>
+          )}
+          {admin && !remote && !sharedPlanSelected && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={disabled}
+              onClick={() => unlimited(chosen)}
+            >
+              设为无限期（自用）
+            </Button>
+          )}
+          {admin && !remote && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={disabled}
+              onClick={() =>
+                setModal(
+                  <LimitsDialog lines={chosen} close={close} saved={completed} />,
+                )
+              }
+            >
+              额度 / 限速
+            </Button>
+          )}
+          {admin && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={disabled}
+                onClick={() =>
+                  setModal(<ExportDialog lines={chosen} close={close} />)
+                }
+              >
+                导出
+              </Button>
+              {!sharedPlanSelected && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={disabled}
+                  onClick={() => remove(chosen)}
+                >
+                  删除
+                </Button>
+              )}
+            </>
+          )}
+          <Button variant="ghost" size="sm" onClick={() => setSelected([])}>
+            取消选择
+          </Button>
+        </div>
+      )}
+
+      {error && (
+        <p
+          role="alert"
+          className="m-4 rounded-lg border border-destructive/25 bg-destructive/10 p-3 text-xs text-destructive"
+        >
+          {error}
+        </p>
+      )}
+
+      {lines.length ? (
+        <CardTable>
+          <div
+            className={`overflow-x-auto fleet-responsive proxy-responsive ${
+              selectable ? "" : "proxy-readonly"
+            }`}
+            tabIndex={0}
+            role="region"
+            aria-label="代理列表"
+          >
+            <table className="data-table [&_th]:px-3 [&_td]:px-3">
+              <thead>
+                <tr>
+                  <th className="w-10">
+                    <input
+                      type="checkbox"
+                      aria-label="选择全部筛选结果"
+                      disabled={disabled}
+                      checked={lines.every((line) => selected.includes(line.id))}
+                      ref={(element) => {
+                        if (element)
+                          element.indeterminate =
+                            lines.some((line) => selected.includes(line.id)) &&
+                            !lines.every((line) => selected.includes(line.id));
+                      }}
+                      onChange={(event) =>
+                        setSelected(
+                          event.target.checked
+                            ? lines.map((line) => line.id)
+                            : [],
+                        )
+                      }
+                    />
+                  </th>
+                  <th>名称 / 归属 / 路径</th>
+                  <th>接入入口</th>
+                  <th>状态</th>
+                  <th>周期用量</th>
+                  <th>实时速率</th>
+                  <th>到期 / 重置</th>
+                  <th>报价</th>
+                  <th className="text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {lines.map((line) => (
+                  <tr key={line.id}>
+                    <td data-label="选择代理">
+                      <input
+                        type="checkbox"
+                        aria-label={`选择 ${line.name}`}
+                        disabled={disabled}
+                        checked={selected.includes(line.id)}
+                        onChange={(event) =>
+                          setSelected((old) =>
+                            event.target.checked
+                              ? [...old, line.id]
+                              : old.filter((id) => id !== line.id),
+                          )
+                        }
+                      />
+                    </td>
+                    <td data-label="名称 / 归属 / 路径" className="min-w-[170px] max-w-[245px]">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <p className="break-all text-[13px] font-semibold text-foreground">
+                          {line.name}
+                        </p>
+                        <Badge variant="secondary" appearance="light" size="xs">
+                          {billing
+                            ? state.customers.find(
+                                (customer) =>
+                                  customer.id === line.rental?.customer_id,
+                              )?.name || "自用"
+                            : admin
+                              ? "远端"
+                              : "未授权"}
+                        </Badge>
+                      </div>
+                      {admin && (
+                        <div className="mt-1.5">
+                          <PathView line={line} state={state} />
+                        </div>
+                      )}
+                    </td>
+                    <td data-label="接入入口" className="max-w-[185px]">
+                      <Badge variant="primary" appearance="light" size="sm">
+                        {protocolNames[line.access.protocol]}
+                      </Badge>
+                      <p className="mono mt-1.5 break-all text-[11px] leading-relaxed text-muted-foreground">
+                        {lineEndpoint(line, state.nodes)}
+                      </p>
+                    </td>
+                    <td data-label="状态" className="whitespace-nowrap">
+                      <div className="flex flex-col items-start gap-1">
+                        <RentalStatusBadge status={line.rental_status} />
+                        <SyncLabel status={line.sync_status} />
+                        {!line.published && (
+                          <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                            有待应用的配置
+                          </span>
+                        )}
+                        {state.checks[line.id]?.ok === false && (
+                          <span className="text-[11px] font-medium text-destructive">
+                            最近探测未通过
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td data-label="周期用量">
+                      <RentalUsage line={line} />
+                    </td>
+                    <td data-label="实时速率">
+                      <RentalSpeed line={line} now={state.time} />
+                    </td>
+                    <td data-label="到期 / 重置" className="whitespace-nowrap">
+                      {billing || admin ? <RentalDates line={line} /> : "未授权"}
+                    </td>
+                    <td data-label="报价" className="whitespace-nowrap">
+                      {billing || admin ? <RentalPrices line={line} /> : "未授权"}
+                    </td>
+                    <td data-label="操作" className="whitespace-nowrap">
+                      <div className="flex flex-wrap items-center justify-start gap-1 sm:justify-end">
+                        {billing && line.customer_plan_id && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              location.hash = "customers";
+                            }}
+                          >
+                            前往客户套餐
+                          </Button>
+                        )}
+                        {billing && !line.customer_plan_id && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={disabled}
+                            onClick={() =>
+                              setModal(
+                                <RentalEditor
+                                  line={line}
+                                  state={state}
+                                  close={close}
+                                  saved={saved}
+                                />,
+                              )
+                            }
+                          >
+                            出租信息
+                          </Button>
+                        )}
+                        {billing && !line.customer_plan_id && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={disabled || !line.rental}
+                            onClick={() =>
+                              setModal(
+                                <RenewalDialog
+                                  lines={[line]}
+                                  close={close}
+                                  saved={saved}
+                                />,
+                              )
+                            }
+                          >
+                            收款 / 续费
+                          </Button>
+                        )}
+                        {role !== "viewer" && (
+                          <DropdownMenu.Root>
+                            <DropdownMenu.Trigger
+                              className="row-menu-trigger"
+                              aria-label={`${line.name} 更多操作`}
+                              disabled={disabled}
+                            >
+                              <MoreHorizontal className="size-4" />
+                            </DropdownMenu.Trigger>
+                            <DropdownMenu.Portal>
+                              <DropdownMenu.Content
+                                className="row-menu-content"
+                                align="end"
+                                sideOffset={4}
+                                collisionPadding={8}
+                              >
+                                {admin && (
+                                  <>
+                                    <DropdownMenu.Item
+                                      onSelect={() =>
+                                        void operate(
+                                          line.enabled ? "disable" : "enable",
+                                          [line],
+                                        )
+                                      }
+                                    >
+                                      {line.enabled ? <Ban /> : <Play />}
+                                      {line.enabled ? "手动停用" : "解除手动停用"}
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      onSelect={() =>
+                                        setModal(
+                                          <LimitsDialog
+                                            lines={[line]}
+                                            close={close}
+                                            saved={saved}
+                                          />,
+                                        )
+                                      }
+                                    >
+                                      <Gauge />
+                                      调整额度 / 限速
+                                    </DropdownMenu.Item>
+                                    {!remote && !line.customer_plan_id && (
+                                      <DropdownMenu.Item
+                                        onSelect={() => unlimited([line])}
+                                      >
+                                        <InfinityIcon />
+                                        设为无限期（自用）
+                                      </DropdownMenu.Item>
+                                    )}
+                                    <DropdownMenu.Item
+                                      disabled={!line.published || !line.enabled}
+                                      onSelect={() => share(line)}
+                                    >
+                                      <Share2 />
+                                      分享配置
+                                    </DropdownMenu.Item>
+                                  </>
+                                )}
+                                {billing && !line.customer_plan_id && (
+                                  <DropdownMenu.Item
+                                    disabled={!line.rental || !line.published}
+                                    onSelect={() =>
+                                      setModal(
+                                        <QueryLinkDialog
+                                          line={line}
+                                          close={close}
+                                          saved={saved}
+                                        />,
+                                      )
+                                    }
+                                  >
+                                    <Link2 />
+                                    客户私密查询链接
+                                  </DropdownMenu.Item>
+                                )}
+                                {admin && (
+                                  <>
+                                    <DropdownMenu.Separator className="my-1 h-px bg-border" />
+                                    <DropdownMenu.Item
+                                      onSelect={() =>
+                                        setModal(
+                                          <AccessPolicyEditor
+                                            line={line}
+                                            close={close}
+                                            saved={saved}
+                                          />,
+                                        )
+                                      }
+                                    >
+                                      <Shield />
+                                      网站 / 端口 / 连接限制
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      onSelect={() => edit(line)}
+                                    >
+                                      <Pencil />
+                                      编辑代理配置
+                                    </DropdownMenu.Item>
+                                  </>
+                                )}
+                                {operations && (
+                                  <>
+                                    <DropdownMenu.Separator className="my-1 h-px bg-border" />
+                                    <DropdownMenu.Item
+                                      disabled={!line.published || !line.enabled}
+                                      onSelect={() => probe(line)}
+                                    >
+                                      <Activity />
+                                      检查连接
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      onSelect={() =>
+                                        setModal(
+                                          <Diagnostics
+                                            nodes={state.nodes.filter((n) =>
+                                              line.hops.some(
+                                                (h) => h.node_id === n.id,
+                                              ),
+                                            )}
+                                            lineId={line.id}
+                                            canSyncTime={admin}
+                                            close={close}
+                                          />,
+                                        )
+                                      }
+                                    >
+                                      <FileText />
+                                      日志与诊断
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      onSelect={() => apply(line)}
+                                    >
+                                      <RefreshCw />
+                                      应用配置修改
+                                    </DropdownMenu.Item>
+                                  </>
+                                )}
+                                {admin && !line.customer_plan_id && (
+                                  <>
+                                    <DropdownMenu.Separator className="my-1 h-px bg-border" />
+                                    <DropdownMenu.Item
+                                      className="text-destructive"
+                                      onSelect={() => remove([line])}
+                                    >
+                                      <Trash2 />
+                                      删除代理
+                                    </DropdownMenu.Item>
+                                  </>
+                                )}
+                              </DropdownMenu.Content>
+                            </DropdownMenu.Portal>
+                          </DropdownMenu.Root>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardTable>
+      ) : (
+        <Empty
+          title={all.length ? "没有匹配结果" : "暂无代理"}
+          action={
+            admin &&
+            !all.length && (
+              <Button onClick={create}>
+                <Plus />
+                新建代理
+              </Button>
+            )
+          }
+        >
+          {admin
+            ? "创建代理后可一键导出分享链接，或在「出租信息」中分配客户与周期报价。"
+            : "当前没有可查看的代理。"}
+        </Empty>
+      )}
+
+      <CardFooter className="flex flex-wrap items-center justify-between gap-3 py-3 text-xs text-muted-foreground">
+        <span>
+          共 {lines.length} 条记录
+          {operations &&
+            state.lines.some((line) => !line.published) &&
+            " · 存在未同步的草稿修改"}
+        </span>
+        {operations && state.lines.some((line) => !line.published) && (
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={disabled}
+            onClick={() => apply()}
+          >
+            <CheckCircle2 />
+            应用待处理配置修改
+          </Button>
+        )}
+      </CardFooter>
+
+      {modal}
+    </Card>
+  );
 }

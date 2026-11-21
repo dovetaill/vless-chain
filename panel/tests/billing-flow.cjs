@@ -82,7 +82,7 @@ if (!root) throw new Error('CHAIN_TEST_ROOT must identify the owned verification
             assert.ok(data.amount_fen > 0 && data.amount_fen <= net);
             result = { id: `adjustment-${state.payment_adjustments.length + 1}`, payment_id: data.payment_id, request_id: data.request_id, kind: data.kind, delta_fen: -data.amount_fen, created: now + 2, note: data.note, disable_line: data.disable_line, affected_line_ids: data.disable_line ? data.expected_line_ids : [], session: 'billing-session-a', operator: actor };
             state.payment_adjustments.push(result);
-            if (data.disable_line) state.lines.filter(line => data.expected_line_ids.includes(line.id)).forEach(line => { line.enabled = false; });
+            if (data.disable_line) state.lines.filter(line => data.expected_line_ids.includes(line.id)).forEach(line => { line.enabled = false; line.sync_status = 'pending'; });
           }
           if (loseAdjustment) { loseAdjustment = false; return route.abort('failed'); }
         } else throw new Error('Unexpected mutation: ' + url.pathname);
@@ -121,16 +121,23 @@ if (!root) throw new Error('CHAIN_TEST_ROOT must identify the owned verification
     assert.equal(writes.length, writesBeforeRecovery, '响应丢失后重开只查询，不重新下单或收款');
     assert.equal(state.payments.length, 1);
     assert.ok(reads.some(read => read.startsWith('/api/rentals/orders/by-request/')));
+    await page.evaluate(() => localStorage.setItem('chain-order:billing-session-a', 'newer-order-request'));
+    await button('已核对，关闭订单').click();
+    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    assert.equal(await page.evaluate(() => localStorage.getItem('chain-order:billing-session-a')), 'newer-order-request', '旧订单回执不可清除更新的待核对请求');
+    await page.evaluate(id => localStorage.setItem('chain-order:billing-session-a', id), state.rental_orders[0].request_id);
+    await button('开通 / 续费订单').click();
     await button('已核对，关闭订单').click();
     await page.getByRole('dialog').waitFor({ state: 'hidden' });
     assert.equal(await page.evaluate(() => localStorage.getItem('chain-order:billing-session-a')), null);
+    await page.getByText('订单 order-1 · 流水 payment-1', { exact: true }).waitFor();
     const originalExpiry = state.customer_plans[0].rental.expires_at;
 
     await button('退款 / 纠错').click();
     await page.getByLabel('本次实际退款 · 元', { exact: true }).fill('5');
     await page.getByLabel('代理权益处理', { exact: true }).selectOption('keep');
     await page.getByLabel('原因 / 凭据', { exact: true }).fill('线下退款凭据 A');
-    await page.getByLabel(/确认已经实际完成线下退款/).check();
+    await page.getByLabel(/确认已经实际完成线下退款，保留原代理权益/).check();
     await button('确认追加记录').click();
     await page.getByRole('dialog').getByText(/该请求结果尚需核对/).waitFor();
     await page.getByRole('dialog').getByRole('alert').filter({ hasText: /fetch|请求|网络/i }).last().waitFor();
@@ -138,18 +145,40 @@ if (!root) throw new Error('CHAIN_TEST_ROOT must identify the owned verification
     const adjustmentsBeforeRecovery = writes.filter(write => write.path === '/api/rentals/adjustments').length;
     await button('退款 / 纠错').click();
     await page.getByText(/^已登记 人工退款/).waitFor();
+    await page.getByText('原收款流水 payment-1', { exact: true }).waitFor();
+    await page.getByText('调整流水 adjustment-1', { exact: true }).waitFor();
+    await close();
+    await page.getByText('调整流水 adjustment-1 · 原收款流水 payment-1', { exact: true }).waitFor();
+    state.payments.push({ ...state.payments[0], id: 'payment-2', request_id: 'another-order', line_id: 'old-line', line_name: '已有独立线路', amount_fen: 7900 });
+    await page.reload();
+    await page.getByRole('row').filter({ hasText: '流水 payment-2' }).getByRole('button', { name: '退款 / 纠错' }).click();
+    const receipt = page.getByRole('dialog');
+    await receipt.getByText('当前打开的收款 payment-2 与这笔回执无关。', { exact: true }).waitFor();
+    await receipt.getByText('原收款流水 payment-1', { exact: true }).waitFor();
+    await receipt.getByText('调整流水 adjustment-1', { exact: true }).waitFor();
+    assert.equal(await receipt.getByText('当前可退', { exact: true }).isVisible(), false);
+    assert.equal(await receipt.getByRole('button', { name: '确认追加记录' }).count(), 0);
     assert.equal(writes.filter(write => write.path === '/api/rentals/adjustments').length, adjustmentsBeforeRecovery);
+    const pendingKey = 'chain-adjustment:billing-session-a';
+    await page.evaluate(key => localStorage.setItem(key, 'newer-request'), pendingKey);
     await button('已核对原操作，关闭').click();
     await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    assert.equal(await page.evaluate(key => localStorage.getItem(key), pendingKey), 'newer-request', '旧回执不可清除后来登记的请求');
     assert.equal(state.lines[0].enabled, true, '仅退款不自动停用权益');
     assert.equal(state.customer_plans[0].rental.expires_at, originalExpiry);
 
-    await button('退款 / 纠错').click();
+    await page.getByRole('row').filter({ hasText: '订单 order-1' }).getByRole('button', { name: '退款 / 纠错' }).click();
+    await button('已核对，重新填写').click();
+    assert.ok(reads.includes('/api/rentals/adjustments/by-request/newer-request'));
+    assert.equal(await page.evaluate(key => localStorage.getItem(key), pendingKey), null);
     await page.getByLabel('本次实际退款 · 元', { exact: true }).fill('5');
+    await page.getByLabel(/确认已经实际完成线下退款，保留原代理权益/).check();
     await page.getByLabel('代理权益处理', { exact: true }).selectOption('disable');
+    const confirmDisable = page.getByLabel(/确认已经实际完成线下退款，并提交停用所选关联线路的请求/);
+    assert.equal(await confirmDisable.isChecked(), false, '扩大操作范围须重新确认');
     await page.getByRole('dialog').getByText('新草稿线路 · draft-a', { exact: true }).waitFor();
     await page.getByLabel('原因 / 凭据', { exact: true }).fill('线下退款凭据 B，并停用套餐');
-    await page.getByLabel(/确认已经实际完成线下退款/).check();
+    await confirmDisable.check();
     await button('确认追加记录').click();
     await page.getByRole('dialog').waitFor({ state: 'hidden' });
     const refunds = writes.filter(write => write.path === '/api/rentals/adjustments');
@@ -162,6 +191,11 @@ if (!root) throw new Error('CHAIN_TEST_ROOT must identify the owned verification
     assert.equal(state.lines[0].enabled, false);
     assert.equal(state.lines[1].enabled, true, '不影响旧独立线路');
     assert.equal(state.customer_plans[0].rental.expires_at, originalExpiry);
+    await page.getByText(/已提交停用请求，当前状态见代理列表/).first().waitFor();
+    assert.equal(await page.getByText(/关联代理当前已同步停用/).count(), 0);
+    state.lines[0].sync_status = 'synced';
+    await page.reload();
+    await page.getByText(/关联代理当前已同步停用/).first().waitFor();
     assert.deepEqual(errors, []);
     const downloading = page.waitForEvent('download');
     await button('导出筛选后的流水 CSV').click();
@@ -169,9 +203,33 @@ if (!root) throw new Error('CHAIN_TEST_ROOT must identify the owned verification
     const chunks = [];
     for await (const chunk of await download.createReadStream()) chunks.push(chunk);
     const csv = Buffer.concat(chunks).toString('utf8');
+    assert.ok(csv.includes('已提交停用关联代理请求'), '历史导出只记录当时的操作');
     assert.ok(csv.includes('"-5.00"'), '退款导出为可参与对账求和的数值');
     assert.ok(!csv.includes('"\'-5.00"'), '内部生成的数值无需按外部文本转义');
     await download.delete();
+
+    const batchLines = ['线路甲', '线路乙', '线路丙'].map((name, i) => ({
+      ...line(`independent-${i}`, name, false), rental: state.customer_plans[0].rental,
+    }));
+    state.lines.push(...batchLines);
+    const previousOrder = state.rental_orders[0];
+    const batch = { ...previousOrder, id: 'pending-batch', request_id: 'batch-request',
+      confirmed_at: 0, confirmed_by: null, confirmed_session: '',
+      items: batchLines.slice(0, 2).map(l => ({ ...previousOrder.items[0], line_id: l.id, line_name: l.name })) };
+    state.rental_orders.push(batch);
+    await page.evaluate(id => localStorage.setItem('chain-order:billing-session-a', id), batch.request_id);
+    await page.goto('http://chain.test/admin#lines');
+    await page.reload();
+    const writesBeforeReview = writes.length;
+    for (const [name, relation] of [['线路甲', '与这笔订单的线路范围不完全一致。'], ['线路丙', '与这笔订单无关。']]) {
+      await page.getByRole('row').filter({ hasText: name }).getByRole('button', { name: '收款 / 续费', exact: true }).click();
+      const dialog = page.getByRole('dialog');
+      await dialog.getByText(`当前打开的「${name}」${relation}`, { exact: true }).waitFor();
+      assert.equal(await dialog.getByRole('checkbox', { name: /已逐项核对「线路甲、线路乙」/ }).isChecked(), false);
+      await close();
+    }
+    assert.equal(writes.length, writesBeforeReview, '从其他入口核对范围不得重新下单或确认收款');
+    assert.deepEqual(errors, []);
     console.log('PASS customer plan draft binding, pending/manual payment, unknown-result recovery, explicit refund scope and preserved independent rights');
   } finally {
     if (browser) await browser.close();

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { expiringSoon, lowQuota, matchesLine, parseMoney, recentDays } from "./business";
+import { endpoint, expiringSoon, lineEndpoint, lowQuota, matchesLine, parseExternalSummary, parseMoney, recentDays } from "./business";
 import type { Line, PanelState } from "../types";
 
 assert.equal(parseMoney("0"), 0);
@@ -36,3 +36,50 @@ assert.equal(lowQuota({ ...line, limits: { ...line.limits, monthly_gib: null } }
 // Charged quota uses the multiplier; raw transfer totals remain unchanged.
 assert.equal(lowQuota({...line, traffic:{...line.traffic!, upload:1, download:1, charged:1024 ** 3}}),true);
 assert.equal(lowQuota({...line, traffic:{...line.traffic!, upload:1024 ** 3, download:0, charged:0}}),false);
+
+// Endpoint and external summary formatting never leak credentials or raw payloads.
+assert.equal(endpoint("192.0.2.1", 443), "192.0.2.1:443");
+assert.equal(endpoint("2001:db8::1", 443), "[2001:db8::1]:443");
+assert.equal(endpoint("[2001:db8::1]", 443), "[2001:db8::1]:443");
+assert.equal(matchesLine(line, state, "vps-hk.example 443", "HK-VPS https://vps-hk.example:8443"), true);
+assert.equal(matchesLine(line, state, "proxy.example:443"), true);
+const relay = { ...line, access: { ...line.access, public_host: "relay.example", public_port: 24443 } };
+assert.equal(lineEndpoint(relay, state.nodes), "proxy.example:24443");
+assert.equal(lineEndpoint({ ...relay, access: { ...relay.access, host: "" } }, state.nodes), "relay.example:24443");
+const viaNode = { ...line, access: { ...line.access, host: "" } };
+assert.equal(lineEndpoint(viaNode, state.nodes), "192.0.2.1:443");
+assert.equal(lineEndpoint(viaNode, []), "端口 443");
+assert.equal(lineEndpoint({ ...viaNode, hops: [] }, []), "—");
+for (const mode of ["auto", "manual"]) {
+  const legacy = { ...viaNode, access: { ...viaNode.access, tls: { ...line.access.tls, mode, domain: "tls.example" } } };
+  assert.equal(lineEndpoint(legacy, state.nodes), "tls.example:443");
+  assert.equal(matchesLine(legacy, state, "tls.example:443"), true);
+}
+const ipv6 = { ...line, access: { ...line.access, host: "2001:db8::1" } };
+assert.equal(matchesLine(ipv6, state, "[2001:db8::1]:443"), true);
+assert.equal(matchesLine(ipv6, state, "[2001:db8::1]:8443"), false);
+
+const vmessB64 = Buffer.from(JSON.stringify({ add: "198.51.100.55", port: "8443", id: "secret-vmess-uuid" })).toString("base64");
+assert.deepEqual(parseExternalSummary(`vmess://${vmessB64}`), { protocol: "VMESS", target: "198.51.100.55:8443" });
+const wgB64 = Buffer.from(JSON.stringify({
+  type: "wireguard",
+  "private-key": "secret-wg-priv",
+  peers: [{ server: "198.51.100.66", port: 51820 }, { server: "2001:db8::66", port: 51821 }],
+})).toString("base64url");
+assert.deepEqual(parseExternalSummary(`mihomo://${wgB64}`), {
+  protocol: "WIREGUARD",
+  target: "198.51.100.66:51820、[2001:db8::66]:51821",
+});
+const ssB64 = Buffer.from("aes-256-gcm:secret-ss-pass@198.51.100.77:8388").toString("base64");
+assert.deepEqual(parseExternalSummary(`ss://${ssB64}?plugin=obfs-local#tag`), {
+  protocol: "SS",
+  target: "198.51.100.77:8388",
+});
+assert.deepEqual(parseExternalSummary(`ss://${ssB64}/?plugin=obfs-local#tag`), {
+  protocol: "SS",
+  target: "198.51.100.77:8388",
+});
+assert.deepEqual(parseExternalSummary("vmess://!!!corrupted-secret-payload!!!"), {
+  protocol: "VMESS",
+  target: "地址未知",
+});

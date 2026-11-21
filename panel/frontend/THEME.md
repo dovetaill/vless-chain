@@ -1,7 +1,7 @@
 # 主题来源
 
-基于用户提供的已购买主题 `metronic-tailwind-react-starter-kit_v9.5.0.zip` 中的 `typescript/vite/`。
+基于用户提供的已购买主题 `metronic-tailwind-react-starter-kit_v9.5.0.zip`（`typescript/vite/`）与同版本 `metronic-tailwind-react-demos_v9.5.0.zip`（Demo 1）。
 
-选用 React + TypeScript + Vite，不需要 Next.js 运行时。保留主题的 Button、Card、Badge、Dialog、Input、工具函数和全局 Tailwind 设计变量；Dialog 关闭文案改为中文，全局样式将 Tailwind 扫描范围限定在源码。布局参考同版本已购买 React demos 的 Demo1 和 branded auth：加入可折叠侧栏、顶栏、工作空间、总览卡片、品牌登录与移动导航。页面和图表按本项目真实数据实现，未引入演示账号或模拟业务指标。登录和数据均接本项目 Rust API。
+选用 React + TypeScript + Vite，无需 Next.js 运行时。已接入主题的 Button、Card、Badge、Dialog、DropdownMenu、Popover、Tooltip、Tabs、Switch、Progress、Alert、Separator、Input、工具函数与全局 Tailwind 设计变量，完整支持 **Metronic Demo 1 浅色 / 深色 / 跟随系统模式**（含首屏无闪烁主题初始化）。布局采用 Demo 1 分组可折叠侧栏、毛玻璃顶栏（面包屑、实时连接指示、告警 Popover、右上角个人菜单）、Branded 双栏登录页与响应式移动端卡片表格；低频的导航视图偏好（自用 / 小型运营 / 商业运营）收敛至右上角个人菜单及系统设置页。所有页面、趋势图表与状态流均直接对接本项目真实 Rust API，无演示账号或模拟业务数据。
 
-`src/components/ui/`、`src/lib/utils.ts`、`src/styles/globals.css`、`src/main.tsx` 来源于上述主题。主题版权及使用条件沿用购买时的许可；这些文件不因本项目使用而改变许可。四个原始 ZIP 未修改。
+`src/components/ui/`、`src/lib/utils.ts`、`src/styles/globals.css`、`src/styles/config.metronic.css`、`src/main.tsx` 来源于上述已购买主题并针对中文后台排版定制。主题版权及使用条件沿用购买时的许可；原始 ZIP 归档未做修改。

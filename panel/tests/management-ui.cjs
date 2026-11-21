@@ -21,12 +21,41 @@ const root = process.env.CHAIN_TEST_ROOT;
     const policy = { enabled: true, interval: 300, failures: 3, recoveries: 2, offline: 60, reminder: 86400, url: 'https://example.com', quota: [80,95,100], expiry_days: [7,3,1,0] };
     const monitor = { local: policy, effective: policy, override: null, controller: '', channels: { telegram_token:'',telegram_chat:'',smtp_host:'',smtp_port:465,smtp_starttls:false,smtp_user:'',smtp_password:'',mail_from:'',mail_to:'' }, telegram_set:true,password_set:false,notices:[] };
     const now = Math.floor(Date.now()/1000);
+    const recoveringKey = 'probe:local:recovering';
+    const pathKey = 'probe:local:line-0';
+    const epochLog = '1795000000 代理组件启动；此前日志保留';
+    const datedLog = '2026/11/21 00:00:00 [Warning] 探测连接失败';
+    const verdict = '自动分段检查：出口及后续链路通过';
+    monitor.checks = {
+      [recoveringKey]: { ok: true, checked_at: now, detail: '首次成功' },
+      healthy: { ok: true, checked_at: now, detail: '正常样本' },
+      failing: { ok: false, checked_at: now, detail: '失败样本' },
+      'clock:local': { ok: true, checked_at: now, detail: '两个 HTTPS 时间参考一致；本机与参考相差 0 秒' },
+      'clock:skewed': { ok: false, checked_at: now, detail: '两个 HTTPS 时间参考一致；本机与参考相差 120 秒' },
+      'clock:unknown': { ok: false, checked_at: now, detail: '无法取得两个一致的可信时间参考；时钟偏差未验证' },
+      [pathKey]: { ok: false, checked_at: now, detail: ['入口连接失败', epochLog, datedLog, verdict, '出口 HTTP 200'].join('\n'), outbound: { ok: true, detail: '出口 HTTP 200' } },
+      'probe:local:line-1': { ok: false, checked_at: now, detail: '入口连接重置; Xray: 测试内核日志', outbound: { ok: false, detail: '出口连接失败' } },
+      'probe:local:timeout': { ok: false, checked_at: now, detail: '入口超时\n' + datedLog + '\n自动分段检查超时；下轮自动重查。' },
+    };
+    monitor.conditions = {
+      [recoveringKey]: { active: true, message: '恢复样本' },
+      'clock:local': { active: false, message: '本机：系统时钟偏差 0 秒，请启用时间同步' },
+      'clock:skewed': { active: true, bad: 3, message: '备用机：系统时钟偏差 120 秒，请启用时间同步' },
+      'clock:unknown': { active: true, bad: 0, message: '节点乙：系统时钟偏差 120 秒，请启用时间同步' },
+      [pathKey]: { active: true, message: 'REALITY：本机入口 24443 未通过' },
+    };
     const line = (i) => ({id:`line-${i}`,name:`代理 ${i}`,kind:'vless',hops:[{node_id:'local',port:10000+i}],enabled:true,published:true,external_id:null,chain:[],target:'',network:'tcp',share:null,
       access:{host:'192.0.2.1',protocol:'vless',username:'',password:'',method:'',public_host:'',public_port:null,shared_port:false,fallback:'',transport:{network:'tcp',path:'/',host:'',mode:'auto'},reality:{target:'www.microsoft.com:443',server_name:'www.microsoft.com'},tls:{mode:'off',domain:'',cert:'',key:''}},
       limits:{upload_mbps:null,download_mbps:null,monthly_gib:100},traffic:{epoch:'',month:'',upload:1024,download:2048,total_upload:1024,total_download:2048,upload_bps:100,download_bps:200,connections:1,sampled_at:now,blocked:false,days:{},cycle_start:now-100,cycle_end:now+100},rental:null,rental_status:'active',sync_status:'synced'});
     const fleet = {remotes:Array.from({length:50},(_,i)=>({id:`vps-${i}`,name:`VPS ${String(i).padStart(2,'0')}`,url:`https://vps-${i}.example`,seen:now,error:'',snapshot:{...state,time:now,local_node_id:'local',version:'0.2.29',agent_version:i===0?'0.2.28':'0.2.29',agent_seen:now,maintenance:true,
       nodes:[{id:'local',name:'本机',host:'192.0.2.1',seen:now,online:true,report:{running:true,applied:true,error:'',revision:'',traffic:{},system:{sampled_at:now,network_rx_bps:1024,network_tx_bps:2048,cpu_percent:10,memory_total:4096,memory_used:1024}}}],
       lines:Array.from({length:10},(_,j)=>line(j)),externals:[{id:'ext-a',name:'外部落地',url:'socks5://a:b@example.com:1080'}]}})),controller:'',policy:null,tasks:{}};
+    const sample = fleet.remotes[8].snapshot;
+    state.nodes = sample.nodes;
+    state.lines = sample.lines.slice(0, 2);
+    state.lines[0].access.host = '';
+    Object.assign(state.lines[0].access.tls, { mode: 'manual', domain: 'tls.example' });
+    state.lines[1].access.host = '2001:db8::8';
     let failSave = false, failLatest = false, disconnected = false, remoteRevoked = false;
 
     await page.route('**/*', async route => {
@@ -75,11 +104,61 @@ const root = process.env.CHAIN_TEST_ROOT;
     });
     await page.goto('http://chain.test/admin#monitoring');
     await page.getByRole('button',{name:'保存配置',exact:true}).waitFor();
+    const policyToggle = page.getByLabel('启用定时检测和状态提醒');
+    assert.equal(await policyToggle.isChecked(), true);
+    await page.locator('form').getByRole('button', { name: '查看说明' }).first().click();
+    await page.locator('[data-slot="popover-content"]').click({ position: { x: 20, y: 15 } });
+    assert.equal(await policyToggle.isChecked(), true, '点击说明浮层不可误触复选框');
+    await page.keyboard.press('Escape');
+    const clockRow = page.getByRole('row').filter({ hasText: '本机 · 系统时钟' });
+    await clockRow.getByText('通过', { exact: true }).waitFor();
+    assert.ok(!(await clockRow.innerText()).includes('请启用时间同步'));
+    assert.ok((await page.getByRole('row').filter({ hasText: '备用机 · 系统时钟' }).innerText()).includes('请启用时间同步'));
+    const unverified = await page.getByRole('row').filter({ hasText: '节点乙 · 系统时钟' }).innerText();
+    assert.ok(unverified.includes('时钟偏差未验证') && !unverified.includes('请启用时间同步'));
+    const pathRow = page.getByRole('row').filter({ hasText: '代理 0 · REALITY' });
+    const summary = pathRow.locator('td[data-label="检测结果摘要"] p').first();
+    const summaryText = await summary.innerText();
+    assert.ok(summaryText.includes(verdict) && summaryText.includes('出口 HTTP 200') && summaryText.includes('24443'));
+    assert.ok(!summaryText.includes(epochLog) && !summaryText.includes(datedLog));
+    await pathRow.getByRole('button', { name: '查看内核调试日志' }).click();
+    const logText = await pathRow.locator('pre').innerText();
+    assert.ok(logText.includes(epochLog) && logText.includes(datedLog) && !logText.includes(verdict));
+    await page.getByText('入口连接重置 · 自动分段检查：出口及后续链路也未通过', { exact: true }).waitFor();
+    await page.getByText('入口超时 · 自动分段检查超时；下轮自动重查。', { exact: true }).waitFor();
+    await page.getByLabel('搜索检测记录').fill('代理 0');
+    assert.equal(await page.getByRole('region', { name: '最近自动检测列表' }).locator('tbody tr').count(), 1);
+    await page.getByLabel('搜索检测记录').fill('');
+    const recoveringRow = page.getByRole('row').filter({ hasText: '恢复样本' });
+    const filterChecks = name => page.getByRole('button', { name, exact: true }).click();
+    await filterChecks('仅看异常');
+    await recoveringRow.getByText('恢复确认中', { exact: true }).waitFor();
+    await page.getByText('失败样本', { exact: true }).waitFor();
+    await filterChecks('已通过');
+    assert.equal(await recoveringRow.count(), 0);
+    await page.getByText('正常样本', { exact: true }).waitFor();
+    monitor.conditions[recoveringKey].active = false;
+    await page.reload();
+    await filterChecks('已通过');
+    await recoveringRow.getByText('通过', { exact: true }).waitFor();
+    await filterChecks('仅看异常');
+    assert.equal(await recoveringRow.count(), 0);
+    monitor.conditions[recoveringKey].active = true;
+    monitor.effective = { ...policy, enabled: false };
+    await page.reload();
+    await filterChecks('已通过');
+    await recoveringRow.getByText('历史通过', { exact: true }).waitFor();
+    monitor.effective = policy;
+    await page.reload();
     await page.getByLabel('检测间隔（秒）',{exact:true}).fill('600');
     await page.getByRole('button',{name:'保存配置',exact:true}).click();
     await page.getByText('配置已保存',{exact:true}).waitFor();
     assert.equal(writes.find(w => w.path === '/api/monitoring').body.local.interval,600);
     assert.equal(writes.find(w => w.path === '/api/monitoring').body.channels.telegram_token,'');
+    await page.locator('aside nav').getByRole('button', { name: '代理', exact: true }).click();
+    const entries = page.getByRole('region', { name: '代理列表', exact: true }).locator('[data-label="接入入口"]');
+    await entries.getByText('tls.example:10000', { exact: true }).waitFor();
+    await entries.getByText('[2001:db8::8]:10001', { exact: true }).waitFor();
     await page.locator('aside nav').getByRole('button',{name:'多机总控',exact:true}).click();
     const nav=page.getByRole('navigation',{name:'总控功能'});
     const go=async name=>nav.getByRole('button',{name,exact:true}).click();
@@ -87,6 +166,29 @@ const root = process.env.CHAIN_TEST_ROOT;
     const closeDialog=async()=>{await dialog().getByRole('button',{name:'关闭',exact:true}).first().click();await dialog().waitFor({state:'hidden'});};
     await page.getByText('VPS 状态',{exact:true}).waitFor();
     await page.getByText('↑ 100.0 KiB/s · 有效 50/50 台',{exact:true}).waitFor();
+    const chart = page.getByLabel(/网卡速率趋势/);
+    await chart.getByRole('button').first().waitFor();
+    for (const offset of [5, 10, 15, 20]) {
+      const count = await chart.getByRole('button').count();
+      fleet.server_now = now + offset;
+      for (const remote of fleet.remotes) {
+        remote.error = offset === 10 ? '模拟快照中断' : '';
+        const system = remote.snapshot.nodes[0].report.system;
+        system.sampled_at = now + offset;
+        system.network_rx_bps = offset === 15 ? 0 : 1024;
+      }
+      await page.getByRole('button', { name: '刷新总控', exact: true }).click();
+      await chart.getByRole('button').nth(count).waitFor();
+    }
+    const paths = await chart.locator('svg path').evaluateAll(nodes => nodes.map(p => [p.getAttribute('fill'), p.getAttribute('d')]));
+    assert.equal(paths.length, 4);
+    for (const [fill, path] of paths) {
+      assert.equal((path.match(/M/g) || []).length, 2, '收发曲线和填充均须在缺样处断开');
+      assert.equal((path.match(/Z/g) || []).length, fill === 'none' ? 0 : 2);
+    }
+    delete fleet.server_now;
+    fleet.remotes.forEach(remote => { remote.snapshot.nodes[0].report.system.sampled_at = now; });
+    await page.reload();
     assert.equal(await page.getByText('接入与授权',{exact:true}).count(),0);
     await go('VPS');
     const originalSystem = fleet.remotes[0].snapshot.nodes[0].report.system;
@@ -151,6 +253,12 @@ const root = process.env.CHAIN_TEST_ROOT;
     await go('所有代理');
     const rows=page.getByRole('region',{name:'代理列表',exact:true}).locator('tbody tr');
     assert.equal(await rows.count(),20);await page.getByText('共 500 条 · 每页 20 条 · 第 1 / 25 页',{exact:true}).waitFor();
+    for (const [address, name] of [['tls.example:10000', '代理 0'], ['[2001:db8::8]:10001', '代理 1']]) {
+      await page.getByLabel('搜索总控列表').fill(address);
+      await rows.getByText(name, { exact: true }).waitFor();
+      assert.equal(await rows.count(), 1);
+    }
+    await page.getByLabel('搜索总控列表').fill('');
     fleet.remotes[0].snapshot.lines[0].enabled=false;fleet.remotes[0].snapshot.lines[0].sync_status='pending';
     await page.getByRole('button',{name:'刷新总控',exact:true}).click();await rows.first().getByText('停用待生效',{exact:true}).waitFor();
     fleet.remotes[0].snapshot.lines[0].sync_status='error';
@@ -192,6 +300,12 @@ const root = process.env.CHAIN_TEST_ROOT;
     for(const path of ['/lines','/diagnostics/local/reality','/preview','/publish']) assert.ok(writes.some(w=>w.path==='/api/fleet/vps-1/forward'&&w.body.path===path),path);
     assert.equal(writes.filter(w=>['/api/lines','/api/publish','/api/diagnostics/local/reality'].includes(w.path)).length,0);
     await go('外部代理');await page.getByLabel('筛选 VPS').selectOption('vps-2');
+    const fleetExtText = await page.getByRole('region',{name:'外部代理列表'}).innerText();
+    assert.ok(fleetExtText.includes('SOCKS5') && fleetExtText.includes('example.com:1080'), '总控外部代理显示协议与真实地址');
+    assert.ok(!fleetExtText.includes('a:b'), '总控外部代理不暴露账号密码');
+    await page.getByLabel('搜索总控列表').fill('example.com:1080');
+    assert.equal(await page.getByRole('region',{name:'外部代理列表'}).locator('tbody tr').count(), 1);
+    await page.getByLabel('搜索总控列表').fill('');
     await page.getByRole('region',{name:'外部代理列表'}).getByRole('button',{name:'编辑',exact:true}).click();
     await dialog().getByLabel('名称',{exact:true}).fill('修改后的落地');acceptDialog=false;await page.keyboard.press('Escape');assert.equal(await dialog().getByLabel('名称',{exact:true}).inputValue(),'修改后的落地');acceptDialog=true;await dialog().getByRole('button',{name:'保存',exact:true}).click();
     await dialog().getByRole('heading',{name:'应用修改 · VPS 02'}).waitFor();await dialog().getByRole('button',{name:'确认并应用',exact:true}).click();await dialog().waitFor({state:'hidden'});
