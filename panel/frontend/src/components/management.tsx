@@ -107,7 +107,7 @@ export function PolicyFields({
         </InfoTip>
       </div>
 
-      <div className="grid gap-3.5 md:grid-cols-2 lg:grid-cols-3">
+      <div className="grid items-end gap-3.5 md:grid-cols-2 lg:grid-cols-3">
         <div className="md:col-span-2 lg:col-span-3">
           <Field label="检测目标（HTTP / HTTPS）">
             <Input
@@ -911,18 +911,18 @@ export function Monitoring({
                             {parsed.headline}
                           </p>
                           {parsed.more && (
-                            <div className="mt-1">
+                            <div className="mt-1.5">
                               <button
                                 type="button"
                                 onClick={() =>
                                   setExpandedNoticeId(open ? null : n.id)
                                 }
-                                className="cursor-pointer text-[11px] text-primary hover:underline"
+                                className="cursor-pointer text-[11px] font-medium text-primary hover:underline"
                               >
                                 {open ? "收起详情" : "展开探测详情"}
                               </button>
                               {open && (
-                                <p className="mt-1 break-words rounded-md bg-muted/40 p-2 text-[11px] leading-relaxed text-muted-foreground">
+                                <p className="mt-1.5 break-words rounded-md bg-muted/40 p-2.5 text-[11px] leading-relaxed text-muted-foreground">
                                   {parsed.more}
                                 </p>
                               )}

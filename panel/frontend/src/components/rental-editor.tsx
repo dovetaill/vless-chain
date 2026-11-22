@@ -240,7 +240,7 @@ export function RentalEditor({
 
       <details className="details">
         <summary>查看本线路收款记录</summary>
-        <div className="mt-3">
+        <div className="mt-3.5">
           <PaymentTable
             lines={state.lines}
             payments={state.payments.filter(

@@ -493,7 +493,7 @@ export function LineEditor({
         <summary>
           {usesReality ? "监听端口 · REALITY 默认 443" : "监听端口 · 自动分配"}
         </summary>
-        <div className="mt-3 space-y-3">
+        <div className="mt-3.5 space-y-3.5">
           {protocol === "vless" && (
             <label className="flex items-center gap-2 text-xs font-medium">
               <input
@@ -748,7 +748,7 @@ export function LineEditor({
                     : "TLS 证书"
                 }`}
           </summary>
-          <div className="mt-3 space-y-3.5">
+          <div className="mt-3.5 space-y-3.5">
             <Field
               label="HTTPS / 证书"
               hint={
@@ -1024,7 +1024,7 @@ export function LineEditor({
       {!line && (
         <details className="details">
           <summary>流量额度与带宽上限（可选）</summary>
-          <div className="grid gap-3.5 pt-3.5 sm:grid-cols-3">
+          <div className="mt-3.5 grid gap-3.5 sm:grid-cols-3">
             <Field label="上传上限 · Mbps">
               <Input
                 name="upload"

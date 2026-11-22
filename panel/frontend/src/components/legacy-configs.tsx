@@ -69,15 +69,17 @@ function Editor({
       {!!value.source_inbounds?.length && (
         <details className="details">
           <summary>原面板入口配置备份（含未启用入口）</summary>
-          <p className="muted mt-2">
-            仅作迁移对照保留，不会自动启用原面板中未运行的入口或用户。
-          </p>
-          <textarea
-            aria-label="原面板入口配置备份"
-            readOnly
-            className="textarea mono mt-2 min-h-48 text-xs"
-            value={JSON.stringify(value.source_inbounds, null, 2)}
-          />
+          <div className="mt-3.5 space-y-3">
+            <p className="muted">
+              仅作迁移对照保留，不会自动启用原面板中未运行的入口或用户。
+            </p>
+            <textarea
+              aria-label="原面板入口配置备份"
+              readOnly
+              className="textarea mono min-h-48 text-xs"
+              value={JSON.stringify(value.source_inbounds, null, 2)}
+            />
+          </div>
         </details>
       )}
     </Modal>

@@ -662,7 +662,7 @@ export function App() {
         {secondaryPages.length > 0 && (
           <details
             key={mode}
-            className="pt-2"
+            className="group pt-2"
             open={secondaryPages.some((p) => p.id === page) || undefined}
           >
             <summary
@@ -673,8 +673,9 @@ export function App() {
                 <MoreHorizontal className="size-[17px] shrink-0" />
                 <span className="sidebar-label">更多模块</span>
               </span>
+              <ChevronRight className="sidebar-label size-3.5 shrink-0 text-muted-foreground/70 transition-transform group-open:rotate-90" />
             </summary>
-            <div className="mt-0.5 space-y-0.5 border-l border-border ms-4 ps-2">
+            <div className="mt-1 space-y-0.5 border-l border-border ms-4 ps-2">
               {secondaryPages.map(navigationButton)}
             </div>
           </details>
@@ -841,26 +842,38 @@ export function App() {
                           最近配置同步
                         </p>
                         <div className="space-y-1.5">
-                          {state.jobs.map((job) => (
-                            <details
-                              key={job.id}
-                              className="rounded-md border border-border/70 bg-muted/25 px-2.5 py-2 text-xs"
-                            >
-                              <summary className="flex cursor-pointer list-none items-center justify-between gap-2 font-medium [&::-webkit-details-marker]:hidden">
-                                <span>{jobNames[job.state] || job.state}</span>
-                                <span className="text-[11px] font-normal text-muted-foreground tabular-nums">
-                                  {stamp(job.started)}
-                                </span>
-                              </summary>
-                              {job.events.length > 0 && (
-                                <div className="mt-2 space-y-1 border-t border-border pt-2 text-[11px] text-muted-foreground">
+                          {state.jobs.map((job) =>
+                            job.events.length > 0 ? (
+                              <details
+                                key={job.id}
+                                className="details details-compact"
+                              >
+                                <summary>
+                                  <span className="flex min-w-0 flex-1 items-center justify-between gap-2">
+                                    <span>{jobNames[job.state] || job.state}</span>
+                                    <span className="text-[11px] font-normal text-muted-foreground tabular-nums">
+                                      {stamp(job.started)}
+                                    </span>
+                                  </span>
+                                </summary>
+                                <div className="mt-2.5 space-y-1.5 text-[11px] leading-relaxed text-muted-foreground">
                                   {job.events.map((event, i) => (
                                     <p key={i}>{event.message}</p>
                                   ))}
                                 </div>
-                              )}
-                            </details>
-                          ))}
+                              </details>
+                            ) : (
+                              <div
+                                key={job.id}
+                                className="flex items-center justify-between gap-2 rounded-lg border border-border/70 bg-muted/25 px-3 py-2 text-xs font-medium"
+                              >
+                                <span>{jobNames[job.state] || job.state}</span>
+                                <span className="text-[11px] font-normal text-muted-foreground tabular-nums">
+                                  {stamp(job.started)}
+                                </span>
+                              </div>
+                            ),
+                          )}
                         </div>
                       </div>
                     )}

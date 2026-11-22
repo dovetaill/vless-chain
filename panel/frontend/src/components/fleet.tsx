@@ -350,7 +350,7 @@ function Trend({ points, now }: { points: Point[]; now: number }) {
         </div>
         <details className="details mt-3">
           <summary>采样明细（{points.length}）</summary>
-          <div className="mt-2.5 max-h-48 overflow-auto rounded-md border border-border">
+          <div className="mt-3.5 max-h-48 overflow-auto rounded-md border border-border">
             <table className="data-table">
               <thead>
                 <tr>
@@ -1455,9 +1455,9 @@ export function Fleet({ state }: { state: PanelState }) {
                             <li key={i} className="break-words">
                               {issue.detail}
                               {issue.evidence && (
-                                <details className="details mt-1.5">
+                                <details className="details details-compact mt-2">
                                   <summary>自动检测详情</summary>
-                                  <p className="mt-1.5 whitespace-pre-wrap text-xs">
+                                  <p className="mt-2.5 whitespace-pre-wrap break-words text-xs leading-relaxed text-muted-foreground">
                                     {issue.evidence}
                                   </p>
                                 </details>
@@ -1768,7 +1768,7 @@ export function Fleet({ state }: { state: PanelState }) {
                 </div>
 
                 {chosen.length > 0 && maintenanceTab && (
-                  <div className="space-y-3 rounded-lg border border-border bg-muted/25 p-3.5">
+                  <div className="space-y-3.5 rounded-xl border border-border bg-muted/25 p-4">
                     {maintenanceTab === "program" && (
                       <div className="flex flex-wrap items-center gap-2.5">
                         <Button
@@ -2119,11 +2119,11 @@ export function Fleet({ state }: { state: PanelState }) {
                                 : "尚无探测记录"}
                             </p>
                             {latestCheck(r, line) && (
-                              <details className="mt-1">
-                                <summary className="cursor-pointer text-xs text-primary hover:underline">
+                              <details className="details-inline mt-1.5">
+                                <summary>
                                   探测结果详情
                                 </summary>
-                                <p className="mt-1 max-w-64 whitespace-normal text-xs text-muted-foreground">
+                                <p className="mt-1.5 max-w-64 whitespace-normal break-words rounded-md border border-border/70 bg-muted/35 px-2.5 py-2 text-xs leading-relaxed text-muted-foreground">
                                   {latestCheck(r, line)!.ok ? "通过" : "失败"} ·{" "}
                                   {latestCheck(r, line)!.latency_ms != null
                                     ? `${latestCheck(r, line)!.latency_ms} ms · `
@@ -2539,7 +2539,7 @@ export function Fleet({ state }: { state: PanelState }) {
                   先在目标 VPS 的「多机总控 → 总控设置」生成一次性接入码，再回到本页填写。
                 </p>
                 <form
-                  className="grid gap-3.5 md:grid-cols-2"
+                  className="grid items-end gap-3.5 md:grid-cols-2"
                   onSubmit={(e) => {
                     e.preventDefault();
                     const form = e.currentTarget,
@@ -2679,9 +2679,9 @@ export function Fleet({ state }: { state: PanelState }) {
                     {issue.detail}
                   </p>
                   {issue.evidence && (
-                    <details className="details mt-2">
+                    <details className="details details-compact mt-2.5">
                       <summary>自动检测详情</summary>
-                      <p className="mt-1.5 whitespace-pre-wrap break-words text-xs">
+                      <p className="mt-2.5 whitespace-pre-wrap break-words text-xs leading-relaxed text-muted-foreground">
                         {issue.evidence}
                       </p>
                     </details>

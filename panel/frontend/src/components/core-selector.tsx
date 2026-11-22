@@ -64,11 +64,11 @@ export function CoreSelector({
   return (
     <fieldset
       disabled={disabled}
-      className="space-y-3 rounded-xl border border-border bg-card p-3.5 text-xs"
+      className="space-y-3.5 rounded-xl border border-border bg-card p-4 text-xs"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
-          <span className="font-semibold text-foreground">代理内核版本</span>
+          <span className="text-[13px] font-semibold text-foreground">代理内核版本</span>
           <InfoTip>
             切换内核保留 UUID、密钥与现有客户端链接，后台自动验收链路；若为安全修复且未勾选允许回退，切换失败时将安全隔离内核并保留 Agent 心跳。
           </InfoTip>
@@ -78,8 +78,8 @@ export function CoreSelector({
         </Badge>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2">
-        <label className="space-y-1 font-medium text-foreground">
+      <div className="grid gap-3.5 sm:grid-cols-2">
+        <label className="field">
           <span>选择内核</span>
           <select
             className="select"
@@ -98,7 +98,7 @@ export function CoreSelector({
           </select>
         </label>
 
-        <label className="space-y-1 font-medium text-foreground">
+        <label className="field">
           <span>官方版本</span>
           <select
             aria-label="官方版本"
@@ -130,8 +130,8 @@ export function CoreSelector({
 
       <details className="details">
         <summary>高级版本与安全回退选项</summary>
-        <div className="mt-3 space-y-2.5">
-          <label className="block space-y-1 font-medium">
+        <div className="mt-3.5 space-y-3.5">
+          <label className="field">
             <span>手动指定版本号</span>
             <Input
               placeholder="例如 26.10.21"
@@ -144,42 +144,44 @@ export function CoreSelector({
               }
             />
           </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={value.prerelease}
-              onChange={(e) =>
-                onChange({ ...value, prerelease: e.target.checked })
-              }
-            />
-            <span>显示并允许选择预发布（Pre-release）版本</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={value.security_update}
-              onChange={(e) =>
-                onChange({
-                  ...value,
-                  security_update: e.target.checked,
-                  rollback_safe: false,
-                })
-              }
-            />
-            <span>本次属于安全更新，禁止自动回退到未确认安全的旧版</span>
-          </label>
-          {value.security_update && (
+          <div className="space-y-2.5">
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={value.rollback_safe}
+                checked={value.prerelease}
                 onChange={(e) =>
-                  onChange({ ...value, rollback_safe: e.target.checked })
+                  onChange({ ...value, prerelease: e.target.checked })
                 }
               />
-              <span>已核实原版本不受本次漏洞影响，允许失败时回退</span>
+              <span>显示并允许选择预发布（Pre-release）版本</span>
             </label>
-          )}
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={value.security_update}
+                onChange={(e) =>
+                  onChange({
+                    ...value,
+                    security_update: e.target.checked,
+                    rollback_safe: false,
+                  })
+                }
+              />
+              <span>本次属于安全更新，禁止自动回退到未确认安全的旧版</span>
+            </label>
+            {value.security_update && (
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={value.rollback_safe}
+                  onChange={(e) =>
+                    onChange({ ...value, rollback_safe: e.target.checked })
+                  }
+                />
+                <span>已核实原版本不受本次漏洞影响，允许失败时回退</span>
+              </label>
+            )}
+          </div>
         </div>
       </details>
 

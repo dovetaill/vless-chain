@@ -202,7 +202,7 @@ body {
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.4rem;
+    gap: 0.4375rem;
     font-size: 0.8125rem;
     font-weight: 500;
     color: var(--foreground);
@@ -227,23 +227,24 @@ body {
     padding: 0.75rem 1rem;
   }
 
-  .details summary {
+  .details > summary {
     cursor: pointer;
     list-style: none;
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 0.5rem;
     color: var(--foreground);
     font-size: 0.8125rem;
     font-weight: 500;
     user-select: none;
   }
 
-  .details summary::-webkit-details-marker {
+  .details > summary::-webkit-details-marker {
     display: none;
   }
 
-  .details summary::after {
+  .details > summary::after {
     content: "";
     width: 0.875rem;
     height: 0.875rem;
@@ -254,7 +255,66 @@ body {
     transition: transform 0.15s ease;
   }
 
-  .details[open] summary::after {
+  .details[open] > summary {
+    padding-bottom: 0.625rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .details[open] > summary::after {
+    transform: rotate(90deg);
+  }
+
+  .details-compact {
+    padding: 0.55rem 0.75rem;
+    border-radius: 0.5rem;
+    background: color-mix(in srgb, var(--card) 82%, transparent);
+  }
+
+  .details-compact > summary {
+    font-size: 0.75rem;
+  }
+
+  .details-compact[open] > summary {
+    padding-bottom: 0.5rem;
+  }
+
+  .details-inline > summary {
+    cursor: pointer;
+    list-style: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--primary);
+    user-select: none;
+  }
+
+  .details-inline > summary:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .details-inline > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .details-inline > summary::after {
+    content: "";
+    width: 0.75rem;
+    height: 0.75rem;
+    flex-shrink: 0;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 18 6-6-6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: center;
+    transition: transform 0.15s ease;
+  }
+
+  .dark .details-inline > summary::after {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2360a5fa' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 18 6-6-6-6'/%3E%3C/svg%3E");
+  }
+
+  .details-inline[open] > summary::after {
     transform: rotate(90deg);
   }
 

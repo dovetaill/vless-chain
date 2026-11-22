@@ -339,7 +339,7 @@ export function Maintenance({ state }: { state: PanelState }) {
 
           <details className="details">
             <summary>其他维护</summary>
-            <div className="mt-3 space-y-2.5">
+            <div className="mt-3.5 space-y-2.5">
               <div className="flex flex-wrap items-center gap-2">
                 <Button
                   size="sm"
@@ -385,158 +385,166 @@ export function Maintenance({ state }: { state: PanelState }) {
           {task && (
             <TaskContainer
               role={historicalUpgrade ? undefined : "status"}
-              className="space-y-2 rounded-xl border border-border bg-muted/20 p-4 text-xs"
+              className={
+                historicalUpgrade
+                  ? "details text-xs"
+                  : "rounded-xl border border-border bg-muted/20 p-4 text-xs"
+              }
             >
               {historicalUpgrade && (
-                <summary className="cursor-pointer font-medium text-muted-foreground">
+                <summary className="text-muted-foreground">
                   历史升级记录 · 当前组件版本已更新
                 </summary>
               )}
-              <p className="font-semibold text-foreground">
-                {task.action === "upgrade"
-                  ? `升级 ${task.version || ""}`
-                  : "维护任务"}
-                ：{statuses[task.state] || task.state}
-              </p>
-              {task.error && <p className="text-destructive">{task.error}</p>}
-              {["failed", "unknown"].includes(task.state) &&
-                state.core_maintenance?.pending &&
-                state.core_maintenance.pending !== task.id && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      setTask(undefined);
-                      setTaskId(state.core_maintenance!.pending!);
-                      localStorage.setItem(
-                        storageKey,
-                        state.core_maintenance!.pending!,
-                      );
-                    }}
-                  >
-                    返回待验证内核任务
-                  </Button>
-                )}
-              {(task.verification?.detail || task.detail) && (
-                <p className="text-muted-foreground">
-                  {task.verification?.detail || task.detail}
+              <div className={historicalUpgrade ? "mt-3.5 space-y-2.5" : "space-y-2.5"}>
+                <p className="font-semibold text-foreground">
+                  {task.action === "upgrade"
+                    ? `升级 ${task.version || ""}`
+                    : "维护任务"}
+                  ：{statuses[task.state] || task.state}
                 </p>
-              )}
-              {task.network && (
-                <div className="space-y-1 text-muted-foreground">
-                  <p>
-                    系统默认：{task.network.after.congestion_control} +{" "}
-                    {task.network.after.qdisc}
-                  </p>
-                  <p>
-                    网卡队列：
-                    {task.network.after.interfaces
-                      .map((q) => `${q.dev} / ${q.parent}: ${q.kind}`)
-                      .join("；") || "未知"}
-                  </p>
-                  {task.network.after.warning && (
-                    <p className="text-amber-600 dark:text-amber-400">
-                      {task.network.after.warning}
-                    </p>
+                {task.error && <p className="text-destructive">{task.error}</p>}
+                {["failed", "unknown"].includes(task.state) &&
+                  state.core_maintenance?.pending &&
+                  state.core_maintenance.pending !== task.id && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setTask(undefined);
+                        setTaskId(state.core_maintenance!.pending!);
+                        localStorage.setItem(
+                          storageKey,
+                          state.core_maintenance!.pending!,
+                        );
+                      }}
+                    >
+                      返回待验证内核任务
+                    </Button>
                   )}
-                </div>
-              )}
-              {task.core_version && (
-                <p className="text-muted-foreground">
-                  {task.core} 目标版本：{task.core_version}
-                </p>
-              )}
-              {task.state === "awaiting_verification" &&
-                task.verification &&
-                task.verification.state !== "manual" && (
-                  <p>正在后台自动验收，可关闭此页面。</p>
+                {(task.verification?.detail || task.detail) && (
+                  <p className="text-muted-foreground">
+                    {task.verification?.detail || task.detail}
+                  </p>
                 )}
-              {task.core &&
-                ["failed", "unknown"].includes(task.state) &&
-                state.core_maintenance?.pending === task.id && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={submitting}
-                    onClick={() =>
-                      setConfirm({
-                        id: coreDecisionId(task.id, "core-reject"),
-                        action: "core-reject",
-                        core: task.core,
-                        task_id: task.id,
-                      })
-                    }
-                  >
-                    恢复中断的内核切换
-                  </Button>
-                )}
-              {task.core &&
-                task.state === "awaiting_verification" &&
-                (!task.verification ||
-                  task.verification.state === "manual") && (
-                  <div className="space-y-2 pt-1">
+                {task.network && (
+                  <div className="space-y-1 text-muted-foreground">
                     <p>
-                      请使用升级前的原链接验证连接、实际传输及所需的 UDP 功能。
+                      系统默认：{task.network.after.congestion_control} +{" "}
+                      {task.network.after.qdisc}
                     </p>
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        size="sm"
-                        disabled={submitting}
-                        onClick={() =>
-                          setConfirm({
-                            id: coreDecisionId(task.id, "core-confirm"),
-                            action: "core-confirm",
-                            core: task.core,
-                            task_id: task.id,
-                          })
-                        }
-                      >
-                        原链接已验证通过
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={submitting}
-                        onClick={() =>
-                          setConfirm({
-                            id: coreDecisionId(task.id, "core-reject"),
-                            action: "core-reject",
-                            core: task.core,
-                            task_id: task.id,
-                            keep_agent_on_failure: true,
-                          })
-                        }
-                      >
-                        报告链接验证失败
-                      </Button>
-                    </div>
+                    <p>
+                      网卡队列：
+                      {task.network.after.interfaces
+                        .map((q) => `${q.dev} / ${q.parent}: ${q.kind}`)
+                        .join("；") || "未知"}
+                    </p>
+                    {task.network.after.warning && (
+                      <p className="text-amber-600 dark:text-amber-400">
+                        {task.network.after.warning}
+                      </p>
+                    )}
                   </div>
                 )}
-              <details className="pt-1">
-                <summary className="cursor-pointer text-muted-foreground">
-                  任务详情
-                </summary>
-                <p className="mono mt-1 break-all text-[11px] text-muted-foreground">
-                  任务 ID: {task.id}
-                </p>
-                {task.after && (
-                  <p className="mt-0.5 text-muted-foreground">
-                    已安装：
-                    {Object.entries(task.after)
-                      .map(([role, version]) => `${role} ${version}`)
-                      .join(" · ")}
+                {task.core_version && (
+                  <p className="text-muted-foreground">
+                    {task.core} 目标版本：{task.core_version}
                   </p>
                 )}
-              </details>
-              {task.state === "succeeded" && task.action === "upgrade" && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => location.reload()}
-                >
-                  刷新页面使用新版界面
-                </Button>
-              )}
+                {task.state === "awaiting_verification" &&
+                  task.verification &&
+                  task.verification.state !== "manual" && (
+                    <p>正在后台自动验收，可关闭此页面。</p>
+                  )}
+                {task.core &&
+                  ["failed", "unknown"].includes(task.state) &&
+                  state.core_maintenance?.pending === task.id && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={submitting}
+                      onClick={() =>
+                        setConfirm({
+                          id: coreDecisionId(task.id, "core-reject"),
+                          action: "core-reject",
+                          core: task.core,
+                          task_id: task.id,
+                        })
+                      }
+                    >
+                      恢复中断的内核切换
+                    </Button>
+                  )}
+                {task.core &&
+                  task.state === "awaiting_verification" &&
+                  (!task.verification ||
+                    task.verification.state === "manual") && (
+                    <div className="space-y-2 pt-1">
+                      <p>
+                        请使用升级前的原链接验证连接、实际传输及所需的 UDP 功能。
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          disabled={submitting}
+                          onClick={() =>
+                            setConfirm({
+                              id: coreDecisionId(task.id, "core-confirm"),
+                              action: "core-confirm",
+                              core: task.core,
+                              task_id: task.id,
+                            })
+                          }
+                        >
+                          原链接已验证通过
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={submitting}
+                          onClick={() =>
+                            setConfirm({
+                              id: coreDecisionId(task.id, "core-reject"),
+                              action: "core-reject",
+                              core: task.core,
+                              task_id: task.id,
+                              keep_agent_on_failure: true,
+                            })
+                          }
+                        >
+                          报告链接验证失败
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                <details className="details details-compact">
+                  <summary className="text-muted-foreground">
+                    任务详情
+                  </summary>
+                  <div className="mt-2.5 space-y-1.5 leading-relaxed text-muted-foreground">
+                    <p className="mono break-all text-[11px]">
+                      任务 ID: {task.id}
+                    </p>
+                    {task.after && (
+                      <p>
+                        已安装：
+                        {Object.entries(task.after)
+                          .map(([role, version]) => `${role} ${version}`)
+                          .join(" · ")}
+                      </p>
+                    )}
+                  </div>
+                </details>
+                {task.state === "succeeded" && task.action === "upgrade" && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => location.reload()}
+                  >
+                    刷新页面使用新版界面
+                  </Button>
+                )}
+              </div>
             </TaskContainer>
           )}
 
@@ -605,8 +613,8 @@ export function Maintenance({ state }: { state: PanelState }) {
             </CardHeading>
           </CardHeader>
           <CardContent className="grid gap-5 md:grid-cols-2">
-            <div className="space-y-2">
-              <span className="text-xs font-medium text-foreground">外观主题</span>
+            <div className="field">
+              <span>外观主题</span>
               <div className="grid grid-cols-3 gap-2">
                 {(
                   [
@@ -632,8 +640,8 @@ export function Maintenance({ state }: { state: PanelState }) {
               </div>
             </div>
 
-            <div className="space-y-2">
-              <label htmlFor="pref-workspace-mode" className="text-xs font-medium text-foreground">
+            <div className="field">
+              <label htmlFor="pref-workspace-mode">
                 使用模式
               </label>
               <select

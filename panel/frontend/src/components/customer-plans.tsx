@@ -411,96 +411,98 @@ function PlanEditor({
         return (
           <fieldset
             key={index}
-            className="space-y-3 rounded-xl border border-border bg-muted/20 p-3.5"
+            className="rounded-xl border border-border bg-muted/20 p-3.5"
           >
             <legend className="px-1.5 text-xs font-semibold text-foreground">
               成员 {index + 1}
             </legend>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <Field label={`成员 ${index + 1} 名称`}>
-                <Input
-                  required
-                  maxLength={40}
-                  value={member.name}
-                  onChange={(event) =>
-                    update(index, { name: event.target.value })
-                  }
-                />
-              </Field>
-              <Field label={`成员 ${index + 1} 额外硬上限 · GiB`}>
-                <Input
-                  type="number"
-                  min="0.001"
-                  step="any"
-                  placeholder="留空共用总额"
-                  value={member.monthly_gib ?? ""}
-                  onChange={(event) =>
-                    update(index, {
-                      monthly_gib: event.target.value
-                        ? Number(event.target.value)
-                        : null,
-                    })
-                  }
-                />
-              </Field>
-            </div>
-            {!candidates.length ? (
-              <p className="text-xs text-amber-600 dark:text-amber-400">
-                暂无可绑定的未发布草稿线路。请先在「代理」页面新建代理并选择「仅保存草稿」。
-              </p>
-            ) : (
-              <div className="max-h-40 space-y-1.5 overflow-auto rounded-lg border border-border bg-card p-2.5">
-                {candidates.map((line) => {
-                  const retained = Boolean(
-                    original?.line_ids.includes(line.id),
-                  );
-                  const elsewhere = members.some(
-                    (other, i) =>
-                      i !== index && other.line_ids.includes(line.id),
-                  );
-                  return (
-                    <label
-                      key={line.id}
-                      className="flex items-center gap-2 text-xs text-foreground"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={member.line_ids.includes(line.id)}
-                        disabled={retained || elsewhere}
-                        onChange={(event) =>
-                          update(index, {
-                            line_ids: event.target.checked
-                              ? [...member.line_ids, line.id]
-                              : member.line_ids.filter((id) => id !== line.id),
-                          })
-                        }
-                      />
-                      <span>
-                        {line.name}
-                        {retained
-                          ? "（已绑定）"
-                          : elsewhere
-                            ? "（已分配其他成员）"
-                            : ""}
-                      </span>
-                    </label>
-                  );
-                })}
+            <div className="space-y-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field label={`成员 ${index + 1} 名称`}>
+                  <Input
+                    required
+                    maxLength={40}
+                    value={member.name}
+                    onChange={(event) =>
+                      update(index, { name: event.target.value })
+                    }
+                  />
+                </Field>
+                <Field label={`成员 ${index + 1} 额外硬上限 · GiB`}>
+                  <Input
+                    type="number"
+                    min="0.001"
+                    step="any"
+                    placeholder="留空共用总额"
+                    value={member.monthly_gib ?? ""}
+                    onChange={(event) =>
+                      update(index, {
+                        monthly_gib: event.target.value
+                          ? Number(event.target.value)
+                          : null,
+                      })
+                    }
+                  />
+                </Field>
               </div>
-            )}
-            {!original && members.length > 1 && (
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  setMembers((old) => old.filter((_, i) => i !== index));
-                  setMembersChanged(true);
-                }}
-              >
-                移除此成员
-              </Button>
-            )}
+              {!candidates.length ? (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  暂无可绑定的未发布草稿线路。请先在「代理」页面新建代理并选择「仅保存草稿」。
+                </p>
+              ) : (
+                <div className="max-h-40 space-y-1.5 overflow-auto rounded-lg border border-border bg-card p-2.5">
+                  {candidates.map((line) => {
+                    const retained = Boolean(
+                      original?.line_ids.includes(line.id),
+                    );
+                    const elsewhere = members.some(
+                      (other, i) =>
+                        i !== index && other.line_ids.includes(line.id),
+                    );
+                    return (
+                      <label
+                        key={line.id}
+                        className="flex items-center gap-2 text-xs text-foreground"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={member.line_ids.includes(line.id)}
+                          disabled={retained || elsewhere}
+                          onChange={(event) =>
+                            update(index, {
+                              line_ids: event.target.checked
+                                ? [...member.line_ids, line.id]
+                                : member.line_ids.filter((id) => id !== line.id),
+                            })
+                          }
+                        />
+                        <span>
+                          {line.name}
+                          {retained
+                            ? "（已绑定）"
+                            : elsewhere
+                              ? "（已分配其他成员）"
+                              : ""}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+              {!original && members.length > 1 && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setMembers((old) => old.filter((_, i) => i !== index));
+                    setMembersChanged(true);
+                  }}
+                >
+                  移除此成员
+                </Button>
+              )}
+            </div>
           </fieldset>
         );
       })}

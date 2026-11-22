@@ -350,7 +350,7 @@ function ResourceEditor({
           <option>UTC</option>
         </datalist>
       </div>
-      <fieldset className="space-y-2 rounded-xl border border-border bg-muted/20 p-3.5">
+      <fieldset className="rounded-xl border border-border bg-muted/20 p-3.5">
         <legend className="px-1.5 text-xs font-semibold text-foreground">
           共享成员
         </legend>

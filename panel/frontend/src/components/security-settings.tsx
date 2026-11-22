@@ -110,7 +110,7 @@ function TotpSetup({
           <QR value={setup.url} />
           <details className="details">
             <summary>手动输入密钥</summary>
-            <div className="mt-3 space-y-2">
+            <div className="mt-3.5 space-y-2.5">
               <pre className="secret">{setup.secret}</pre>
               <CopyButton size="sm" value={setup.secret} />
             </div>

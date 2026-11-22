@@ -303,8 +303,8 @@ export function Diagnostics({
           className="space-y-3 rounded-xl border border-border bg-muted/20 p-3.5"
           aria-label="日志筛选"
         >
-          <div className="grid gap-3 sm:grid-cols-2">
-            <label className="space-y-1 text-xs font-medium text-foreground">
+          <div className="grid gap-3.5 sm:grid-cols-2">
+            <label className="field">
               <span>日志来源</span>
               <select
                 className="select"
@@ -326,7 +326,7 @@ export function Diagnostics({
                 ))}
               </select>
             </label>
-            <label className="space-y-1 text-xs font-medium text-foreground">
+            <label className="field">
               <span>节点</span>
               <select
                 className="select"
@@ -556,8 +556,8 @@ export function Diagnostics({
         {lineId && (
           <details className="details">
             <summary>分段连接检查</summary>
-            <div className="mt-3 space-y-3">
-              <label className="block space-y-1 text-xs font-medium">
+            <div className="mt-3.5 space-y-3.5">
+              <label className="field">
                 <span>检查网址</span>
                 <Input
                   type="url"
@@ -597,9 +597,9 @@ export function Diagnostics({
 
         <details className="details" aria-label="日志存储设置">
           <summary>日志存储上限与开关设置</summary>
-          <div className="mt-3 space-y-3">
-            <div className="grid gap-3 sm:grid-cols-2">
-              <label className="space-y-1 text-xs font-medium">
+          <div className="mt-3.5 space-y-3.5">
+            <div className="grid gap-3.5 sm:grid-cols-2">
+              <label className="field">
                 <span>日志总大小上限（MiB）</span>
                 <Input
                   type="number"
@@ -611,7 +611,7 @@ export function Diagnostics({
                   onChange={(e) => setSizeValue(e.target.value)}
                 />
               </label>
-              <div className="space-y-1 text-xs font-medium">
+              <div className="field">
                 <label htmlFor="log-retention">保留时长</label>
                 <div className="flex gap-2">
                   <Input
@@ -628,7 +628,7 @@ export function Diagnostics({
                     onChange={(e) => setRetentionValue(e.target.value)}
                   />
                   <select
-                    className="select w-28"
+                    className="select w-28 shrink-0"
                     aria-label="日志保留时长单位"
                     value={retentionUnit}
                     disabled={savingLogs || data?.retention_hours === undefined}
