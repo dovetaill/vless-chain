@@ -1,13 +1,6 @@
 use super::super::{Options, strings, workspace::Workspace};
 use anyhow::{Context, Result, ensure};
-use axum::{
-    Router,
-    body::to_bytes,
-    extract::{Request, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::any,
-};
+use axum::{Router, routing::any};
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -15,10 +8,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -26,12 +16,6 @@ use tokio::{
     task::JoinHandle,
 };
 
-pub struct Preflight {
-    pub enabled: Arc<AtomicBool>,
-    pub intercepted: Arc<AtomicUsize>,
-    pub port: u16,
-    pub disconnect: Arc<std::sync::Mutex<Option<(String, u32)>>>,
-}
 pub struct Harness<'a> {
     pub work: &'a Workspace,
     pub root: PathBuf,
@@ -43,7 +27,6 @@ pub struct Harness<'a> {
     ports: RefCell<BTreeSet<u16>>,
     tasks: RefCell<Vec<JoinHandle<()>>>,
     children: RefCell<Vec<u32>>,
-    pub preflight: Option<Preflight>,
     client: reqwest::Client,
 }
 impl<'a> Harness<'a> {
@@ -69,7 +52,6 @@ impl<'a> Harness<'a> {
             ports: RefCell::new(BTreeSet::new()),
             tasks: RefCell::new(vec![]),
             children: RefCell::new(vec![]),
-            preflight: None,
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(48))
@@ -89,7 +71,6 @@ impl<'a> Harness<'a> {
                 std::net::UdpSocket::bind(("127.0.0.1", port)),
             ) {
                 self.ports.borrow_mut().insert(port);
-                self.record()?;
                 return Ok(port);
             }
         }
@@ -97,19 +78,10 @@ impl<'a> Harness<'a> {
     }
     pub fn remember(&self, port: u16) -> Result<()> {
         self.ports.borrow_mut().insert(port);
-        self.record()
+        Ok(())
     }
     pub fn task(&self, task: JoinHandle<()>) {
         self.tasks.borrow_mut().push(task);
-    }
-    fn record(&self) -> Result<()> {
-        fs::write(
-            self.root.join("listeners.json"),
-            serde_json::to_vec(
-                &json!({"ports":*self.ports.borrow(),"root":self.root,"pid":std::process::id()}),
-            )?,
-        )?;
-        Ok(())
     }
     pub fn launch(
         &self,
@@ -118,14 +90,6 @@ impl<'a> Harness<'a> {
         mut env: BTreeMap<String, String>,
         args: &[String],
     ) -> Result<u32> {
-        if let Some(preflight) = &self.preflight {
-            if env.get("CHAIN_PANEL_URL") == Some(&self.base) {
-                env.insert(
-                    "CHAIN_PANEL_URL".into(),
-                    format!("http://127.0.0.1:{}", preflight.port),
-                );
-            }
-        }
         env.insert("TMPDIR".into(), self.root.display().to_string());
         let mut command = vec![binary.display().to_string()];
         command.extend(args.iter().cloned());
@@ -279,7 +243,7 @@ impl<'a> Harness<'a> {
             Ok(())
         }
         scan(self, &self.root)?;
-        self.record()
+        Ok(())
     }
     pub async fn login(&self, data: &Path) -> Result<()> {
         self.request(
@@ -425,7 +389,6 @@ impl<'a> Harness<'a> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         self.ports.borrow_mut().insert(port);
-        self.record()?;
         let body = Arc::new(body);
         self.tasks.borrow_mut().push(tokio::spawn(async move {
             let app = Router::new().fallback(any(move || {
@@ -433,27 +396,6 @@ impl<'a> Harness<'a> {
                 async move { ([("content-type", "text/plain")], body.as_ref().clone()) }
             }));
             let _ = axum::serve(listener, app).await;
-        }));
-        Ok(port)
-    }
-    pub async fn website(&self) -> Result<u16> {
-        use base64::Engine;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        self.remember(port)?;
-        self.tasks.borrow_mut().push(tokio::spawn(async move {
-            let mut children=tokio::task::JoinSet::new();while let Ok((mut stream,_))=listener.accept().await {children.spawn(async move {let _=tokio::time::timeout(Duration::from_secs(10),async {
-                let mut header=vec![];while !header.ends_with(b"\r\n\r\n") {let mut byte=[0];stream.read_exact(&mut byte).await?;header.push(byte[0]);ensure!(header.len()<16384,"请求头过大");}
-                let header=String::from_utf8(header)?;
-                if header.lines().any(|l|l.eq_ignore_ascii_case("Upgrade: websocket")) {
-                    let key=header.lines().find_map(|l|l.split_once(':').filter(|(k,_)|k.eq_ignore_ascii_case("Sec-WebSocket-Key")).map(|(_,v)|v.trim())).context("WebSocket key 缺失")?;
-                    let digest=openssl::hash::hash(openssl::hash::MessageDigest::sha1(),format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes())?;let accept=base64::engine::general_purpose::STANDARD.encode(digest);
-                    stream.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await?;
-                    let mut head=[0;2];stream.read_exact(&mut head).await?;let mut mask=[0;4];stream.read_exact(&mut mask).await?;let mut data=vec![0;(head[1]&127) as usize];stream.read_exact(&mut data).await?;for (i,v) in data.iter_mut().enumerate(){*v^=mask[i%4];}stream.write_all(&[0x81,data.len() as u8]).await?;stream.write_all(&data).await?;
-                }else{let path=header.split_whitespace().nth(1).context("缺少请求地址")?;stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{path}",path.len()).as_bytes()).await?;}
-                Ok::<_,anyhow::Error>(())
-            }).await;});}
         }));
         Ok(port)
     }
@@ -485,7 +427,6 @@ impl<'a> Harness<'a> {
                 let _ = udp.send_to(&bytes[..n], peer).await;
             }
         }));
-        self.record()?;
         Ok(port)
     }
     pub async fn tls(&self, domain: &str) -> Result<(u16, PathBuf, PathBuf)> {
@@ -554,7 +495,6 @@ impl<'a> Harness<'a> {
                 });
             }
         }));
-        self.record()?;
         Ok((port, cert, key))
     }
     pub fn allow_loopback(&mut self, ports: &[u16]) -> Result<()> {
@@ -586,109 +526,6 @@ impl<'a> Harness<'a> {
         )?;
         super::executable(&wrapper)?;
         self.xray = wrapper;
-        Ok(())
-    }
-    pub async fn preflight(&mut self, target: u16, enabled: bool) -> Result<()> {
-        self.preflight_named(target, "localhost", enabled).await
-    }
-    pub async fn preflight_named(
-        &mut self,
-        target: u16,
-        server_name: &str,
-        enabled: bool,
-    ) -> Result<()> {
-        ensure!(
-            self.ports.borrow().contains(&target),
-            "预检夹具必须使用本任务端口"
-        );
-        #[derive(Clone)]
-        struct Proxy {
-            base: String,
-            target: u16,
-            server_name: String,
-            enabled: Arc<AtomicBool>,
-            intercepted: Arc<AtomicUsize>,
-            client: reqwest::Client,
-            disconnect: Arc<std::sync::Mutex<Option<(String, u32)>>>,
-        }
-        async fn proxy(State(state): State<Proxy>, request: Request) -> impl IntoResponse {
-            let path = request.uri().path().to_string();
-            if !path.starts_with("/api/agent/") {
-                return (StatusCode::FORBIDDEN, Vec::new());
-            }
-            let authorization = request.headers().get("authorization").cloned();
-            let body = match to_bytes(request.into_body(), 2 * 1024 * 1024).await {
-                Ok(v) => v,
-                Err(_) => return (StatusCode::BAD_REQUEST, vec![]),
-            };
-            let forward = |body: Vec<u8>| {
-                let client = state.client.clone();
-                let url = format!("{}{path}", state.base);
-                let authorization = authorization.clone();
-                async move {
-                    let mut req = client
-                        .post(url)
-                        .header("content-type", "application/json")
-                        .body(body);
-                    if let Some(v) = authorization {
-                        req = req.header("authorization", v);
-                    }
-                    req.send().await
-                }
-            };
-            let result=async {
-                let response=forward(body.to_vec()).await?;let mut status=response.status();let mut body=response.bytes().await?.to_vec();
-                if status.is_success()&&path.ends_with("/diagnostics")&&state.enabled.load(Ordering::SeqCst) {
-                    let task:Value=serde_json::from_slice(&body)?;
-                    if task["request"]["operation"]=="reality-preflight" {
-                        anyhow::ensure!(task["request"]["request"]==json!({"target":format!("127.0.0.1:{}",state.target),"server_name":state.server_name}),"意外预检目标");
-                        {let mut disconnect=state.disconnect.lock().unwrap();
-                        if disconnect.as_ref().is_some_and(|(token,_)|authorization.as_ref().and_then(|v|v.to_str().ok())==Some(token.as_str())) {
-                            let (_,pid)=disconnect.take().unwrap();unsafe{libc::kill(-(pid as i32),libc::SIGTERM);}
-                        }
-                        }
-                        let response=forward(serde_json::to_vec(&json!({"id":task["id"],"result":{"ok":true,"cloudflare_checked":true,"fallback":{"status":"verified"}}}))?).await?;
-                        status=response.status();body=response.bytes().await?.to_vec();state.intercepted.fetch_add(1,Ordering::SeqCst);
-                    }
-                }Ok::<_,anyhow::Error>((status,body))
-            }.await;
-            result.unwrap_or((
-                StatusCode::SERVICE_UNAVAILABLE,
-                br#"{"error":"fixture upstream unavailable"}"#.to_vec(),
-            ))
-        }
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        self.ports.borrow_mut().insert(port);
-        let enabled = Arc::new(AtomicBool::new(enabled));
-        let intercepted = Arc::new(AtomicUsize::new(0));
-        let disconnect = Arc::new(std::sync::Mutex::new(None));
-        let state = Proxy {
-            base: self.base.clone(),
-            target,
-            server_name: server_name.into(),
-            enabled: enabled.clone(),
-            intercepted: intercepted.clone(),
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(20))
-                .build()?,
-            disconnect: disconnect.clone(),
-        };
-        self.tasks.borrow_mut().push(tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                Router::new().fallback(any(proxy)).with_state(state),
-            )
-            .await;
-        }));
-        self.preflight = Some(Preflight {
-            enabled,
-            intercepted,
-            port,
-            disconnect,
-        });
-        self.record()?;
         Ok(())
     }
     pub async fn close(&self) -> Result<()> {

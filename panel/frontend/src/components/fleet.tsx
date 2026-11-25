@@ -22,9 +22,15 @@ import {
   Trash2,
   Wrench,
 } from "lucide-react";
-import { DropdownMenu } from "radix-ui";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import "./fleet.css";
-import { publishChecked, api, remoteApi } from "../api";
+import { api, remoteApi } from "../api";
 import { Diagnostics } from "./diagnostics";
 import { NetworkTuning, type NetworkTarget } from "./network-tuning";
 import { LimitsDialog } from "./rental-editor";
@@ -70,6 +76,7 @@ import {
   issues,
   remoteNow,
   latestCheck,
+  lineRateValid,
   lineStatus,
   localNode,
   metrics,
@@ -77,6 +84,7 @@ import {
   recent,
   statuses,
   verificationFailed,
+  verificationDetail,
   maintenanceSucceeded,
   taskNeedsAttention,
   taskStatus,
@@ -489,21 +497,32 @@ export function Fleet({ state }: { state: PanelState }) {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  const [releaseError, setReleaseError] = useState("");
+  const [manualVersion, setManualVersion] = useState("");
+
   const fetchRelease = useCallback(async () => {
     setReleaseLoading(true);
     setRelease(undefined);
+    setReleaseError("");
     try {
       setRelease(await api("/fleet/release/latest"));
     } catch (e) {
-      setError(errorText(e));
+      setReleaseError(errorText(e));
     } finally {
       setReleaseLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void fetchRelease();
-  }, [fetchRelease]);
+    if (
+      (maintenanceTab === "program" || maintenanceTab === "more") &&
+      !release &&
+      !releaseLoading &&
+      !releaseError
+    ) {
+      void fetchRelease();
+    }
+  }, [maintenanceTab, release, releaseLoading, releaseError, fetchRelease]);
 
   const remotes = data?.remotes || [],
     stats = metrics(remotes, now);
@@ -598,7 +617,7 @@ export function Fleet({ state }: { state: PanelState }) {
       matchesLine(
         line,
         {
-          customers: r.snapshot?.customers || [],
+          customers: [],
           nodes: r.snapshot?.nodes || [],
         },
         search,
@@ -629,11 +648,7 @@ export function Fleet({ state }: { state: PanelState }) {
   if (sort === "rate")
     filteredLines.sort((a, b) => {
       const speed = (v: typeof a) =>
-        connected(v.r, now) &&
-        v.line.enabled &&
-        v.line.rental_status !== "offline" &&
-        v.line.traffic &&
-        recent(v.line.traffic.sampled_at, now)
+        v.line.traffic && lineRateValid(v.r, v.line, now)
           ? v.line.traffic.upload_bps + v.line.traffic.download_bps
           : -1;
       return speed(b) - speed(a);
@@ -729,7 +744,7 @@ export function Fleet({ state }: { state: PanelState }) {
         submit="确认并应用"
         close={close}
         action={async () => {
-          await publishChecked(remoteApi(r.id));
+          await remoteApi(r.id)("/publish", "POST", {});
           setPendingApply((old) => old.filter((id) => id !== r.id));
           setMessage(`${r.name}：已提交应用，请查看代理的同步状态。`);
           close();
@@ -757,13 +772,15 @@ export function Fleet({ state }: { state: PanelState }) {
   }
 
   async function lineAction(r: Remote, line: Line, action: string) {
-    const state = await freshState(r);
-    const current = state.lines.find((item) => item.id === line.id);
-    if (!current) throw new Error("该代理已不存在，请刷新列表。");
     const request = remoteApi(r.id);
     const saved = async () => {
       await freshState(r);
     };
+    const needFresh = !r.snapshot || ["toggle", "share", "probe"].includes(action);
+    const state = needFresh ? await freshState(r) : r.snapshot!;
+    const current = state.lines.find((item) => item.id === line.id) || line;
+    if (needFresh && !state.lines.some((item) => item.id === line.id))
+      throw new Error("该代理已不存在，请刷新列表。");
     if (action === "toggle") {
       await request("/lines/operate", "POST", {
         line_ids: [current.id],
@@ -838,9 +855,12 @@ export function Fleet({ state }: { state: PanelState }) {
   }
 
   async function openExternal(r: Remote, external?: External) {
-    const state = await freshState(r),
-      current = external && state.externals.find((e) => e.id === external.id);
-    if (external && !current) throw new Error("该外部代理已不存在。");
+    let current = external;
+    if (external) {
+      const state = await freshState(r);
+      current = state.externals.find((e) => e.id === external.id);
+      if (!current) throw new Error("该外部代理已不存在。");
+    }
     setDetail(undefined);
     setModal(
       <Modal
@@ -945,7 +965,9 @@ export function Fleet({ state }: { state: PanelState }) {
     if (!targets.length) return;
     const id = requestId(),
       version =
-        action === "core-upgrade" ? coreChoice.version : release?.version || "";
+        action === "core-upgrade"
+          ? coreChoice.version.trim()
+          : manualVersion.trim() || release?.version || "";
     const blocked = targets.filter(
       (r) =>
         !connected(r, now) ||
@@ -976,10 +998,8 @@ export function Fleet({ state }: { state: PanelState }) {
               }。最多 5 台并发滚动执行，单台异常不会阻塞其余机器。`
         }
         submit={
-          (action === "core-upgrade"
-            ? blocked.length === targets.length
-            : blocked.length > 0) ||
-          (action === "upgrade" && !release)
+          blocked.length === targets.length ||
+          (action === "upgrade" && !version)
             ? undefined
             : "确认执行"
         }
@@ -1116,7 +1136,7 @@ export function Fleet({ state }: { state: PanelState }) {
             role="alert"
             className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-800 dark:text-amber-300"
           >
-            {action === "core-upgrade" && blocked.length < targets.length
+            {blocked.length < targets.length
               ? "以下 VPS 将独立记录处理结果，其余继续执行："
               : "无法执行："}
             {blocked
@@ -1127,13 +1147,13 @@ export function Fleet({ state }: { state: PanelState }) {
                       ? "失联或数据过期"
                       : !r.snapshot?.maintenance
                         ? "尚未安装维护组件"
-                        : action === "upgrade"
-                          ? "请先使用推荐稳定版升级，以支持内核选择"
+                        : action === "core-upgrade"
+                          ? "请先更新维护组件以支持独立内核升级"
                           : "请先升级以支持整套重启"
                   }）`,
               )
               .join("、")}
-            。请修复或调整选择；不会自动跳过。
+            。
           </p>
         )}
       </Modal>,
@@ -1770,34 +1790,51 @@ export function Fleet({ state }: { state: PanelState }) {
                 {chosen.length > 0 && maintenanceTab && (
                   <div className="space-y-3.5 rounded-xl border border-border bg-muted/25 p-4">
                     {maintenanceTab === "program" && (
-                      <div className="flex flex-wrap items-center gap-2.5">
-                        <Button
-                          size="sm"
-                          disabled={
-                            busy ||
-                            releaseLoading ||
-                            !release ||
-                            running.some((t) => t.state === "running")
-                          }
-                          onClick={() => batch("upgrade")}
-                        >
-                          批量升级
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={busy || releaseLoading}
-                          onClick={() => void fetchRelease()}
-                        >
-                          {releaseLoading
-                            ? "正在获取最新版本…"
-                            : "检查最新版本"}
-                        </Button>
-                        <span className="text-xs text-muted-foreground">
-                          {release
-                            ? `最新正式版 ${release.version}`
-                            : "先检查版本，再升级所选 VPS"}
-                        </span>
+                      <div className="space-y-2.5">
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          <Button
+                            size="sm"
+                            disabled={
+                              busy ||
+                              releaseLoading ||
+                              !(manualVersion.trim() || release?.version) ||
+                              running.some((t) => t.state === "running")
+                            }
+                            onClick={() => batch("upgrade")}
+                          >
+                            批量升级
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busy || releaseLoading}
+                            onClick={() => void fetchRelease()}
+                          >
+                            {releaseLoading
+                              ? "正在获取最新版本…"
+                              : "检查最新版本"}
+                          </Button>
+                          <Input
+                            variant="sm"
+                            className="w-44"
+                            aria-label="指定升级版本号"
+                            placeholder={
+                              release ? `默认 ${release.version}` : "手动输入版本（如 0.2.81）"
+                            }
+                            value={manualVersion}
+                            onChange={(e) => setManualVersion(e.target.value)}
+                          />
+                          <span className="text-xs text-muted-foreground">
+                            {release
+                              ? `最新正式版 ${release.version}`
+                              : "可自动检查版本或直接指定目标正式版"}
+                          </span>
+                        </div>
+                        {releaseError && (
+                          <p role="alert" className="text-xs text-amber-600 dark:text-amber-400">
+                            在线查询最新版本失败（{releaseError}）；可直接填写目标正式版本号执行升级。
+                          </p>
+                        )}
                       </div>
                     )}
                     {maintenanceTab === "core" && (
@@ -1814,7 +1851,7 @@ export function Fleet({ state }: { state: PanelState }) {
                           disabled={
                             busy ||
                             running.some((t) => t.state === "running") ||
-                            !/^\d+\.\d+\.\d+$/.test(coreChoice.version)
+                            !coreChoice.version.trim()
                           }
                           onClick={() => batch("core-upgrade")}
                         >
@@ -1892,7 +1929,7 @@ export function Fleet({ state }: { state: PanelState }) {
                               <Versions remote={r} />
                             </div>
                           </td>
-                          <td data-label="状态" className="align-top">
+                          <td data-label="状态" className="fleet-status-cell align-top">
                             <Status
                               tone={
                                 health(r, now) === "在线" ? "good" : "warn"
@@ -1996,11 +2033,7 @@ export function Fleet({ state }: { state: PanelState }) {
                     key={action}
                     size="sm"
                     variant="outline"
-                    disabled={
-                      busy ||
-                      !chosenLines.length ||
-                      running.some((t) => t.state === "running")
-                    }
+                    disabled={busy || !chosenLines.length}
                     onClick={() => batch(action)}
                   >
                     {actions[action]}
@@ -2040,7 +2073,9 @@ export function Fleet({ state }: { state: PanelState }) {
                   disabled={
                     busy ||
                     !chosenLines.length ||
-                    chosenLines.some((t) => t.line.customer_plan_id)
+                    chosenLines.some(
+                      (t) => t.line.customer_plan_id && t.line.enabled,
+                    )
                   }
                   onClick={() =>
                     setModal(
@@ -2058,9 +2093,11 @@ export function Fleet({ state }: { state: PanelState }) {
                 >
                   删除
                 </Button>
-                {chosenLines.some((t) => t.line.customer_plan_id) && (
+                {chosenLines.some(
+                  (t) => t.line.customer_plan_id && t.line.enabled,
+                ) && (
                   <span className="text-xs text-muted-foreground">
-                    套餐线路不可删除，可停用并保留历史。
+                    启用中的套餐线路请先停用后再删除。
                   </span>
                 )}
               </div>
@@ -2080,12 +2117,7 @@ export function Fleet({ state }: { state: PanelState }) {
                   <tbody>
                     {slice(filteredLines).map(({ r, line }) => {
                       const t = line.traffic,
-                        valid =
-                          connected(r, now) &&
-                          !!t &&
-                          recent(t.sampled_at, now) &&
-                          line.rental_status !== "offline" &&
-                          line.enabled;
+                        valid = lineRateValid(r, line, now);
                       const statusText = lineStatus(r, line, now);
                       return (
                         <tr key={key(r, line)}>
@@ -2109,7 +2141,7 @@ export function Fleet({ state }: { state: PanelState }) {
                           <td data-label="所属 VPS" className="text-xs font-medium">
                             {r.name}
                           </td>
-                          <td data-label="状态 / 探测">
+                          <td data-label="状态 / 探测" className="fleet-status-cell">
                             <Status tone={lineStatusTone(statusText)}>
                               {statusText}
                             </Status>
@@ -2132,25 +2164,22 @@ export function Fleet({ state }: { state: PanelState }) {
                                 </p>
                               </details>
                             )}
-                            {line.enabled &&
-                              line.sync_status === "synced" &&
-                              (line.kind !== "forward" ||
-                                line.network.includes("tcp")) && (
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  className="mt-2"
-                                  disabled={
-                                    busy ||
-                                    !connected(r, now) ||
-                                    line.rental_status !== "active"
-                                  }
-                                  onClick={() => void recheck(r, line.id)}
-                                >
-                                  立即复查
-                                </Button>
-                              )}
+                            {line.enabled && line.sync_status === "synced" && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="mt-2"
+                                disabled={
+                                  busy ||
+                                  !connected(r, now) ||
+                                  line.rental_status !== "active"
+                                }
+                                onClick={() => void recheck(r, line.id)}
+                              >
+                                立即复查
+                              </Button>
+                            )}
                             {probeFeedback?.key === key(r, line) && (
                               <p role="status" className="mt-1.5 text-xs text-muted-foreground">
                                 {probeFeedback.text}
@@ -2188,109 +2217,110 @@ export function Fleet({ state }: { state: PanelState }) {
                               >
                                 编辑
                               </Button>
-                              <DropdownMenu.Root>
-                                <DropdownMenu.Trigger
-                                  className="row-menu-trigger"
-                                  aria-label={`${r.name} / ${line.name} 更多操作`}
-                                  disabled={busy}
-                                >
-                                  <MoreHorizontal className="size-4" />
-                                </DropdownMenu.Trigger>
-                                <DropdownMenu.Portal>
-                                  <DropdownMenu.Content
-                                    className="row-menu-content"
-                                    align="end"
-                                    sideOffset={4}
-                                    collisionPadding={8}
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    mode="icon"
+                                    aria-label={`${r.name} / ${line.name} 更多操作`}
+                                    disabled={busy}
                                   >
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        void run(() =>
-                                          lineAction(r, line, "toggle"),
-                                        )
-                                      }
-                                    >
-                                      <Power />
-                                      {line.enabled
-                                        ? "手动停用"
-                                        : "解除手动停用"}
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        void run(() =>
-                                          lineAction(r, line, "limits"),
-                                        )
-                                      }
-                                    >
-                                      <Gauge />
-                                      调整额度 / 限速
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      disabled={!line.published || !line.enabled}
-                                      onSelect={() =>
-                                        void run(() =>
-                                          lineAction(r, line, "share"),
-                                        )
-                                      }
-                                    >
-                                      <Share2 />
-                                      分享配置
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        void run(() =>
-                                          lineAction(r, line, "access"),
-                                        )
-                                      }
-                                    >
-                                      <Shield />
-                                      网站 / 端口 / 连接限制
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Separator className="my-1 h-px bg-border" />
-                                    <DropdownMenu.Item
-                                      disabled={!line.published || !line.enabled}
-                                      onSelect={() =>
-                                        void run(() =>
-                                          lineAction(r, line, "probe"),
-                                        )
-                                      }
-                                    >
-                                      <Activity />
-                                      检查连接
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        void run(() =>
-                                          lineAction(r, line, "diagnostics"),
-                                        )
-                                      }
-                                    >
-                                      <FileText />
-                                      日志与诊断
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        void run(() => prepareApply(r))
-                                      }
-                                    >
-                                      <CheckCircle2 />
-                                      应用配置修改
-                                    </DropdownMenu.Item>
-                                    {!line.customer_plan_id && (
-                                      <>
-                                        <DropdownMenu.Separator className="my-1 h-px bg-border" />
-                                        <DropdownMenu.Item
-                                          className="text-destructive"
-                                          onSelect={() => remove(r, line)}
-                                        >
-                                          <Trash2 />
-                                          删除代理
-                                        </DropdownMenu.Item>
-                                      </>
-                                    )}
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Portal>
-                              </DropdownMenu.Root>
+                                    <MoreHorizontal className="size-4" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  align="end"
+                                  collisionPadding={8}
+                                  className="min-w-50"
+                                >
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      void run(() =>
+                                        lineAction(r, line, "toggle"),
+                                      )
+                                    }
+                                  >
+                                    <Power />
+                                    {line.enabled
+                                      ? "手动停用"
+                                      : "解除手动停用"}
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      void run(() =>
+                                        lineAction(r, line, "limits"),
+                                      )
+                                    }
+                                  >
+                                    <Gauge />
+                                    调整额度 / 限速
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    disabled={!line.published || !line.enabled}
+                                    onSelect={() =>
+                                      void run(() =>
+                                        lineAction(r, line, "share"),
+                                      )
+                                    }
+                                  >
+                                    <Share2 />
+                                    分享配置
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      void run(() =>
+                                        lineAction(r, line, "access"),
+                                      )
+                                    }
+                                  >
+                                    <Shield />
+                                    网站 / 端口 / 连接限制
+                                  </DropdownMenuItem>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    disabled={!line.published || !line.enabled}
+                                    onSelect={() =>
+                                      void run(() =>
+                                        lineAction(r, line, "probe"),
+                                      )
+                                    }
+                                  >
+                                    <Activity />
+                                    检查连接
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      void run(() =>
+                                        lineAction(r, line, "diagnostics"),
+                                      )
+                                    }
+                                  >
+                                    <FileText />
+                                    日志与诊断
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      void run(() => prepareApply(r))
+                                    }
+                                  >
+                                    <CheckCircle2 />
+                                    应用配置修改
+                                  </DropdownMenuItem>
+                                  {(!line.customer_plan_id || !line.enabled) && (
+                                    <>
+                                      <DropdownMenuSeparator />
+                                      <DropdownMenuItem
+                                        variant="destructive"
+                                        onSelect={() => remove(r, line)}
+                                      >
+                                        <Trash2 />
+                                        删除代理
+                                      </DropdownMenuItem>
+                                    </>
+                                  )}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
                             </div>
                           </td>
                         </tr>
@@ -2610,9 +2640,7 @@ export function Fleet({ state }: { state: PanelState }) {
                 覆盖所有已接入 VPS 的本地策略
               </label>
               {override && (
-                <div className="fleet-policy-fields">
-                  <PolicyFields value={policy} change={setPolicy} />
-                </div>
+                <PolicyFields compact value={policy} change={setPolicy} />
               )}
               <Button
                 disabled={busy}
@@ -2714,106 +2742,94 @@ export function Fleet({ state }: { state: PanelState }) {
             </p>
           )}
 
-          {localNode(activeDetail) && (
-            <div className="space-y-3 rounded-xl border border-border bg-card p-4">
-              <div className="flex items-center justify-between gap-2">
-                <h4 className="text-xs font-semibold text-foreground">
-                  系统资源状态
-                </h4>
-                {(() => {
-                  const n = localNode(activeDetail)!,
-                    s = n.report.system ?? {},
-                    valid =
-                      connected(activeDetail, now) &&
-                      n.online &&
-                      recent(n.seen, remoteNow(activeDetail, now)) &&
-                      recent(s.sampled_at, remoteNow(activeDetail, now));
-                  return (
-                    <span className="text-[11px] text-muted-foreground tabular-nums">
-                      采样 {stamp(s.sampled_at || 0)}
-                      {!valid && " · 已过期或未知"}
-                    </span>
-                  );
-                })()}
-              </div>
-              {(() => {
-                const n = localNode(activeDetail)!,
-                  s = n.report.system ?? {},
-                  valid =
-                    connected(activeDetail, now) &&
-                    n.online &&
-                    recent(n.seen, remoteNow(activeDetail, now)) &&
-                    recent(s.sampled_at, remoteNow(activeDetail, now));
-                const cpuPct =
-                  valid && s.cpu_percent != null
-                    ? Math.min(100, Math.max(0, s.cpu_percent))
-                    : null;
-                const memPct =
-                  valid && s.memory_total && s.memory_used != null
-                    ? Math.min(100, (s.memory_used / s.memory_total) * 100)
-                    : null;
-                const diskPct =
-                  valid && s.disk_total && s.disk_used != null
-                    ? Math.min(100, (s.disk_used / s.disk_total) * 100)
-                    : null;
-                return (
-                  <div className="grid gap-3 sm:grid-cols-3">
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
-                      <p className="text-xs font-medium tabular-nums">
-                        CPU：
-                        {cpuPct != null ? `${s.cpu_percent!.toFixed(1)}%` : "—"}
-                      </p>
-                      {cpuPct != null && (
-                        <Progress
-                          aria-label="CPU"
-                          value={cpuPct}
-                          className="mt-2 h-1.5"
-                        />
-                      )}
-                    </div>
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
-                      <p className="text-xs font-medium tabular-nums">
-                        内存：
-                        {memPct != null
-                          ? `${bytes(s.memory_used!)} / ${bytes(s.memory_total!)}`
-                          : "—"}
-                      </p>
-                      {memPct != null && (
-                        <Progress
-                          aria-label="内存"
-                          value={memPct}
-                          className="mt-2 h-1.5"
-                        />
-                      )}
-                    </div>
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
-                      <p className="text-xs font-medium tabular-nums">
-                        磁盘：
-                        {diskPct != null
-                          ? `${bytes(s.disk_used!)} / ${bytes(s.disk_total!)}`
-                          : "—"}
-                      </p>
-                      {diskPct != null && (
-                        <Progress
-                          aria-label="磁盘"
-                          value={diskPct}
-                          className="mt-2 h-1.5"
-                        />
-                      )}
-                    </div>
-                    {n.report.error && (
-                      <p
-                        role="alert"
-                        className="rounded-lg border border-destructive/25 bg-destructive/10 p-2.5 text-xs text-destructive sm:col-span-3"
-                      >
-                        {n.report.error}
-                      </p>
+          {(() => {
+            const n = localNode(activeDetail);
+            if (!n) return null;
+            const s = n.report.system ?? {},
+              valid =
+                connected(activeDetail, now) &&
+                n.online &&
+                recent(n.seen, remoteNow(activeDetail, now)) &&
+                recent(s.sampled_at, remoteNow(activeDetail, now));
+            const cpuPct =
+              valid && s.cpu_percent != null
+                ? Math.min(100, Math.max(0, s.cpu_percent))
+                : null;
+            const memPct =
+              valid && s.memory_total && s.memory_used != null
+                ? Math.min(100, (s.memory_used / s.memory_total) * 100)
+                : null;
+            const diskPct =
+              valid && s.disk_total && s.disk_used != null
+                ? Math.min(100, (s.disk_used / s.disk_total) * 100)
+                : null;
+            return (
+              <div className="space-y-3 rounded-xl border border-border bg-card p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="text-xs font-semibold text-foreground">
+                    系统资源状态
+                  </h4>
+                  <span className="text-[11px] text-muted-foreground tabular-nums">
+                    采样 {stamp(s.sampled_at || 0)}
+                    {!valid && " · 已过期或未知"}
+                  </span>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <p className="text-xs font-medium tabular-nums">
+                      CPU：
+                      {cpuPct != null ? `${s.cpu_percent!.toFixed(1)}%` : "—"}
+                    </p>
+                    {cpuPct != null && (
+                      <Progress
+                        aria-label="CPU"
+                        value={cpuPct}
+                        className="mt-2 h-1.5"
+                      />
                     )}
                   </div>
-                );
-              })()}
-            </div>
-          )}
+                  <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <p className="text-xs font-medium tabular-nums">
+                      内存：
+                      {memPct != null
+                        ? `${bytes(s.memory_used!)} / ${bytes(s.memory_total!)}`
+                        : "—"}
+                    </p>
+                    {memPct != null && (
+                      <Progress
+                        aria-label="内存"
+                        value={memPct}
+                        className="mt-2 h-1.5"
+                      />
+                    )}
+                  </div>
+                  <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <p className="text-xs font-medium tabular-nums">
+                      磁盘：
+                      {diskPct != null
+                        ? `${bytes(s.disk_used!)} / ${bytes(s.disk_total!)}`
+                        : "—"}
+                    </p>
+                    {diskPct != null && (
+                      <Progress
+                        aria-label="磁盘"
+                        value={diskPct}
+                        className="mt-2 h-1.5"
+                      />
+                    )}
+                  </div>
+                  {n.report.error && (
+                    <p
+                      role="alert"
+                      className="rounded-lg border border-destructive/25 bg-destructive/10 p-2.5 text-xs text-destructive sm:col-span-3"
+                    >
+                      {n.report.error}
+                    </p>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
 
           <div className="space-y-2.5">
             <h4 className="text-xs font-semibold text-muted-foreground">
@@ -3018,11 +3034,7 @@ export function Fleet({ state }: { state: PanelState }) {
                       ? t.state === "succeeded"
                       : maintenanceSucceeded(t);
                   const issue = verifyFailed
-                    ? t.result?.verification?.detail ||
-                      (t.error || t.result?.error || "").replace(
-                        /^组件维护已完成，但整链验证失败[：:]?\s*/,
-                        "",
-                      )
+                    ? verificationDetail(t) || t.result?.error
                     : t.error || t.result?.error;
                   const targetName =
                     t.id === "local" ? "本机（主控）" : remote?.name || t.id;
@@ -3186,9 +3198,6 @@ export function Fleet({ state }: { state: PanelState }) {
                                               action,
                                               task_id: t.task_id,
                                               core: activeTask.core,
-                                              ...(action === "core-reject"
-                                                ? { keep_agent_on_failure: true }
-                                                : {}),
                                             });
                                             forgetFailedDecision(receipt);
                                             if (receipt.state === "failed")
@@ -3451,7 +3460,6 @@ export function Fleet({ state }: { state: PanelState }) {
       {editor && (
         <LineEditor
           line={editor.line}
-          kind={editor.line?.kind || "vless"}
           state={editor.state}
           remoteName={editor.remote.name}
           defaultHost={new URL(editor.remote.url).hostname.replace(

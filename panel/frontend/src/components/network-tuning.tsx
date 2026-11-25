@@ -100,6 +100,22 @@ export function NetworkTuning({
       : [];
   const algorithms = common("algorithms"),
     queues = common("queues");
+
+  useEffect(() => {
+    if (!ready) return;
+    const first = states[targets[0].id];
+    if (algorithms.length > 0 && !algorithms.includes(cc)) {
+      setCc(
+        algorithms.includes(first.congestion_control)
+          ? first.congestion_control
+          : algorithms[0],
+      );
+    }
+    if (queues.length > 0 && !queues.includes(queue)) {
+      setQueue(queues.includes(first.qdisc) ? first.qdisc : queues[0]);
+    }
+  }, [ready, algorithms, queues, cc, queue, states, targets]);
+
   const valid = ready && algorithms.includes(cc) && queues.includes(queue);
 
   return (
@@ -158,7 +174,7 @@ export function NetworkTuning({
           >
             {!algorithms.includes(cc) && (
               <option value={cc} disabled>
-                {cc}（待全部机器确认支持）
+                {ready ? "无共同支持的拥塞控制算法" : `${cc}（待全部机器确认支持）`}
               </option>
             )}
             {algorithms.map((value) => (
@@ -176,7 +192,7 @@ export function NetworkTuning({
           >
             {!queues.includes(queue) && (
               <option value={queue} disabled>
-                {queue}（待全部机器确认支持）
+                {ready ? "无共同支持的默认队列" : `${queue}（待全部机器确认支持）`}
               </option>
             )}
             {queues.map((value) => (
@@ -187,6 +203,11 @@ export function NetworkTuning({
           </select>
         </Field>
       </div>
+      {ready && (!algorithms.length || !queues.length) && (
+        <p role="alert" className="text-xs text-destructive">
+          所选机器无共同支持的算法或队列，请缩小选择范围分别设置。
+        </p>
+      )}
 
       <div className="max-h-72 space-y-2.5 overflow-y-auto pr-1">
         {targets.map((remote) => (

@@ -15,9 +15,20 @@ pub fn xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 pub fn executable(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_else(|| PATH.into()))
         .map(|p| p.join(name))
-        .find(|p| p.is_file())
+        .find(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+pub(super) fn system_account(name: &str) -> Result<Option<(u32, u32)>> {
+    let c_name = std::ffi::CString::new(name)?;
+    let record = unsafe { libc::getpwnam(c_name.as_ptr()) };
+    if record.is_null() {
+        return Ok(None);
+    }
+    let record = unsafe { &*record };
+    ensure!(record.pw_uid != 0, "服务账户不能是 root");
+    Ok(Some((record.pw_uid, record.pw_gid)))
 }
 pub fn definition(
     manager: &Manager,
@@ -200,23 +211,9 @@ pub async fn remove_account(name: &str) -> Result<()> {
         "账户名称无效"
     );
     let c = CString::new(name)?;
-    let user = unsafe { libc::getpwnam(c.as_ptr()) };
-    if user.is_null() {
+    let Some((uid, gid)) = system_account(name)? else {
         return Ok(());
-    }
-    let u = unsafe { &*user };
-    let uid = u.pw_uid;
-    let gid = u.pw_gid;
-    ensure!(
-        uid != 0
-            && unsafe { CStr::from_ptr(u.pw_dir) }.to_str()? == format!("/var/lib/{name}")
-            && ["nologin", "false"]
-                .iter()
-                .any(|s| unsafe { CStr::from_ptr(u.pw_shell) }
-                    .to_string_lossy()
-                    .ends_with(s)),
-        "账户归属不匹配"
-    );
+    };
     let g = unsafe { libc::getgrgid(gid) };
     ensure!(!g.is_null(), "服务组不存在");
     ensure!(
@@ -299,28 +296,35 @@ pub async fn stop_openrc_residue(manager: &Manager, name: &str) -> Result<()> {
     let binary = executable("supervise-daemon")
         .context("缺少 supervisor")?
         .canonicalize()?;
-    let args = fs::read(process.join("cmdline"))?
+    let args = fs::read(process.join("cmdline"))
+        .unwrap_or_default()
         .split(|c| *c == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8(s.to_vec()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let bytes = fs::read(process.join("environ"))?;
+        .filter_map(|s| String::from_utf8(s.to_vec()).ok())
+        .collect::<Vec<_>>();
+    let bytes = fs::read(process.join("environ")).unwrap_or_default();
     let vars = bytes
         .split(|c| *c == 0)
         .filter_map(|s| std::str::from_utf8(s).ok())
         .filter_map(|s| s.split_once('='))
         .collect::<BTreeMap<_, _>>();
     let role = name.strip_prefix("chain-").unwrap();
-    ensure!(
-        fs::metadata(&process)?.uid() == 0
-            && fs::read_link(process.join("exe"))? == binary
-            && args.get(1).map(String::as_str) == Some(name)
-            && args.get(2).map(String::as_str) == Some("--start")
-            && args.ends_with(&[format!("/opt/chain/current-{role}/bin/{name}"), "--".into()])
-            && vars.get("RC_SVCNAME") == Some(&name)
-            && vars.get("RC_SERVICE").copied() == Some(format!("/etc/init.d/{name}").as_str()),
-        "supervisor 身份不匹配，拒绝清理"
-    );
+    let expected_cmd = manager
+        .base
+        .join(format!("current-{role}/bin/{name}"))
+        .display()
+        .to_string();
+    let matches_supervisor = fs::metadata(&process).is_ok_and(|m| m.uid() == 0)
+        && fs::read_link(process.join("exe")).ok().as_ref() == Some(&binary)
+        && args.get(1).map(String::as_str) == Some(name)
+        && args.get(2).map(String::as_str) == Some("--start")
+        && args.ends_with(&[expected_cmd, "--".into()])
+        && vars.get("RC_SVCNAME") == Some(&name)
+        && vars.get("RC_SERVICE").copied() == Some(format!("/etc/init.d/{name}").as_str());
+    if !matches_supervisor {
+        fs::remove_file(pidfile)?;
+        return Ok(());
+    }
     command(
         "env",
         &[

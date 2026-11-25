@@ -71,9 +71,26 @@ pub fn validate(doc: &Document, plan: &Plan, previous: Option<&Plan>) -> Result<
     ensure!(doc.customers.iter().any(|c| c.id == plan.customer_id), "请选择已有客户");
     ensure!(plan.monthly_gib.is_finite() && plan.monthly_gib > 0.0 && plan.monthly_gib <= 1e9, "套餐共享额度须为正数");
     ensure!(!plan.members.is_empty() && plan.members.len() <= 500, "套餐须有 1–500 名成员");
+    let at = now();
     if let Some(old) = previous {
-        ensure!(old.customer_id == plan.customer_id, "已有套餐不能直接转给另一位客户");
-        ensure!(old.members.iter().all(|m| plan.members.iter().any(|n| n.id == m.id && m.line_ids.iter().all(|id| n.line_ids.contains(id)))), "已有成员和线路不能移出套餐；请停用线路，保留历史归属");
+        let key = old.key();
+        let ever_billed = doc.rentals.get(&key).is_some_and(|r| r.started_at > 0)
+            || doc.payments.iter().any(|p| p.line_id == key);
+        if ever_billed {
+            ensure!(old.customer_id == plan.customer_id, "已开通套餐不能直接转给另一位客户");
+        }
+        let active_lease = doc
+            .rentals
+            .get(&key)
+            .is_some_and(|r| r.started_at > 0 && (r.expires_at == 0 || r.expires_at > at));
+        if active_lease {
+            for old_id in old.lines() {
+                if !plan.lines().any(|id| id == old_id) {
+                    let disabled = doc.lines.iter().find(|l| l.id == *old_id).is_none_or(|l| !l.enabled);
+                    ensure!(disabled, "启用中的已开通套餐线路不能直接移出；请先停用该线路后再解绑");
+                }
+            }
+        }
     }
     let mut member_ids = BTreeSet::new();
     let mut lines = BTreeSet::new();
@@ -85,17 +102,15 @@ pub fn validate(doc: &Document, plan: &Plan, previous: Option<&Plan>) -> Result<
         ensure!(!member.line_ids.is_empty(), "每名成员至少关联一条线路");
         for id in &member.line_ids {
             ensure!(lines.insert(id), "一条线路不能同时属于多个成员");
-            let line = doc.lines.iter().find(|l| l.id == *id && l.kind == Kind::Vless).context("套餐线路不存在")?;
+            let line = doc.lines.iter().find(|l| l.id == *id).context("套餐线路不存在")?;
             ensure!(for_line(doc, id).is_none_or(|p| p.id == plan.id), "线路已属于其他套餐");
             if !previous.is_some_and(|p| p.lines().any(|old| old == id)) {
-                ensure!(!doc.rentals.contains_key(id) && !doc.applied_lines.iter().any(|l| l.id == *id), "只能加入未出租且未发布的新线路；原独立租赁保持不变");
+                ensure!(!doc.rentals.contains_key(id), "只能加入未绑定独立租约或其他套餐的空闲线路");
             }
             ensure!(!doc.lines.iter().any(|l| l.proxy_chain().iter().any(|r| r == &format!("line:{id}"))), "套餐线路不能作为其他线路的链式出口，以免重复记账");
-            let node = line.hops.first().and_then(|h| doc.nodes.iter().find(|n| n.id == h.node_id)).context("套餐线路缺少入口节点")?;
-            ensure!(node.report.system["customer_plan_version"] == 1, "请先升级套餐线路的入口 Agent 并等待心跳");
+            line.hops.first().and_then(|h| doc.nodes.iter().find(|n| n.id == h.node_id)).context("套餐线路缺少入口节点")?;
         }
     }
-    let at = now();
     let anchor = doc.rentals.get(&plan.key()).map(|r| r.started_at).unwrap_or(0);
     let cycle = crate::rental::cycle(anchor, at).0;
     for (key, limit) in std::iter::once((plan.key(), plan.monthly_gib)).chain(plan.members.iter().filter_map(|m| m.monthly_gib.map(|g| (member_key(plan, m), g)))) {
@@ -107,17 +122,22 @@ pub fn validate(doc: &Document, plan: &Plan, previous: Option<&Plan>) -> Result<
 
 pub fn view(doc: &Document, at: u64) -> Vec<Value> {
     doc.customer_plans.iter().map(|plan| {
-        let rental = doc.rentals.get(&plan.key());
-        let usage = |key: &str| {
+        let key = plan.key();
+        let rental = doc.rentals.get(&key);
+        let usage = |budget_key: &str| {
             let cycle = rental.map(|r| crate::rental::cycle(r.started_at, at).0).unwrap_or(0);
-            let ledger = doc.customer_ledgers.get(key).filter(|l| l.cycle == cycle);
+            let ledger = doc.customer_ledgers.get(budget_key).filter(|l| l.cycle == cycle);
             json!({"used":ledger.map(|l| l.allocations.values().fold(0u64, |sum, a| sum.saturating_add(a.used))).unwrap_or(0),
                 "reserved":ledger.map(|l| l.allocations.values().fold(0u64, |sum, a| sum.saturating_add(a.granted))).unwrap_or(0)})
         };
-        json!({"id":plan.id,"name":plan.name,"customer_id":plan.customer_id,"monthly_gib":plan.monthly_gib,"usage":usage(&plan.key()),
-            "members":plan.members.iter().map(|m| json!({"id":m.id,"name":m.name,"line_ids":m.line_ids,"monthly_gib":m.monthly_gib,"usage":usage(&member_key(plan,m))})).collect::<Vec<_>>(),
-            "rental":rental.map(|r| json!({"customer_id":r.customer_id,"prices":r.prices,"started_at":r.started_at,"expires_at":r.expires_at,"paid_months":r.paid_months,
-                "permanent":r.started_at>0 && r.expires_at==0,"next_reset_at":if r.started_at>0 {crate::rental::cycle(r.started_at,at).1} else {0},"query_link_exists":!r.query_token_hash.is_empty()}))})
+        let query_link_exists = doc.customer_query_tokens.contains_key(&key);
+        json!({"id":plan.id,"name":plan.name,"customer_id":plan.customer_id,"monthly_gib":plan.monthly_gib,"usage":usage(&key),
+            "members":plan.members.iter().map(|m| {
+                let mkey = member_key(plan, m);
+                json!({"id":m.id,"name":m.name,"line_ids":m.line_ids,"monthly_gib":m.monthly_gib,"usage":usage(&mkey),
+                    "query_link_exists":doc.customer_query_tokens.contains_key(&mkey)})
+            }).collect::<Vec<_>>(),
+            "rental":rental.map(|r| crate::rental::rental_summary(r, at, query_link_exists))})
     }).collect()
 }
 
@@ -133,47 +153,37 @@ mod tests {
             doc.lines.push(serde_json::from_value(json!({"id":name,"name":name,"kind":"vless","enabled":true,"hops":[{"node_id":name,"port":443,"uuid":"existing-credential"}]})).unwrap());
             doc.nodes.push(serde_json::from_value(json!({"id":name,"name":name,"host":"192.0.2.1","token_hash":"test",
                 "reality":{"target":"","server_name":"","private_key":"","public_key":"","short_id":""},
-                "report":{"system":{"customer_plan_version":1}},"desired":{"revision":"r","config":{"_chain":[{"resource_ids":[plan.key(),member_key(&plan,&plan.members[0])]}]}}})).unwrap());
+                "desired":{"revision":"r","config":{"_chain":[{"resource_ids":[plan.key(),member_key(&plan,&plan.members[0])]}]}}})).unwrap());
         }
         (doc, plan)
     }
     #[test]
-    fn existing_entitlements_are_not_merged_and_members_keep_one_owner() {
+    fn existing_entitlements_are_not_merged_and_draft_or_disabled_lines_can_unbind() {
         let (mut doc, plan) = fixture();
         validate(&doc, &plan, None).unwrap();
         doc.rentals.insert("a".into(), Rental::default());
         assert!(validate(&doc, &plan, None).is_err());
         doc.rentals.clear();
+        // Published idle lines ARE allowed into a plan.
         doc.applied_lines.push(doc.lines[0].clone());
-        assert!(validate(&doc, &plan, None).is_err());
-        doc.applied_lines.clear();
+        validate(&doc, &plan, None).unwrap();
         let mut repeated = plan.clone();
         repeated.members.push(Member { id:id(), name:"第二人".into(), line_ids:vec!["a".into()], monthly_gib:None });
         assert!(validate(&doc, &repeated, None).is_err());
-        doc.nodes[0].report.system = json!({});
-        assert!(validate(&doc, &plan, None).is_err(), "旧Agent不能忽略共享扣费约束");
-    }
-    #[test]
-    fn customer_grants_require_explicit_protocol_version() {
-        let (mut doc, plan) = fixture();
-        let at = 1_800_000_000;
-        doc.rentals.insert(plan.key(), Rental { started_at:at-1, expires_at:at+100, ..Default::default() });
-        doc.customer_plans.push(plan.clone());
-        for resource in [plan.key(), member_key(&plan, &plan.members[0])] {
-            let mut request: resources::Request = serde_json::from_value(json!({
-                "resource":resource, "epoch":id(), "cycle":0, "used":0, "want":80
-            })).unwrap();
-            assert_eq!(request.customer_plan_version, 0);
-            let before = serde_json::to_value(&doc.customer_ledgers).unwrap();
-            for version in [0, 2, u32::MAX] {
-                request.customer_plan_version = version;
-                let error = resources::allocate(&mut doc, "a", &request, at).err().unwrap();
-                assert!(error.to_string().contains("计费协议版本 1"));
-                assert_eq!(serde_json::to_value(&doc.customer_ledgers).unwrap(), before);
-            }
-            request.customer_plan_version = 1;
-            assert_eq!(resources::allocate(&mut doc, "a", &request, at).unwrap().cap, 80);
-        }
+
+        // Draft plan (unstarted) allows freely removing a line.
+        let mut shrunk = plan.clone();
+        shrunk.members[0].line_ids = vec!["a".into()];
+        validate(&doc, &shrunk, Some(&plan)).unwrap();
+
+        // Started plan blocks removing an enabled line, but allows unbinding a disabled line.
+        doc.rentals.insert(plan.key(), Rental { customer_id: "c".into(), started_at: 100, expires_at: 200, ..Default::default() });
+        validate(&doc, &shrunk, Some(&plan)).unwrap();
+        let active_end = now() + 3600;
+        doc.rentals.insert(plan.key(), Rental { customer_id: "c".into(), started_at: 100, expires_at: active_end, ..Default::default() });
+        assert!(validate(&doc, &shrunk, Some(&plan)).is_err());
+        doc.lines[1].enabled = false;
+        validate(&doc, &shrunk, Some(&plan)).unwrap();
     }
     #[test]
     fn customer_grants_share_one_ceiling_across_nodes_and_restart_epochs() {
@@ -181,7 +191,7 @@ mod tests {
         let at = 1_800_000_000;
         doc.rentals.insert(plan.key(), Rental { customer_id:"c".into(), started_at:at-1, expires_at:at+100, ..Default::default() });
         doc.customer_plans.push(plan.clone());
-        let mut request = resources::Request { customer_plan_version:1, resource:plan.key(), epoch:id(), cycle:0, used:0, want:16*1024*1024, preferred_want:None };
+        let mut request = resources::Request { resource:plan.key(), epoch:id(), cycle:0, used:0, want:16*1024*1024, preferred_want:None, customer_plan_version:1 };
         let first = resources::allocate(&mut doc,"a",&request,at).unwrap();
         request.epoch = id();
         let second = resources::allocate(&mut doc,"b",&request,at).unwrap();

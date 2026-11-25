@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, api } from "../api";
 import type {
+  Limits,
   Line,
   PanelState,
   Payment,
@@ -16,6 +17,21 @@ import { CopyButton, Field, InfoTip, Modal, errorText, field, number } from "./s
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { Input } from "./ui/input";
+
+export function orderStorageKey(lineIds: string[]) {
+  return `chain-order:${[...lineIds].sort().join(",")}`;
+}
+
+export function clearOrderStorage(order: Pick<RentalOrder, "request_id" | "items">) {
+  const key = orderStorageKey(order.items.map((item) => item.line_id));
+  if (localStorage.getItem(key) === order.request_id) {
+    localStorage.removeItem(key);
+  }
+}
+
+export function adjustmentStorageKey(paymentId: string) {
+  return `chain-adjustment:${paymentId}`;
+}
 
 export function PaymentTable({
   payments,
@@ -271,9 +287,11 @@ export function RenewalDialog({
       (line) => line.rental?.customer_id && line.rental.prices[term.id] != null,
     ),
   );
+  const storageKey = orderStorageKey(lines.map((line) => line.id));
   const [term, setTerm] = useState<Term>(available[0]?.id || "monthly");
-  const [storageKey, setStorageKey] = useState("");
-  const [pendingId, setPendingId] = useState("");
+  const [pendingId, setPendingId] = useState(
+    () => localStorage.getItem(storageKey) || "",
+  );
   const [order, setOrder] = useState<RentalOrder | null>(null);
   const [notice, setNotice] = useState("");
   const [missing, setMissing] = useState(false);
@@ -281,11 +299,17 @@ export function RenewalDialog({
   async function restore(requestId: string) {
     setMissing(false);
     try {
-      setOrder(
-        await api<RentalOrder>(
-          `/rentals/orders/by-request/${encodeURIComponent(requestId)}`,
-        ),
+      const found = await api<RentalOrder>(
+        `/rentals/orders/by-request/${encodeURIComponent(requestId)}`,
       );
+      if (found.cancelled_at > 0) {
+        if (localStorage.getItem(storageKey) === requestId)
+          localStorage.removeItem(storageKey);
+        setPendingId("");
+        setNotice("");
+        return;
+      }
+      setOrder(found);
       setNotice("");
     } catch (error) {
       setNotice(errorText(error));
@@ -294,39 +318,37 @@ export function RenewalDialog({
   }
 
   useEffect(() => {
+    const requestId = localStorage.getItem(storageKey) || "";
+    setPendingId(requestId);
+    if (!requestId) return;
     let alive = true;
-    void api<{ scope: string }>("/rentals/context")
-      .then(async ({ scope }) => {
+    void api<RentalOrder>(
+      `/rentals/orders/by-request/${encodeURIComponent(requestId)}`,
+    )
+      .then((found) => {
         if (!alive) return;
-        const key = `chain-order:${scope}`;
-        const requestId = localStorage.getItem(key) || "";
-        setStorageKey(key);
-        setPendingId(requestId);
-        if (requestId) {
-          try {
-            const found = await api<RentalOrder>(
-              `/rentals/orders/by-request/${encodeURIComponent(requestId)}`,
-            );
-            if (alive) setOrder(found);
-          } catch (error) {
-            if (alive) {
-              setNotice(errorText(error));
-              setMissing(error instanceof ApiError && error.status === 404);
-            }
-          }
+        if (found.cancelled_at > 0) {
+          if (localStorage.getItem(storageKey) === requestId)
+            localStorage.removeItem(storageKey);
+          setPendingId("");
+          return;
         }
+        setOrder(found);
       })
       .catch((error) => {
-        if (alive) setNotice(errorText(error));
+        if (alive) {
+          setNotice(errorText(error));
+          setMissing(error instanceof ApiError && error.status === 404);
+        }
       });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [storageKey]);
 
   const clear = () => {
     const targetId = order?.request_id || pendingId;
-    if (storageKey && targetId && localStorage.getItem(storageKey) === targetId) {
+    if (targetId && localStorage.getItem(storageKey) === targetId) {
       localStorage.removeItem(storageKey);
     }
     setPendingId("");
@@ -356,11 +378,7 @@ export function RenewalDialog({
           : `批量开通 / 续费 · ${lines.length} 条`
       }
       description="先建立待收款订单，再核对线下到账并下发租期权益。"
-      submit={
-        storageKey && !pendingId && available.length
-          ? "保存待收款订单"
-          : undefined
-      }
+      submit={!pendingId && available.length ? "保存待收款订单" : undefined}
       close={close}
       action={async (data) => {
         const previous = localStorage.getItem(storageKey);
@@ -386,12 +404,25 @@ export function RenewalDialog({
         const requestId = billingRequestId();
         localStorage.setItem(storageKey, requestId);
         setPendingId(requestId);
-        setOrder(
-          await api<RentalOrder>("/rentals/orders", "POST", {
-            ...payload,
-            request_id: requestId,
-          }),
-        );
+        try {
+          setOrder(
+            await api<RentalOrder>("/rentals/orders", "POST", {
+              ...payload,
+              request_id: requestId,
+            }),
+          );
+        } catch (error) {
+          if (
+            error instanceof ApiError &&
+            error.status >= 400 &&
+            error.status < 500
+          ) {
+            if (localStorage.getItem(storageKey) === requestId)
+              localStorage.removeItem(storageKey);
+            setPendingId("");
+          }
+          throw error;
+        }
         await saved();
       }}
     >
@@ -400,7 +431,6 @@ export function RenewalDialog({
           {notice}
         </p>
       )}
-      {!storageKey && <p className="muted">正在核对当前会话状态…</p>}
       {pendingId ? (
         <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
           <p className="text-xs font-medium text-foreground">
@@ -662,6 +692,7 @@ export function PaymentAdjustmentDialog({
   close: () => void;
   saved: () => Promise<void>;
 }) {
+  const storageKey = adjustmentStorageKey(payment.id);
   const changes = adjustments.filter((a) => a.payment_id === payment.id);
   const gross =
     payment.amount_fen +
@@ -673,12 +704,14 @@ export function PaymentAdjustmentDialog({
   const [kind, setKind] = useState<"refund" | "correction">("refund");
   const [disableLine, setDisableLine] = useState(false);
   const [submitted, setSubmitted] = useState(false);
-  const [storageKey, setStorageKey] = useState("");
   const [recovery, setRecovery] = useState<{
     id: string;
     record?: PaymentAdjustment;
     missing?: boolean;
-  } | null>(null);
+  } | null>(() => {
+    const requestId = localStorage.getItem(storageKey);
+    return requestId ? { id: requestId } : null;
+  });
   const [notice, setNotice] = useState("");
   const request = useRef<{ id: string; payload: object } | null>(null);
 
@@ -702,38 +735,32 @@ export function PaymentAdjustmentDialog({
   }
 
   useEffect(() => {
+    const requestId = localStorage.getItem(storageKey);
+    if (!requestId) {
+      setRecovery(null);
+      return;
+    }
     let alive = true;
-    void api<{ scope: string }>("/rentals/context")
-      .then(async ({ scope }) => {
-        if (!alive) return;
-        const key = `chain-adjustment:${scope}`;
-        const requestId = localStorage.getItem(key);
-        setStorageKey(key);
-        if (requestId) {
-          setRecovery({ id: requestId });
-          try {
-            const record = await api<PaymentAdjustment>(
-              `/rentals/adjustments/by-request/${encodeURIComponent(requestId)}`,
-            );
-            if (alive) setRecovery({ id: requestId, record });
-          } catch (error) {
-            if (alive) {
-              setRecovery({
-                id: requestId,
-                missing: error instanceof ApiError && error.status === 404,
-              });
-              setNotice(errorText(error));
-            }
-          }
-        }
+    setRecovery({ id: requestId });
+    void api<PaymentAdjustment>(
+      `/rentals/adjustments/by-request/${encodeURIComponent(requestId)}`,
+    )
+      .then((record) => {
+        if (alive) setRecovery({ id: requestId, record });
       })
       .catch((error) => {
-        if (alive) setNotice(errorText(error));
+        if (alive) {
+          setRecovery({
+            id: requestId,
+            missing: error instanceof ApiError && error.status === 404,
+          });
+          setNotice(errorText(error));
+        }
       });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [storageKey]);
 
   const clear = () => {
     if (localStorage.getItem(storageKey) === (recovery?.id ?? request.current?.id))
@@ -749,7 +776,7 @@ export function PaymentAdjustmentDialog({
       title="人工退款 / 金额纠错"
       description={recovery ? "核对上一次退款或纠错的登记结果" : `${payment.customer_name} · ${payment.line_name}`}
       submit={
-        !storageKey || recovery
+        recovery
           ? undefined
           : submitted
             ? "使用原请求核对并重试"
@@ -790,7 +817,8 @@ export function PaymentAdjustmentDialog({
         } catch (error) {
           if (
             error instanceof ApiError &&
-            [400, 401, 403, 404, 409, 422].includes(error.status)
+            error.status >= 400 &&
+            error.status < 500
           )
             clear();
           throw error;
@@ -805,7 +833,6 @@ export function PaymentAdjustmentDialog({
           {notice}
         </p>
       )}
-      {!storageKey && <p className="muted">正在核对当前会话状态…</p>}
       {recovery && (
         <div className="space-y-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5">
           <p className="text-xs font-medium text-foreground">
@@ -813,9 +840,6 @@ export function PaymentAdjustmentDialog({
           </p>
           {recovery.record ? (
             <>
-              {recovery.record.payment_id !== payment.id && (
-                <p className="text-xs font-medium">当前打开的收款 {payment.id} 与这笔回执无关。</p>
-              )}
               <p className="break-all text-xs">原收款流水 {recovery.record.payment_id}</p>
               <p className="break-all text-xs">调整流水 {recovery.record.id}</p>
               <p className="text-xs text-foreground">
@@ -885,7 +909,7 @@ export function PaymentAdjustmentDialog({
 
       <fieldset
         hidden={Boolean(recovery)}
-        disabled={submitted || !storageKey || Boolean(recovery)}
+        disabled={submitted || Boolean(recovery)}
         className="space-y-3.5"
       >
         <Field label="记录类型">
@@ -958,7 +982,7 @@ export function PaymentAdjustmentDialog({
             className="textarea"
             name="note"
             required
-            maxLength={600}
+            maxLength={2000}
             rows={3}
             placeholder="填写退款凭据编号或金额更正说明"
           />
@@ -981,6 +1005,30 @@ export function PaymentAdjustmentDialog({
         </p>
       )}
     </Modal>
+  );
+}
+
+export function LimitsFields({ initial }: { initial?: Limits | null }) {
+  return (
+    <div className="grid gap-3.5 sm:grid-cols-3">
+      {[
+        { key: "quota", label: "月额度 · GiB", value: initial?.monthly_gib, min: "0.000001" },
+        { key: "upload", label: "上传上限 · Mbps", value: initial?.upload_mbps, min: "0.001" },
+        { key: "download", label: "下载上限 · Mbps", value: initial?.download_mbps, min: "0.001" },
+      ].map((input) => (
+        <Field key={input.key} label={input.label}>
+          <Input
+            name={input.key}
+            type="number"
+            min={input.min}
+            max="1000000000"
+            step="any"
+            placeholder="不限"
+            defaultValue={input.value ?? ""}
+          />
+        </Field>
+      ))}
+    </div>
   );
 }
 
@@ -1027,66 +1075,48 @@ export function LimitsDialog({
           </Badge>
         ))}
       </div>
-      <div className="grid gap-3.5 sm:grid-cols-3">
-        {[
-          { key: "quota", label: "月额度 · GiB", value: initial?.monthly_gib },
-          { key: "upload", label: "上传上限 · Mbps", value: initial?.upload_mbps },
-          {
-            key: "download",
-            label: "下载上限 · Mbps",
-            value: initial?.download_mbps,
-          },
-        ].map((input) => (
-          <Field key={input.key} label={input.label}>
-            <Input
-              name={input.key}
-              type="number"
-              min="0.001"
-              step="any"
-              placeholder="不限"
-              defaultValue={input.value ?? ""}
-            />
-          </Field>
-        ))}
-      </div>
+      <LimitsFields initial={initial} />
     </Modal>
   );
 }
 
-export function QueryLinkDialog({
-  line,
+export function QueryLinkModal({
+  title,
+  description,
+  hint,
+  path,
+  exists = false,
   close,
   saved,
 }: {
-  line: Line;
+  title: string;
+  description: string;
+  hint: string;
+  path: string;
+  exists?: boolean;
   close: () => void;
   saved: () => Promise<void>;
 }) {
   const [url, setUrl] = useState("");
   return (
     <Modal
-      title="客户私密查询链接"
-      description={line.name}
+      title={title}
+      description={description}
       submit={
         url
           ? undefined
-          : line.rental?.query_link_exists
+          : exists
             ? "重新生成并使旧链接失效"
             : "生成查询链接"
       }
       close={close}
       action={async () => {
-        const result = await api<{ path: string }>(
-          `/rentals/${line.id}/query-link`,
-          "POST",
-        );
+        const result = await api<{ path: string }>(path, "POST", {});
         setUrl(new URL(result.path, location.origin).href);
         await saved();
       }}
     >
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        客户凭此链接免登录查询该线路余量、到期日与续费报价；重新生成将使旧查询链接失效。
-      </p>
+      <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>
       {url && (
         <>
           <Field label="查询链接">
@@ -1105,5 +1135,27 @@ export function QueryLinkDialog({
         </>
       )}
     </Modal>
+  );
+}
+
+export function QueryLinkDialog({
+  line,
+  close,
+  saved,
+}: {
+  line: Line;
+  close: () => void;
+  saved: () => Promise<void>;
+}) {
+  return (
+    <QueryLinkModal
+      title="客户私密查询链接"
+      description={line.name}
+      hint="客户凭此链接免登录查询该线路余量、到期日与续费报价；重新生成将使旧查询链接失效。"
+      path={`/rentals/${line.id}/query-link`}
+      exists={Boolean(line.rental?.query_link_exists)}
+      close={close}
+      saved={saved}
+    />
   );
 }

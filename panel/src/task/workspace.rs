@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, ensure};
-use serde_json::json;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -7,6 +6,7 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -77,6 +77,7 @@ pub struct Workspace {
     pub root: PathBuf,
     pub env: BTreeMap<String, String>,
     children: RefCell<Vec<Child>>,
+    commands: AtomicUsize,
     before: u64,
 }
 pub(crate) fn configure_cache(
@@ -105,10 +106,6 @@ impl Workspace {
     pub fn new(parent: &Path) -> Result<Self> {
         let parent = parent.canonicalize()?;
         let before = free_space(&parent)?;
-        ensure!(
-            before > 2 * 1024 * 1024 * 1024,
-            "工作目录至少需要 2 GiB 可用空间"
-        );
         let directory = tempfile::Builder::new()
             .prefix(".chain-build-")
             .tempdir_in(parent)?;
@@ -142,9 +139,9 @@ impl Workspace {
             root,
             env,
             children: RefCell::new(vec![]),
+            commands: AtomicUsize::new(0),
             before,
         };
-        work.record()?;
         println!(
             "临时目录：{}；拥有者 PID/PGID={}/{}；不启动构建监听服务。",
             work.root.display(),
@@ -154,15 +151,12 @@ impl Workspace {
         Ok(work)
     }
 
-    fn record(&self) -> Result<()> {
-        fs::write(
-            self.root.join("ownership.json"),
-            serde_json::to_vec_pretty(&json!({
-                "pid":std::process::id(), "pgid":unsafe {libc::getpgrp()},
-                "cwd":std::env::current_dir()?, "root":self.root,
-                "groups":self.children.borrow().iter().map(Child::id).collect::<Vec<_>>(), "ports":[]
-            }))?,
-        )?;
+    pub fn require_space(&self, min_bytes: u64) -> Result<()> {
+        ensure!(
+            free_space(&self.root)? > min_bytes,
+            "工作目录至少需要 {} GiB 可用空间",
+            min_bytes / (1024 * 1024 * 1024)
+        );
         Ok(())
     }
 
@@ -199,7 +193,6 @@ impl Workspace {
             .spawn()?;
         let pid = child.id();
         self.children.borrow_mut().push(child);
-        self.record()?;
         Ok(pid)
     }
 
@@ -242,7 +235,6 @@ impl Workspace {
     pub fn register(&self, child: Child) -> Result<u32> {
         let pid = child.id();
         self.children.borrow_mut().push(child);
-        self.record()?;
         Ok(pid)
     }
     pub fn poll(&self, pid: u32) -> Result<Option<std::process::ExitStatus>> {
@@ -263,64 +255,62 @@ impl Workspace {
         success: bool,
     ) -> Result<String> {
         ensure!(!args.is_empty(), "命令不能为空");
-        let log = self
-            .root
-            .join(format!("command-{}.log", self.children.borrow().len()));
-        let mut command = Command::new(&args[0]);
+        let seq = self.commands.fetch_add(1, Ordering::Relaxed);
+        let log = self.root.join(format!("command-{seq}.log"));
+        let mut command = tokio::process::Command::new(&args[0]);
         command
             .args(&args[1..])
             .current_dir(cwd)
             .envs(&self.env)
+            .kill_on_drop(true)
             .process_group(0);
         if capture {
             let stream = fs::File::create(&log)?;
             command.stdout(stream.try_clone()?).stderr(stream);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("无法执行 {}", args[0]))?;
-        println!("执行：{}；PID/PGID={}", args.join(" "), child.id());
-        let index = self.children.borrow().len();
-        self.children.borrow_mut().push(child);
-        self.record()?;
-        let start = Instant::now();
-        loop {
-            if let Some(status) = self.children.borrow_mut()[index].try_wait()? {
-                let text = if capture {
-                    fs::read_to_string(&log)?
-                } else {
-                    String::new()
-                };
-                if status.success() != success {
-                    let tail: String = text
-                        .chars()
-                        .rev()
-                        .take(3000)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect();
-                    let message = format!("{} 失败（{status}）：{tail}", args.join(" "));
-                    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
-                        eprintln!(
-                            "::error::{}",
-                            message
-                                .replace('%', "%25")
-                                .replace('\r', "%0D")
-                                .replace('\n', "%0A")
-                        );
+        let pid = child.id().unwrap_or(0);
+        println!("执行：{}；PID/PGID={pid}", args.join(" "));
+        let status = match tokio::time::timeout(Duration::from_secs(2400), child.wait()).await {
+            Ok(res) => res?,
+            Err(_) => {
+                if pid > 0 {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
                     }
-                    anyhow::bail!(message);
                 }
-                return Ok(text.trim().into());
+                anyhow::bail!("命令超时：{}", args.join(" "));
             }
-            ensure!(
-                start.elapsed() < Duration::from_secs(2400),
-                "命令超时：{}",
-                args.join(" ")
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let text = if capture {
+            fs::read_to_string(&log)?
+        } else {
+            String::new()
+        };
+        if status.success() != success {
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(3000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let message = format!("{} 失败（{status}）：{tail}", args.join(" "));
+            if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+                eprintln!(
+                    "::error::{}",
+                    message
+                        .replace('%', "%25")
+                        .replace('\r', "%0D")
+                        .replace('\n', "%0A")
+                );
+            }
+            anyhow::bail!(message);
         }
+        Ok(text.trim().into())
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -366,41 +356,6 @@ impl Workspace {
             "仍有本次进程，保留目录 {}",
             self.root.display()
         );
-        #[cfg(target_os = "linux")]
-        for process in fs::read_dir("/proc")? {
-            let process = process?.path();
-            if let Ok(links) = fs::read_dir(process.join("fd")) {
-                for link in links
-                    .flatten()
-                    .map(|v| v.path())
-                    .chain([process.join("exe"), process.join("cwd")])
-                {
-                    ensure!(
-                        !fs::read_link(&link).is_ok_and(|v| v.starts_with(&self.root)),
-                        "仍有进程持有临时文件：{}",
-                        link.display()
-                    );
-                }
-            }
-            if let Ok(maps) = fs::read_to_string(process.join("maps")) {
-                ensure!(
-                    !maps.contains(self.root.to_str().context("工作目录须为 UTF-8")?),
-                    "仍有进程映射临时文件：{}",
-                    process.display()
-                );
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let output = Command::new("lsof")
-                .args(["-nP", "+D"])
-                .arg(&self.root)
-                .output()?;
-            ensure!(
-                output.status.code() == Some(1) && output.stdout.is_empty(),
-                "临时目录仍有打开的文件"
-            );
-        }
         fn size(root: &Path) -> Result<u64> {
             let mut total = 0;
             for entry in fs::read_dir(root)? {

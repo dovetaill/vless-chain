@@ -1,19 +1,13 @@
 export interface Traffic {
   charged?: number | null;
-  epoch: string;
-  month: string;
   upload: number;
   download: number;
-  total_upload: number;
-  total_download: number;
   upload_bps: number;
   download_bps: number;
   connections: number;
   sampled_at: number;
   blocked: boolean;
   days: Record<string, [number, number]>;
-  cycle_start: number;
-  cycle_end: number;
 }
 export interface NodeInfo {
   id: string;
@@ -33,7 +27,6 @@ export interface NodeInfo {
     system: {
       memory_total?: number;
       memory_used?: number;
-      load_1m?: number;
       network_rx?: number;
       network_tx?: number;
       sampled_at?: number;
@@ -74,8 +67,6 @@ export interface Access {
   username: string;
   password: string;
   method: string;
-  public_host: string;
-  public_port: number | null;
   tls: TLS;
 }
 export interface Limits {
@@ -98,7 +89,6 @@ export interface Rental {
   prices: Prices;
   started_at: number;
   expires_at: number;
-  paid_months: number;
   next_reset_at: number;
   query_link_exists: boolean;
   permanent: boolean;
@@ -131,9 +121,6 @@ export interface RentalOrder {
   cancelled_at: number;
   term: Term;
   note: string;
-  created_session: string;
-  confirmed_session: string;
-  cancelled_session: string;
   created_by?: Operator | null;
   confirmed_by?: Operator | null;
   cancelled_by?: Operator | null;
@@ -149,7 +136,6 @@ export interface PaymentAdjustment {
   note: string;
   disable_line: boolean;
   affected_line_ids?: string[];
-  session: string;
   operator?: Operator | null;
 }
 export interface Line {
@@ -158,14 +144,11 @@ export interface Line {
   multiplier?: number;
   id: string;
   name: string;
-  kind: "vless" | "forward" | "website";
+  kind: "vless";
   hops: Hop[];
   enabled: boolean;
   published: boolean;
-  external_id: string | null;
   chain: string[];
-  target: string;
-  network: string;
   share: string | null;
   access: Access;
   limits: Limits;
@@ -179,7 +162,7 @@ export interface CustomerPlan {
   name: string;
   customer_id: string;
   monthly_gib: number;
-  members: { id: string; name: string; line_ids: string[]; monthly_gib: number | null; usage: { used: number; reserved: number } }[];
+  members: { id: string; name: string; line_ids: string[]; monthly_gib: number | null; usage: { used: number; reserved: number }; query_link_exists?: boolean }[];
   usage: { used: number; reserved: number };
   rental: Rental | null;
 }
@@ -211,8 +194,8 @@ export interface PanelState {
   maintenance_actions?: string[];
   cores?: { xray?: string; mihomo?: string; xray_channel?: string; xray_prerelease?: boolean } | null;
   core_maintenance?: { supported: boolean; versions: Record<string, string>; recommended: Record<string, string>;
-    history: Record<string, { version: string; safe: boolean }>; blocked?: { core: string } | null; pending?: string | null };
-  legacy_configs?: { id: string; node_id: string; name: string; enabled: boolean; published: boolean; pending_delete?: boolean; ports: number[] }[];
+    blocked?: { core: string } | null; pending?: string | null };
+  legacy_configs?: { id: string; node_id: string; name: string; enabled: boolean; published: boolean; pending_delete?: boolean; ports: (number | string)[] }[];
   pending_imports?: { id: string; name: string; reason: string }[];
   local_node_id: string | null;
   nodes: NodeInfo[];

@@ -198,12 +198,12 @@
   background: var(--card);
 }
 
-.fleet-workspace .data-table td[data-label="状态"] {
+.fleet-workspace .data-table td.fleet-status-cell {
   white-space: normal;
   min-width: 170px;
 }
 
-.fleet-workspace .data-table td[data-label="状态"] p {
+.fleet-workspace .data-table td.fleet-status-cell p {
   overflow-wrap: anywhere;
 }
 
@@ -327,27 +327,6 @@
   scrollbar-gutter: stable;
 }
 
-.fleet-workspace .fleet-policy-fields {
-  container-type: inline-size;
-  min-width: 0;
-}
-
-.fleet-workspace .fleet-policy-fields > div > .grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: end;
-}
-
-.fleet-workspace .fleet-policy-fields > div > .grid > :first-child,
-.fleet-workspace .fleet-policy-fields > div > .grid > :last-child {
-  grid-column: 1 / -1;
-}
-
-@container (max-width: 24rem) {
-  .fleet-workspace .fleet-policy-fields > div > .grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
 @media (max-width: 1200px) {
   .fleet-workspace .fleet-overview-panels,
   .fleet-workspace .fleet-settings {
@@ -406,7 +385,7 @@
     padding-top: 0.5rem;
     border-top: 1px solid var(--border);
   }
-  .fleet-workspace .fleet-responsive td[data-label="状态"] {
+  .fleet-workspace .fleet-responsive td.fleet-status-cell {
     grid-column: 1 / -1;
   }
   .fleet-workspace .fleet-pagination {
@@ -414,8 +393,5 @@
   }
   .fleet-workspace .fleet-setting-section {
     padding: 0.875rem;
-  }
-  .fleet-workspace .fleet-policy-fields > div > .grid {
-    grid-template-columns: minmax(0, 1fr);
   }
 }

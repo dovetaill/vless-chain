@@ -291,7 +291,6 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
- "http-body-util",
  "hyper",
  "hyper-util",
  "include_dir",

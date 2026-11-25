@@ -16,7 +16,7 @@ assert.deepEqual(days.at(-1), { date: "2026-01-02", upload: 2, download: 3 });
 
 const line = {
   name: "东京代理", hops: [{ node_id: "node", port: 443 }],
-  access: { host: "proxy.example", public_host: "", public_port: null, password: "secret", tls: { domain: "" } },
+  access: { host: "proxy.example", password: "secret", tls: { domain: "" } },
   rental: { customer_id: "customer", expires_at: 100 + 7 * 86400 },
   limits: { monthly_gib: 1 }, traffic: { upload: 0, download: 1024 ** 3 * 0.9 },
 } as Line;
@@ -43,9 +43,6 @@ assert.equal(endpoint("2001:db8::1", 443), "[2001:db8::1]:443");
 assert.equal(endpoint("[2001:db8::1]", 443), "[2001:db8::1]:443");
 assert.equal(matchesLine(line, state, "vps-hk.example 443", "HK-VPS https://vps-hk.example:8443"), true);
 assert.equal(matchesLine(line, state, "proxy.example:443"), true);
-const relay = { ...line, access: { ...line.access, public_host: "relay.example", public_port: 24443 } };
-assert.equal(lineEndpoint(relay, state.nodes), "proxy.example:24443");
-assert.equal(lineEndpoint({ ...relay, access: { ...relay.access, host: "" } }, state.nodes), "relay.example:24443");
 const viaNode = { ...line, access: { ...line.access, host: "" } };
 assert.equal(lineEndpoint(viaNode, state.nodes), "192.0.2.1:443");
 assert.equal(lineEndpoint(viaNode, []), "端口 443");
@@ -59,8 +56,8 @@ const ipv6 = { ...line, access: { ...line.access, host: "2001:db8::1" } };
 assert.equal(matchesLine(ipv6, state, "[2001:db8::1]:443"), true);
 assert.equal(matchesLine(ipv6, state, "[2001:db8::1]:8443"), false);
 
-const vmessB64 = Buffer.from(JSON.stringify({ add: "198.51.100.55", port: "8443", id: "secret-vmess-uuid" })).toString("base64");
-assert.deepEqual(parseExternalSummary(`vmess://${vmessB64}`), { protocol: "VMESS", target: "198.51.100.55:8443" });
+const vmessB64 = Buffer.from(JSON.stringify({ add: "198.51.100.55", port: "8443", id: "secret-vmess-uuid" })).toString("base64url");
+assert.deepEqual(parseExternalSummary(`vmess://${vmessB64}#节点备注`), { protocol: "VMESS", target: "198.51.100.55:8443" });
 const wgB64 = Buffer.from(JSON.stringify({
   type: "wireguard",
   "private-key": "secret-wg-priv",
@@ -69,6 +66,11 @@ const wgB64 = Buffer.from(JSON.stringify({
 assert.deepEqual(parseExternalSummary(`mihomo://${wgB64}`), {
   protocol: "WIREGUARD",
   target: "198.51.100.66:51820、[2001:db8::66]:51821",
+});
+const ssrB64 = Buffer.from("198.51.100.88:8389:origin:aes-256-cfb:plain:cGFzcw/?obfsparam=").toString("base64url");
+assert.deepEqual(parseExternalSummary(`ssr://${ssrB64}#SSR节点`), {
+  protocol: "SSR",
+  target: "198.51.100.88:8389",
 });
 const ssB64 = Buffer.from("aes-256-gcm:secret-ss-pass@198.51.100.77:8388").toString("base64");
 assert.deepEqual(parseExternalSummary(`ss://${ssB64}?plugin=obfs-local#tag`), {

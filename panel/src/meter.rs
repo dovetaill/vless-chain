@@ -379,7 +379,7 @@ mod tests {
     use crate::gateway;
 
     fn lane(dir: &std::path::Path) -> Arc<Lane> {
-        let spec: gateway::Spec = serde_json::from_value(serde_json::json!({"id":"test","port":1,"backend":2,"kind":"vless","protocol":"vless","network":"tcp","limits":{},"tls":{},"target":""})).unwrap();
+        let spec: gateway::Spec = serde_json::from_value(serde_json::json!({"id":"test","port":1,"backend":2,"kind":"vless","protocol":"vless","network":"tcp","limits":{},"tls":{}})).unwrap();
         Lane::new(&spec, gateway::Book::open(dir).unwrap())
     }
 

@@ -326,10 +326,7 @@ export function SecuritySettings({
   const close = () => setModal(null);
   const security = state.security;
   const passkeyAvailable =
-    window.isSecureContext &&
-    Boolean(window.PublicKeyCredential) &&
-    !/^\d+\.\d+\.\d+\.\d+$/.test(location.hostname) &&
-    !location.hostname.includes(":");
+    window.isSecureContext && Boolean(window.PublicKeyCredential);
 
   const proof = (data: FormData) => ({
     token: field(data, "token"),
@@ -514,7 +511,7 @@ export function SecuritySettings({
               </Button>
               {!passkeyAvailable && (
                 <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
-                  需通过 HTTPS 域名访问面板方可绑定 Passkey。
+                  需通过 HTTPS 域名或本机 localhost 访问面板方可绑定 Passkey。
                 </p>
               )}
             </div>

@@ -1,8 +1,8 @@
 import { useState, type ReactNode } from "react";
-import { Plus, Users } from "lucide-react";
+import { Plus, Trash2, Users } from "lucide-react";
 import { api } from "../api";
 import type { CustomerPlan, PanelState, Prices } from "../types";
-import { beijingTime, money, parseMoney, terms } from "../lib/business";
+import { beijingTime, parseMoney, terms } from "../lib/business";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import {
@@ -16,7 +16,6 @@ import {
 import { Progress } from "./ui/progress";
 import { Input } from "./ui/input";
 import {
-  CopyButton,
   Empty,
   Field,
   InfoTip,
@@ -25,7 +24,7 @@ import {
   field,
   number,
 } from "./shared";
-import { RenewalDialog } from "./rental-editor";
+import { QueryLinkModal, RenewalDialog } from "./rental-editor";
 
 export function CustomerPlans({
   state,
@@ -78,6 +77,14 @@ export function CustomerPlans({
                 (line) => line.id === id && line.sync_status === "synced",
               ),
             ).length;
+            const activeLease = Boolean(
+              plan.rental?.started_at &&
+                (plan.rental.permanent || plan.rental.expires_at > state.time),
+            );
+            const hasEnabledLine = ids.some((id) =>
+              state.lines.some((line) => line.id === id && line.enabled),
+            );
+            const deleteBlocked = activeLease && hasEnabledLine;
             const totalBytes = plan.monthly_gib * 1024 ** 3;
             const usedPct =
               totalBytes > 0
@@ -124,7 +131,17 @@ export function CustomerPlans({
                       variant="outline"
                       disabled={state.busy}
                       onClick={() =>
-                        setModal(<PlanQueryLink plan={plan} close={close} />)
+                        setModal(
+                          <QueryLinkModal
+                            title="套餐私密查询链接"
+                            description={plan.name}
+                            hint="凭此链接可查看整套共享套餐与全部成员用量，适合交付客户负责人；重新生成将使旧查询链接失效。"
+                            path={`/customer-plans/${plan.id}/query-link`}
+                            exists={Boolean(plan.rental?.query_link_exists)}
+                            close={close}
+                            saved={saved}
+                          />,
+                        )
                       }
                     >
                       套餐查询链接
@@ -149,6 +166,34 @@ export function CustomerPlans({
                       }
                     >
                       开通 / 续费订单
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={state.busy || deleteBlocked}
+                      title={
+                        deleteBlocked
+                          ? "在用套餐仍有启用中的线路；请先停用关联线路或等待到期后再删除套餐"
+                          : undefined
+                      }
+                      onClick={() =>
+                        setModal(
+                          <Modal
+                            title="删除共享套餐"
+                            description={`确定删除共享套餐「${plan.name}」吗？关联线路将解除套餐绑定，历史收款流水仍保留。`}
+                            submit="确认删除套餐"
+                            close={close}
+                            action={async () => {
+                              await api(`/customer-plans/${plan.id}`, "DELETE");
+                              await saved();
+                              close();
+                            }}
+                          />,
+                        )
+                      }
+                    >
+                      <Trash2 />
+                      删除套餐
                     </Button>
                   </div>
                 </div>
@@ -210,10 +255,14 @@ export function CustomerPlans({
                         disabled={state.busy}
                         onClick={() =>
                           setModal(
-                            <PlanQueryLink
-                              plan={plan}
-                              member={member}
+                            <QueryLinkModal
+                              title="成员私密查询链接"
+                              description={`${plan.name} / ${member.name}`}
+                              hint="凭此链接仅可查看该成员自身及套餐共享总额，不展示其他成员明细；重新生成将使旧查询链接失效。"
+                              path={`/customer-plans/${plan.id}/members/${member.id}/query-link`}
+                              exists={Boolean(member.query_link_exists)}
                               close={close}
+                              saved={saved}
                             />,
                           )
                         }
@@ -230,49 +279,6 @@ export function CustomerPlans({
       </CardContent>
       {modal}
     </Card>
-  );
-}
-
-function PlanQueryLink({
-  plan,
-  member,
-  close,
-}: {
-  plan: CustomerPlan;
-  member?: CustomerPlan["members"][number];
-  close: () => void;
-}) {
-  const [url, setUrl] = useState("");
-  return (
-    <Modal
-      title={member ? "成员私密查询链接" : "套餐私密查询链接"}
-      description={`${plan.name}${member ? ` / ${member.name}` : ""}`}
-      submit={url ? undefined : "生成新链接并撤销原链接"}
-      close={close}
-      action={async () => {
-        const result = await api<{ path: string }>(
-          `/customer-plans/${plan.id}${member ? `/members/${member.id}` : ""}/query-link`,
-          "POST",
-          {},
-        );
-        setUrl(new URL(result.path, location.origin).href);
-      }}
-    >
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        {member
-          ? "凭此链接仅可查看该成员自身及套餐共享总额，不展示其他成员明细。"
-          : "凭此链接可查看整套共享套餐与全部成员用量，适合交付客户负责人。"}
-        重新生成后旧链接立即作废。
-      </p>
-      {url && (
-        <>
-          <Field label="私密查询链接">
-            <textarea className="textarea mono" readOnly rows={3} value={url} />
-          </Field>
-          <CopyButton value={url} label="复制私密查询链接" />
-        </>
-      )}
-    </Modal>
   );
 }
 
@@ -303,6 +309,15 @@ function PlanEditor({
       : [{ id: "", name: "成员 1", line_ids: [], monthly_gib: null }],
   );
   const [membersChanged, setMembersChanged] = useState(false);
+  const hasHistory =
+    Boolean(plan?.rental?.started_at) ||
+    Boolean(plan && state.payments.some((p) => p.line_id === `plan:${plan.id}`));
+  const activeLease = Boolean(
+    plan?.rental &&
+      plan.rental.started_at > 0 &&
+      (plan.rental.expires_at === 0 || plan.rental.expires_at > state.time),
+  );
+  const planLineIds = new Set(plan?.members.flatMap((m) => m.line_ids) ?? []);
   const eligible = state.lines.filter((line) => line.plan_eligible === true);
 
   function update(index: number, patch: Partial<DraftMember>) {
@@ -329,7 +344,7 @@ function PlanEditor({
         await api("/customer-plans", "POST", {
           id: plan?.id || "",
           name: field(data, "name"),
-          customer_id: plan?.customer_id || field(data, "customer"),
+          customer_id: hasHistory ? plan!.customer_id : field(data, "customer"),
           monthly_gib: number(data, "quota"),
           members,
           prices,
@@ -343,7 +358,7 @@ function PlanEditor({
           <Input
             name="name"
             required
-            maxLength={40}
+            maxLength={120}
             defaultValue={plan?.name || ""}
           />
         </Field>
@@ -352,7 +367,7 @@ function PlanEditor({
             className="select"
             name="customer"
             required
-            disabled={Boolean(plan)}
+            disabled={hasHistory}
             defaultValue={plan?.customer_id || ""}
           >
             <option value="" disabled>
@@ -374,7 +389,7 @@ function PlanEditor({
         <Input
           name="quota"
           type="number"
-          min="0.001"
+          min="0.000001"
           max="1000000000"
           step="any"
           required
@@ -406,8 +421,16 @@ function PlanEditor({
         const candidates = state.lines.filter(
           (line) =>
             member.line_ids.includes(line.id) ||
+            planLineIds.has(line.id) ||
             eligible.some((candidate) => candidate.id === line.id),
         );
+        const memberLocked =
+          activeLease &&
+          Boolean(
+            original?.line_ids.some(
+              (id) => state.lines.find((line) => line.id === id)?.enabled,
+            ),
+          );
         return (
           <fieldset
             key={index}
@@ -421,7 +444,7 @@ function PlanEditor({
                 <Field label={`成员 ${index + 1} 名称`}>
                   <Input
                     required
-                    maxLength={40}
+                    maxLength={120}
                     value={member.name}
                     onChange={(event) =>
                       update(index, { name: event.target.value })
@@ -431,7 +454,8 @@ function PlanEditor({
                 <Field label={`成员 ${index + 1} 额外硬上限 · GiB`}>
                   <Input
                     type="number"
-                    min="0.001"
+                    min="0.000001"
+                    max="1000000000"
                     step="any"
                     placeholder="留空共用总额"
                     value={member.monthly_gib ?? ""}
@@ -447,7 +471,7 @@ function PlanEditor({
               </div>
               {!candidates.length ? (
                 <p className="text-xs text-amber-600 dark:text-amber-400">
-                  暂无可绑定的未发布草稿线路。请先在「代理」页面新建代理并选择「仅保存草稿」。
+                  暂无可绑定的空闲线路。请先在「代理」页面新建代理（可选择「仅保存草稿」）。
                 </p>
               ) : (
                 <div className="max-h-40 space-y-1.5 overflow-auto rounded-lg border border-border bg-card p-2.5">
@@ -455,6 +479,7 @@ function PlanEditor({
                     const retained = Boolean(
                       original?.line_ids.includes(line.id),
                     );
+                    const locked = activeLease && retained && line.enabled;
                     const elsewhere = members.some(
                       (other, i) =>
                         i !== index && other.line_ids.includes(line.id),
@@ -467,29 +492,32 @@ function PlanEditor({
                         <input
                           type="checkbox"
                           checked={member.line_ids.includes(line.id)}
-                          disabled={retained || elsewhere}
-                          onChange={(event) =>
+                          disabled={locked || elsewhere}
+                          onChange={(event) => {
                             update(index, {
                               line_ids: event.target.checked
                                 ? [...member.line_ids, line.id]
                                 : member.line_ids.filter((id) => id !== line.id),
-                            })
-                          }
+                            });
+                            setMembersChanged(true);
+                          }}
                         />
                         <span>
                           {line.name}
-                          {retained
-                            ? "（已绑定）"
-                            : elsewhere
-                              ? "（已分配其他成员）"
-                              : ""}
+                          {locked
+                            ? "（已开通启用中）"
+                            : retained && !line.enabled
+                              ? "（已停用，可解绑）"
+                              : elsewhere
+                                ? "（已分配其他成员）"
+                                : ""}
                         </span>
                       </label>
                     );
                   })}
                 </div>
               )}
-              {!original && members.length > 1 && (
+              {!memberLocked && members.length > 1 && (
                 <Button
                   type="button"
                   size="sm"

@@ -1,11 +1,10 @@
 use super::*;
 use chain_panel::security::{self, Challenge};
 use webauthn_rs::prelude::*;
-macro_rules! ensure {($condition:expr,$($message:tt)*)=>{if !$condition {return Err(anyhow::anyhow!($($message)*).into());}};}
 
 pub fn summary(s: &Security) -> Value {
     json!({"totp_enabled":!s.totp_secret.is_empty(),"recovery_remaining":s.recovery_hashes.len(),"origin":s.origin,
-        "passkeys":s.passkeys.iter().map(|v|json!({"id":v["id"],"name":v["name"],"created":v["created"]})).collect::<Vec<_>>()})
+        "passkeys":s.passkeys.iter().map(|v|json!({"id":v.id,"name":v.name,"created":v.created})).collect::<Vec<_>>()})
 }
 
 fn member_view(member: &OperatorMember) -> Value {
@@ -21,19 +20,20 @@ pub struct MemberInput {
     name: String,
     role: Role,
 }
-pub async fn create_member(State(app): State<App>, Json(input): Json<MemberInput>) -> ApiResult<Json<Value>> {
-    reauthenticate(&app, &input.proof)?;
+pub async fn create_member(State(app): State<App>, headers: HeaderMap, Json(input): Json<MemberInput>) -> ApiResult<Json<Value>> {
     let name = input.name.trim();
     ensure!(!name.is_empty() && name.len() <= 120 && !name.chars().any(char::is_control), "成员名称须为 1–120 字节且不能含控制字符");
     ensure!(input.role != Role::Admin, "不能创建第二个内置管理员，请选择运维、财务或只读成员");
     let token = secret();
     let member = OperatorMember { id: id(), name: name.into(), role: input.role, token_hash: digest(&token), created_at: now(), revoked_at: 0 };
-    edit(&app, |doc| { doc.operator_members.push(member.clone()); Ok(()) })?;
+    reauthenticate_edit(&app, &headers, &input.proof, |doc| {
+        doc.operator_members.push(member.clone());
+        Ok(())
+    })?;
     Ok(Json(json!({"member":member_view(&member),"token":token})))
 }
-pub async fn revoke_member(State(app): State<App>, Path(id): Path<String>, Json(proof): Json<Proof>) -> ApiResult<Json<Value>> {
-    reauthenticate(&app, &proof)?;
-    edit(&app, |doc| {
+pub async fn revoke_member(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>, Json(proof): Json<Proof>) -> ApiResult<Json<Value>> {
+    reauthenticate_edit(&app, &headers, &proof, |doc| {
         let member = doc.operator_members.iter_mut().find(|m| m.id == id).context("成员不存在")?;
         if member.revoked_at == 0 { member.revoked_at = now(); }
         member.token_hash.clear();
@@ -56,15 +56,42 @@ pub struct Proof {
     #[serde(default)]
     pub code: String,
 }
-fn reauthenticate(app: &App, proof: &Proof) -> ApiResult<()> {
-    app.auth.rate_limit()?;
+fn session_bucket(headers: &HeaderMap) -> String {
+    format!("reauth:{}", digest(&cookie(headers)))
+}
+fn reauthenticate_edit<T>(
+    app: &App,
+    headers: &HeaderMap,
+    proof: &Proof,
+    f: impl FnOnce(&mut Document) -> Result<T>,
+) -> ApiResult<T> {
+    let bucket = session_bucket(headers);
+    app.auth.check_rate_limit(&bucket)?;
     if !equal(&digest(&proof.token), &app.admin_hash.lock().unwrap()) {
+        app.auth.record_failure(&bucket);
         return Err(error(StatusCode::UNAUTHORIZED, "当前管理员密钥不正确"));
     }
     let mut store = app.store.lock().unwrap();
-    security::second_factor(&mut store.doc.security, &proof.code)?;
-    store.save()?;
-    Ok(())
+    if store.doc.busy() {
+        return Err(error(StatusCode::CONFLICT, "正在发布或恢复配置，请等待完成"));
+    }
+    let previous = store.doc.clone();
+    if let Err(e) = security::second_factor(&mut store.doc.security, &proof.code) {
+        store.doc = previous;
+        app.auth.record_failure(&bucket);
+        return Err(e.into());
+    }
+    let outcome = f(&mut store.doc).and_then(|value| {
+        store.save()?;
+        Ok(value)
+    });
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            store.doc = previous;
+            Err(e.into())
+        }
+    }
 }
 #[derive(Deserialize)]
 pub struct Rotate {
@@ -73,8 +100,7 @@ pub struct Rotate {
     #[serde(default)]
     new_token: String,
 }
-pub async fn rotate(State(app): State<App>, Json(input): Json<Rotate>) -> ApiResult<Json<Value>> {
-    reauthenticate(&app, &input.proof)?;
+pub async fn rotate(State(app): State<App>, headers: HeaderMap, Json(input): Json<Rotate>) -> ApiResult<Json<Value>> {
     let token = if input.new_token.is_empty() {
         secret()
     } else {
@@ -86,6 +112,7 @@ pub async fn rotate(State(app): State<App>, Json(input): Json<Rotate>) -> ApiRes
             "管理员密钥须为 32–512 字符，且两端无空白",
         ));
     }
+    reauthenticate_edit(&app, &headers, &input.proof, |_| Ok(()))?;
     atomic_write(&app.token_file, token.as_bytes())?;
     *app.admin_hash.lock().unwrap() = digest(&token);
     app.sessions.lock().unwrap().clear();
@@ -100,19 +127,13 @@ pub async fn totp_start(
     headers: HeaderMap,
     Json(proof): Json<Proof>,
 ) -> ApiResult<Json<Value>> {
-    reauthenticate(&app, &proof)?;
-    if !app
-        .store
-        .lock()
-        .unwrap()
-        .doc
-        .security
-        .totp_secret
-        .is_empty()
-    {
-        return Err(error(StatusCode::CONFLICT, "请先关闭已有 TOTP 再重新绑定"));
-    }
     let (secret, url) = security::new_totp()?;
+    reauthenticate_edit(&app, &headers, &proof, |doc| {
+        if !doc.security.totp_secret.is_empty() {
+            anyhow::bail!("请先关闭已有 TOTP 再重新绑定");
+        }
+        Ok(())
+    })?;
     app.auth
         .enroll
         .lock()
@@ -134,8 +155,9 @@ pub async fn totp_finish(
     headers: HeaderMap,
     Json(input): Json<Code>,
 ) -> ApiResult<Json<Value>> {
-    app.auth.rate_limit()?;
     let session = digest(&cookie(&headers));
+    let bucket = format!("totp:{session}");
+    app.auth.check_rate_limit(&bucket)?;
     let (secret, expiry) = app
         .auth
         .enroll
@@ -151,7 +173,10 @@ pub async fn totp_finish(
         totp_secret: secret,
         ..Default::default()
     };
-    security::second_factor(&mut setup, &input.code)?;
+    if let Err(e) = security::second_factor(&mut setup, &input.code) {
+        app.auth.record_failure(&bucket);
+        return Err(e.into());
+    }
     let codes: Vec<String> = (0..10).map(|_| secret_code()).collect();
     setup.recovery_hashes = codes.iter().map(|s| digest(s)).collect();
     {
@@ -175,14 +200,15 @@ fn secret_code() -> String {
 }
 pub async fn totp_disable(
     State(app): State<App>,
+    headers: HeaderMap,
     Json(proof): Json<Proof>,
 ) -> ApiResult<Json<Value>> {
-    reauthenticate(&app, &proof)?;
-    let mut store = app.store.lock().unwrap();
-    store.doc.security.totp_secret.clear();
-    store.doc.security.recovery_hashes.clear();
-    store.doc.security.totp_step = 0;
-    store.save()?;
+    reauthenticate_edit(&app, &headers, &proof, |doc| {
+        doc.security.totp_secret.clear();
+        doc.security.recovery_hashes.clear();
+        doc.security.totp_step = 0;
+        Ok(())
+    })?;
     app.sessions.lock().unwrap().clear();
     Ok(Json(json!({"ok":true})))
 }
@@ -198,44 +224,37 @@ pub async fn register_start(
     headers: HeaderMap,
     Json(input): Json<RegisterInput>,
 ) -> ApiResult<Json<Value>> {
-    reauthenticate(&app, &input.proof)?;
     ensure!(
         !input.name.trim().is_empty() && input.name.len() <= 120,
         "请输入 Passkey 名称"
     );
-    let engine = security::engine(&input.origin)?;
-    let origin = url::Url::parse(&input.origin)?
-        .origin()
-        .ascii_serialization();
-    let excluded = {
-        let store = app.store.lock().unwrap();
-        let security = &store.doc.security;
+    let (engine, origin) = security::engine(&input.origin)?;
+    let user = uuid::Uuid::from_u128(0x6ad1249f0f034f88a4a7069b7f5466a1);
+    let challenge = secret();
+    let session = digest(&cookie(&headers));
+    let name = input.name;
+    let options = reauthenticate_edit(&app, &headers, &input.proof, |doc| {
+        let s = &doc.security;
         ensure!(
-            security.passkeys.is_empty() || security.origin == origin,
+            s.passkeys.is_empty() || s.origin == origin,
             "已有 Passkey 绑定其他域名，请先删除旧凭据再更改域名"
         );
-        security
-            .passkeys
-            .iter()
-            .filter_map(|v| serde_json::from_value::<Passkey>(v["credential"].clone()).ok())
-            .map(|p| p.cred_id().clone())
-            .collect()
-    };
-    let user = uuid::Uuid::from_u128(0x6ad1249f0f034f88a4a7069b7f5466a1);
-    let (options, state) = engine
-        .start_passkey_registration(user, "administrator", "Chain Panel 管理员", Some(excluded))
-        .map_err(anyhow::Error::from)?;
-    let challenge = secret();
-    app.auth.insert(
-        challenge.clone(),
-        Challenge::Register {
-            state,
-            session: digest(&cookie(&headers)),
-            origin,
-            name: input.name,
-            expires: now() + 300,
-        },
-    )?;
+        let excluded: Vec<_> = s.passkeys.iter().map(|p| p.credential.cred_id().clone()).collect();
+        let (options, state) = engine
+            .start_passkey_registration(user, "administrator", "Chain Panel 管理员", Some(excluded))
+            .map_err(anyhow::Error::from)?;
+        app.auth.insert(
+            challenge.clone(),
+            Challenge::Register {
+                state,
+                session,
+                origin,
+                name,
+                expires: now() + 300,
+            },
+        )?;
+        Ok(options)
+    })?;
     Ok(Json(json!({"challenge_id":challenge,"options":options})))
 }
 #[derive(Deserialize)]
@@ -263,7 +282,8 @@ pub async fn register_finish(
         "注册会话不匹配"
     );
     let credential: RegisterPublicKeyCredential = serde_json::from_value(input.credential)?;
-    let passkey = security::engine(&origin)?
+    let (engine, _) = security::engine(&origin)?;
+    let passkey = engine
         .finish_passkey_registration(&credential, &state)
         .map_err(anyhow::Error::from)?;
     let mut store = app.store.lock().unwrap();
@@ -276,29 +296,29 @@ pub async fn register_finish(
         "认证域名已变化，请重新开始"
     );
     store.doc.security.origin = origin;
-    store
-        .doc
-        .security
-        .passkeys
-        .push(json!({"id":id(),"name":name,"created":now(),"credential":passkey}));
+    store.doc.security.passkeys.push(StoredPasskey {
+        id: id(),
+        name,
+        created: now(),
+        credential: passkey,
+    });
     store.save()?;
     Ok(Json(json!({"ok":true})))
 }
-pub async fn login_start(State(app): State<App>) -> ApiResult<Json<Value>> {
-    app.auth.rate_limit()?;
+pub async fn login_start(State(app): State<App>, request: Request) -> ApiResult<Json<Value>> {
+    let ip = client_ip_from_request(&request);
+    app.auth.rate_limit(&format!("passkey:{ip}"))?;
     let (origin, keys) = {
         let store = app.store.lock().unwrap();
         let s = &store.doc.security;
         (
             s.origin.clone(),
-            s.passkeys
-                .iter()
-                .map(|v| serde_json::from_value::<Passkey>(v["credential"].clone()))
-                .collect::<std::result::Result<Vec<_>, _>>()?,
+            s.passkeys.iter().map(|p| p.credential.clone()).collect::<Vec<_>>(),
         )
     };
     ensure!(!keys.is_empty(), "尚未绑定 Passkey");
-    let (options, state) = security::engine(&origin)?
+    let (engine, _) = security::engine(&origin)?;
+    let (options, state) = engine
         .start_passkey_authentication(&keys)
         .map_err(anyhow::Error::from)?;
     let challenge = secret();
@@ -320,7 +340,8 @@ pub async fn login_finish(
         return Err(error(StatusCode::BAD_REQUEST, "验证类型不匹配"));
     };
     let credential: PublicKeyCredential = serde_json::from_value(input.credential)?;
-    let result = security::engine(&origin)?
+    let (engine, _) = security::engine(&origin)?;
+    let result = engine
         .finish_passkey_authentication(&credential, &state)
         .map_err(anyhow::Error::from)?;
     {
@@ -330,10 +351,8 @@ pub async fn login_finish(
             "认证配置已变化，请重新登录"
         );
         let mut matched = false;
-        for value in &mut store.doc.security.passkeys {
-            let mut key: Passkey = serde_json::from_value(value["credential"].clone())?;
-            if key.update_credential(&result).is_some() {
-                value["credential"] = json!(key);
+        for entry in &mut store.doc.security.passkeys {
+            if entry.credential.update_credential(&result).is_some() {
                 matched = true;
             }
         }
@@ -353,16 +372,42 @@ pub async fn remove_passkey(
     headers: HeaderMap,
     Json(input): Json<Remove>,
 ) -> ApiResult<Json<Value>> {
-    reauthenticate(&app, &input.proof)?;
-    let mut store = app.store.lock().unwrap();
-    store
-        .doc
-        .security
-        .passkeys
-        .retain(|v| v["id"].as_str() != Some(&input.id));
-    store.save()?;
+    reauthenticate_edit(&app, &headers, &input.proof, |doc| {
+        doc.security.passkeys.retain(|v| v.id != input.id);
+        Ok(())
+    })?;
     let session = digest(&cookie(&headers));
     app.sessions.lock().unwrap().retain(|k, _| k == &session);
     app.auth.challenges.lock().unwrap().clear();
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn second_factor_is_checked_before_disabling_totp_or_rotating_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = fleet_api::tests::app(dir.path());
+        let original_token = "test".to_string();
+        std::fs::write(&app.token_file, &original_token).unwrap();
+        let (secret_key, _) = security::new_totp().unwrap();
+        {
+            let mut store = app.store.lock().unwrap();
+            store.doc.security.totp_secret = secret_key.clone();
+            store.save().unwrap();
+        }
+        let headers = HeaderMap::new();
+        let bad_proof = Proof { token: original_token.clone(), code: String::new() };
+        assert!(totp_disable(State(app.clone()), headers.clone(), Json(bad_proof)).await.is_err());
+        assert_eq!(app.store.lock().unwrap().doc.security.totp_secret, secret_key);
+
+        let bad_rotate = Rotate {
+            proof: Proof { token: original_token.clone(), code: "000000".into() },
+            new_token: "n".repeat(40),
+        };
+        assert!(rotate(State(app.clone()), headers, Json(bad_rotate)).await.is_err());
+        assert_eq!(std::fs::read_to_string(&app.token_file).unwrap(), original_token);
+    }
 }

@@ -5,9 +5,7 @@ const path = require('node:path');
 const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
 const [base, tokenFile, root, agentDir, lineId] = process.argv.slice(2);
 (async () => {
-  const server = await chromium.launchServer({headless:true, executablePath:process.env.CHAIN_TEST_CHROMIUM});
-  fs.writeFileSync(path.join(root,'diagnostics-browser.json'),JSON.stringify({pid:process.pid,browser:server.process().pid,endpoint:server.wsEndpoint()}));
-  const browser = await chromium.connect(server.wsEndpoint());
+  const browser = await chromium.launch({headless:true, executablePath:process.env.CHAIN_TEST_CHROMIUM});
   try {
     const page = await browser.newPage({viewport:{width:1440,height:1000},locale:'zh-CN'});
     page.setDefaultTimeout(20000);
@@ -42,7 +40,7 @@ const [base, tokenFile, root, agentDir, lineId] = process.argv.slice(2);
     assert.doesNotMatch(fs.readFileSync(dest,'utf8'),/fixture-password/);
     await page.route('**/api/diagnostics/*/path',r=>r.fulfill({json:{stage:'外部出口',result:{ok:false,detail:'certificate is not yet valid'},note:'隔离检查'}}));
     await page.getByText('分段连接检查',{exact:true}).click();
-    await button('开启 10 分钟详细诊断窗口').click();await button('执行详细检查').click();
+    await button('执行详细检查').click();
     await dialog().getByText(/入口尚未验证/).waitFor();
     let tasks=0;
     await page.route('**/api/federation/task',r=>{tasks++;return r.fulfill({json:r.request().postDataJSON().action==='status'?{state:'succeeded',detail:'模拟校时完成'}:{}});});
@@ -62,5 +60,5 @@ const [base, tokenFile, root, agentDir, lineId] = process.argv.slice(2);
     await button('刷新日志').click();await page.getByRole('alert').filter({hasText:'Agent 离线'}).waitFor();
     await close();assert.deepEqual(errors,[]);
     console.log('PASS real browser: Agent logs, follow/pause/close, archives, redacted download, isolated failure guidance, simulated time confirmation, desktop/mobile');
-  } finally {await browser.close();await server.close();}
+  } finally {await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

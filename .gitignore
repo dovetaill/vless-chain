@@ -1,5 +1,8 @@
 /release-output/
 /.chain-build-*/
+/.chain-bootstrap-*/
+/*-report-*.txt
+/panel/*-report-*.txt
 __pycache__/
 *.pyc
 /metronic-tailwind-html-demos_v9.5.0.zip

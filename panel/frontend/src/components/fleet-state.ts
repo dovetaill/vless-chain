@@ -42,9 +42,19 @@ export type Task = {
     };
   }[];
 };
+export const LEGACY_VERIFICATION_PREFIX = "组件维护已完成，但整链验证失败：";
 export function verificationFailed(target: Task["targets"][number]) {
-  if (target.result?.verification) return target.result.verification.state === "failed";
-  return (target.error || target.result?.error || "").startsWith("组件维护已完成，但整链验证失败");
+  return (
+    target.result?.verification?.state === "failed" ||
+    !!target.error?.startsWith(LEGACY_VERIFICATION_PREFIX)
+  );
+}
+export function verificationDetail(target: Task["targets"][number]) {
+  if (target.result?.verification?.detail) return target.result.verification.detail;
+  if (target.error?.startsWith(LEGACY_VERIFICATION_PREFIX)) {
+    return target.error.slice(LEGACY_VERIFICATION_PREFIX.length);
+  }
+  return target.error;
 }
 export function maintenanceSucceeded(target: Task["targets"][number]) {
   return target.state === "succeeded" || target.result?.maintenance_state === "succeeded" || verificationFailed(target);
@@ -190,6 +200,15 @@ export function lineStatus(r: Remote, line: Line, now: number) {
   if (check && !check.ok) return "最近探测失败";
   return "已启用";
 }
+export function lineRateValid(r: Remote, line: Line, now: number) {
+  return (
+    connected(r, now) &&
+    line.enabled &&
+    line.rental_status !== "offline" &&
+    !!line.traffic &&
+    recent(line.traffic.sampled_at, remoteNow(r, now))
+  );
+}
 export function metrics(remotes: Remote[], now: number) {
   let rx = 0,
     tx = 0,
@@ -222,13 +241,7 @@ export function metrics(remotes: Remote[], now: number) {
         usage++;
         used += traffic.upload + traffic.download;
       }
-      if (
-        connected(r, now) &&
-        line.enabled &&
-        line.rental_status !== "offline" &&
-        traffic &&
-        recent(traffic.sampled_at, remoteNow(r, now))
-      ) {
+      if (traffic && lineRateValid(r, line, now)) {
         sampled++;
         upload += traffic.upload_bps;
         download += traffic.download_bps;
@@ -244,9 +257,9 @@ export function priority(r: Remote, now: number) {
     ? 0
     : ["Agent 上报中断", "Agent 未接入"].includes(status)
       ? 1
-      : status !== "在线"
-        ? 2
-        : mismatch(r)
-          ? 3
+      : status === "组件版本不一致"
+        ? 3
+        : status !== "在线"
+          ? 2
           : 4;
 }

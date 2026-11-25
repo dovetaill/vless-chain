@@ -2,10 +2,10 @@
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-pub fn ports(config: &Value) -> Result<BTreeSet<u16>> {
-    let mut result = BTreeSet::new();
+pub fn port_ranges(config: &Value) -> Result<Vec<(u16, u16)>> {
+    let mut ranges = Vec::new();
     for inbound in config["inbounds"]
         .as_array()
         .context("旧配置 inbounds 必须是数组")?
@@ -14,23 +14,73 @@ pub fn ports(config: &Value) -> Result<BTreeSet<u16>> {
         let value = &inbound["port"];
         if let Some(port) = value.as_u64() {
             ensure!(port > 0 && port <= 65535, "旧配置端口无效");
-            result.insert(port as u16);
+            let p = port as u16;
+            ranges.push((p, p));
         } else if let Some(value) = value.as_str() {
             for range in value.split(',') {
                 let (first, last) = range.split_once('-').unwrap_or((range, range));
                 let first: u16 = first.trim().parse().context("旧配置端口范围无效")?;
                 let last: u16 = last.trim().parse().context("旧配置端口范围无效")?;
                 ensure!(first > 0 && first <= last, "旧配置端口范围无效");
-                result.extend(first..=last);
+                ranges.push((first, last));
             }
         } else {
             anyhow::bail!("旧配置入口缺少端口；Unix socket / TUN 入口需要原运行环境，不能自动接管");
         }
     }
-    Ok(result)
+    ranges.sort_unstable();
+    let mut merged: Vec<(u16, u16)> = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        if let Some(prev) = merged.last_mut()
+            && first <= prev.1.saturating_add(1)
+        {
+            prev.1 = prev.1.max(last);
+        } else {
+            merged.push((first, last));
+        }
+    }
+    Ok(merged)
 }
 
-pub fn validate(profile: &LegacyConfig) -> Result<()> {
+pub fn port_in_ranges(ranges: &[(u16, u16)], port: u16) -> bool {
+    ranges.iter().any(|&(first, last)| (first..=last).contains(&port))
+}
+
+pub fn ranges_overlap(a: &[(u16, u16)], b: &[(u16, u16)]) -> Option<u16> {
+    for &(fa, la) in a {
+        for &(fb, lb) in b {
+            if fa <= lb && fb <= la {
+                return Some(fa.max(fb));
+            }
+        }
+    }
+    None
+}
+
+pub fn ports(config: &Value) -> Result<Vec<Value>> {
+    Ok(port_ranges(config)?
+        .into_iter()
+        .map(|(first, last)| {
+            if first == last {
+                json!(first)
+            } else {
+                json!(format!("{first}-{last}"))
+            }
+        })
+        .collect())
+}
+
+pub fn node_ranges(doc: &Document) -> Result<BTreeMap<String, Vec<(u16, u16)>>> {
+    let mut map: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
+    for profile in doc.legacy_configs.iter().filter(|p| p.enabled) {
+        map.entry(profile.node_id.clone())
+            .or_default()
+            .extend(port_ranges(&profile.config)?);
+    }
+    Ok(map)
+}
+
+fn validate_with_ranges(profile: &LegacyConfig) -> Result<Vec<(u16, u16)>> {
     uuid::Uuid::parse_str(&profile.id).context("旧配置 ID 无效")?;
     if !profile.asset_dir.is_empty() {
         let path = std::path::Path::new(&profile.asset_dir);
@@ -63,7 +113,7 @@ pub fn validate(profile: &LegacyConfig) -> Result<()> {
         profile.config["outbounds"].is_array(),
         "旧配置 outbounds 必须是数组"
     );
-    ports(&profile.config)?;
+    let ranges = port_ranges(&profile.config)?;
     fn files(value: &Value) -> Result<()> {
         match value {
             Value::Object(object) => {
@@ -86,21 +136,28 @@ pub fn validate(profile: &LegacyConfig) -> Result<()> {
         }
         Ok(())
     }
-    files(&profile.config)
+    files(&profile.config)?;
+    Ok(ranges)
 }
 
-pub fn attach(
-    doc: &Document,
-    configs: &mut std::collections::BTreeMap<String, Value>,
-) -> Result<()> {
+pub fn validate(profile: &LegacyConfig) -> Result<()> {
+    validate_with_ranges(profile).map(|_| ())
+}
+
+pub fn attach(doc: &Document, configs: &mut BTreeMap<String, Value>) -> Result<()> {
     let mut ids = BTreeSet::new();
-    let mut reserved: BTreeSet<(String, u16)> = doc
-        .lines
-        .iter()
-        .flat_map(|line| line.hops.iter().map(|hop| (hop.node_id.clone(), hop.port)))
-        .collect();
+    let mut reserved_ports: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+    for line in &doc.lines {
+        for hop in &line.hops {
+            reserved_ports
+                .entry(hop.node_id.clone())
+                .or_default()
+                .insert(hop.port);
+        }
+    }
+    let mut reserved_ranges: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
     for profile in &doc.legacy_configs {
-        validate(profile)?;
+        let ranges = validate_with_ranges(profile)?;
         ensure!(ids.insert(&profile.id), "旧配置 ID 重复");
         let config = configs
             .get_mut(&profile.node_id)
@@ -108,22 +165,33 @@ pub fn attach(
         if !profile.enabled {
             continue;
         }
-        for port in ports(&profile.config)? {
-            ensure!(
-                reserved.insert((profile.node_id.clone(), port)),
-                "旧配置 {} 的端口 {port} 与其他代理冲突",
-                profile.name
-            );
-            for inbound in config["inbounds"].as_array().into_iter().flatten() {
+        if let Some(ports) = reserved_ports.get(&profile.node_id) {
+            for &port in ports {
                 ensure!(
-                    inbound["port"].as_u64() != Some(port as u64),
+                    !port_in_ranges(&ranges, port),
+                    "旧配置 {} 的端口 {port} 与其他代理冲突",
+                    profile.name
+                );
+            }
+        }
+        let existing = reserved_ranges.entry(profile.node_id.clone()).or_default();
+        if let Some(conflict) = ranges_overlap(existing, &ranges) {
+            anyhow::bail!("旧配置 {} 的端口 {conflict} 与其他代理冲突", profile.name);
+        }
+        existing.extend_from_slice(&ranges);
+        for inbound in config["inbounds"].as_array().into_iter().flatten() {
+            if let Some(port) = inbound["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
+                ensure!(
+                    !port_in_ranges(&ranges, port),
                     "旧配置端口 {port} 与平台内部入口冲突"
                 );
             }
-            for spec in config["_chain"].as_array().into_iter().flatten() {
-                for field in ["port", "backend"] {
+        }
+        for spec in config["_chain"].as_array().into_iter().flatten() {
+            for field in ["port", "backend"] {
+                if let Some(port) = spec[field].as_u64().and_then(|p| u16::try_from(p).ok()) {
                     ensure!(
-                        spec[field].as_u64() != Some(port as u64),
+                        !port_in_ranges(&ranges, port),
                         "旧配置端口 {port} 与平台入口冲突"
                     );
                 }
@@ -197,12 +265,16 @@ mod tests {
         assert!(decoded == vec![profile]);
     }
     #[test]
-    fn validates_ranges_and_rejects_external_certificate_paths() {
+    fn validates_ranges_without_expanding_large_port_spans_and_rejects_external_paths() {
         let mut profile = profile();
-        profile.config["inbounds"][0]["port"] = json!("4000-4002,5000");
+        profile.config["inbounds"][0]["port"] = json!("10000-60000,60001,60005");
+        assert_eq!(
+            port_ranges(&profile.config).unwrap(),
+            vec![(10000, 60001), (60005, 60005)]
+        );
         assert_eq!(
             ports(&profile.config).unwrap(),
-            BTreeSet::from([4000, 4001, 4002, 5000])
+            vec![json!("10000-60001"), json!(60005)]
         );
         profile.config["inbounds"][0]["streamSettings"]["tlsSettings"] =
             json!({"certificates":[{"keyFile":"/root/key.pem"}]});
@@ -217,7 +289,7 @@ mod tests {
     fn refuses_node_port_conflicts() {
         let profile = profile();
         let mut configs =
-            std::collections::BTreeMap::from([("node".into(), json!({"inbounds":[{"port":443}]}))]);
+            BTreeMap::from([("node".into(), json!({"inbounds":[{"port":443}]}))]);
         let doc = Document {
             legacy_configs: vec![profile],
             ..Default::default()

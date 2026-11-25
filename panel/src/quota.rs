@@ -120,10 +120,8 @@ impl Journal {
         }
         let journal = self.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let storage = journal
-                .storage
-                .get()
-                .ok_or_else(|| anyhow::anyhow!("硬额度账本尚未就绪"))?;
+            journal.connect()?;
+            let storage = journal.storage.get().unwrap();
             let mut db = storage.db.lock().unwrap();
             let tx = db.transaction()?;
             for (id, cycle, ceiling) in &missing {

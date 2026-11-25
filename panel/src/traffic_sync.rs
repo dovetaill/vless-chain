@@ -104,7 +104,7 @@ impl Incoming {
         self.next = 0;
         self.complete = false;
     }
-    pub fn receive(&mut self, mut page: Page) -> Result<Option<Rows>> {
+    pub fn receive(&mut self, mut page: Page, size: usize) -> Result<Option<Rows>> {
         self.expire();
         ensure!(
             page.session == self.session && page.sequence > 0 && page.sequence >= self.sequence,
@@ -128,7 +128,6 @@ impl Incoming {
         {
             ensure!(last < first, "流量分页包含重复线路");
         }
-        let size = serde_json::to_vec(&page)?.len();
         ensure!(
             size <= PAGE_BYTES && self.bytes + size <= STAGING_BYTES,
             "节点流量快照超过接收容量"
@@ -171,16 +170,19 @@ mod tests {
             .map(|p| serde_json::to_vec(&p.unwrap()).unwrap())
             .collect();
         assert!(encoded.len() > 1 && encoded.iter().all(|p| p.len() <= PAGE_BYTES));
-        let decode = |i: usize| serde_json::from_slice::<Page>(&encoded[i]).unwrap();
-        assert!(incoming.receive(decode(1)).is_err());
+        let decode = |i: usize| (serde_json::from_slice::<Page>(&encoded[i]).unwrap(), encoded[i].len());
+        let (p1, s1) = decode(1);
+        assert!(incoming.receive(p1, s1).is_err());
         for i in 0..encoded.len() {
-            let result = incoming.receive(decode(i)).unwrap();
+            let (p, s) = decode(i);
+            let result = incoming.receive(p, s).unwrap();
             if i + 1 == encoded.len() {
                 assert_eq!(result.unwrap(), rows);
             } else {
                 assert!(result.is_none());
             }
-            assert!(incoming.receive(decode(i)).unwrap().is_none());
+            let (dup, dup_s) = decode(i);
+            assert!(incoming.receive(dup, dup_s).unwrap().is_none());
         }
         assert!(
             incoming
@@ -188,16 +190,18 @@ mod tests {
                     pages(Uuid::new_v4(), 2, Rows::new())
                         .next()
                         .unwrap()
-                        .unwrap()
+                        .unwrap(),
+                    64,
                 )
                 .is_err()
         );
         assert_eq!(
             incoming
-                .receive(pages(session, 2, Rows::new()).next().unwrap().unwrap())
+                .receive(pages(session, 2, Rows::new()).next().unwrap().unwrap(), 64)
                 .unwrap(),
             Some(Rows::new())
         );
-        assert!(incoming.receive(decode(0)).is_err());
+        let (p0, s0) = decode(0);
+        assert!(incoming.receive(p0, s0).is_err());
     }
 }

@@ -22,10 +22,20 @@ pub async fn packages(names: &[&str]) -> Result<()> {
         args.extend(missing);
         command("sudo", &args, 300).await?;
     } else if platform::executable("apt-get").is_some() {
-        command("apt-get", &["update"], 180).await?;
-        let mut args = vec!["install", "-y"];
+        command(
+            "env",
+            &["DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
+            180,
+        )
+        .await?;
+        let mut args = vec![
+            "DEBIAN_FRONTEND=noninteractive",
+            "apt-get",
+            "install",
+            "-y",
+        ];
         args.extend(missing);
-        command("apt-get", &args, 300).await?;
+        command("env", &args, 300).await?;
     } else {
         let (program, mut args) = if platform::executable("apk").is_some() {
             ("apk", vec!["add", "--no-cache"])
@@ -128,63 +138,15 @@ pub fn site(manager: &Manager, domain: &str, port: u16, tls: bool) -> String {
     }
     text
 }
-async fn existing_certificate(manager: &Manager, domain: &str) -> Result<bool> {
-    let dir = crate::acme::paths(
+fn existing_certificate(manager: &Manager, domain: &str) -> bool {
+    crate::acme::remaining(
         &manager.path("/etc/letsencrypt"),
         &format!("chain-panel-{domain}"),
-    );
-    let cert = dir.join("fullchain.pem");
-    let key = dir.join("privkey.pem");
-    certificate(&cert, &key, domain).await
-}
-async fn certificate(cert: &std::path::Path, key: &std::path::Path, domain: &str) -> Result<bool> {
-    if !cert.exists() && !key.exists() {
-        return Ok(false);
-    }
-    ensure!(
-        cert.is_file() && key.is_file(),
-        "已有证书或私钥缺失，拒绝重新申请覆盖"
-    );
-    let cert_bytes = fs::read(&cert)?;
-    let key_bytes = fs::read(&key)?;
-    let chain = openssl::x509::X509::stack_from_pem(&cert_bytes)?;
-    let leaf = chain.first().context("证书链为空")?;
-    let private = openssl::pkey::PKey::private_key_from_pem(&key_bytes)?;
-    ensure!(
-        leaf.public_key()?.public_eq(&private),
-        "已有证书与私钥不匹配"
-    );
-    let expiry = output(
-        "openssl",
-        &[
-            "x509",
-            "-in",
-            cert.to_str().unwrap(),
-            "-noout",
-            "-checkend",
-            "0",
-        ],
-        15,
+        domain,
     )
-    .await?;
-    if !expiry.status.success() {
-        return Ok(false);
-    }
-    command(
-        "openssl",
-        &[
-            "verify",
-            "-trusted",
-            cert.to_str().unwrap(),
-            "-partial_chain",
-            "-verify_hostname",
-            domain,
-            cert.to_str().unwrap(),
-        ],
-        15,
-    )
-    .await?;
-    Ok(true)
+    .ok()
+    .flatten()
+    .is_some_and(|seconds| seconds > 0)
 }
 pub(crate) async fn check_http_challenge(
     url: &str,
@@ -224,29 +186,10 @@ pub async fn activate(
     manager: &Manager,
     name: &str,
     port: u16,
-    host: &str,
 ) -> Result<Option<String>> {
     let domain = nginx::domain(name)?;
     ensure!(manager.live(), "离线安装树不申请证书或操作 Nginx");
-    let expected: std::net::IpAddr = host
-        .parse()
-        .context("HTTPS DNS 校验需要 --local-host 指定本机公网 IP")?;
-    let addresses = tokio::net::lookup_host((domain.as_str(), 443))
-        .await?
-        .map(|v| v.ip())
-        .collect::<std::collections::BTreeSet<_>>();
-    ensure!(
-        !addresses.is_empty() && addresses.contains(&expected),
-        "域名没有解析到本机地址"
-    );
-    for ip in &addresses {
-        ensure!(
-            *ip == expected
-                || std::net::TcpListener::bind(std::net::SocketAddr::new(*ip, 0)).is_ok(),
-            "域名包含非本机地址 {ip}，请修正 A/AAAA"
-        );
-    }
-    packages(&["nginx", "openssl"]).await?;
+    packages(&["nginx"]).await?;
     let main = nginx::main_path(manager);
     let files = nginx::files(&main)?;
     let directory = nginx::site_directory(&main)?;
@@ -254,22 +197,18 @@ pub async fn activate(
     ordinary(&path)?;
     for (file, text) in &files {
         if file == &path
-            || (file == &directory.join("chain-proxy-acme.conf")
-                && text == &proxy_acme_config(manager))
+            || (file == &directory.join("chain-proxy-acme.conf") && text.starts_with(OWNER))
         {
             continue;
         }
-        for d in nginx::parse(text)? {
-            if d.words.first().is_some_and(|s| s == "server_name") {
-                ensure!(
-                    !d.words.iter().skip(1).any(|n| n == &domain
-                        || n.starts_with('~')
-                        || n.starts_with('*') && domain.ends_with(n.trim_start_matches('*'))),
-                    "域名与已有站点冲突：{}",
-                    file.display()
-                );
-            }
-        }
+        let existing_names = super::ingress::server_names_on_ports(text, &["80", "443"], false)?;
+        ensure!(
+            !existing_names
+                .iter()
+                .any(|n| super::ingress::domain_matches(&domain, n)),
+            "域名与已有站点冲突：{}",
+            file.display()
+        );
     }
     let previous = if path.exists() {
         let text = fs::read_to_string(&path)?;
@@ -281,7 +220,7 @@ pub async fn activate(
     let webroot = manager.path("/var/lib/chain-acme");
     ordinary(&webroot)?;
     crate::acme::challenge_directory(&webroot.join(".well-known/acme-challenge"))?;
-    let reusable = existing_certificate(manager, &domain).await?;
+    let reusable = existing_certificate(manager, &domain);
     let result: Result<()> = async {
         if !reusable {
             nginx::replace_owned(
@@ -464,187 +403,6 @@ pub async fn renew_once(manager: &Manager, domain: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn manual(
-    manager: &Manager,
-    domain: &str,
-    upstream: u16,
-    settings: &serde_json::Value,
-) -> Result<()> {
-    use std::{
-        ffi::{CStr, CString},
-        os::unix::fs::MetadataExt,
-        path::Path,
-    };
-    ensure!(manager.live(), "离线安装不配置 HTTPS 服务");
-    let domain = nginx::domain(domain)?;
-    let port = settings["port"]
-        .as_u64()
-        .filter(|p| (1..=65535).contains(p))
-        .context("HTTPS 端口无效")?;
-    let cert = Path::new(settings["cert"].as_str().context("缺少证书路径")?);
-    let key = Path::new(settings["key"].as_str().context("缺少私钥路径")?);
-    ensure!(cert.is_absolute() && key.is_absolute(), "证书需要绝对路径");
-    packages(&["nginx", "openssl"]).await?;
-    ensure!(certificate(cert, key, &domain).await?, "证书已过期或不可用");
-    let name = CString::new("nobody")?;
-    let user = unsafe { libc::getpwnam(name.as_ptr()) };
-    ensure!(!user.is_null(), "无法确认独立 HTTPS 工作账户");
-    let (uid, gid) = unsafe { ((*user).pw_uid, (*user).pw_gid) };
-    ensure!(uid != 0 && gid != 0, "HTTPS 工作账户必须非特权");
-    let group = unsafe { libc::getgrgid(gid) };
-    ensure!(!group.is_null(), "HTTPS 工作组不存在");
-    let group = unsafe { CStr::from_ptr((*group).gr_name) }
-        .to_str()?
-        .to_owned();
-    let runtime = manager.path("/var/lib/chain-panel-https");
-    ordinary(&runtime)?;
-    if runtime.exists() {
-        ensure!(
-            fs::read_to_string(runtime.join(".chain-owner"))?.trim() == OWNER,
-            "HTTPS 临时目录归属不符"
-        );
-    } else {
-        super::install::owned_dir(&runtime, 0, 0, 0o755)?;
-        atomic(&runtime.join(".chain-owner"), OWNER.as_bytes(), 0o600)?;
-    }
-    let mut temporary = String::new();
-    for name in ["client_body", "proxy", "fastcgi", "uwsgi", "scgi"] {
-        let path = runtime.join(name);
-        super::install::owned_dir(&path, uid, gid, 0o700)?;
-        temporary.push_str(&format!(
-            "{name}_temp_path {};\n",
-            nginx::quote(path.to_str().unwrap())
-        ));
-    }
-    let config = manager.path("/etc/chain-panel-https/nginx.conf");
-    let unit = if manager.kind() == "systemd" {
-        manager.path("/etc/systemd/system/chain-panel-https.service")
-    } else if manager.kind() == "openrc" {
-        manager.path("/etc/init.d/chain-panel-https")
-    } else {
-        manager.path("/Library/LaunchDaemons/org.vless-chain.chain-panel-https.plist")
-    };
-    let mut previous = vec![];
-    for path in [&config, &unit] {
-        ordinary(path)?;
-        previous.push(if path.exists() {
-            let text = fs::read_to_string(path)?;
-            ensure!(
-                text.contains(OWNER) || text.contains(super::upgrade::OWNER),
-                "独立 HTTPS 配置归属不符"
-            );
-            Some((text, fs::metadata(path)?.mode() & 0o777))
-        } else {
-            None
-        });
-    }
-    let body = format!(
-        "{OWNER}\nuser nobody {};\npid {}/nginx.pid;\nerror_log {}/error.log;\nlock_file {}/nginx.lock;\nevents {{}}\nhttp {{ access_log off;\n{temporary}server {{ listen {port} ssl; server_name {domain};\nssl_certificate {}; ssl_certificate_key {}; ssl_protocols TLSv1.2 TLSv1.3; client_max_body_size 2m;\nlocation / {{ proxy_pass http://127.0.0.1:{upstream}; proxy_http_version 1.1; proxy_set_header Host $http_host; proxy_set_header X-Forwarded-Proto https; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 120s; }} }} }}\n",
-        nginx::quote(&group),
-        runtime.display(),
-        runtime.display(),
-        runtime.display(),
-        nginx::quote(cert.to_str().unwrap()),
-        nginx::quote(key.to_str().unwrap())
-    );
-    fs::create_dir_all(config.parent().unwrap())?;
-    let nginx = platform::executable("nginx").context("缺少 Nginx")?;
-    let args = vec![
-        nginx.display().to_string(),
-        "-c".into(),
-        config.display().to_string(),
-        "-g".into(),
-        "daemon off;".into(),
-    ];
-    let definition = if manager.kind() == "systemd" {
-        format!(
-            "{OWNER}\n[Unit]\nDescription=Chain Panel HTTPS\nAfter=network.target\n[Service]\nExecStart={}\nExecReload={} -c {} -s reload\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n",
-            args.iter()
-                .map(|v| nginx::quote(v))
-                .collect::<Vec<_>>()
-                .join(" "),
-            nginx.display(),
-            config.display()
-        )
-    } else {
-        platform::definition(
-            manager,
-            "chain-panel-https",
-            &args,
-            None,
-            &Default::default(),
-        )?
-        .replace(&format!("# {}", super::upgrade::OWNER), OWNER)
-    };
-    let was_active = match manager.kind() {
-        "systemd" => output(
-            "systemctl",
-            &["is-active", "--quiet", "chain-panel-https"],
-            15,
-        )
-        .await?
-        .status
-        .success(),
-        "openrc" => output("rc-service", &["chain-panel-https", "status"], 15)
-            .await?
-            .status
-            .success(),
-        _ => output(
-            "launchctl",
-            &["print", "system/org.vless-chain.chain-panel-https"],
-            15,
-        )
-        .await?
-        .status
-        .success(),
-    };
-    if !was_active {
-        ensure!(
-            std::net::TcpListener::bind(("0.0.0.0", port as u16)).is_ok(),
-            "HTTPS 端口已占用"
-        );
-    }
-    let mut started = false;
-    let result: Result<()> = async {
-        atomic(&config, body.as_bytes(), 0o600)?;
-        nginx::validate_config(manager, &config).await?;
-        atomic(
-            &unit,
-            definition.as_bytes(),
-            if manager.kind() == "openrc" {
-                0o755
-            } else {
-                0o644
-            },
-        )?;
-        platform::enable(manager, "chain-panel-https").await?;
-        started = true;
-        platform::related(manager, "restart", "chain-panel-https").await?;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = result {
-        if started {
-            platform::related(manager, "stop", "chain-panel-https").await?;
-        }
-        for (path, old) in [&config, &unit].into_iter().zip(previous) {
-            if let Some((text, mode)) = old {
-                atomic(path, text.as_bytes(), mode)?;
-            } else if path.exists() {
-                fs::remove_file(path)?;
-            }
-        }
-        if manager.kind() == "systemd" {
-            command("systemctl", &["daemon-reload"], 30).await?;
-        }
-        if was_active {
-            platform::related(manager, "start", "chain-panel-https").await?;
-        }
-        return Err(error.context("独立 HTTPS 配置未完成，原配置已恢复"));
-    }
-    println!("独立 HTTPS 已启动；证书继续由原工具续期，续期后需重载 chain-panel-https。");
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,5 @@
 use super::{
-    super::{Options, repository, strings, workspace::Workspace},
+    super::{repository, strings, workspace::Workspace},
     harness::{Harness, map},
     scenarios::wait,
 };
@@ -11,19 +11,12 @@ use tokio::{
     net::TcpStream,
 };
 
-pub async fn run(work: &Workspace, stage: &Path, case: &str, args: &Options) -> Result<()> {
+pub async fn run(work: &Workspace, stage: &Path, case: &str) -> Result<()> {
     match case {
         "smoke" => smoke(work, stage).await,
         "local-web" => local_web(work, stage).await,
-        "proxy-flow" => proxy_flow(work, stage).await,
-        "sharing" => super::sharing::run(work, stage).await,
-        "rentals" => super::rentals::run(work, stage).await,
-        "resilience" => super::resilience::run(work, stage).await,
-        "fronting" => super::fronting::run(work, stage, args).await,
-        "fleet-two-panels" | "fleet-sharing" => super::fleet::run(work, stage, args).await,
-        "protocols" | "chain-matrix" => super::protocols::run(work, stage, args).await,
         "diagnostics-browser" => diagnostics(work, stage).await,
-        _ => anyhow::bail!("验收 {case} 迁移尚未完成"),
+        _ => anyhow::bail!("验收 {case} 未知"),
     }
 }
 
@@ -81,7 +74,7 @@ async fn restart(
     h.login(&h.root.join("control")).await?;
     Ok(pid)
 }
-pub async fn smoke(work: &Workspace, stage: &Path) -> Result<()> {
+async fn smoke(work: &Workspace, stage: &Path) -> Result<()> {
     let mut h = Harness::new(work, stage, "smoke")?;
     let (tls, cert, key) = h.tls("localhost").await?;
     let http = h.http(b"chain-integration-ok".to_vec()).await?;
@@ -112,7 +105,6 @@ pub async fn smoke(work: &Workspace, stage: &Path) -> Result<()> {
         &[("Origin", "https://untrusted.example")],
     )
     .await?;
-    h.preflight(tls, true).await?;
     let mut nodes = vec![];
     let mut agents = vec![];
     let mut agent_envs = vec![];
@@ -150,10 +142,6 @@ pub async fn smoke(work: &Workspace, stage: &Path) -> Result<()> {
     let reality = json!({"access":{"reality":{"target":format!("127.0.0.1:{tls}"),"server_name":"localhost"}}});
     let mut main = line(&h, &nodes, "三跳代理", &[0, 1, 2], reality.clone(), 200).await?;
     let shared = line(&h, &nodes, "共享入口出口", &[0, 2], reality.clone(), 200).await?;
-    let mut removed = reality.clone();
-    removed["kind"] = json!("forward");
-    removed["target"] = json!(format!("127.0.0.1:{echo}"));
-    line(&h, &nodes, "已移除转发", &[0], removed, 400).await?;
     line(&h, &nodes, "重复节点", &[0, 0], reality.clone(), 400).await?;
     let mut conflict = main.clone();
     conflict["id"] = json!("");
@@ -222,10 +210,7 @@ pub async fn smoke(work: &Workspace, stage: &Path) -> Result<()> {
         "重启丢失业务线路"
     );
     h.probe(&main, &url).await?;
-    *h.preflight.as_ref().unwrap().disconnect.lock().unwrap() = Some((
-        format!("Bearer {}", nodes[2]["token"].as_str().unwrap()),
-        agents[2],
-    ));
+    work.stop(agents[2]).await?;
     let interrupted = line(&h, &nodes, "中断发布测试", &[0, 2], reality, 200).await?;
     let job = h
         .request("/api/publish", "POST", Some(&json!({})), 200)
@@ -447,19 +432,14 @@ async fn local_web(work: &Workspace, stage: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn proxy_flow(work: &Workspace, stage: &Path) -> Result<()> {
-    super::proxy_flow::run(work, stage).await
-}
 async fn diagnostics(work: &Workspace, stage: &Path) -> Result<()> {
     use std::io::Write;
     let mut h = Harness::new(work, stage, "diagnostics-browser")?;
     h.panel(Default::default()).await?;
     let n = node(&h, "浏览器测试节点", None).await?;
     h.agent(0, &n, Default::default()).await?;
-    h.wait_state("诊断能力", 30, |s| {
-        s["nodes"][0]["report"]["system"]["diagnostics_version"] == 1
-    })
-    .await?;
+    h.wait_state("诊断节点上线", 30, |s| s["nodes"][0]["online"] == true)
+        .await?;
     let l = line(
         &h,
         &[n],

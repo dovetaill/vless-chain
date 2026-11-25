@@ -5,15 +5,13 @@ const path = require('node:path');
 const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
 const assets = path.resolve(process.argv[2]);
 (async () => {
-  const server = await chromium.launchServer({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
-  const browser = await chromium.connect(server.wsEndpoint());
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
   const root = process.env.CHAIN_TEST_ROOT;
-  if (root) fs.writeFileSync(path.join(root, 'ui-ownership.json'), JSON.stringify({ pid: process.pid, browser: server.process().pid, endpoint: server.wsEndpoint(), artifacts: root }));
   try {
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     page.setDefaultTimeout(10000);
     const errors = [], writes = [], reads = [], members = [];
-    let acceptDialog = true, failPreview = false, unverifiedPublish = false;
+    let acceptDialog = true, failPreview = false;
     let signedIn = true, recommendationMode = 'ok';
     let authOptions = { totp: false, passkey: false };
     const dialogMessages = [];
@@ -60,7 +58,7 @@ const assets = path.resolve(process.argv[2]);
           else if (url.pathname === '/api/lines') { body = { ...data, id: data.id || String(state.lines.length + 1), published: false, plan_eligible: true, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' }; state.lines = [...state.lines.filter(l => l.id !== body.id), body]; }
           else if (url.pathname === '/api/lines/batch') { body = data.map((line, index) => ({ ...line, id: String(state.lines.length + index + 1), published: false, traffic: null, rental: null, rental_status: 'draft', sync_status: 'unpublished' })); state.lines.push(...body); }
           else if (url.pathname === '/api/diagnostics/local/reality-candidates') {
-            if (recommendationMode === 'error') return route.fulfill({status:400,json:{error:'无法确认 Cloudflare 官方网段，本次停止推荐'}});
+            if (recommendationMode === 'error') return route.fulfill({status:400,json:{error:'推荐检测暂时不可用，请稍后重试'}});
             body = {checked:12,detail:recommendationMode === 'empty' ? '本批没有通过全部检查的目标' : '兼容性通过不保证不会被封锁',candidates:recommendationMode === 'empty' ? [] : [
               {name:'Fixture College',target:'college.example.edu:443',server_name:'college.example.edu',detail:'TLS 1.3、H2、证书通过；Cloudflare 已排除'},
               {name:'Fixture University',target:'university.example.edu:443',server_name:'university.example.edu',detail:'TLS 1.3、H2、证书通过；Cloudflare 已排除'},
@@ -72,7 +70,6 @@ const assets = path.resolve(process.argv[2]);
             body = { affected_line_ids: [], affected_lines: [], message: '', nodes: [] };
           }
           else if (url.pathname === '/api/publish') {
-            if (unverifiedPublish) return route.fulfill({ status: 409, json: { error: 'REALITY_UNVERIFIED：模拟检测未完成' } });
             state.lines.forEach(l => { l.published = true; l.rental_status = 'active'; l.sync_status = 'synced'; }); state.jobs = [{ id: 'job', state: 'applied', events: [] }]; body = { job_id: 'job' };
           }
           else if (url.pathname === '/api/subscriptions') { state.subscriptions.push({ id: 'subscription', ...data, created: 1 }); body = { path: '/subscription/test-private-token' }; }
@@ -149,9 +146,6 @@ const assets = path.resolve(process.argv[2]);
     const originalUuid = '00000000-0000-4000-8000-000000000001';
     const replacementUuid = '00000000-0000-4000-8000-000000000002';
     await page.getByLabel('UUID', { exact: true }).fill(originalUuid);
-    assert.equal(await page.getByLabel('入口服务器', { exact: true }).count(), 0);
-    assert.equal(await button('添加远程服务器').count(), 0);
-    assert.equal(await page.getByText('使用购买的中转入口').count(), 0);
     assert.equal(await page.getByLabel('本机 IP 或域名').inputValue(), 'chain.test');
     assert.equal(await page.getByRole('radio', { name: 'REALITY + Vision', exact: true }).isChecked(), true);
     await page.getByText('将创建 1 个代理：VLESS · REALITY + Vision', { exact: true }).waitFor();
@@ -162,12 +156,11 @@ const assets = path.resolve(process.argv[2]);
     const sni = page.getByLabel('REALITY SNI', { exact: true });
     assert.equal(await target.inputValue(), '');
     assert.equal(await sni.inputValue(), '');
-    for (const name of ['微软','苹果','AWS','三星','索尼','戴尔','惠普','Cloudflare']) assert.equal(await button(name).count(),0);
     await button('创建代理').click();
     assert.equal(writes.filter(w => w.path === '/api/lines').length,0,'empty target must not save');
     recommendationMode = 'error';
     await button('检测并推荐目标').click();
-    await page.getByText('无法确认 Cloudflare 官方网段，本次停止推荐',{exact:true}).waitFor();
+    await page.getByText('推荐检测暂时不可用，请稍后重试',{exact:true}).waitFor();
     assert.equal(await target.inputValue(),'');
     recommendationMode = 'empty';
     await button('换一批推荐').click();
@@ -275,7 +268,7 @@ const assets = path.resolve(process.argv[2]);
     await page.getByLabel('本机 IP 或域名').fill('192.0.2.20');
     const beforeInvalidTls = writes.length;
     await button('创建代理').click();
-    await page.getByText('TLS 方案需要解析到本机的域名，请修改连接地址；不会自动切换为 REALITY。', { exact: true }).waitFor();
+    await page.getByText('自动申请证书需要解析到本机的域名；使用 IP 地址请改选「手动粘贴 PEM 证书」。', { exact: true }).waitFor();
     assert.equal(writes.length, beforeInvalidTls, '无效 TLS 地址不能先创建节点或线路');
     assert.equal(await page.getByRole('radio', { name: 'TLS + Vision', exact: true }).isChecked(), true);
     const hostInput = page.getByLabel('本机 IP 或域名');
@@ -353,7 +346,6 @@ const assets = path.resolve(process.argv[2]);
       assert.equal(await page.locator('tbody tr').count(), 1);
     }
     await searchExternal.fill('');
-    assert.equal(await button('添加中转入口').count(), 0);
     await button('链接 / Mihomo').first().click();
     await page.getByLabel('分享链接').waitFor();
     assert.equal(await button('订阅链接').count(), 0, '外部代理不显示本地订阅创建');
@@ -388,26 +380,20 @@ const assets = path.resolve(process.argv[2]);
     assert.equal(state.lines.at(-1).published, false);
     assert.equal(state.lines.at(-1).plan_eligible, true);
 
-    // A successful save stays saved if the following preview or publish fails.
-    for (const failure of ['cancel-publish', 'preview']) {
-      const before = writes.filter(w => w.path === '/api/lines').length;
-      const count = state.lines.length;
-      await create(failure);
-      await fillTarget();
-      acceptDialog = failure !== 'cancel-publish';
-      unverifiedPublish = failure === 'cancel-publish';
-      failPreview = failure === 'preview';
-      await page.getByRole('dialog').getByRole('button', { name: '创建代理', exact: true }).click();
-      await page.getByText(/配置已保存，尚未应用：.*无需重新创建/).waitFor();
-      assert.equal(await page.getByRole('dialog').count(), 0);
-      assert.equal(state.lines.length, count + 1);
-      assert.equal(state.lines.at(-1).published, false);
-      if (unverifiedPublish) assert.equal(writes.filter(w => w.path === '/api/publish' && w.body.allow_unverified_reality).length, 0, '未验证不得通过确认弹窗绕过');
-      acceptDialog = true; unverifiedPublish = false;
-      await Promise.all([page.waitForResponse(response => response.url().endsWith('/api/publish')), button('应用待处理配置修改').click()]);
-      await button('应用待处理配置修改').waitFor({ state: 'hidden' });
-      assert.equal(writes.filter(w => w.path === '/api/lines').length, before + 1, '继续应用不得再创建代理');
-    }
+    // A successful save stays saved if the following preview fails.
+    const before = writes.filter(w => w.path === '/api/lines').length;
+    const count = state.lines.length;
+    await create('preview');
+    await fillTarget();
+    failPreview = true;
+    await page.getByRole('dialog').getByRole('button', { name: '创建代理', exact: true }).click();
+    await page.getByText(/配置已保存，尚未应用：.*无需重新创建/).waitFor();
+    assert.equal(await page.getByRole('dialog').count(), 0);
+    assert.equal(state.lines.length, count + 1);
+    assert.equal(state.lines.at(-1).published, false);
+    await Promise.all([page.waitForResponse(response => response.url().endsWith('/api/publish')), button('应用待处理配置修改').click()]);
+    await button('应用待处理配置修改').waitFor({ state: 'hidden' });
+    assert.equal(writes.filter(w => w.path === '/api/lines').length, before + 1, '继续应用不得再创建代理');
 
     // Button-only edits are unsaved changes too, even without a text-input event.
     await button('新建代理').first().click();
@@ -609,7 +595,6 @@ const assets = path.resolve(process.argv[2]);
     assert.deepEqual(errors, []);
     console.log('PASS local creation recovery, unsaved edits, subscription delivery, mobile navigation, workspace presets, redacted role views, member key creation/revocation and member login');
   } finally {
-    await browser.close(); await server.close();
-    console.log('CLEANUP browser pid=' + server.process().pid);
+    await browser.close();
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -76,7 +76,6 @@ async fn fetch_ranges(client: &reqwest::Client, ipv4: bool) -> Result<Vec<IpNet>
 
 fn addresses_allowed(addresses: &[SocketAddr], ranges: &[IpNet]) -> bool {
     !addresses.is_empty()
-        && !ranges.is_empty()
         && addresses.iter().all(|address| {
             let ip = address.ip();
             let ip = match ip {
@@ -87,12 +86,14 @@ fn addresses_allowed(addresses: &[SocketAddr], ranges: &[IpNet]) -> bool {
         })
 }
 
-fn cloudflare_headers(headers: &reqwest::header::HeaderMap) -> bool {
-    headers.contains_key("cf-ray")
-        || headers
-            .get(reqwest::header::SERVER)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().contains("cloudflare"))
+fn has_cdn_headers(headers: &reqwest::header::HeaderMap) -> bool {
+    let mut evidence = String::new();
+    for name in ["server", "cf-ray", "x-amz-cf-id"] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            evidence.push_str(&format!("{name}: {value}\n"));
+        }
+    }
+    crate::diagnostics::cdn_provider(&evidence).is_some()
 }
 
 async fn probe(candidate: &Candidate, ranges: &[IpNet]) -> Result<Value> {
@@ -100,21 +101,19 @@ async fn probe(candidate: &Candidate, ranges: &[IpNet]) -> Result<Value> {
         target: format!("{}:443", candidate.host), server_name: candidate.host.clone(),
         credentials: None, limit_fallback_upload: None, limit_fallback_download: None,
     };
-    let (addresses, address) = check_addresses(&input, ranges).await?;
+    let (addresses, address) = check_candidate_addresses(&input, ranges).await?;
     let check = crate::runtime::check_reality(&crate::model::RealityTarget { target: address.to_string(), ..input }).await?;
     ensure!(check["ok"] == true, "TLS 1.3、H2 或证书校验未通过");
     Ok(json!({"name":candidate.name,"target":format!("{}:443",candidate.host),"server_name":candidate.host,
         "tls13":true,"h2":true,"certificate_valid":true,
         "addresses":addresses.iter().map(|a|a.ip().to_string()).collect::<Vec<_>>(),
-        "detail":"TLS 1.3、H2、证书/SNI 检查通过；当前解析地址及响应未发现 Cloudflare，发布时重新检查"}))
+        "detail":"TLS 1.3、H2、证书/SNI 检查通过；当前解析地址及响应未发现已知 CDN"}))
 }
 
-async fn check_addresses(input: &crate::model::RealityTarget, ranges: &[IpNet]) -> Result<(Vec<SocketAddr>, SocketAddr)> {
+async fn check_candidate_addresses(input: &crate::model::RealityTarget, ranges: &[IpNet]) -> Result<(Vec<SocketAddr>, SocketAddr)> {
     let (host, port) = crate::compiler::target(&input.target)?;
     let name = input.server_name.to_ascii_lowercase();
     ensure!(crate::compiler::host_valid(&name), "SNI 无效");
-    ensure!(!["apple", "icloud", "microsoft"].iter().any(|word| name.contains(word))
-        && ![".cn", ".ru", ".ir"].iter().any(|suffix| name.ends_with(suffix)), "目标属于上游告警域名，请重新选择");
     let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
         .await?
         .collect();
@@ -122,7 +121,6 @@ async fn check_addresses(input: &crate::model::RealityTarget, ranges: &[IpNet]) 
         addresses_allowed(&addresses, ranges),
         "DNS 地址为空、非公网或命中 Cloudflare"
     );
-    // Pin the HTTP and TLS checks to the addresses that passed the range filter.
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -133,10 +131,7 @@ async fn check_addresses(input: &crate::model::RealityTarget, ranges: &[IpNet]) 
         .head(format!("https://{}/", crate::compiler::address(&name, port)))
         .send()
         .await?;
-    ensure!(
-        !cloudflare_headers(response.headers()),
-        "响应包含 Cloudflare 特征"
-    );
+    ensure!(!has_cdn_headers(response.headers()), "响应包含 CDN 特征");
     ensure!(
         !response.status().is_redirection(),
         "官网发生重定向，不推荐当前主机名"
@@ -150,19 +145,7 @@ async fn check_addresses(input: &crate::model::RealityTarget, ranges: &[IpNet]) 
 }
 
 pub async fn preflight(binary: &std::path::Path, input: &crate::model::RealityTarget) -> Result<Value> {
-    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(8)).build()?;
-    let (v4, v6) = tokio::try_join!(fetch_ranges(&client, true), fetch_ranges(&client, false))
-        .context("无法确认 Cloudflare 官方网段，已阻止发布")?;
-    let ranges = [v4, v6].concat();
-    check_addresses(input, &ranges).await?;
-    let mut result = crate::diagnostics::reality(binary, input).await?;
-    if result["ok"] == true {
-        // Recheck after the handshake too: the core resolves a domain independently.
-        check_addresses(input, &ranges).await?;
-        result["cloudflare_checked"] = json!(true);
-    }
-    Ok(result)
+    crate::diagnostics::reality(binary, input).await
 }
 
 /// Only a small random sample of known websites is contacted; never scan IP ranges.
@@ -178,9 +161,11 @@ pub async fn recommend() -> Result<Value> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(8))
         .build()?;
-    let (v4, v6) = tokio::try_join!(fetch_ranges(&client, true), fetch_ranges(&client, false))
-        .context("无法确认 Cloudflare 官方 IPv4/IPv6 网段，本次停止推荐，请稍后重试")?;
-    let ranges = [v4, v6].concat();
+    let (v4, v6) = tokio::join!(fetch_ranges(&client, true), fetch_ranges(&client, false));
+    let mut ranges = v4.unwrap_or_default();
+    if let Ok(v6) = v6 {
+        ranges.extend(v6);
+    }
     let checked = candidates.len();
     let results: Vec<_> =
         stream::iter(
@@ -256,7 +241,7 @@ mod tests {
             );
         }
         assert!(!addresses_allowed(&[], &ranges));
-        assert!(!addresses_allowed(&[clean], &[]));
+        assert!(addresses_allowed(&[clean], &[]));
         for invalid in [
             "",
             "<html>unavailable</html>",
@@ -270,14 +255,14 @@ mod tests {
     }
 
     #[test]
-    fn candidate_cloudflare_headers_are_rejected_even_outside_published_ranges() {
+    fn candidate_cdn_headers_are_rejected_even_outside_published_ranges() {
         let mut headers = reqwest::header::HeaderMap::new();
-        assert!(!cloudflare_headers(&headers));
+        assert!(!has_cdn_headers(&headers));
         headers.insert("server", "Cloudflare".parse().unwrap());
-        assert!(cloudflare_headers(&headers));
+        assert!(has_cdn_headers(&headers));
         headers.remove("server");
         headers.insert("cf-ray", "example".parse().unwrap());
-        assert!(cloudflare_headers(&headers));
+        assert!(has_cdn_headers(&headers));
     }
 
     #[test]

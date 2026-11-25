@@ -110,15 +110,10 @@ pub fn safe_traffic(
     Some(value)
 }
 
-pub fn sync_status(doc: &Document, line: &Line) -> &'static str {
-    if !doc.applied_lines.iter().any(|l| l.id == line.id) {
+pub fn sync_status(doc: &Document, line: &Line, at: u64) -> &'static str {
+    let Some(applied) = doc.applied_lines.iter().find(|l| l.id == line.id) else {
         return "unpublished";
-    }
-    let applied = doc
-        .applied_lines
-        .iter()
-        .find(|l| l.id == line.id)
-        .unwrap_or(line);
+    };
     let Some(node) = applied
         .hops
         .first()
@@ -132,7 +127,7 @@ pub fn sync_status(doc: &Document, line: &Line) -> &'static str {
     if applied != line {
         return "unpublished";
     }
-    if now().saturating_sub(node.seen) >= 15
+    if at.saturating_sub(node.seen) >= 15
         || !node.report.applied
         || !node.report.running
         || node.desired.as_ref().map(|d| d.revision.as_str()) != Some(node.report.revision.as_str())
@@ -140,6 +135,40 @@ pub fn sync_status(doc: &Document, line: &Line) -> &'static str {
         return "pending";
     }
     "synced"
+}
+
+pub fn quota_ratio(doc: &Document, line: &Line, at: u64) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    let mut observe = |ratio: f64| {
+        if ratio.is_finite() {
+            best = Some(best.map_or(ratio, |prev| prev.max(ratio)));
+        }
+    };
+    let traffic = safe_traffic(crate::plans::lease(doc, &line.id), traffic(doc, line), at);
+    if let (Some(t), Some(limit)) = (&traffic, line.limits.monthly_gib)
+        && limit > 0.0
+    {
+        observe(t.used() as f64 / (limit * 1073741824.0));
+    }
+    for key in crate::plans::budgets(doc, &line.id) {
+        if let Ok((budget, cycle, _)) = crate::plans::budget(doc, &key, at)
+            && let Some(limit) = budget.monthly_gib
+            && limit > 0.0
+        {
+            let used = doc
+                .customer_ledgers
+                .get(&key)
+                .filter(|l| l.cycle == cycle)
+                .map(|l| {
+                    l.allocations
+                        .values()
+                        .fold(0u64, |sum, a| sum.saturating_add(a.used))
+                })
+                .unwrap_or(0);
+            observe(used as f64 / (limit * 1073741824.0));
+        }
+    }
+    best
 }
 
 pub fn status(doc: &Document, line: &Line, at: u64) -> &'static str {
@@ -175,23 +204,40 @@ pub fn status(doc: &Document, line: &Line, at: u64) -> &'static str {
     "active"
 }
 
+pub fn rental_summary(rental: &Rental, at: u64, query_link_exists: bool) -> Value {
+    json!({
+        "customer_id": rental.customer_id,
+        "prices": rental.prices,
+        "started_at": rental.started_at,
+        "expires_at": rental.expires_at,
+        "paid_months": rental.paid_months,
+        "permanent": rental.started_at > 0 && rental.expires_at == 0,
+        "next_reset_at": if rental.started_at > 0 { cycle(rental.started_at, at).1 } else { 0 },
+        "query_link_exists": query_link_exists,
+    })
+}
+
 pub fn view(doc: &Document, line: &Line, at: u64) -> Value {
+    let plan = crate::plans::for_line(doc, &line.id);
     let rental = crate::plans::lease(doc, &line.id);
-    let value = rental.map(|r| {
-        json!({
-            "customer_id":r.customer_id,"prices":r.prices,"started_at":r.started_at,
-            "expires_at":r.expires_at,"paid_months":r.paid_months,
-        "permanent":r.started_at > 0 && r.expires_at == 0,
-            "next_reset_at":if r.started_at > 0 { cycle(r.started_at, at).1 } else { 0 },
-            "query_link_exists":!r.query_token_hash.is_empty()
-        })
-    });
+    let query_link_exists = if let Some(plan) = plan {
+        doc.customer_query_tokens.contains_key(&plan.key())
+            || plan.members.iter().any(|m| {
+                m.line_ids.contains(&line.id)
+                    && doc
+                        .customer_query_tokens
+                        .contains_key(&crate::plans::member_key(plan, m))
+            })
+    } else {
+        rental.is_some_and(|r| !r.query_token_hash.is_empty())
+    };
+    let value = rental.map(|r| rental_summary(r, at, query_link_exists));
     let multiplier=doc.applied_lines.iter().find(|l|l.id==line.id)
         .and_then(|l|l.hops.first()).and_then(|h|doc.nodes.iter().find(|n|n.id==h.node_id))
         .and_then(|n|n.desired.as_ref()).and_then(|d|d.config["_chain"].as_array())
         .and_then(|specs|specs.iter().find(|s|s["id"]==line.id)).and_then(|s|s["multiplier"].as_u64())
         .unwrap_or_else(||crate::resources::multiplier(doc,line).unwrap_or(1) as u64);
-    json!({"multiplier":multiplier,"rental":value,"customer_plan_id":crate::plans::for_line(doc,&line.id).map(|p|&p.id),"rental_status":status(doc,line,at),"sync_status":sync_status(doc,line),
+    json!({"multiplier":multiplier,"rental":value,"customer_plan_id":plan.map(|p|&p.id),"rental_status":status(doc,line,at),"sync_status":sync_status(doc,line,at),
         "traffic":safe_traffic(rental,traffic(doc,line),at)})
 }
 
@@ -229,16 +275,17 @@ mod tests {
         })).unwrap();
         doc.nodes.push(node);
         doc.applied_lines.push(line.clone());
-        assert_eq!(sync_status(&doc, &line), "synced");
+        let at = now();
+        assert_eq!(sync_status(&doc, &line, at), "synced");
         line.enabled = false;
-        assert_eq!(sync_status(&doc, &line), "unpublished");
+        assert_eq!(sync_status(&doc, &line, at), "unpublished");
         doc.nodes[0].report.error = "apply failed".into();
-        assert_eq!(sync_status(&doc, &line), "error");
+        assert_eq!(sync_status(&doc, &line, at), "error");
         doc.nodes[0].report.error.clear();
         doc.applied_lines[0] = line.clone();
-        assert_eq!(sync_status(&doc, &line), "synced");
+        assert_eq!(sync_status(&doc, &line, at), "synced");
         line.hops[0].port = 8443;
-        assert_eq!(sync_status(&doc, &line), "unpublished");
+        assert_eq!(sync_status(&doc, &line, at), "unpublished");
     }
     #[test]
     fn calendar_months_keep_anchor_day_and_local_time() {

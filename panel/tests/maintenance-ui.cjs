@@ -5,10 +5,8 @@ const path = require('node:path');
 const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
 const assets = path.resolve(process.argv[2]);
 (async () => {
-  const server = await chromium.launchServer({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
-  fs.writeFileSync(path.join(process.env.CHAIN_TEST_ROOT, 'maintenance-browser.json'), JSON.stringify({ pid: process.pid, browser: server.process().pid, endpoint: server.wsEndpoint() }));
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
   try {
-    const browser = await chromium.connect(server.wsEndpoint());
     const page = await browser.newPage();
     page.setDefaultTimeout(10000);
     const errors = [], writes = [];
@@ -58,7 +56,7 @@ const assets = path.resolve(process.argv[2]);
         return route.fulfill({json:result});
       }
       const file=path.join(assets,url.pathname==='/admin'?'index.html':url.pathname);
-      return route.fulfill({body:fs.readFileSync(file),contentType:{'.html':'text/html','.js':'text/javascript','.css':'text/css'}[path.extname(file)]||'application/octet-stream'});
+      return fs.existsSync(file)?route.fulfill({body:fs.readFileSync(file),contentType:{'.html':'text/html','.js':'text/javascript','.css':'text/css'}[path.extname(file)]||'application/octet-stream'}):route.fulfill({status:404});
     });
     const button = name => page.getByRole('button',{name,exact:true});
     const confirm = () => page.getByRole('dialog').getByRole('button',{name:'确认执行',exact:true}).click();
@@ -90,7 +88,6 @@ const assets = path.resolve(process.argv[2]);
     await page.getByText('已是最新正式版',{exact:true}).waitFor();
     assert.equal(await button('升级并重启').isDisabled(),true);
     assert.equal(coreRequests,0);
-    assert.equal(await page.getByRole('region',{name:'版本与维护',exact:true}).getByRole('combobox').count(),0);
     state.maintenance_actions.push('core-upgrade');
     await page.reload();
     await button('代理内核').click();
@@ -181,7 +178,6 @@ const assets = path.resolve(process.argv[2]);
     await page.waitForFunction(()=>!Array.from(document.querySelectorAll('button')).some(b=>b.textContent==='原链接已验证，继续'));
     assert.equal(writes.filter(w=>w.path==='/api/fleet/vps-a/forward').length,1);
     assert.deepEqual(errors,[]);
-    await browser.close();
     console.log('Maintenance UI checks passed');
-  } finally { await server.close(); }
+  } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode=1; });

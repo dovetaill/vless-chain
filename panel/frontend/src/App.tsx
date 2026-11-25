@@ -39,7 +39,6 @@ import {
   Waypoints,
   X,
 } from "lucide-react";
-import { DropdownMenu as RadixDropdown } from "radix-ui";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -68,7 +67,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { api, ApiError, publishChecked } from "./api";
+import { api, ApiError } from "./api";
 import { LineEditor } from "./components/line-editor";
 import { AccessDialog } from "./components/access-dialog";
 import { SecuritySettings } from "./components/security-settings";
@@ -76,7 +75,8 @@ import { Maintenance } from "./components/maintenance";
 import { Dashboard } from "./components/dashboard";
 import { Customers } from "./components/customers";
 import { ProxyList } from "./components/proxy-list";
-import { Fleet, Monitoring } from "./components/management";
+import { Fleet } from "./components/fleet";
+import { Monitoring } from "./components/management";
 import { RentalEditor } from "./components/rental-editor";
 import { ProbeEditor } from "./components/probe-editor";
 import {
@@ -144,7 +144,6 @@ export function App() {
   const [externalSearch, setExternalSearch] = useState("");
   const [modal, setModal] = useState<ReactNode>(null);
   const [editor, setEditor] = useState<{
-    kind: Line["kind"];
     line?: Line;
     initialChain?: string[];
     pendingImport?: { id: string; name: string };
@@ -155,6 +154,7 @@ export function App() {
   const [loggingIn, setLoggingIn] = useState(false);
   const [loginNotice, setLoginNotice] = useState("");
   const [options, setOptions] = useState({ totp: false, passkey: false });
+  const [optionsError, setOptionsError] = useState("");
   const polling = useRef(false);
   const close = () => setModal(null);
 
@@ -193,12 +193,18 @@ export function App() {
     };
   }, [refresh]);
 
+  const loadAuthOptions = useCallback(() => {
+    void api<{ totp: boolean; passkey: boolean }>("/auth/options")
+      .then((value) => {
+        setOptions(value);
+        setOptionsError("");
+      })
+      .catch((e) => setOptionsError(errorText(e)));
+  }, []);
+
   useEffect(() => {
-    if (!state)
-      void api<typeof options>("/auth/options")
-        .then(setOptions)
-        .catch(() => {});
-  }, [Boolean(state)]);
+    if (!state) loadAuthOptions();
+  }, [Boolean(state), connected, loadAuthOptions]);
 
   useEffect(() => {
     if (toast) {
@@ -265,7 +271,7 @@ export function App() {
           submit="确认并应用"
           close={close}
           action={async () => {
-            await publishChecked();
+            await api("/publish", "POST", {});
             await refresh();
             if (share && id) setPendingShare(id);
             close();
@@ -288,7 +294,7 @@ export function App() {
         </Modal>,
       );
     } else {
-      await publishChecked();
+      await api("/publish", "POST", {});
       await refresh();
       if (share && id) setPendingShare(id);
       close();
@@ -296,9 +302,9 @@ export function App() {
     }
   }
 
-  function editLine(kind: Line["kind"], line?: Line, initialChain?: string[]) {
+  function editLine(line?: Line, initialChain?: string[]) {
     if (!state) return;
-    setEditor({ kind, line, initialChain });
+    setEditor({ line, initialChain });
   }
 
   async function ensureLocalServer(host: string): Promise<NodeInfo> {
@@ -389,6 +395,7 @@ export function App() {
       await refresh();
     } catch (e) {
       setLoginError(errorText(e));
+      loadAuthOptions();
     } finally {
       setLoggingIn(false);
     }
@@ -510,6 +517,19 @@ export function App() {
                 <div className="mt-6 border-t border-border pt-4 text-xs leading-relaxed text-muted-foreground">
                   忘记密钥可在服务器终端运行 <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">chainctl</code> 查看或重置登录凭据。
                 </div>
+                {optionsError && (
+                  <p role="alert" className="mt-3 text-xs text-amber-600 dark:text-amber-400">
+                    认证选项读取失败（{optionsError}），若已启用二步验证或 Passkey 可{" "}
+                    <button
+                      type="button"
+                      className="cursor-pointer font-semibold underline"
+                      onClick={loadAuthOptions}
+                    >
+                      重试加载
+                    </button>
+                    。
+                  </p>
+                )}
                 {!connected && (
                   <p className="mt-3 text-xs text-destructive">
                     暂时无法连接面板服务，请稍后重试。
@@ -576,7 +596,6 @@ export function App() {
     );
 
   const current = pages.find((p) => p.id === page)!;
-  const kind: Line["kind"] = "vless";
   const latest = state.jobs[0];
   const role = state.viewer?.role || "admin";
   const admin = role === "admin";
@@ -998,7 +1017,7 @@ export function App() {
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   {page === "lines" && admin && (
-                    <Button disabled={state.busy} onClick={() => editLine(kind)}>
+                    <Button disabled={state.busy} onClick={() => editLine()}>
                       <Plus />
                       新建代理
                     </Button>
@@ -1111,10 +1130,10 @@ export function App() {
                     saved={refresh}
                     remote={!!remotePanel}
                     configureImport={(pendingImport) =>
-                      setEditor({ kind: "vless", pendingImport })
+                      setEditor({ pendingImport })
                     }
-                    create={() => editLine(kind)}
-                    edit={(line) => editLine(line.kind, line)}
+                    create={() => editLine()}
+                    edit={(line) => editLine(line)}
                     share={(line) =>
                       setModal(<AccessDialog line={line} state={state} close={close} />)
                     }
@@ -1249,133 +1268,110 @@ export function App() {
                                           size="sm"
                                           variant="outline"
                                           onClick={() =>
-                                            editLine("vless", undefined, [`external:${e.id}`])
+                                            editLine(undefined, [`external:${e.id}`])
                                           }
                                         >
                                           用于新建代理
                                         </Button>
-                                        <RadixDropdown.Root>
-                                          <RadixDropdown.Trigger
-                                            className="row-menu-trigger"
-                                            aria-label={`${e.name} 更多操作`}
-                                          >
-                                            <MoreHorizontal className="size-4" />
-                                          </RadixDropdown.Trigger>
-                                          <RadixDropdown.Portal>
-                                            <RadixDropdown.Content
-                                              className="row-menu-content"
-                                              align="end"
-                                              sideOffset={4}
-                                              collisionPadding={8}
+                                        <DropdownMenu>
+                                          <DropdownMenuTrigger asChild>
+                                            <Button
+                                              variant="ghost"
+                                              size="sm"
+                                              mode="icon"
+                                              aria-label={`${e.name} 更多操作`}
                                             >
-                                              <RadixDropdown.Item
-                                                onSelect={() =>
-                                                  setModal(
-                                                    <ManualGroup
-                                                      external={e}
-                                                      state={state}
-                                                      close={close}
-                                                      saved={refresh}
-                                                    />,
-                                                  )
-                                                }
-                                              >
-                                                <FolderKanban />
-                                                设置资源组
-                                              </RadixDropdown.Item>
-                                              <RadixDropdown.Item
-                                                onSelect={() =>
-                                                  setModal(
-                                                    <Modal
-                                                      title="编辑外部代理"
-                                                      description="保存后将预览并同步受影响的链式代理。"
-                                                      submit="保存"
-                                                      close={close}
-                                                      action={async (data) => {
-                                                        await api(`/externals/${e.id}`, "POST", {
-                                                          name: field(data, "name"),
-                                                          url: field(data, "url"),
-                                                        });
-                                                        await refresh();
-                                                        close();
-                                                        await apply();
-                                                      }}
-                                                    >
-                                                      <Field label="名称">
-                                                        <Input
-                                                          name="name"
-                                                          defaultValue={e.name}
-                                                          required
-                                                        />
-                                                      </Field>
-                                                      <Field label="分享链接或单节点配置">
-                                                        <textarea
-                                                          className="textarea mono"
-                                                          name="url"
-                                                          rows={6}
-                                                          defaultValue={e.url}
-                                                          required
-                                                        />
-                                                      </Field>
-                                                    </Modal>,
-                                                  )
-                                                }
-                                              >
-                                                <Pencil />
-                                                编辑配置
-                                              </RadixDropdown.Item>
-                                              <RadixDropdown.Separator className="my-1 h-px bg-border" />
-                                              <RadixDropdown.Item
-                                                className="text-destructive"
-                                                onSelect={() =>
-                                                  setModal(
-                                                    <Modal
-                                                      title="删除外部代理"
-                                                      description={`确定移除「${e.name}」吗？`}
-                                                      submit="删除"
-                                                      close={close}
-                                                      action={async () => {
-                                                        await api(
-                                                          `/externals/${e.id}`,
-                                                          "DELETE",
-                                                        );
-                                                        await refresh();
-                                                        close();
-                                                      }}
-                                                    />,
-                                                  )
-                                                }
-                                              >
-                                                <Trash2 />
-                                                删除节点
-                                              </RadixDropdown.Item>
-                                            </RadixDropdown.Content>
-                                          </RadixDropdown.Portal>
-                                        </RadixDropdown.Root>
-                                        <Button
-                                          variant="ghost"
-                                          size="icon"
-                                          className="sr-only"
-                                          tabIndex={-1}
-                                          aria-label={`删除资源 ${e.name}`}
-                                          onClick={() =>
-                                            setModal(
-                                              <Modal
-                                                title="删除外部代理"
-                                                description={`确定移除「${e.name}」吗？`}
-                                                submit="删除"
-                                                close={close}
-                                                action={async () => {
-                                                  await api(`/externals/${e.id}`, "DELETE");
-                                                  await refresh();
-                                                  close();
-                                                }}
-                                              />,
-                                            )
-                                          }
-                                        >
-                                          <Trash2 />
-                                        </Button>
+                                              <MoreHorizontal className="size-4" />
+                                            </Button>
+                                          </DropdownMenuTrigger>
+                                          <DropdownMenuContent
+                                            align="end"
+                                            collisionPadding={8}
+                                            className="min-w-50"
+                                          >
+                                            <DropdownMenuItem
+                                              onSelect={() =>
+                                                setModal(
+                                                  <ManualGroup
+                                                    external={e}
+                                                    state={state}
+                                                    close={close}
+                                                    saved={refresh}
+                                                  />,
+                                                )
+                                              }
+                                            >
+                                              <FolderKanban />
+                                              设置资源组
+                                            </DropdownMenuItem>
+                                            <DropdownMenuItem
+                                              onSelect={() =>
+                                                setModal(
+                                                  <Modal
+                                                    title="编辑外部代理"
+                                                    description="保存后将预览并同步受影响的链式代理。"
+                                                    submit="保存"
+                                                    close={close}
+                                                    action={async (data) => {
+                                                      await api(`/externals/${e.id}`, "POST", {
+                                                        name: field(data, "name"),
+                                                        url: field(data, "url"),
+                                                      });
+                                                      await refresh();
+                                                      close();
+                                                      await apply();
+                                                    }}
+                                                  >
+                                                    <Field label="名称">
+                                                      <Input
+                                                        name="name"
+                                                        defaultValue={e.name}
+                                                        required
+                                                      />
+                                                    </Field>
+                                                    <Field label="分享链接或单节点配置">
+                                                      <textarea
+                                                        className="textarea mono"
+                                                        name="url"
+                                                        rows={6}
+                                                        defaultValue={e.url}
+                                                        required
+                                                      />
+                                                    </Field>
+                                                  </Modal>,
+                                                )
+                                              }
+                                            >
+                                              <Pencil />
+                                              编辑配置
+                                            </DropdownMenuItem>
+                                            <DropdownMenuSeparator />
+                                            <DropdownMenuItem
+                                              variant="destructive"
+                                              onSelect={() =>
+                                                setModal(
+                                                  <Modal
+                                                    title="删除外部代理"
+                                                    description={`确定移除「${e.name}」吗？`}
+                                                    submit="删除"
+                                                    close={close}
+                                                    action={async () => {
+                                                      await api(
+                                                        `/externals/${e.id}`,
+                                                        "DELETE",
+                                                      );
+                                                      await refresh();
+                                                      close();
+                                                    }}
+                                                  />,
+                                                )
+                                              }
+                                            >
+                                              <Trash2 />
+                                              删除节点
+                                            </DropdownMenuItem>
+                                          </DropdownMenuContent>
+                                        </DropdownMenu>
                                       </div>
                                     </td>
                                   </tr>
@@ -1455,7 +1451,7 @@ export function App() {
               try {
                 await apply(
                   value[0].id,
-                  value.length === 1 && value[0].kind === "vless",
+                  value.length === 1,
                   value.map((line) => line.id),
                 );
               } catch (e) {

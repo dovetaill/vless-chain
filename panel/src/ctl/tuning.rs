@@ -116,14 +116,6 @@ fn owned(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 fn replace(path: &Path, expected: Option<&[u8]>, content: Option<&[u8]>) -> Result<()> {
-    ensure!(
-        owned(path)?.as_deref() == expected,
-        "配置被其他操作修改，未覆盖"
-    );
-    let Some(content) = content else {
-        fs::remove_file(path)?;
-        return Ok(());
-    };
     let mut options = fs::OpenOptions::new();
     options
         .read(true)
@@ -131,17 +123,40 @@ fn replace(path: &Path, expected: Option<&[u8]>, content: Option<&[u8]>) -> Resu
         .custom_flags(libc::O_NOFOLLOW)
         .mode(0o644);
     if expected.is_none() {
+        ensure!(
+            fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "配置被其他操作修改，未覆盖"
+        );
+        let Some(content) = content else {
+            return Ok(());
+        };
         options.create_new(true);
+        let mut file = options.open(path)?;
+        if let Err(err) = file.write_all(content).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(err.into());
+        }
+        return Ok(());
     }
+    let expected_bytes = expected.unwrap();
     let mut file = options.open(path)?;
     let info = file.metadata()?;
     ensure!(
-        info.is_file() && info.uid() == unsafe { libc::geteuid() } && info.nlink() == 1,
-        "配置归属已改变"
+        info.is_file()
+            && info.uid() == unsafe { libc::geteuid() }
+            && info.nlink() == 1
+            && info.mode() & 0o022 == 0,
+        "配置归属、类型或权限不匹配"
     );
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    ensure!(bytes == expected.unwrap_or_default(), "配置内容已改变");
+    ensure!(bytes == expected_bytes, "配置被其他操作修改，未覆盖");
+    let Some(content) = content else {
+        drop(file);
+        fs::remove_file(path)?;
+        return Ok(());
+    };
     let result = (|| -> Result<()> {
         file.rewind()?;
         file.write_all(content)?;
@@ -154,9 +169,6 @@ fn replace(path: &Path, expected: Option<&[u8]>, content: Option<&[u8]>) -> Resu
         file.write_all(&bytes)?;
         file.set_len(bytes.len() as u64)?;
         file.sync_all()?;
-        if expected.is_none() {
-            fs::remove_file(path)?;
-        }
         return Err(e);
     }
     Ok(())
@@ -199,14 +211,7 @@ async fn apply_queues(qdisc: &str) -> Vec<String> {
                 serde_json::from_slice::<Vec<Value>>(&filters.stdout)?.is_empty(),
                 "存在流量过滤器，保留队列"
             );
-            ensure!(queues().await?.contains(q), "队列已被其他操作修改，未覆盖");
             command("tc", &args, 3).await?;
-            ensure!(
-                queues().await?.iter().any(|v| v["dev"] == dev
-                    && v["kind"] == qdisc
-                    && v["parent"].as_str().unwrap_or("root") == parent),
-                "切换后实际队列不匹配"
-            );
             Ok(())
         }
         .await;
@@ -276,9 +281,6 @@ pub async fn apply(cc: &str, qdisc: &str) -> Result<Value> {
                 Some(content[i].as_bytes()),
             )?;
             written.push(i);
-        }
-        for i in 0..2 {
-            ensure!(read(KEYS[i])? == desired[i], "默认参数被其他操作修改");
         }
         Ok(())
     }

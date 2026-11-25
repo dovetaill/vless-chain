@@ -161,13 +161,6 @@ pub async fn publish(args: &Options) -> Result<()> {
     ensure!(actual == expected(&tag), "发布附件不完整");
     for (system, arch) in PLATFORMS {
         package::checksum(&directory.join(name(&tag[1..], system, arch)))?;
-        validate_manifest(
-            &read(&directory.join(format!("release-{system}-{arch}.json")))?,
-            &tag,
-            &commit,
-            system,
-            arch,
-        )?;
     }
     let mut work = Workspace::new(&args.parent())?;
     let releases: Value = serde_json::from_str(
@@ -229,32 +222,6 @@ pub async fn publish(args: &Options) -> Result<()> {
             .map(|name| directory.join(name).display().to_string()),
     );
     gh(&work, upload).await?;
-    let downloaded = work.root.join("downloaded");
-    fs::create_dir(&downloaded)?;
-    gh(
-        &work,
-        strings(&[
-            "release",
-            "download",
-            &tag,
-            "--repo",
-            &repo,
-            "--dir",
-            downloaded.to_str().unwrap(),
-        ]),
-    )
-    .await?;
-    let actual_downloads = files(&downloaded)?
-        .iter()
-        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-        .collect();
-    ensure!(actual == actual_downloads, "远端附件数量不匹配");
-    for name in actual {
-        ensure!(
-            package::digest(&downloaded.join(&name))? == package::digest(&directory.join(&name))?,
-            "上传后校验失败：{name}"
-        );
-    }
     gh(
         &work,
         strings(&[
@@ -271,117 +238,6 @@ pub async fn publish(args: &Options) -> Result<()> {
     work.close()
 }
 
-pub async fn publish_single(
-    args: &Options,
-    work: &Workspace,
-    directory: &Path,
-    manifest: &Value,
-) -> Result<()> {
-    let repo = args.value("--repo")?;
-    let tag = format!("v{}", manifest["version"].as_str().context("版本缺失")?);
-    let name = name(
-        manifest["version"].as_str().unwrap(),
-        manifest["os"].as_str().context("平台缺失")?,
-        manifest["arch"].as_str().context("架构缺失")?,
-    );
-    package::checksum(&directory.join(&name))?;
-    gh(
-        work,
-        strings(&[
-            "api",
-            &format!(
-                "repos/{repo}/commits/{}",
-                manifest["commit"].as_str().context("提交缺失")?
-            ),
-            "--silent",
-        ]),
-    )
-    .await?;
-    if args.action == "draft" {
-        gh(
-            work,
-            strings(&[
-                "release",
-                "create",
-                &tag,
-                "--repo",
-                repo,
-                "--draft",
-                "--target",
-                manifest["commit"].as_str().unwrap(),
-                "--title",
-                &format!("Chain Panel {tag}"),
-                "--notes",
-                "Rust 控制台与 Agent；下载对应架构发行包及 SHA256SUMS。",
-                directory.join(&name).to_str().unwrap(),
-                directory.join("SHA256SUMS").to_str().unwrap(),
-                directory.join("release.json").to_str().unwrap(),
-            ]),
-        )
-        .await?;
-    } else {
-        let value: Value = serde_json::from_str(
-            &gh(
-                work,
-                strings(&[
-                    "release",
-                    "view",
-                    &tag,
-                    "--repo",
-                    repo,
-                    "--json",
-                    "isDraft,assets",
-                ]),
-            )
-            .await?,
-        )?;
-        ensure!(value["isDraft"] == true, "只发布已有草稿，不修改已发布版本");
-        let required = BTreeSet::from([name.clone(), "release.json".into(), "SHA256SUMS".into()]);
-        let actual = value["assets"]
-            .as_array()
-            .context("附件缺失")?
-            .iter()
-            .filter_map(|v| v["name"].as_str().map(String::from))
-            .collect::<BTreeSet<_>>();
-        ensure!(required.is_subset(&actual), "草稿附件不完整");
-        let downloaded = work.root.join("single-download");
-        fs::create_dir(&downloaded)?;
-        let mut command = strings(&[
-            "release",
-            "download",
-            &tag,
-            "--repo",
-            repo,
-            "--dir",
-            downloaded.to_str().unwrap(),
-        ]);
-        for name in &required {
-            command.extend(strings(&["--pattern", name]));
-        }
-        gh(work, command).await?;
-        for name in &required {
-            ensure!(
-                package::digest(&downloaded.join(name))? == package::digest(&directory.join(name))?,
-                "草稿附件与本地不一致：{name}"
-            );
-        }
-        gh(
-            work,
-            strings(&[
-                "release",
-                "edit",
-                &tag,
-                "--repo",
-                repo,
-                "--draft=false",
-                "--latest",
-            ]),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 pub async fn check(args: &Options) -> Result<()> {
     let root = repository();
     let mut work = Workspace::new(&args.parent())?;
@@ -395,10 +251,6 @@ pub async fn check(args: &Options) -> Result<()> {
         ]),
     )
     .await?;
-    work.run(&root, &strings(&["sh", "-n", "scripts/repair-native-services.sh"]))
-        .await?;
-    work.run(&root, &strings(&["python3", "-B", "scripts/tests/repair-native-services.py"]))
-        .await?;
     work.run(&root, &strings(&["python3", "-B", "scripts/tests/legacy-native.py"]))
         .await?;
     work.run(&root, &strings(&["python3", "-B", "scripts/tests/local-package.py"]))

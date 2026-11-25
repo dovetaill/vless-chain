@@ -1,25 +1,10 @@
-use super::{
-    package,
-    upgrade::{Manager, atomic, ordinary},
-};
+use super::upgrade::{Manager, ordinary};
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::{self, File},
-    io::{self, Write},
+    io::Write,
     path::Path,
 };
-
-pub fn confirm(message: &str, word: &str, non_interactive: bool) -> Result<()> {
-    if non_interactive {
-        return Ok(());
-    }
-    print!("{message} 输入 {word} 确认：");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    ensure!(input.trim() == word, "已取消操作");
-    Ok(())
-}
 
 fn backup_files<W: Write>(
     bundle: &mut tar::Builder<W>,
@@ -79,12 +64,15 @@ pub fn backup(manager: &Manager, role: &str) -> Result<std::path::PathBuf> {
             .mode(0o700)
             .create(&directory)?;
     }
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let info = fs::metadata(&directory)?;
     ensure!(
-        info.uid() == unsafe { libc::geteuid() } && info.mode() & 0o077 == 0,
-        "备份目录属主或权限不符合私有备份要求，未修改已有权限"
+        info.is_dir() && info.uid() == unsafe { libc::geteuid() },
+        "备份目录属主或类型不符合私有备份要求"
     );
+    if info.mode() & 0o077 != 0 {
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
     let name = format!(
         "{role}-{}-{}.tar.gz",
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
@@ -135,11 +123,13 @@ pub async fn backup_stopped(manager: &Manager, role: &str) -> Result<()> {
 }
 
 pub async fn reset_auth(manager: &Manager, non_interactive: bool) -> Result<()> {
-    confirm(
-        "此操作清除 TOTP、Passkey 和全部会话，保留管理员密钥与业务线路。",
-        "RESET",
-        non_interactive,
-    )?;
+    if !non_interactive {
+        let answer = super::lifecycle::prompt(
+            "此操作清除 TOTP、Passkey 和全部会话，保留管理员密钥与业务线路；输入 RESET 确认",
+            "",
+        )?;
+        ensure!(answer == "RESET", "已取消操作");
+    }
     let _guard = manager.lock()?;
     ensure!(
         manager.state()?["roles"]["panel"].is_object(),
@@ -220,53 +210,6 @@ pub fn reset_database(path: &Path) -> Result<()> {
         "数据库状态记录不唯一"
     );
     transaction.commit()?;
-    Ok(())
-}
-
-pub async fn rollback(manager: &Manager, role: &str) -> Result<()> {
-    let _guard = manager.lock()?;
-    let mut state = manager.state()?;
-    let current = state["roles"][role]["current"]
-        .as_str()
-        .context("尚未安装指定组件")?
-        .to_owned();
-    let previous = state["roles"][role]["previous"]
-        .as_str()
-        .context("没有保留可回滚的历史版本；成功更新默认清理历史版本")?
-        .to_owned();
-    super::upgrade::release_name(&previous)?;
-    let source = manager.base.join("releases").join(&previous);
-    let manifest = package::verify(&source, false)?;
-    package::compatible(&manifest)?;
-    let active = manager.active(role).await?;
-    manager.service("stop", role).await?;
-    let result: Result<()> = async {
-        backup(manager, role)?;
-        manager.link(role, &previous)?;
-        manager.service("start", role).await?;
-        manager.healthy(role.into()).await?;
-        state["roles"][role]["current"] = serde_json::json!(previous);
-        state["roles"][role]["previous"] = serde_json::json!(current);
-        state["roles"][role]["version"] = serde_json::json!(manifest.version);
-        let path = manager.base.join(".chain-install.json");
-        use std::os::unix::fs::PermissionsExt;
-        atomic(
-            &path,
-            &serde_json::to_vec_pretty(&state)?,
-            fs::metadata(&path)?.permissions().mode() & 0o777,
-        )?;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = result {
-        manager.service("stop", role).await?;
-        manager.link(role, &current)?;
-        if active {
-            manager.service("start", role).await?;
-        }
-        return Err(error.context("程序回滚未完成，已恢复原程序链接；业务数据保留"));
-    }
-    println!("程序版本已回滚；没有回退业务数据库");
     Ok(())
 }
 

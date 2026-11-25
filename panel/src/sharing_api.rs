@@ -30,44 +30,43 @@ async fn view(State(app): State<App>) -> Json<Value> {
     Json(json!(state))
 }
 fn schedule(doc: &mut Document) -> Result<()> {
-    let mut updated = doc.clone();
-    schedule_inner(&mut updated)?;
-    doc.nodes = updated.nodes;
-    Ok(())
-}
-fn schedule_inner(doc: &mut Document) -> Result<()> {
-    let mut active = doc.clone();
-    active.lines = doc.applied_lines.clone();
-    active.externals = doc.applied_externals.clone();
-    for node in &mut doc.nodes {
-        let Some(desired) = node.desired.as_mut() else {
+    let active = Document {
+        lines: doc.applied_lines.clone(),
+        externals: doc.applied_externals.clone(),
+        resources: resources::State {
+            resources: doc.resources.resources.clone(),
+            ledgers: BTreeMap::new(),
+        },
+        customer_plans: doc.customer_plans.clone(),
+        rule_sources: doc.rule_sources.clone(),
+        access_policies: doc.access_policies.clone(),
+        ..Default::default()
+    };
+    let mut updates = Vec::new();
+    for (idx, node) in doc.nodes.iter().enumerate() {
+        let Some(desired) = node.desired.as_ref() else {
             continue;
         };
-        let Some(specs) = desired.config["_chain"].as_array_mut() else {
+        let Some(specs) = desired.config["_chain"].as_array() else {
             continue;
         };
-        let before = specs.clone();
-        for spec in specs.iter_mut() {
+        let mut next = specs.clone();
+        for spec in &mut next {
             let Some(line) = active.lines.iter().find(|l| spec["id"] == l.id) else {
                 continue;
             };
-            let pools = resources::pools(&active, line);
-            let policy = rules::compile(&active, &line.id)?;
-            let limit = policy.policy.max_connections.map(|n| n as u64);
-            if limit != spec["access_policy"]["policy"]["max_connections"].as_u64() {
-                rules::check_agent_connection_limit(limit, &node.report.system)?;
-            }
-            spec["resource_ids"] = json!(pools);
-            spec["access_policy"] = json!(policy);
+            spec["resource_ids"] = json!(resources::pools(&active, line));
+            spec["access_policy"] = json!(rules::compile(&active, &line.id)?);
             spec["multiplier"] = json!(resources::multiplier(&active, line)?);
         }
-        if *specs != before {
-            ensure!(
-                node.report.system["sharing_version"] == 1,
-                "请先升级入口 Agent，再应用资源或访问策略"
-            );
-            desired.revision = format!("sharing-{}", id());
+        if next != *specs {
+            updates.push((idx, next));
         }
+    }
+    for (idx, next) in updates {
+        let desired = doc.nodes[idx].desired.as_mut().unwrap();
+        desired.config["_chain"] = json!(next);
+        desired.revision = format!("sharing-{}", id());
     }
     Ok(())
 }
@@ -500,7 +499,9 @@ async fn save_access(
             .map(|d| rules::domain(d))
             .collect::<Result<Vec<_>>>()?;
         doc.access_policies.insert(key.clone(), policy);
-        rules::compile(doc, &key)?;
+        if !doc.applied_lines.iter().any(|l| l.id == key) {
+            rules::compile(doc, &key)?;
+        }
         schedule(doc)
     })?;
     Ok(Json(json!({"ok":true})))
@@ -517,7 +518,14 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                 .collect::<Vec<_>>()
         };
         for key in ids {
-            tokio::select! {_=stop.cancelled()=>return,_=update(&app,&key)=>{}}
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                res = update(&app, &key) => {
+                    if let Err(e) = res {
+                        eprintln!("自动更新规则源 {key} 失败：{e:#}");
+                    }
+                }
+            }
         }
         tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(60))=>{}}
     }
@@ -528,7 +536,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connection_limit_update_keeps_old_revision_until_agent_supports_it() {
+    fn schedule_updates_deployed_access_policy_idempotently() {
         let mut doc = Document::default();
         doc.applied_lines.push(serde_json::from_value(json!({
             "id":"line", "name":"线路", "kind":"vless",
@@ -537,17 +545,10 @@ mod tests {
         doc.nodes.push(serde_json::from_value(json!({
             "id":"node", "name":"入口", "host":"127.0.0.1", "token_hash":"test",
             "reality":{"target":"", "server_name":"", "private_key":"", "public_key":"", "short_id":""},
-            "report":{"system":{"sharing_version":1}},
             "desired":{"revision":"old", "config":{"_chain":[{"id":"line"}]}}
         })).unwrap());
         let limit = rules::MAX_PROXY_CONNECTIONS;
         doc.access_policies.entry("line".into()).or_default().max_connections = Some(limit);
-        assert!(schedule(&mut doc).is_err());
-        let desired = doc.nodes[0].desired.as_ref().unwrap();
-        assert_eq!(desired.revision, "old");
-        assert_eq!(desired.config["_chain"], json!([{"id":"line"}]));
-
-        doc.nodes[0].report.system["max_proxy_connections"] = json!(limit);
         schedule(&mut doc).unwrap();
         let desired = doc.nodes[0].desired.as_ref().unwrap();
         assert_eq!(desired.config["_chain"][0]["access_policy"]["policy"]["max_connections"], limit);
@@ -579,7 +580,7 @@ mod tests {
             let mut store = Store { conn, doc: doc.clone() };
             store.save().unwrap();
             let before = serde_json::to_value(&store.doc).unwrap();
-            let request: resources::Request = serde_json::from_value(json!({"resource":resource,"epoch":id(),"cycle":0,"used":0,"want":amount,"customer_plan_version":1})).unwrap();
+            let request: resources::Request = serde_json::from_value(json!({"resource":resource,"epoch":id(),"cycle":0,"used":0,"want":amount})).unwrap();
             store.conn.execute_batch("PRAGMA query_only=ON").unwrap();
             let error = allocate_grant(&mut store, "node", &request, at).err().expect("SQLite write must fail");
             assert!(matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::ReadOnly), "{error:#}");

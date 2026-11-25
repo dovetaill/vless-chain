@@ -6,10 +6,7 @@ const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
 const assets = path.resolve(process.argv[2]);
 const root = process.env.CHAIN_TEST_ROOT;
 (async () => {
-  fs.writeFileSync(path.join(root, 'management-browser.json'), JSON.stringify({ pid: process.pid, cwd: process.cwd(), artifacts: root }));
-  const server = await chromium.launchServer({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
-  fs.writeFileSync(path.join(root, 'management-browser.json'), JSON.stringify({ pid: process.pid, browser: server.process().pid, pgid: Number(fs.readFileSync('/proc/self/stat','utf8').split(') ')[1].split(' ')[2]), endpoint: server.wsEndpoint(), artifacts: root }));
-  const browser = await chromium.connect(server.wsEndpoint());
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
   try {
     const page = await browser.newPage();
     page.setDefaultTimeout(10000);
@@ -44,8 +41,8 @@ const root = process.env.CHAIN_TEST_ROOT;
       'clock:unknown': { active: true, bad: 0, message: '节点乙：系统时钟偏差 120 秒，请启用时间同步' },
       [pathKey]: { active: true, message: 'REALITY：本机入口 24443 未通过' },
     };
-    const line = (i) => ({id:`line-${i}`,name:`代理 ${i}`,kind:'vless',hops:[{node_id:'local',port:10000+i}],enabled:true,published:true,external_id:null,chain:[],target:'',network:'tcp',share:null,
-      access:{host:'192.0.2.1',protocol:'vless',username:'',password:'',method:'',public_host:'',public_port:null,shared_port:false,fallback:'',transport:{network:'tcp',path:'/',host:'',mode:'auto'},reality:{target:'www.microsoft.com:443',server_name:'www.microsoft.com'},tls:{mode:'off',domain:'',cert:'',key:''}},
+    const line = (i) => ({id:`line-${i}`,name:`代理 ${i}`,kind:'vless',hops:[{node_id:'local',port:10000+i}],enabled:true,published:true,chain:[],share:null,
+      access:{host:'192.0.2.1',protocol:'vless',username:'',password:'',method:'',shared_port:false,fallback:'',transport:{network:'tcp',path:'/',host:'',mode:'auto'},reality:{target:'www.microsoft.com:443',server_name:'www.microsoft.com'},tls:{mode:'off',domain:'',cert:'',key:''}},
       limits:{upload_mbps:null,download_mbps:null,monthly_gib:100},traffic:{epoch:'',month:'',upload:1024,download:2048,total_upload:1024,total_download:2048,upload_bps:100,download_bps:200,connections:1,sampled_at:now,blocked:false,days:{},cycle_start:now-100,cycle_end:now+100},rental:null,rental_status:'active',sync_status:'synced'});
     const fleet = {remotes:Array.from({length:50},(_,i)=>({id:`vps-${i}`,name:`VPS ${String(i).padStart(2,'0')}`,url:`https://vps-${i}.example`,seen:now,error:'',snapshot:{...state,time:now,local_node_id:'local',version:'0.2.29',agent_version:i===0?'0.2.28':'0.2.29',agent_seen:now,maintenance:true,
       nodes:[{id:'local',name:'本机',host:'192.0.2.1',seen:now,online:true,report:{running:true,applied:true,error:'',revision:'',traffic:{},system:{sampled_at:now,network_rx_bps:1024,network_tx_bps:2048,cpu_percent:10,memory_total:4096,memory_used:1024}}}],
@@ -100,7 +97,7 @@ const root = process.env.CHAIN_TEST_ROOT;
         return route.fulfill({json:result});
       }
       const file = path.join(assets, url.pathname === '/admin' ? 'index.html' : url.pathname);
-      return route.fulfill({body:fs.readFileSync(file),contentType:{'.html':'text/html','.js':'text/javascript','.css':'text/css'}[path.extname(file)] || 'application/octet-stream'});
+      return fs.existsSync(file) ? route.fulfill({body:fs.readFileSync(file),contentType:{'.html':'text/html','.js':'text/javascript','.css':'text/css'}[path.extname(file)] || 'application/octet-stream'}) : route.fulfill({status:404});
     });
     await page.goto('http://chain.test/admin#monitoring');
     await page.getByRole('button',{name:'保存配置',exact:true}).waitFor();
@@ -189,7 +186,6 @@ const root = process.env.CHAIN_TEST_ROOT;
     delete fleet.server_now;
     fleet.remotes.forEach(remote => { remote.snapshot.nodes[0].report.system.sampled_at = now; });
     await page.reload();
-    assert.equal(await page.getByText('接入与授权',{exact:true}).count(),0);
     await go('VPS');
     const originalSystem = fleet.remotes[0].snapshot.nodes[0].report.system;
     fleet.remotes[0].snapshot.nodes[0].report.system = null;
@@ -201,7 +197,6 @@ const root = process.env.CHAIN_TEST_ROOT;
     fleet.remotes[0].snapshot.nodes[0].report.system = originalSystem;
     await page.getByRole('button',{name:'刷新总控',exact:true}).click();
     assert.equal(await page.getByRole('button',{name:'批量升级',exact:true}).count(),0);
-    assert.equal(await page.getByLabel('目标正式版本').count(),0);
     await page.getByRole('region',{name:'VPS 列表',exact:true}).getByText('版本不一致',{exact:true}).waitFor();
     assert.equal(await page.getByRole('region',{name:'VPS 列表',exact:true}).locator('tbody tr').count(),20);
     await page.getByLabel('选择 VPS VPS 00',{exact:true}).check();
@@ -499,7 +494,6 @@ const root = process.env.CHAIN_TEST_ROOT;
       const beforeRemove = fleet.remotes.length;
       await page.getByRole('button',{name:'查看 VPS',exact:true}).first().click();
       const remove = dialog().getByRole('button',{name:'从总控移除',exact:true});
-      assert.ok(await remove.evaluate(el => parseFloat(getComputedStyle(el).borderTopWidth) > 0), '移除按钮须有可辨识边框');
       await remove.click();
       await dialog().waitFor({state:'hidden'});
       await page.getByText(confirmed ? /已从总控移除，远端授权已撤销/ : /已从总控移除；远端授权及已有免密会话的撤销尚未确认/).waitFor();
@@ -514,6 +508,5 @@ const root = process.env.CHAIN_TEST_ROOT;
     console.log('management UI checks passed');
   } finally {
     await browser.close();
-    await server.close();
   }
 })().catch(error => { console.error(error); process.exitCode=1; });

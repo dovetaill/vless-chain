@@ -19,6 +19,7 @@ import {
   OrderDialog,
   PaymentAdjustmentDialog,
   PaymentTable,
+  clearOrderStorage,
 } from "./rental-editor";
 import { beijingTime, money, terms } from "../lib/business";
 import { CustomerPlans } from "./customer-plans";
@@ -59,14 +60,14 @@ export function Customers({
           <Input
             name="name"
             required
-            maxLength={80}
+            maxLength={120}
             defaultValue={customer?.name || ""}
           />
         </Field>
         <Field label="联系方式">
           <Input
             name="contact"
-            maxLength={300}
+            maxLength={500}
             defaultValue={customer?.contact || ""}
             placeholder="微信、Telegram、邮箱等"
           />
@@ -76,7 +77,7 @@ export function Customers({
             className="textarea"
             name="notes"
             rows={3}
-            maxLength={2000}
+            maxLength={4000}
             defaultValue={customer?.notes || ""}
           />
         </Field>
@@ -132,9 +133,6 @@ export function Customers({
         delta: p.amount_fen,
         note: p.note,
         rights: "按原记录开通/续费",
-        session:
-          orders.find((o) => o.request_id === p.request_id)
-            ?.confirmed_session || "未记录",
         operator: orders.find((o) => o.request_id === p.request_id)
           ?.confirmed_by,
       })),
@@ -146,7 +144,6 @@ export function Customers({
         delta: a.delta_fen,
         note: a.note,
         rights: a.disable_line ? "已提交停用关联代理请求" : "未调整权益",
-        session: a.session,
         operator: a.operator,
       })),
     ].sort((a, b) => a.at - b.at);
@@ -164,7 +161,6 @@ export function Customers({
         "金额变动（元）",
         "权益处理",
         "备注",
-        "操作会话",
         "操作成员编号",
         "操作成员",
       ],
@@ -182,7 +178,6 @@ export function Customers({
         (row.delta / 100).toFixed(2),
         row.rights,
         row.note,
-        row.session,
         row.operator?.id || "未记录",
         row.operator?.name || "未记录",
       ]),
@@ -359,6 +354,10 @@ export function Customers({
                       const count = state.lines.filter(
                         (line) => line.rental?.customer_id === customer.id,
                       ).length;
+                      const planCount = (state.customer_plans || []).filter(
+                        (plan) => plan.customer_id === customer.id,
+                      ).length;
+                      const hasRelations = count > 0 || planCount > 0;
                       return (
                         <tr key={customer.id}>
                           <td data-label="客户" className="font-semibold">
@@ -393,9 +392,11 @@ export function Customers({
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                disabled={count > 0}
+                                disabled={hasRelations}
                                 title={
-                                  count ? "请先移除或迁移该客户的关联代理" : undefined
+                                  hasRelations
+                                    ? "请先删除或解绑该客户关联的代理与共享套餐（启用中的套餐线路停用后可移除）"
+                                    : undefined
                                 }
                                 onClick={() =>
                                   setModal(
@@ -593,6 +594,7 @@ export function Customers({
                                     "POST",
                                     {},
                                   );
+                                  clearOrderStorage(order);
                                   await saved();
                                   close();
                                 }}

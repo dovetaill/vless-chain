@@ -8,8 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{fs, path::Path, time::Duration};
 
-fn client(cert: &Path, name: &str, port: u16, h2: bool) -> Result<reqwest::Client> {
-    ensure!(!h2, "H2 使用 curl 的真实 ALPN 验收");
+fn client(cert: &Path, name: &str, port: u16) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .no_proxy()
         .add_root_certificate(reqwest::Certificate::from_pem(&fs::read(cert)?)?)
@@ -17,14 +16,14 @@ fn client(cert: &Path, name: &str, port: u16, h2: bool) -> Result<reqwest::Clien
         .timeout(Duration::from_secs(8))
         .build()?)
 }
-async fn page(cert: &Path, name: &str, port: u16, h2: bool) -> Result<(String, reqwest::Version)> {
-    let r = client(cert, name, port, h2)?
+async fn page(cert: &Path, name: &str, port: u16) -> Result<String> {
+    Ok(client(cert, name, port)?
         .get(format!("https://{name}:{port}/"))
         .send()
         .await?
-        .error_for_status()?;
-    let v = r.version();
-    Ok((r.text().await?, v))
+        .error_for_status()?
+        .text()
+        .await?)
 }
 async fn h2_page(h: &Harness<'_>, cert: &Path, name: &str, port: u16) -> Result<String> {
     let body = h
@@ -153,9 +152,9 @@ stream {{
         ]),
     )?;
     wait("已有 HTTPS 与 PROXY 来源地址", async || {
-        Ok(page(&cert, "existing.test", public, false)
+        Ok(page(&cert, "existing.test", public)
             .await
-            .is_ok_and(|v| v.0 == "existing-site 127.0.0.1"))
+            .is_ok_and(|v| v == "existing-site 127.0.0.1"))
     })
     .await?;
     ensure!(
@@ -176,7 +175,6 @@ stream {{
         ensure!(check["ok"] == false, "生产检查不应接受私网目标：{check}");
     }
     let n=h.request("/api/nodes","POST",Some(&json!({"name":"fronting","host":"127.0.0.1","target":format!("127.0.0.1:{tls}"),"server_name":"reality.test"})),200).await?;
-    h.preflight_named(tls, "reality.test", true).await?;
     crate::runtime::private_dir(&h.root.join("agent-0"), "chain-agent")?;
     h.launch(
         "ingress-watcher",
@@ -273,9 +271,8 @@ stream {{
     protocols::mihomo(&h, &lines, http, Some(udp), &cert).await?;
     let port = lines[1]["hops"][0]["port"].as_u64().unwrap() as u16;
     ensure!(
-        page(&cert, "tls.test", port, false)
+        page(&cert, "tls.test", port)
             .await?
-            .0
             .contains("欢迎访问"),
         "TLS 网页回落丢失"
     );
@@ -297,7 +294,7 @@ stream {{
     }
     h.publish("applied").await?;
     ensure!(
-        page(&cert, "existing.test", public, false).await?.0 == "existing-site 127.0.0.1",
+        page(&cert, "existing.test", public).await? == "existing-site 127.0.0.1",
         "共享端口影响已有站点"
     );
     ensure!(
@@ -317,7 +314,7 @@ stream {{
     h.publish("rolled_back").await?;
     ensure!(
         fs::read(&routes)? == before
-            && page(&cert, "existing.test", public, false).await?.0 == "existing-site 127.0.0.1",
+            && page(&cert, "existing.test", public).await? == "existing-site 127.0.0.1",
         "回滚改变既有站点或路由"
     );
     h.request(
@@ -339,7 +336,7 @@ stream {{
     h.publish("applied").await?;
     ensure!(
         fs::read_to_string(routes)? == "# chain-ingress managed v1\n\n"
-            && page(&cert, "existing.test", public, false).await?.0 == "existing-site 127.0.0.1",
+            && page(&cert, "existing.test", public).await? == "existing-site 127.0.0.1",
         "删除后路由或既有站点异常"
     );
     ensure!(

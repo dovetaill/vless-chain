@@ -20,7 +20,13 @@ import {
   Shield,
   Trash2,
 } from "lucide-react";
-import { DropdownMenu } from "radix-ui";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import { api } from "../api";
 import type { Line, PanelState } from "../types";
 import { expiringSoon, lineEndpoint, lowQuota, matchesLine } from "../lib/business";
@@ -197,7 +203,7 @@ export function ProxyList({
     setSelected([]);
   };
 
-  const all = state.lines.filter((line) => line.kind === "vless");
+  const all = state.lines;
   const lines = all.filter(
     (line) =>
       matchesLine(line, state, search) &&
@@ -210,6 +216,9 @@ export function ProxyList({
   );
   const chosen = all.filter((line) => selected.includes(line.id));
   const sharedPlanSelected = chosen.some((line) => line.customer_plan_id);
+  const enabledPlanSelected = chosen.some(
+    (line) => line.customer_plan_id && line.enabled,
+  );
   const disabled = state.busy || pending;
 
   async function operate(action: "enable" | "disable", targets: Line[]) {
@@ -465,9 +474,9 @@ export function ProxyList({
               包含共享套餐线路，请到客户与收款按套餐收款。
             </span>
           )}
-          {admin && sharedPlanSelected && (
+          {admin && enabledPlanSelected && (
             <span className="text-xs text-muted-foreground">
-              套餐线路不可删除；可停用并保留历史。
+              启用中的套餐线路请先停用后再删除。
             </span>
           )}
           {admin && !remote && !sharedPlanSelected && (
@@ -506,7 +515,7 @@ export function ProxyList({
               >
                 导出
               </Button>
-              {!sharedPlanSelected && (
+              {!enabledPlanSelected && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -536,8 +545,8 @@ export function ProxyList({
       {lines.length ? (
         <CardTable>
           <div
-            className={`overflow-x-auto fleet-responsive proxy-responsive ${
-              selectable ? "" : "proxy-readonly"
+            className={`overflow-x-auto fleet-responsive ${
+              selectable ? "proxy-responsive" : ""
             }`}
             tabIndex={0}
             role="region"
@@ -546,27 +555,29 @@ export function ProxyList({
             <table className="data-table [&_th]:px-3 [&_td]:px-3">
               <thead>
                 <tr>
-                  <th className="w-10">
-                    <input
-                      type="checkbox"
-                      aria-label="选择全部筛选结果"
-                      disabled={disabled}
-                      checked={lines.every((line) => selected.includes(line.id))}
-                      ref={(element) => {
-                        if (element)
-                          element.indeterminate =
-                            lines.some((line) => selected.includes(line.id)) &&
-                            !lines.every((line) => selected.includes(line.id));
-                      }}
-                      onChange={(event) =>
-                        setSelected(
-                          event.target.checked
-                            ? lines.map((line) => line.id)
-                            : [],
-                        )
-                      }
-                    />
-                  </th>
+                  {selectable && (
+                    <th className="w-10">
+                      <input
+                        type="checkbox"
+                        aria-label="选择全部筛选结果"
+                        disabled={disabled}
+                        checked={lines.every((line) => selected.includes(line.id))}
+                        ref={(element) => {
+                          if (element)
+                            element.indeterminate =
+                              lines.some((line) => selected.includes(line.id)) &&
+                              !lines.every((line) => selected.includes(line.id));
+                        }}
+                        onChange={(event) =>
+                          setSelected(
+                            event.target.checked
+                              ? lines.map((line) => line.id)
+                              : [],
+                          )
+                        }
+                      />
+                    </th>
+                  )}
                   <th>名称 / 归属 / 路径</th>
                   <th>接入入口</th>
                   <th>状态</th>
@@ -580,21 +591,23 @@ export function ProxyList({
               <tbody>
                 {lines.map((line) => (
                   <tr key={line.id}>
-                    <td data-label="选择代理">
-                      <input
-                        type="checkbox"
-                        aria-label={`选择 ${line.name}`}
-                        disabled={disabled}
-                        checked={selected.includes(line.id)}
-                        onChange={(event) =>
-                          setSelected((old) =>
-                            event.target.checked
-                              ? [...old, line.id]
-                              : old.filter((id) => id !== line.id),
-                          )
-                        }
-                      />
-                    </td>
+                    {selectable && (
+                      <td data-label="选择代理">
+                        <input
+                          type="checkbox"
+                          aria-label={`选择 ${line.name}`}
+                          disabled={disabled}
+                          checked={selected.includes(line.id)}
+                          onChange={(event) =>
+                            setSelected((old) =>
+                              event.target.checked
+                                ? [...old, line.id]
+                                : old.filter((id) => id !== line.id),
+                            )
+                          }
+                        />
+                      </td>
+                    )}
                     <td data-label="名称 / 归属 / 路径" className="min-w-[170px] max-w-[245px]">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <p className="break-all text-[13px] font-semibold text-foreground">
@@ -704,71 +717,91 @@ export function ProxyList({
                           </Button>
                         )}
                         {role !== "viewer" && (
-                          <DropdownMenu.Root>
-                            <DropdownMenu.Trigger
-                              className="row-menu-trigger"
-                              aria-label={`${line.name} 更多操作`}
-                              disabled={disabled}
-                            >
-                              <MoreHorizontal className="size-4" />
-                            </DropdownMenu.Trigger>
-                            <DropdownMenu.Portal>
-                              <DropdownMenu.Content
-                                className="row-menu-content"
-                                align="end"
-                                sideOffset={4}
-                                collisionPadding={8}
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                mode="icon"
+                                aria-label={`${line.name} 更多操作`}
+                                disabled={disabled}
                               >
-                                {admin && (
-                                  <>
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        void operate(
-                                          line.enabled ? "disable" : "enable",
-                                          [line],
-                                        )
-                                      }
-                                    >
-                                      {line.enabled ? <Ban /> : <Play />}
-                                      {line.enabled ? "手动停用" : "解除手动停用"}
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        setModal(
-                                          <LimitsDialog
-                                            lines={[line]}
-                                            close={close}
-                                            saved={saved}
-                                          />,
-                                        )
-                                      }
-                                    >
-                                      <Gauge />
-                                      调整额度 / 限速
-                                    </DropdownMenu.Item>
-                                    {!remote && !line.customer_plan_id && (
-                                      <DropdownMenu.Item
-                                        onSelect={() => unlimited([line])}
-                                      >
-                                        <InfinityIcon />
-                                        设为无限期（自用）
-                                      </DropdownMenu.Item>
-                                    )}
-                                    <DropdownMenu.Item
-                                      disabled={!line.published || !line.enabled}
-                                      onSelect={() => share(line)}
-                                    >
-                                      <Share2 />
-                                      分享配置
-                                    </DropdownMenu.Item>
-                                  </>
-                                )}
-                                {billing && !line.customer_plan_id && (
-                                  <DropdownMenu.Item
-                                    disabled={!line.rental || !line.published}
+                                <MoreHorizontal className="size-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent
+                              align="end"
+                              collisionPadding={8}
+                              className="min-w-50"
+                            >
+                              {admin && (
+                                <>
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      void operate(
+                                        line.enabled ? "disable" : "enable",
+                                        [line],
+                                      )
+                                    }
+                                  >
+                                    {line.enabled ? <Ban /> : <Play />}
+                                    {line.enabled ? "手动停用" : "解除手动停用"}
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
                                     onSelect={() =>
                                       setModal(
-                                        <QueryLinkDialog
+                                        <LimitsDialog
+                                          lines={[line]}
+                                          close={close}
+                                          saved={saved}
+                                        />,
+                                      )
+                                    }
+                                  >
+                                    <Gauge />
+                                    调整额度 / 限速
+                                  </DropdownMenuItem>
+                                  {!remote && !line.customer_plan_id && (
+                                    <DropdownMenuItem
+                                      onSelect={() => unlimited([line])}
+                                    >
+                                      <InfinityIcon />
+                                      设为无限期（自用）
+                                    </DropdownMenuItem>
+                                  )}
+                                  <DropdownMenuItem
+                                    disabled={!line.published || !line.enabled}
+                                    onSelect={() => share(line)}
+                                  >
+                                    <Share2 />
+                                    分享配置
+                                  </DropdownMenuItem>
+                                </>
+                              )}
+                              {billing && !line.customer_plan_id && (
+                                <DropdownMenuItem
+                                  disabled={!line.rental || !line.published}
+                                  onSelect={() =>
+                                    setModal(
+                                      <QueryLinkDialog
+                                        line={line}
+                                        close={close}
+                                        saved={saved}
+                                      />,
+                                    )
+                                  }
+                                >
+                                  <Link2 />
+                                  客户私密查询链接
+                                </DropdownMenuItem>
+                              )}
+                              {admin && (
+                                <>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      setModal(
+                                        <AccessPolicyEditor
                                           line={line}
                                           close={close}
                                           saved={saved}
@@ -776,87 +809,68 @@ export function ProxyList({
                                       )
                                     }
                                   >
-                                    <Link2 />
-                                    客户私密查询链接
-                                  </DropdownMenu.Item>
-                                )}
-                                {admin && (
-                                  <>
-                                    <DropdownMenu.Separator className="my-1 h-px bg-border" />
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        setModal(
-                                          <AccessPolicyEditor
-                                            line={line}
-                                            close={close}
-                                            saved={saved}
-                                          />,
-                                        )
-                                      }
-                                    >
-                                      <Shield />
-                                      网站 / 端口 / 连接限制
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() => edit(line)}
-                                    >
-                                      <Pencil />
-                                      编辑代理配置
-                                    </DropdownMenu.Item>
-                                  </>
-                                )}
-                                {operations && (
-                                  <>
-                                    <DropdownMenu.Separator className="my-1 h-px bg-border" />
-                                    <DropdownMenu.Item
-                                      disabled={!line.published || !line.enabled}
-                                      onSelect={() => probe(line)}
-                                    >
-                                      <Activity />
-                                      检查连接
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() =>
-                                        setModal(
-                                          <Diagnostics
-                                            nodes={state.nodes.filter((n) =>
-                                              line.hops.some(
-                                                (h) => h.node_id === n.id,
-                                              ),
-                                            )}
-                                            lineId={line.id}
-                                            canSyncTime={admin}
-                                            close={close}
-                                          />,
-                                        )
-                                      }
-                                    >
-                                      <FileText />
-                                      日志与诊断
-                                    </DropdownMenu.Item>
-                                    <DropdownMenu.Item
-                                      onSelect={() => apply(line)}
-                                    >
-                                      <RefreshCw />
-                                      应用配置修改
-                                    </DropdownMenu.Item>
-                                  </>
-                                )}
-                                {admin && !line.customer_plan_id && (
-                                  <>
-                                    <DropdownMenu.Separator className="my-1 h-px bg-border" />
-                                    <DropdownMenu.Item
-                                      className="text-destructive"
-                                      onSelect={() => remove([line])}
-                                    >
-                                      <Trash2 />
-                                      删除代理
-                                    </DropdownMenu.Item>
-                                  </>
-                                )}
-                              </DropdownMenu.Content>
-                            </DropdownMenu.Portal>
-                          </DropdownMenu.Root>
+                                    <Shield />
+                                    网站 / 端口 / 连接限制
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onSelect={() => edit(line)}
+                                  >
+                                    <Pencil />
+                                    编辑代理配置
+                                  </DropdownMenuItem>
+                                </>
+                              )}
+                              {operations && (
+                                <>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    disabled={!line.published || !line.enabled}
+                                    onSelect={() => probe(line)}
+                                  >
+                                    <Activity />
+                                    检查连接
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onSelect={() =>
+                                      setModal(
+                                        <Diagnostics
+                                          nodes={state.nodes.filter((n) =>
+                                            line.hops.some(
+                                              (h) => h.node_id === n.id,
+                                            ),
+                                          )}
+                                          lineId={line.id}
+                                          canSyncTime={admin}
+                                          close={close}
+                                        />,
+                                      )
+                                    }
+                                  >
+                                    <FileText />
+                                    日志与诊断
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onSelect={() => apply(line)}
+                                  >
+                                    <RefreshCw />
+                                    应用配置修改
+                                  </DropdownMenuItem>
+                                </>
+                              )}
+                              {admin && (!line.customer_plan_id || !line.enabled) && (
+                                <>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    variant="destructive"
+                                    onSelect={() => remove([line])}
+                                  >
+                                    <Trash2 />
+                                    删除代理
+                                  </DropdownMenuItem>
+                                </>
+                              )}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         )}
                       </div>
                     </td>

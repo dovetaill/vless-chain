@@ -13,8 +13,11 @@ use tokio::{
     net::{TcpStream, UdpSocket},
 };
 
+pub fn traffic_sum(t: &Value) -> u64 {
+    t["upload"].as_u64().unwrap_or(0) + t["download"].as_u64().unwrap_or(0)
+}
 pub fn used(l: &Value) -> u64 {
-    l["traffic"]["upload"].as_u64().unwrap_or(0) + l["traffic"]["download"].as_u64().unwrap_or(0)
+    traffic_sum(&l["traffic"])
 }
 pub async fn operate(
     h: &Harness<'_>,
@@ -90,7 +93,6 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     .await?;
     h.anonymous("/api/state", "GET", None, 401).await?;
     let n = node(&h, "租赁验证节点", Some(target)).await?;
-    h.preflight(target, true).await?;
     let (agent, agent_env) = h
         .agent(0, &n, map(&[("SSL_CERT_FILE", cert.display().to_string())]))
         .await?;
@@ -716,19 +718,23 @@ async fn protocol_metering(
     .await?;
     Ok(())
 }
+pub async fn plain_connect(port: u16, target: u16) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut reply = [0; 2];
+    stream.read_exact(&mut reply).await?;
+    ensure!(reply == [5, 0], "无认证 SOCKS 客户端协商失败");
+    let mut packet = vec![5, 1, 0, 1, 127, 0, 0, 1];
+    packet.extend(target.to_be_bytes());
+    stream.write_all(&packet).await?;
+    let mut reply = [0; 10];
+    stream.read_exact(&mut reply).await?;
+    ensure!(reply[..2] == [5, 0] && reply[3] == 1, "无认证 SOCKS 连接失败");
+    Ok(stream)
+}
 pub async fn plain_echo(port: u16, target: u16, payload: &[u8]) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(8), async {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
-        stream.write_all(&[5, 1, 0]).await?;
-        let mut reply = [0; 2];
-        stream.read_exact(&mut reply).await?;
-        ensure!(reply == [5, 0], "无认证 SOCKS 客户端协商失败");
-        let mut packet = vec![5, 1, 0, 1, 127, 0, 0, 1];
-        packet.extend(target.to_be_bytes());
-        stream.write_all(&packet).await?;
-        let mut reply = [0; 10];
-        stream.read_exact(&mut reply).await?;
-        ensure!(reply[..2] == [5, 0], "无认证 SOCKS 连接失败");
+        let mut stream = plain_connect(port, target).await?;
         stream.write_all(payload).await?;
         let mut response = vec![0; payload.len()];
         stream.read_exact(&mut response).await?;

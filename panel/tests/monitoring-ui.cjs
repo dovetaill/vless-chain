@@ -38,7 +38,7 @@ const assets = path.resolve(process.argv[2]);
         return route.fulfill({ json: url.pathname === '/api/fleet' ? fleet : url.pathname === '/api/state' ? state : {} });
       }
       const file = path.join(assets, url.pathname === '/admin' ? 'index.html' : url.pathname);
-      return route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' });
+      return fs.existsSync(file) ? route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' }) : route.fulfill({ status: 404 });
     });
     await page.goto('http://chain.test/admin#fleet');
     await page.getByText('VPS · 入口检测异常，出口正常', { exact: true }).waitFor();

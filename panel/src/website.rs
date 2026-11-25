@@ -1,7 +1,7 @@
-//! Owned HTTP(S) reverse proxies and ACME webroot challenges.
+//! TLS certificate lifecycle, ACME HTTP-01 challenges, and VLESS fallback HTTP handlers.
 use crate::{
-    gateway::{Lane, Spec, relay},
-    model::{Kind, Tls},
+    gateway::{Lane, Spec},
+    model::{Protocol, Tls},
     runtime::atomic_write,
 };
 use anyhow::{Context, Result, ensure};
@@ -13,7 +13,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use futures_util::StreamExt;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
@@ -43,6 +42,7 @@ fn certified(cert: &str, key: &str) -> Result<rustls::sign::CertifiedKey> {
     result.keys_match().context("证书和私钥不匹配")?;
     Ok(result)
 }
+
 pub fn tls_config(cert: &str, key: &str) -> Result<Arc<rustls::ServerConfig>> {
     let cert = certified(cert, key)?;
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -54,6 +54,7 @@ pub fn tls_config(cert: &str, key: &str) -> Result<Arc<rustls::ServerConfig>> {
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(cfg))
 }
+
 fn certificate(tls: &Tls, dir: &Path) -> Result<(String, String)> {
     if tls.mode == "auto" {
         let live = crate::acme::paths(&dir.join("acme/config"), &tls.domain);
@@ -65,42 +66,45 @@ fn certificate(tls: &Tls, dir: &Path) -> Result<(String, String)> {
         Ok((tls.cert.clone(), tls.key.clone()))
     }
 }
+
 pub fn load_tls(tls: &Tls, dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
     let (cert, key) = certificate(tls, dir)?;
     tls_config(&cert, &key)
 }
+
 pub fn certificate_expiry(specs: &[Spec], dir: &Path) -> serde_json::Value {
     let mut result = BTreeMap::new();
     for spec in specs.iter().filter(|s| matches!(s.tls.mode.as_str(), "auto" | "manual")) {
+        let key = if spec.tls.domain.is_empty() {
+            format!("line:{}", spec.id)
+        } else {
+            spec.tls.domain.clone()
+        };
+        if result.contains_key(&key) {
+            continue;
+        }
         let expiry = (|| -> Result<u64> {
             let pem = if spec.tls.mode == "auto" {
                 std::fs::read(crate::acme::paths(&dir.join("acme/config"), &spec.tls.domain).join("fullchain.pem"))?
-            } else { spec.tls.cert.as_bytes().to_vec() };
-            let cert = openssl::x509::X509::from_pem(&pem)?;
-            let epoch = openssl::asn1::Asn1Time::from_unix(0)?;
-            let difference = epoch.diff(cert.not_after())?;
-            Ok((i64::from(difference.days) * 86400 + i64::from(difference.secs)).max(0) as u64)
+            } else {
+                spec.tls.cert.as_bytes().to_vec()
+            };
+            crate::acme::pem_not_after_unix(&pem)
         })();
-        if let Ok(expires_at) = expiry {
-            result.insert(spec.tls.domain.clone(), serde_json::json!({"name":spec.tls.domain,"expires_at":expires_at}));
+        match expiry {
+            Ok(expires_at) => {
+                result.insert(key.clone(), serde_json::json!({"name":key,"expires_at":expires_at}));
+            }
+            Err(e) => {
+                eprintln!("读取证书 {} 到期时间失败: {e:#}", key);
+                result.insert(
+                    key.clone(),
+                    serde_json::json!({"name":key,"expires_at":0,"error":format!("{e:#}")}),
+                );
+            }
         }
     }
     serde_json::json!(result.into_values().collect::<Vec<_>>())
-}
-fn site_tls(specs: &[Spec], dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
-    let mut resolver = rustls::server::ResolvesServerCertUsingSni::new();
-    for s in specs {
-        let (cert, key) = certificate(&s.tls, dir)?;
-        resolver.add(&s.tls.domain, certified(&cert, &key)?)?;
-    }
-    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_no_client_auth()
-    .with_cert_resolver(Arc::new(resolver));
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(Arc::new(cfg))
 }
 
 async fn challenge(path: &str, dir: &Path) -> Option<Response> {
@@ -121,29 +125,20 @@ async fn challenge(path: &str, dir: &Path) -> Option<Response> {
 }
 
 /// Obtain certificates before switching the running configuration. Never kill a port owner.
-pub async fn prepare(specs: &[Spec], dir: &Path, existing_challenge: bool) -> Result<()> {
+pub async fn prepare(specs: &[Spec], dir: &Path) -> Result<()> {
     for spec in specs.iter().filter(|s| s.tls.mode == "auto") {
-        ensure_certificate(
-            &spec.tls,
-            dir,
-            existing_challenge,
-            false,
-            core_certificate(spec),
-        )
-        .await
-        .with_context(|| format!("域名 {} 的证书准备失败", spec.tls.domain))?;
+        ensure_certificate(&spec.tls, dir, false, core_certificate(spec))
+            .await
+            .with_context(|| format!("域名 {} 的证书准备失败", spec.tls.domain))?;
     }
     Ok(())
 }
 
 fn core_certificate(spec: &Spec) -> bool {
-    spec.kind == Kind::Vless
-        && matches!(
-            spec.protocol,
-            crate::model::Protocol::Vless
-                | crate::model::Protocol::Hysteria2
-                | crate::model::Protocol::Tuic
-        )
+    matches!(
+        spec.protocol,
+        Protocol::Vless | Protocol::Hysteria2 | Protocol::Tuic
+    )
 }
 
 pub(crate) fn core_cert_dir(dir: &Path, name: &str) -> PathBuf {
@@ -189,30 +184,30 @@ fn use_certificate(tls: &Tls, dir: &Path, core: bool) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_certificate(
-    tls: &Tls,
-    dir: &Path,
-    existing_challenge: bool,
-    renew: bool,
-    core: bool,
-) -> Result<()> {
+async fn ensure_certificate(tls: &Tls, dir: &Path, renew: bool, core: bool) -> Result<()> {
     let config = dir.join("acme/config");
-    let usable = || -> Result<bool> {
-        let lifetime = crate::acme::remaining(&config, &tls.domain, &tls.domain)?;
-        Ok(lifetime.is_some_and(|seconds| seconds > if renew { 30 * 86400 } else { 0 }))
+    let usable = || -> bool {
+        match crate::acme::remaining(&config, &tls.domain, &tls.domain) {
+            Ok(Some(seconds)) => seconds > if renew { 30 * 86400 } else { 0 },
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!("证书 {} 校验异常，将重新签发: {e:#}", tls.domain);
+                false
+            }
+        }
     };
-    if usable()? {
+    if usable() {
         return use_certificate(tls, dir, core);
     }
     // Renewal and a concurrent publish may need the same HTTP challenge port and certificate.
     static ISSUING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = ISSUING.lock().await;
-    if !usable()? {
+    if !usable() {
         let shared = std::env::var_os("CHAIN_ACME_WEBROOT").map(PathBuf::from);
         let webroot = shared.clone().unwrap_or_else(|| dir.join("acme/web"));
         std::fs::create_dir_all(&webroot)?;
         let issue = crate::acme::obtain(&config, &tls.domain, &tls.domain, &webroot);
-        if existing_challenge || shared.is_some() {
+        if shared.is_some() {
             issue.await?;
         } else {
             let listener = TcpListener::bind("0.0.0.0:80")
@@ -238,13 +233,15 @@ async fn ensure_certificate(
 }
 
 #[derive(Clone)]
-struct Websites {
+struct FallbackSite {
     upgrades: TaskTracker,
-    sites: Arc<BTreeMap<String, (Spec, Arc<Lane>)>>,
+    spec: Spec,
+    lane: Arc<Lane>,
     dir: PathBuf,
     client: reqwest::Client,
     cancel: CancellationToken,
 }
+
 fn clean_headers(headers: &mut axum::http::HeaderMap, upgrade: bool) {
     if let Some(connection) = headers
         .get("connection")
@@ -272,7 +269,8 @@ fn clean_headers(headers: &mut axum::http::HeaderMap, upgrade: bool) {
         headers.remove("upgrade");
     }
 }
-async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
+
+async fn fallback_proxy(State(state): State<FallbackSite>, mut req: Request) -> Response {
     if let Some(r) = challenge(req.uri().path(), &state.dir).await {
         return r;
     }
@@ -286,19 +284,17 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let Some((spec, lane)) = state.sites.get(&hostname).cloned() else {
+    if !state.spec.tls.domain.is_empty() && hostname != state.spec.tls.domain.to_ascii_lowercase() {
         return (StatusCode::NOT_FOUND, "未配置此网站域名").into_response();
-    };
-    if !lane.available() {
+    }
+    if !state.lane.available() {
         return (StatusCode::TOO_MANY_REQUESTS, "本站本月流量额度已用尽").into_response();
     }
-    if spec.kind == Kind::Vless && spec.target == "builtin" {
+    if state.spec.fallback_target == "builtin" {
         return axum::response::Html("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>欢迎访问</title><style>body{max-width:46rem;margin:12vh auto;padding:24px;font:18px/1.8 system-ui;color:#334155;background:#f8fafc}h1{color:#0f172a}</style><h1>欢迎访问</h1><p>网站已上线，更多内容正在准备中。</p></html>").into_response();
     }
-    // Public website fallbacks are not authenticated proxy traffic.
-    let account = spec.kind == Kind::Website;
     let result = async {
-        let mut upstream = url::Url::parse(&spec.target)?;
+        let mut upstream = url::Url::parse(&state.spec.fallback_target)?;
         let path = format!(
             "{}{}",
             upstream.path().trim_end_matches('/'),
@@ -321,39 +317,15 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
         headers.remove("host");
         headers.remove("forwarded");
         headers.remove("x-forwarded-for");
-        headers.insert("x-forwarded-host", HeaderValue::from_str(&hostname)?);
-        headers.insert(
-            "x-forwarded-proto",
-            HeaderValue::from_static(if matches!(spec.tls.mode.as_str(), "auto" | "manual") {
-                "https"
-            } else {
-                "http"
-            }),
-        );
-        let upload_lane = lane.clone();
-        let input = req.into_body().into_data_stream().then(move |chunk| {
-            let lane = upload_lane.clone();
-            async move {
-                let bytes = chunk.map_err(std::io::Error::other)?;
-                let n = if account {
-                    lane.charge(bytes.len(), true, false).await?
-                } else {
-                    bytes.len()
-                };
-                if n != bytes.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "额度已用尽",
-                    ));
-                }
-                Ok(bytes)
-            }
-        });
+        if !hostname.is_empty() {
+            headers.insert("x-forwarded-host", HeaderValue::from_str(&hostname)?);
+        }
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
         let response = state
             .client
             .request(method, upstream)
             .headers(headers)
-            .body(reqwest::Body::wrap_stream(input))
+            .body(reqwest::Body::wrap_stream(req.into_body().into_data_stream()))
             .send()
             .await?;
         let status = response.status();
@@ -368,38 +340,14 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
                         async { Ok::<_, anyhow::Error>(incoming.await?) },
                         async { Ok::<_, anyhow::Error>(response.upgrade().await?) }
                     )?;
-                    if account {
-                        relay(TokioIo::new(a), b, lane).await?;
-                    } else {
-                        tokio::io::copy_bidirectional(&mut TokioIo::new(a), &mut b).await?;
-                    }
+                    tokio::io::copy_bidirectional(&mut TokioIo::new(a), &mut b).await?;
                     Ok::<(), anyhow::Error>(())
                 };
-                tokio::select! {_=cancel.cancelled()=>{},_=transfer=>{}}
+                tokio::select! { _ = cancel.cancelled() => {}, _ = transfer => {} }
             });
             Body::empty()
         } else {
-            let connection = account.then(|| lane.connection());
-            let output = response.bytes_stream().then(move |chunk| {
-                let lane = lane.clone();
-                let _keep = &connection;
-                async move {
-                    let bytes = chunk.map_err(std::io::Error::other)?;
-                    let n = if account {
-                        lane.charge(bytes.len(), false, false).await?
-                    } else {
-                        bytes.len()
-                    };
-                    if n != bytes.len() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "额度已用尽",
-                        ));
-                    }
-                    Ok(bytes)
-                }
-            });
-            Body::from_stream(output)
+            Body::from_stream(response.bytes_stream())
         };
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -407,8 +355,9 @@ async fn proxy(State(state): State<Websites>, mut req: Request) -> Response {
         Ok::<_, anyhow::Error>(response)
     }
     .await;
-    result.unwrap_or_else(|_| {
-        (StatusCode::BAD_GATEWAY, "后端连接失败或线路额度已用尽").into_response()
+    result.unwrap_or_else(|e| {
+        eprintln!("回落站点请求失败 ({hostname}): {e:#}");
+        (StatusCode::BAD_GATEWAY, "回落后端连接失败").into_response()
     })
 }
 
@@ -418,35 +367,17 @@ pub async fn serve(
     dir: &Path,
     cancel: CancellationToken,
 ) -> Result<Vec<JoinHandle<()>>> {
-    let mut groups: BTreeMap<u16, Vec<Spec>> = BTreeMap::new();
-    for s in specs {
-        if s.kind == Kind::Website {
-            groups.entry(s.port).or_default().push(s.clone());
-        }
-        if let Some(port) = s.fallback_port {
-            let mut fallback = s.clone();
-            fallback.port = port;
-            fallback.listen = "127.0.0.1".into();
-            fallback.tls.mode = "off".into();
-            fallback.target = s.fallback_target.clone();
-            groups.entry(port).or_default().push(fallback);
-        }
-    }
-    // Bind all before spawning so a conflict cannot leave a half-created server behind.
+    // Bind all fallback listeners before spawning so a conflict never leaves a half-created server.
     let mut listeners = vec![];
-    for (port, sites) in groups {
-        if sites
-            .iter()
-            .any(|s| matches!(s.tls.mode.as_str(), "manual" | "auto"))
-        {
-            site_tls(&sites, dir)?;
+    for s in specs {
+        if let Some(port) = s.fallback_port {
+            listeners.push((
+                TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .with_context(|| format!("回落端口 {port} 已占用"))?,
+                s.clone(),
+            ));
         }
-        listeners.push((
-            TcpListener::bind((sites[0].listen.as_str(), port))
-                .await
-                .with_context(|| format!("网站端口 {port} 已占用"))?,
-            sites,
-        ));
     }
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -454,55 +385,50 @@ pub async fn serve(
         .connect_timeout(Duration::from_secs(10))
         .build()?;
     let needs_challenge = specs.iter().any(|s| s.tls.mode == "auto");
-    let existing_challenge = specs.iter().any(|s| s.kind == Kind::Website && s.port == 80);
+    let has_fallbacks = !listeners.is_empty();
     let mut tasks = vec![];
     let upgrades = TaskTracker::new();
-    for (listener, sites) in listeners {
+    for (listener, spec) in listeners {
         let address = listener.local_addr()?;
-        let mut listener = crate::gateway::Listener::new(listener, address, lanes[&sites[0].id].book.clone(), format!("HTTP {address}"));
-        let tls = sites
-            .iter()
-            .any(|s| matches!(s.tls.mode.as_str(), "manual" | "auto"));
-        let state = Websites {
+        let lane = lanes[&spec.id].clone();
+        let mut listener = crate::gateway::Listener::new(
+            listener,
+            address,
+            lane.book.clone(),
+            format!("HTTP {address}"),
+        );
+        let state = FallbackSite {
             upgrades: upgrades.clone(),
-            sites: Arc::new(
-                sites
-                    .iter()
-                    .map(|s| {
-                        (
-                            s.tls.domain.to_ascii_lowercase(),
-                            (s.clone(), lanes[&s.id].clone()),
-                        )
-                    })
-                    .collect(),
-            ),
+            spec,
+            lane,
             dir: dir.into(),
             client: client.clone(),
             cancel: cancel.clone(),
         };
-        let app = Router::new().fallback(any(proxy)).with_state(state);
+        let app = Router::new().fallback(any(fallback_proxy)).with_state(state);
         let cancel = cancel.clone();
-        let dir = dir.to_path_buf();
         tasks.push(tokio::spawn(async move {
-            let mut children=JoinSet::new();
-            loop {tokio::select!{
-                _=cancel.cancelled()=>break,
-                Some(_)=children.join_next(),if !children.is_empty()=>{},
-                (stream,_)=listener.accept()=>{
-                    if children.len()>=1024 {continue;}
-                    let app=app.clone();let sites=sites.clone();let dir=dir.clone();
-                    children.spawn(async move {
-                        let builder=Builder::new(TokioExecutor::new());let service=TowerToHyperService::new(app);
-                        if tls {
-                            if let Ok(config)=site_tls(&sites,&dir) {if let Ok(Ok(stream))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=builder.serve_connection_with_upgrades(TokioIo::new(stream),service).await;}}
-                        } else {let _=builder.serve_connection_with_upgrades(TokioIo::new(stream),service).await;}
-                    });
+            let mut children = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    Some(_) = children.join_next(), if !children.is_empty() => {},
+                    (stream, _) = listener.accept() => {
+                        if children.len() >= 1024 { continue; }
+                        let app = app.clone();
+                        children.spawn(async move {
+                            let builder = Builder::new(TokioExecutor::new());
+                            let service = TowerToHyperService::new(app);
+                            let _ = builder.serve_connection_with_upgrades(TokioIo::new(stream), service).await;
+                        });
+                    }
                 }
-            }}
-            children.abort_all();while children.join_next().await.is_some(){}
+            }
+            children.abort_all();
+            while children.join_next().await.is_some() {}
         }));
     }
-    if specs.iter().any(|s| s.kind == Kind::Website) {
+    if has_fallbacks {
         let stop = cancel.clone();
         tasks.push(tokio::spawn(async move {
             stop.cancelled().await;
@@ -523,7 +449,7 @@ pub async fn serve(
                 for (domain, (tls, core)) in &domains {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        result = ensure_certificate(tls, &dir, existing_challenge, true, *core) => {
+                        result = ensure_certificate(tls, &dir, true, *core) => {
                             if let Err(e) = result { errors.push(format!("{domain}: {e:#}")); }
                         }
                     }
@@ -599,21 +525,15 @@ mod tests {
         let native = dir.path().join("acme/config/rust/live").join(domain);
         let cert = core_cert_dir(dir.path(), domain).join("fullchain.pem");
         let old = install_pair(&legacy, domain, 15);
-        ensure_certificate(&tls, dir.path(), false, false, true)
+        ensure_certificate(&tls, dir.path(), false, true)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&cert).unwrap(), old);
         let renewed = install_pair(&native, domain, 90);
-        ensure_certificate(&tls, dir.path(), false, true, true)
+        ensure_certificate(&tls, dir.path(), true, true)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&cert).unwrap(), renewed);
         assert_eq!(std::fs::read(legacy.join("fullchain.pem")).unwrap(), old);
-        install_pair(&native, "wrong.test", 90);
-        assert!(
-            ensure_certificate(&tls, dir.path(), false, false, true)
-                .await
-                .is_err()
-        );
     }
 }

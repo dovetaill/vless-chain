@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Clock, Download, Eraser, Pause, Play, RefreshCw } from "lucide-react";
 import { api } from "../api";
-import { InfoTip, Modal, errorText, stamp } from "./shared";
+import { InfoTip, Modal, download, errorText, stamp } from "./shared";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { Input } from "./ui/input";
@@ -46,7 +46,6 @@ export function Diagnostics({
   const [target, setTarget] = useState("https://example.com/");
   const [diagnosing, setDiagnosing] = useState(false);
   const [diagnostic, setDiagnostic] = useState("");
-  const [until, setUntil] = useState(0);
   const [task, setTask] = useState<string>();
   const [taskMessage, setTaskMessage] = useState("");
   const [taskFailed, setTaskFailed] = useState(false);
@@ -133,6 +132,7 @@ export function Diagnostics({
   useEffect(() => {
     if (!task) return;
     let stopped = false;
+    let failures = 0;
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
@@ -142,6 +142,7 @@ export function Diagnostics({
           error?: string;
         }>("/federation/task", "POST", { action: "status", id: task });
         if (stopped) return;
+        failures = 0;
         setTaskFailed(value.state === "failed");
         setTaskMessage(
           [
@@ -165,11 +166,19 @@ export function Diagnostics({
         } else timer = setTimeout(() => void poll(), 3000);
       } catch (e) {
         if (!stopped) {
-          setTaskFailed(true);
-          setTaskMessage(
-            `无法读取校时任务结果：${errorText(e)}；任务可能仍在运行，请在维护任务中查看。`,
-          );
-          setTask(undefined);
+          failures += 1;
+          if (failures < 10) {
+            setTaskMessage(
+              `暂时无法读取校时任务结果（${errorText(e)}），正在按原任务继续查询…`,
+            );
+            timer = setTimeout(() => void poll(), 3000);
+          } else {
+            setTaskFailed(true);
+            setTaskMessage(
+              `无法确认校时任务结果：${errorText(e)}；请刷新日志与时钟状态核对。`,
+            );
+            setTask(undefined);
+          }
         }
       }
     }
@@ -179,15 +188,6 @@ export function Diagnostics({
       clearTimeout(timer);
     };
   }, [task]);
-
-  useEffect(() => {
-    if (!until) return;
-    const timer = setTimeout(() => {
-      setUntil(0);
-      setDiagnostic("详细诊断窗口已到期。");
-    }, Math.max(0, until - Date.now()));
-    return () => clearTimeout(timer);
-  }, [until]);
 
   async function diagnose() {
     setDiagnosing(true);
@@ -265,18 +265,6 @@ export function Diagnostics({
     } finally {
       setSavingLogs(false);
     }
-  }
-
-  function download() {
-    if (!data) return;
-    const url = URL.createObjectURL(
-      new Blob([data.text], { type: "text/plain;charset=utf-8" }),
-    );
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `chain-${source}-logs.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -423,7 +411,7 @@ export function Diagnostics({
                 size="sm"
                 variant="outline"
                 disabled={!data}
-                onClick={download}
+                onClick={() => data && download(`chain-${source}-logs.txt`, data.text)}
               >
                 <Download />
                 下载脱敏日志
@@ -566,25 +554,14 @@ export function Diagnostics({
                 />
               </label>
               <div className="flex flex-wrap items-center gap-2">
-                {!until ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setUntil(Date.now() + 600000)}
-                  >
-                    开启 10 分钟详细诊断窗口
-                  </Button>
-                ) : (
-                  <Button
-                    type="button"
-                    size="sm"
-                    disabled={diagnosing}
-                    onClick={() => void diagnose()}
-                  >
-                    {diagnosing ? "正在分段检查…" : "执行详细检查"}
-                  </Button>
-                )}
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={diagnosing}
+                  onClick={() => void diagnose()}
+                >
+                  {diagnosing ? "正在分段检查…" : "执行详细检查"}
+                </Button>
               </div>
               {diagnostic && (
                 <pre className="mono max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-muted p-3 text-xs">

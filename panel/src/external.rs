@@ -88,7 +88,8 @@ pub fn import(input: &str) -> Result<(String, String)> {
     if node.get("plugin").is_some() || node.get("plugin-opts").is_some()
         || matches!(text(&node,"network","tcp")?, "ws" | "grpc" | "h2" | "http")
         || kind == "hysteria2" && fields.keys().any(|k| ["obfs","ports","hop-interval","up","down","udp-mtu","handshake-timeout"].contains(&k.as_str()))
-        || kind == "socks5" && flag(&node,"tls",false)? {
+        || kind == "socks5" && flag(&node,"tls",false)?
+        || matches!(kind, "vless" | "vmess" | "trojan") && flag(&node, "skip-cert-verify", false)? {
         return Ok((native::encode(&node)?,text(&node,"name",text(&node,"server","代理")?)?.into()));
     }
     // Reject unsupported settings instead of silently changing how the proxy connects.
@@ -208,7 +209,6 @@ pub fn import(input: &str) -> Result<(String, String)> {
         "tls",
         matches!(kind, "trojan" | "hysteria2" | "tuic"),
     )?;
-    ensure!(kind != "socks5" || !tls, "SOCKS5 导入暂不支持 TLS");
     let scheme = if kind == "http" && tls { "https" } else { kind };
     let mut url = Url::parse(&format!("{scheme}://{}", address(host, port)))?;
     let user = match kind {
@@ -466,9 +466,9 @@ mod tests {
         assert!(import(&input.replace("network: tcp", "network: invalid")).is_err());
         assert!(import(&input.replace("tls: true", "tls: true, dialer-proxy: hidden")).is_err());
         assert!(import(&input.replace("port: 8443", "port: 0")).is_err());
-        assert!(
-            import(&input.replace("skip-cert-verify: false", "skip-cert-verify: true")).is_err()
-        );
+        let (self_signed, _) = import(&input.replace("skip-cert-verify: false", "skip-cert-verify: true")).unwrap();
+        assert!(self_signed.starts_with("mihomo://"));
+        assert_eq!(mihomo(&self_signed, "landing-a").unwrap()["skip-cert-verify"], true);
     }
     #[test]
     fn other_protocols_and_security_flags_round_trip() {

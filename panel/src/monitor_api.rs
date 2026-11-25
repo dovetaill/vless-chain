@@ -253,7 +253,7 @@ pub fn record_manual_probe(doc: &mut Document, line: &Line, request: &ProbeReque
         || request.mode != "http" || request.url != policy.url || doc.busy()
         || !doc.applied_lines.iter().any(|current| current.id == line.id
             && chain_panel::rental::status(doc, current, now()) == "active"
-            && serde_json::to_value(current).ok() == serde_json::to_value(line).ok()) {
+            && current == line) {
         return;
     }
     record_probe(doc, key, "本机", line, &policy, true, result);
@@ -288,6 +288,7 @@ async fn notify(app: &App) -> Result<()> {
         }
     }
     if !notice.mail_done && !channels.smtp_host.is_empty() {
+        let secret = channels.smtp_password.clone();
         let channels = channels.clone();
         let message = notice.message.clone();
         match tokio::task::spawn_blocking(move || {
@@ -296,7 +297,18 @@ async fn notify(app: &App) -> Result<()> {
         .await?
         {
             Ok(()) => notice.mail_done = true,
-            Err(_) => failures.push("邮件发送失败，请检查 SMTP、TLS 和账号配置".into()),
+            Err(e) => {
+                let raw = format!("{e:#}");
+                let masked = if secret.is_empty() {
+                    raw
+                } else {
+                    raw.replace(&secret, "[已隐藏]")
+                };
+                failures.push(format!(
+                    "邮件发送失败：{}",
+                    chain_panel::diagnostics::redact(&masked)
+                ));
+            }
         }
     }
     notice.attempts += 1;
@@ -343,10 +355,22 @@ pub(super) async fn poll_remote(
             .as_ref()
             .is_ok_and(|v| v["monitoring"]["effective"]["enabled"] == true)
     {
-        fleet_api::request(&remote, "GET", "/api/federation/document", None)
+        match fleet_api::request(&remote, "GET", "/api/federation/document", None)
             .await
-            .ok()
-            .and_then(|v| serde_json::from_value(v).ok())
+            .and_then(|v| serde_json::from_value::<Document>(v).context("解析远端探测配置失败"))
+        {
+            Ok(doc) => Some(doc),
+            Err(error) => {
+                let detail = format!("拉取探测配置失败：{error:#}");
+                eprintln!("{}：{detail}", remote.name);
+                if policy_error.is_empty() {
+                    policy_error = detail;
+                } else {
+                    policy_error = format!("{policy_error}；{detail}");
+                }
+                None
+            }
+        }
     } else {
         None
     };
@@ -465,7 +489,7 @@ async fn check(
     let mut s = app.store.lock().unwrap();
     if local && (s.doc.busy() || !s.doc.applied_lines.iter().any(|current| current.id == line.id
         && chain_panel::rental::status(&s.doc, current, now()) == "active"
-        && serde_json::to_value(current).ok() == serde_json::to_value(&line).ok())) {
+        && *current == line)) {
         return;
     }
     if !local
@@ -525,15 +549,14 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                 eprintln!("监控任务失败：{e}");
             }
         }
-        let (doc, p) = {
-            let s = app.store.lock().unwrap();
-            (s.doc.clone(), s.doc.monitoring.policy())
-        };
+        let p = app.store.lock().unwrap().doc.monitoring.policy();
         if now() >= next_state && p.enabled {
             let mut s = app.store.lock().unwrap();
             prune_probe_conditions(&mut s.doc);
             local_conditions(&mut s.doc, &p);
-            let _ = s.save();
+            if let Err(e) = s.save() {
+                eprintln!("保存监控状态失败：{e}");
+            }
             next_state = now() + 15;
         }
         if notification_task
@@ -588,6 +611,23 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
             continue;
         }
         {
+            let (doc, busy) = {
+                let s = app.store.lock().unwrap();
+                (
+                    Document {
+                        fleet: s.doc.fleet.clone(),
+                        nodes: s.doc.nodes.clone(),
+                        applied_nodes: s.doc.applied_nodes.clone(),
+                        applied_lines: s.doc.applied_lines.clone(),
+                        applied_externals: s.doc.applied_externals.clone(),
+                        rentals: s.doc.rentals.clone(),
+                        customer_plans: s.doc.customer_plans.clone(),
+                        customer_ledgers: s.doc.customer_ledgers.clone(),
+                        ..Default::default()
+                    },
+                    s.doc.busy(),
+                )
+            };
             let at = now();
             let mut pending = vec![];
             for remote in &doc.fleet.remotes {
@@ -600,7 +640,7 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                 nodes: doc.applied_nodes.clone(), lines: doc.applied_lines.clone(),
                 externals: doc.applied_externals.clone(), ..Default::default()
             };
-            if p.enabled && !doc.busy() {
+            if p.enabled && !busy {
                 for line in local.lines.iter().filter(|l| chain_panel::rental::status(&doc, l, at) == "active") {
                     let key = format!("local:{}", line.id);
                     if !running_tasks.contains_key(&key) {
@@ -616,7 +656,15 @@ pub async fn run(app: App, stop: tokio_util::sync::CancellationToken) {
                 if !remote.error.is_empty() || at.saturating_sub(remote.seen) >= p.offline {
                     continue;
                 }
-                let rp: Policy = serde_json::from_value(remote.snapshot["monitoring"]["effective"].clone()).unwrap_or_default();
+                let rp: Policy = match serde_json::from_value(remote.snapshot["monitoring"]["effective"].clone()) {
+                    Ok(rp) => rp,
+                    Err(e) => {
+                        if !remote.snapshot["monitoring"]["effective"].is_null() {
+                            eprintln!("解析远端 {} 监控策略失败：{e}", remote.name);
+                        }
+                        continue;
+                    }
+                };
                 if !rp.enabled || remote.snapshot["busy"] == true {
                     continue;
                 }

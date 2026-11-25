@@ -3,6 +3,7 @@ use super::{
     business::{line, node},
     harness::{Harness, map},
     protocols::{PROFILES, binary, udp_echo},
+    rentals::used,
     scenarios::wait,
 };
 use anyhow::{Context, Result, ensure};
@@ -15,13 +16,7 @@ async fn counters(h: &Harness<'_>, lines: &[Value]) -> Result<BTreeMap<String, u
         .context("缺少线路")?
         .iter()
         .filter(|l| lines.iter().any(|v| v["id"] == l["id"]))
-        .map(|l| {
-            (
-                l["id"].as_str().unwrap().to_string(),
-                l["traffic"]["upload"].as_u64().unwrap_or(0)
-                    + l["traffic"]["download"].as_u64().unwrap_or(0),
-            )
-        })
+        .map(|l| (l["id"].as_str().unwrap().to_string(), used(l)))
         .collect())
 }
 async fn traversed(h: &Harness<'_>, lines: &[Value], before: &BTreeMap<String, u64>) -> Result<()> {
@@ -193,7 +188,6 @@ pub async fn run(work: &Workspace, stage: &Path, args: &Options) -> Result<()> {
     h.panel(map(&[("SSL_CERT_FILE", cert.display().to_string())]))
         .await?;
     let n = node(&h, "chain-matrix", Some(target)).await?;
-    h.preflight(target, true).await?;
     h.agent(0, &n, map(&[("SSL_CERT_FILE", cert.display().to_string())]))
         .await?;
     h.wait_state("矩阵 Agent", 30, |s| s["nodes"][0]["online"] == true)

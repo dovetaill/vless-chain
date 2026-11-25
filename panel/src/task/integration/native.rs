@@ -17,18 +17,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub struct Case<'a> {
+struct Case<'a> {
     work: &'a Workspace,
-    pub root: PathBuf,
-    pub base: PathBuf,
-    pub ctl: PathBuf,
-    pub archive: PathBuf,
-    pub state: Value,
+    root: PathBuf,
+    base: PathBuf,
+    ctl: PathBuf,
+    archive: PathBuf,
+    state: Value,
     protected: Vec<PathBuf>,
     before: BTreeMap<PathBuf, (Vec<u8>, u64, u32, u32, u32, i64, i64)>,
 }
 impl<'a> Case<'a> {
-    pub fn new(work: &'a Workspace, stage: &Path, name: &str) -> Result<Self> {
+    fn new(work: &'a Workspace, stage: &Path, name: &str) -> Result<Self> {
         let directory = work.root.join(format!("native-{name}"));
         fs::create_dir(&directory)?;
         let root = directory.join("host");
@@ -71,7 +71,7 @@ impl<'a> Case<'a> {
             protected.push(unit);
             symlink("releases/old", base.join(format!("current-{role}")))?;
             state["roles"][role] =
-                json!({"current":"old","previous":null,"version":"0.2.48","custom":"preserve"});
+                json!({"current":"old","version":"0.2.48","custom":"preserve"});
         }
         fs::write(
             base.join(".chain-install.json"),
@@ -153,14 +153,14 @@ impl<'a> Case<'a> {
             })
             .collect()
     }
-    pub fn unchanged(&self) -> Result<()> {
+    fn unchanged(&self) -> Result<()> {
         ensure!(
             self.snapshot()? == self.before,
             "凭据、配置或业务数据的内容/元数据发生变化"
         );
         Ok(())
     }
-    pub async fn cli(&self, args: &[&str], success: bool) -> Result<String> {
+    async fn cli(&self, args: &[&str], success: bool) -> Result<String> {
         let mut command = vec![self.ctl.display().to_string()];
         command.extend(strings(args));
         command.extend(strings(&["--root", self.root.to_str().unwrap()]));
@@ -175,7 +175,7 @@ impl<'a> Case<'a> {
         );
         Ok(out)
     }
-    pub async fn update(&self, component: Option<&str>, success: bool) -> Result<String> {
+    async fn update(&self, component: Option<&str>, success: bool) -> Result<String> {
         let mut args = vec![
             "update",
             "--package",
@@ -197,7 +197,7 @@ pub async fn exercise(work: &Workspace, stage: &Path) -> Result<()> {
         ensure!(
             state["roles"][role]["version"] == "0.3.0"
                 && state["roles"][role]["custom"] == "preserve"
-                && state["roles"][role]["previous"].is_null(),
+                && state["roles"][role].get("previous").is_none(),
             "升级丢失角色元数据"
         );
         ensure!(
@@ -340,18 +340,35 @@ pub async fn exercise(work: &Workspace, stage: &Path) -> Result<()> {
         "损坏包产生发行目录"
     );
 
+    let recovered = Case::new(work, stage, "interrupted-recovery")?;
+    symlink(
+        "releases/interrupted-target",
+        recovered.base.join("current-panel.tmp"),
+    )?;
+    fs::rename(
+        recovered.base.join("current-panel.tmp"),
+        recovered.base.join("current-panel"),
+    )?;
+    fs::write(
+        recovered.base.join(".update-pending.json"),
+        serde_json::to_vec(&json!({
+            "before": recovered.state,
+            "target": "interrupted-target",
+            "roles": ["panel", "agent"],
+            "running": [false, false],
+            "services": []
+        }))?,
+    )?;
+    recovered.update(None, true).await?;
+    ensure!(
+        !recovered.base.join(".update-pending.json").exists()
+            && read(&recovered.base.join(".chain-install.json"))?["roles"]["panel"]["version"]
+                == "0.3.0",
+        "中断升级事务未能自动恢复完成更新"
+    );
+    recovered.unchanged()?;
+
     let foreign = Case::new(work, stage, "foreign")?;
-    let journal = foreign.base.join(".update-pending.json");
-    fs::write(&journal, r#"{"fixture":"interrupted"}"#)?;
-    ensure!(
-        foreign.update(None, false).await?.contains("上次升级中断"),
-        "未拒绝中断升级"
-    );
-    ensure!(
-        fs::read_to_string(&journal)? == r#"{"fixture":"interrupted"}"#,
-        "中断日志被覆盖"
-    );
-    fs::remove_file(journal)?;
     let manager = Manager {
         root: foreign.root.clone(),
         base: foreign.base.clone(),
@@ -452,29 +469,9 @@ pub async fn exercise(work: &Workspace, stage: &Path) -> Result<()> {
     );
     guarded.unchanged()?;
     sandbox(work, &case.ctl).await?;
-    #[cfg(target_os = "linux")]
-    {
-        let root = work.root.join("nginx-sandbox");
-        fs::create_dir(&root)?;
-        fs::write(
-            root.join("request.json"),
-            serde_json::to_vec(
-                &json!({"nginx_check":true,"args":[std::env::current_exe()?,"integration","--case","nginx-worker"],"env":{"PATH":"/usr/bin:/bin"}}),
-            )?,
-        )?;
-        work.run(
-            &work.root,
-            &strings(&[
-                case.ctl.to_str().unwrap(),
-                "internal-core-worker",
-                root.to_str().unwrap(),
-            ]),
-        )
-        .await?;
-    }
-    terminal(work, &case).await?;
+    super::fixtures::terminal_checks(work, &case.ctl, &case.root).await?;
     println!(
-        "PASS 原生双组件/单组件升级、离线安装、元数据保留、校验失败、外来服务/站点拒绝、中断升级、卸载/清理、沙箱和终端恢复"
+        "PASS 原生双组件/单组件升级、离线安装、元数据保留、校验失败、外来服务/站点拒绝、中断升级恢复、卸载/清理、沙箱和终端恢复"
     );
     Ok(())
 }
@@ -519,9 +516,4 @@ async fn sandbox(work: &Workspace, ctl: &Path) -> Result<()> {
         "候选进程逃逸沙箱"
     );
     Ok(())
-}
-
-async fn terminal(_work: &Workspace, _case: &Case<'_>) -> Result<()> {
-    // Implemented with a native PTY in the fixture runner; no language runtime is spawned.
-    super::scenarios::terminal_checks(_work, &_case.ctl, &_case.root).await
 }

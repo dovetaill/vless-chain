@@ -321,11 +321,23 @@ async fn real_jws_http01_csr_issue_reuse_renew_and_reject_bad_certificate() {
             .exists()
     );
     fs::write(current.join("privkey.pem"), "corrupted").unwrap();
+    assert!(!reusable(&config, "certificate.test", "certificate.test", false).unwrap());
+    *state.bad.lock().unwrap() = false;
     assert!(
-        obtain(&config, "certificate.test", "certificate.test", &web)
-            .await
-            .is_err()
+        issue(
+            &config,
+            "certificate.test",
+            "certificate.test",
+            &web,
+            builder(),
+            &url
+        )
+        .await
+        .unwrap()
     );
+    let healed = paths(&config, "certificate.test").canonicalize().unwrap();
+    assert_ne!(healed, current);
+    assert!(remaining(&config, "certificate.test", "certificate.test").unwrap().unwrap() > 89 * 86400);
     let task = server.0.take().unwrap();
     task.abort();
     let _ = task.await;
@@ -335,6 +347,8 @@ fn rejects_unsafe_names_and_foreign_write_links() {
     for name in ["", "../escape", "a/b", "a\nb", ".bad", "bad.", "a..b"] {
         assert!(identifier(name).is_err());
     }
+    assert!(domain_identifier("*.example.com", true).is_ok());
+    assert!(domain_identifier("*.example.com", false).is_err());
     let root = tempfile::tempdir().unwrap();
     let foreign = root.path().join("foreign");
     fs::create_dir(&foreign).unwrap();

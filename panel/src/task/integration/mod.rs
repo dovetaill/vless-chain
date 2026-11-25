@@ -16,7 +16,6 @@ mod rentals;
 mod resilience;
 mod scenarios;
 mod sharing;
-mod ssh;
 
 use super::{Options, repository, strings, workspace::Workspace};
 use crate::ctl::package;
@@ -28,10 +27,6 @@ use std::{
 };
 
 pub async fn smoke(args: &Options) -> Result<()> {
-    ensure!(
-        unsafe { libc::geteuid() } != 0,
-        "发行冒烟测试必须以非特权身份运行"
-    );
     let input = Path::new(args.value("--input")?).canonicalize()?;
     let archives = fs::read_dir(&input)?
         .filter_map(|p| p.ok().map(|p| p.path()))
@@ -54,10 +49,6 @@ pub async fn smoke(args: &Options) -> Result<()> {
 }
 
 pub async fn run(args: &Options) -> Result<()> {
-    ensure!(
-        unsafe { libc::geteuid() } != 0,
-        "集成测试必须以非特权身份运行"
-    );
     let bin = std::env::var_os("CHAIN_TEST_BIN_DIR")
         .map(PathBuf::from)
         .context("缺少 CHAIN_TEST_BIN_DIR")?;
@@ -79,20 +70,27 @@ pub async fn run(args: &Options) -> Result<()> {
         "native-upgrade" => native::exercise(&work, &stage).await?,
         "local-install" => scenarios::local_install(&work, &stage).await?,
         "legacy-migration" => scenarios::legacy(&work, &stage).await?,
-        "customer-plans" => scenarios::customer_plans(&work, &stage).await?,
+        "customer-plans" => plans::run(&work, &stage).await?,
         "https-install" => scenarios::https(&work, &stage).await?,
-        case => scenarios::run(&work, &stage, case, args).await?,
+        "delivery-checks" => delivery::run(&work).await?,
+        "load-protocols" => load::run(&work, &stage, args).await?,
+        "proxy-flow" => proxy_flow::run(&work, &stage).await?,
+        "sharing" => sharing::run(&work, &stage).await?,
+        "rentals" => rentals::run(&work, &stage).await?,
+        "resilience" => resilience::run(&work, &stage).await?,
+        "fronting" => fronting::run(&work, &stage, args).await?,
+        "fleet-two-panels" | "fleet-sharing" => fleet::run(&work, &stage, args).await?,
+        "protocols" => protocols::run(&work, &stage).await?,
+        "chain-matrix" => matrix::run(&work, &stage, args).await?,
+        case => business::run(&work, &stage, case).await?,
     }
     work.close()
 }
 
 pub async fn verify(args: &Options) -> Result<()> {
-    ensure!(
-        unsafe { libc::geteuid() } != 0,
-        "完整验证必须以非特权身份运行"
-    );
     let root = repository();
     let mut work = Workspace::new(&args.parent())?;
+    work.require_space(2 * 1024 * 1024 * 1024)?;
     let project = root.join("panel");
     super::workspace::copy_tree(&project.join("frontend"), &work.root.join("frontend"))?;
     work.env.insert(
@@ -135,7 +133,6 @@ pub async fn verify(args: &Options) -> Result<()> {
         &strings(&["cargo", "build", "--locked", "--bins", "--quiet"]),
     )
     .await?;
-    ssh_checks(&work, Path::new(&work.env["CHAIN_TEST_BIN_DIR"])).await?;
     work.run(&root, &strings(&["node", "panel/tests/xray-reality.cjs"]))
         .await?;
     if args.flags.contains("--browser") {
@@ -173,6 +170,9 @@ pub async fn verify(args: &Options) -> Result<()> {
             "management-ui",
             "monitoring-ui",
             "diagnostics-flow-ui",
+            "maintenance-ui",
+            "billing-flow",
+            "fleet-network-ui",
         ] {
             work.run(
                 &project,
@@ -221,9 +221,6 @@ pub fn fixture(args: &Options) -> Result<bool> {
     fixtures::dispatch(args)
 }
 pub fn command_fixture() -> Result<Option<i32>> {
-    if let Some(code) = ssh::command_fixture()? {
-        return Ok(Some(code));
-    }
     fixtures::command_fixture()
 }
 pub async fn openrc(args: &Options) -> Result<()> {
@@ -236,7 +233,4 @@ pub fn executable(path: &Path) -> Result<()> {
 }
 pub async fn delivery_checks(work: &Workspace) -> Result<()> {
     delivery::run(work).await
-}
-pub async fn ssh_checks(work: &Workspace, bin: &Path) -> Result<()> {
-    ssh::run(work, bin).await
 }

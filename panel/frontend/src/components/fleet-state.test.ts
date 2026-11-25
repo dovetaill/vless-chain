@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { connected, health, issues, lineStatus, metrics, remoteNow, verificationFailed, maintenanceSucceeded, taskNeedsAttention, taskStatus, type Remote, type Task } from "./fleet-state";
+import { connected, health, issues, lineRateValid, lineStatus, metrics, priority, remoteNow, verificationFailed, maintenanceSucceeded, taskNeedsAttention, taskStatus, type Remote, type Task } from "./fleet-state";
 import type { Line, PanelState } from "../types";
 
 const now = 1000;
@@ -100,12 +100,25 @@ assert.doesNotMatch(issues(probeWarning, now)[0].detail, /正在自动确认恢�
 probeWarning.snapshot!.monitoring.effective!.enabled = true;
 probeWarning.snapshot!.monitoring.conditions["probe:local:line"].active = false;
 assert.equal(health(probeWarning, now), "在线");
+assert.equal(lineRateValid(skewed, line, now), true);
+assert.equal(lineRateValid(skewed, line, now + 100), false);
+assert.equal(priority({ ...remote, seen: now - 100 }, now), 0);
+const agentOffline = structuredClone(remote);
+agentOffline.snapshot!.nodes[0].online = false;
+assert.equal(priority(agentOffline, now), 1);
+assert.equal(priority(stopped, now), 2);
+const versionMismatch = structuredClone(remote);
+versionMismatch.snapshot!.version = "0.2.81";
+versionMismatch.snapshot!.agent_version = "0.2.80";
+assert.equal(priority(versionMismatch, now), 3);
+assert.equal(priority(remote, now), 4);
 console.log("fleet-state assertions passed");
 
 assert.equal(verificationFailed({id:"vps", state:"failed", result:{maintenance_state:"succeeded", verification:{state:"failed", detail:"probe failed"}}}), true);
-assert.equal(verificationFailed({id:"vps", state:"failed", error:"组件维护已完成，但整链验证失败：timeout"}), true);
+assert.equal(verificationFailed({id:"vps", state:"failed", error:"组件维护已完成，但整链验证失败：旧版本连接超时"}), true);
+assert.equal(maintenanceSucceeded({id:"vps", state:"failed", error:"组件维护已完成，但整链验证失败：旧版本连接超时"}), true);
 assert.equal(verificationFailed({id:"vps", state:"failed", error:"安装失败"}), false);
-assert.equal(verificationFailed({id:"vps", state:"succeeded", error:"组件维护已完成，但整链验证失败：old", result:{verification:{state:"succeeded"}}}), false);
+assert.equal(verificationFailed({id:"vps", state:"succeeded", result:{verification:{state:"succeeded"}}}), false);
 const maintained: Task = {id:"task", action:"upgrade", state:"succeeded", targets:[{id:"vps", state:"succeeded", result:{maintenance_state:"succeeded", verification:{state:"failed"}}}]};
 assert.equal(maintenanceSucceeded(maintained.targets[0]), true);
 assert.equal(taskNeedsAttention(maintained), true);

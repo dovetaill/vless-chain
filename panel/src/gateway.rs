@@ -1,6 +1,6 @@
 //! Per-line data plane: byte accounting, shared rate budgets and local quota enforcement.
 //! No host firewall or qdisc is changed. All listeners/tasks belong to this Agent.
-use crate::{model::*, runtime::atomic_write};
+use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use chrono::{Datelike, FixedOffset, TimeZone, Utc};
 use rusqlite::Connection as Database;
@@ -66,7 +66,6 @@ pub struct Spec {
     pub network: String,
     pub limits: Limits,
     pub tls: Tls,
-    pub target: String,
 }
 fn one() -> u32 {
     1
@@ -100,11 +99,9 @@ pub struct Book {
     pub resources: RwLock<Option<Arc<crate::resources::Client>>>,
     pub listener_errors: Mutex<BTreeMap<String, String>>,
     pub proxy_capacity: ProxyCapacity,
-    path: PathBuf,
     quota: Arc<crate::quota::Journal>,
     ledger: Arc<Mutex<Ledger>>,
     sample: Mutex<(Instant, BTreeMap<String, [u64; 2]>)>,
-    snapshot_write: Mutex<()>,
     flusher: Option<std_mpsc::Sender<FlushRequest>>,
     writer: Option<std::thread::JoinHandle<()>>,
 }
@@ -307,11 +304,9 @@ impl Book {
             resources: RwLock::new(None),
             listener_errors: Mutex::default(),
             proxy_capacity: ProxyCapacity::for_node(),
-            path,
             quota,
             ledger,
             sample: Mutex::new((Instant::now(), BTreeMap::new())),
-            snapshot_write: Mutex::new(()),
             flusher: Some(flusher),
             writer: Some(writer),
         }))
@@ -343,20 +338,13 @@ impl Book {
         }
         Ok(())
     }
-    pub fn save(&self) -> Result<()> {
-        self.flush()?;
-        let _writer = self.snapshot_write.lock().unwrap();
-        let rows = self.ledger.lock().unwrap().confirmed();
-        let bytes = serde_json::to_vec(&rows)?;
-        atomic_write(&self.path, &bytes)
-    }
     fn settle_quota(&self) -> Result<()> {
         let rows = self.ledger.lock().unwrap().items.iter()
             .map(|(id, row)| (id.clone(), row.cycle_start, row.used())).collect();
         self.quota.settle(rows)
     }
     pub(crate) fn finish(&self) -> Result<()> {
-        self.save()?;
+        self.flush()?;
         self.settle_quota()?;
         if let Some(client) = self.resources.read().unwrap().clone() {
             client.settle_quota()?;
@@ -568,45 +556,15 @@ impl Lane {
         }
         false
     }
-    fn available_at(&self, at: u64) -> bool {
+    fn refresh_state(&self, at: u64) -> (bool, CancellationToken) {
         let policy = self.policy.read().unwrap();
         let mut flush_now = false;
         let (forced, exhausted, blocked) = {
             let mut state = self.book.ledger.lock().unwrap();
             let forced = !policy.open(at);
             let (_, month) = state.day_labels(at);
-            let (t, rolled) = state.billing_row(&self.id, policy.lease.as_ref(), at, &month, &self.book.quota);
-            let exhausted = policy.limits.monthly_gib.is_some_and(|q| {
-                t.used() >= (q * 1073741824.0) as u64
-                    || ((q * 1073741824.0) as u64).saturating_sub(t.used())
-                        < policy.multiplier as u64
-            });
-            let blocked = forced || exhausted;
-            let newly_blocked = !t.blocked && blocked;
-            t.blocked = blocked;
-            if rolled || newly_blocked {
-                state.mark_dirty(&self.id);
-                flush_now = true;
-            }
-            (forced, exhausted, blocked)
-        };
-        if flush_now {
-            self.book.notify_flush();
-        }
-        if self.should_stop(forced, exhausted) {
-            self.stopped.lock().unwrap().cancel();
-        }
-        !blocked
-    }
-    pub fn cancellation(&self) -> CancellationToken {
-        let at = now();
-        let policy = self.policy.read().unwrap();
-        let mut flush_now = false;
-        let (forced, exhausted, blocked) = {
-            let mut state = self.book.ledger.lock().unwrap();
-            let forced = !policy.open(at);
-            let (_, month) = state.day_labels(at);
-            let (t, rolled) = state.billing_row(&self.id, policy.lease.as_ref(), at, &month, &self.book.quota);
+            let (t, rolled) =
+                state.billing_row(&self.id, policy.lease.as_ref(), at, &month, &self.book.quota);
             let exhausted = policy.limits.monthly_gib.is_some_and(|q| {
                 t.used() >= (q * 1073741824.0) as u64
                     || ((q * 1073741824.0) as u64).saturating_sub(t.used())
@@ -630,7 +588,13 @@ impl Lane {
         } else if !blocked && stopped.is_cancelled() {
             *stopped = CancellationToken::new();
         }
-        stopped.clone()
+        (!blocked, stopped.clone())
+    }
+    fn available_at(&self, at: u64) -> bool {
+        self.refresh_state(at).0
+    }
+    pub fn cancellation(&self) -> CancellationToken {
+        self.refresh_state(now()).1
     }
     async fn supervise(self: Arc<Self>, cancel: CancellationToken) {
         loop {
@@ -715,7 +679,8 @@ impl Lane {
         if self.policy.read().unwrap().limits.monthly_gib.is_some() {
             self.book.quota.ready().await.map_err(io::Error::other)?;
         }
-        if !self.available() {
+        let (open, stopped) = self.refresh_state(now());
+        if !open {
             self.drain_transfers().await;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -723,7 +688,6 @@ impl Lane {
             ));
         }
         let index = if upload { 0 } else { 1 };
-        let stopped = self.cancellation();
         let pacing = activity.map(TcpActivity::waiting);
         // Fast-skip the per-direction async Mutex completely when no rate limit is configured.
         let _direction = if self.rates.borrow()[index].is_some() {
@@ -823,11 +787,7 @@ impl Lane {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             if let Some(cap) = limit {
-                self.book.quota.ready().await.map_err(io::Error::other)?;
                 let end = used + capped as u64 * multiplier as u64;
-                if used < self.book.quota.recovered(&self.id, cycle) {
-                    return Err(io::Error::other("线路账本刚刚恢复，需重新核对余额"));
-                }
                 self.book.quota.cover(&[(&self.id, cycle, end, cap)]).await.map_err(io::Error::other)?;
             }
             if !resource_ids.is_empty() {
@@ -1077,15 +1037,6 @@ fn configure_tcp_keepalive(stream: &TcpStream) {
             let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, (&count as *const libc::c_int).cast(), size);
         }
     }
-}
-
-pub async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    r: R,
-    w: W,
-    lane: Arc<Lane>,
-    upload: bool,
-) -> io::Result<()> {
-    pump_tcp(r, w, lane, upload, None).await
 }
 
 async fn pump_tcp<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -1407,7 +1358,7 @@ async fn connection<A: AsyncRead + AsyncWrite + Unpin>(
     )
     .await??;
     backend.set_nodelay(true)?;
-    if spec.protocol == Protocol::Socks && spec.kind == Kind::Vless {
+    if spec.protocol == Protocol::Socks {
         if let Some(relay) = tokio::time::timeout(
             Duration::from_secs(15),
             socks_handshake(
@@ -1422,16 +1373,12 @@ async fn connection<A: AsyncRead + AsyncWrite + Unpin>(
             return Ok(socks_udp(&mut stream, &mut backend, relay, peer).await?);
         }
     }
-    if spec.kind == Kind::Vless {
-        if let Err(error) = copy_tcp(stream, &mut backend, None).await {
-            if error.kind() == io::ErrorKind::ConnectionReset {
-                // A reset client cannot consume a delayed reply. Pass the abort to the local core.
-                let _ = backend.set_zero_linger();
-            }
-            return Err(error.into());
+    if let Err(error) = copy_tcp(stream, &mut backend, None).await {
+        if error.kind() == io::ErrorKind::ConnectionReset {
+            // A reset client cannot consume a delayed reply. Pass the abort to the local core.
+            let _ = backend.set_zero_linger();
         }
-    } else {
-        relay(stream, backend, lane).await?;
+        return Err(error.into());
     }
     Ok(())
 }
@@ -1633,13 +1580,32 @@ impl Gateway {
             }
             self.lanes.insert(spec.id.clone(), lane);
         }
-        for spec in specs.iter().filter(|s| s.kind != Kind::Website) {
+        for spec in &specs {
             let lane = self.lanes[&spec.id].clone();
             if spec.network.contains("tcp") {
+                let tls_cache = if matches!(spec.tls.mode.as_str(), "manual" | "auto")
+                    && spec.protocol != Protocol::Vless
+                {
+                    let initial = crate::website::load_tls(&spec.tls, &dir)
+                        .with_context(|| format!("入口 {} TLS 证书加载失败", spec.id))?;
+                    let mtime = (spec.tls.mode == "auto")
+                        .then(|| {
+                            crate::acme::paths(&dir.join("acme/config"), &spec.tls.domain)
+                                .join("fullchain.pem")
+                                .metadata()
+                                .and_then(|m| m.modified())
+                                .ok()
+                        })
+                        .flatten();
+                    Some(Arc::new(Mutex::new((mtime, initial))))
+                } else {
+                    None
+                };
                 let listener = bind_tcp(&spec.listen, spec.port)
                     .await
                     .with_context(|| format!("入口 TCP {} 已占用", spec.port))?;
                 let address = listener.local_addr()?;
+                let tls_label = format!("{} TLS {address}", spec.id);
                 let mut listener = Listener::new(listener, address, book.clone(), format!("{} TCP {address}", spec.id));
                 let spec = spec.clone();
                 let cancel = self.cancel.clone();
@@ -1655,6 +1621,7 @@ impl Gateway {
                             if children.len() >= lane.transport_limit() { continue; }
                             let Some(slot) = lane.book.proxy_capacity.acquire_ingress(&spec.id) else { continue };
                             let spec=spec.clone();let lane=lane.clone();let dir=dir.clone();
+                            let tls_cache=tls_cache.clone();let tls_label=tls_label.clone();
                             children.spawn(async move {
                                 let _slot = slot;
                                 let stopped = lane.cancellation();
@@ -1667,10 +1634,33 @@ impl Gateway {
                                     let Ok(Ok(peer)) = tokio::time::timeout(Duration::from_secs(3),proxy_peer(&mut stream)).await else { return; };
                                     peer
                                 } else { peer.ip() };
-                                if matches!(spec.tls.mode.as_str(),"manual"|"auto") && spec.protocol != Protocol::Vless {
-                                    if let Ok(config)=crate::website::load_tls(&spec.tls,&dir) {
-                                        if let Ok(Ok(tls))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=connection(tls,spec,lane,peer,local).await;}
-                                    }
+                                if let Some(cache) = tls_cache {
+                                    let config = {
+                                        let mut guard = cache.lock().unwrap();
+                                        if spec.tls.mode == "auto" {
+                                            let current_mtime = crate::acme::paths(&dir.join("acme/config"), &spec.tls.domain)
+                                                .join("fullchain.pem")
+                                                .metadata()
+                                                .and_then(|m| m.modified())
+                                                .ok();
+                                            if current_mtime.is_some() && current_mtime != guard.0 {
+                                                match crate::website::load_tls(&spec.tls, &dir) {
+                                                    Ok(fresh) => {
+                                                        guard.0 = current_mtime;
+                                                        guard.1 = fresh;
+                                                        lane.book.listener_errors.lock().unwrap().remove(&tls_label);
+                                                    }
+                                                    Err(e) => {
+                                                        let detail = format!("TLS 证书热重载失败，继续使用上一份有效证书: {e:#}");
+                                                        eprintln!("{tls_label}: {detail}");
+                                                        lane.book.listener_errors.lock().unwrap().insert(tls_label.clone(), detail);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        guard.1.clone()
+                                    };
+                                    if let Ok(Ok(tls))=tokio::time::timeout(Duration::from_secs(15),tokio_rustls::TlsAcceptor::from(config).accept(stream)).await {let _=connection(tls,spec,lane,peer,local).await;}
                                 } else {let _=connection(stream,spec,lane,peer,local).await;}
                                 };
                                 tokio::select! {_=stopped.cancelled()=>{},_=transfer=>{}}
@@ -1680,9 +1670,7 @@ impl Gateway {
                     children.abort_all();while children.join_next().await.is_some() {}
                 }));
             }
-            if spec.network.contains("udp")
-                && !(spec.kind == Kind::Vless && spec.protocol == Protocol::Socks)
-            {
+            if spec.network.contains("udp") && spec.protocol != Protocol::Socks {
                 let socket = Arc::new(
                     bind_udp(&spec.listen, spec.port)
                         .await
@@ -1706,21 +1694,20 @@ impl Gateway {
                                 let Some(slot) = lane.book.proxy_capacity.acquire_ingress(&spec.id) else { continue };
                                 let (tx,mut rx)=mpsc::channel::<bytes::Bytes>(512);sessions.insert(peer,tx);
                                 let socket=socket.clone();let lane=lane.clone();let backend_port=spec.backend;
-                                let account=spec.kind != Kind::Vless;
                                 children.spawn(async move {
                                     let _slot = slot;
                                     let stopped = lane.cancellation();
                                     let result=async {
                                         let backend=UdpSocket::bind("127.0.0.1:0").await?;backend.connect(("127.0.0.1",backend_port)).await?;
-                                        let _connection=account.then(|| lane.connection());let mut out=vec![0u8;65536];
+                                        let mut out=vec![0u8;65536];
                                         loop {tokio::select!{
                                             packet=tokio::time::timeout(Duration::from_secs(60),rx.recv())=>{
                                                 let Ok(Some(packet))=packet else {break};
-                                                let transfer=if account {Some(lane.transfer(packet.len(),true,true).await?)} else {None};backend.send(&packet).await?;drop(transfer);
+                                                backend.send(&packet).await?;
                                             }
                                             response=backend.recv(&mut out)=>{
                                                 let n=response?;
-                                                let transfer=if account {Some(lane.transfer(n,false,true).await?)} else {None};socket.send_to(&out[..n],peer).await?;drop(transfer);
+                                                socket.send_to(&out[..n],peer).await?;
                                             }
                                         }}Ok::<(),io::Error>(())
                                     };tokio::select! {_=stopped.cancelled()=>{},_=result=>{}}
@@ -1744,7 +1731,6 @@ impl Gateway {
         for spec in specs {
             if let Some(lane) = self.lanes.get(&spec.id) {
                 lane.update(spec);
-                lane.available();
             }
         }
         self.specs = specs.to_vec();
@@ -1787,16 +1773,25 @@ pub fn same_listeners(a: &[Spec], b: &[Spec]) -> bool {
     normalize(a) == normalize(b)
 }
 pub fn specs(config: &serde_json::Value) -> Result<Vec<Spec>> {
-    let specs: Vec<Spec> = serde_json::from_value(
+    let items: Vec<serde_json::Value> = serde_json::from_value(
         config
             .get("_chain")
             .cloned()
             .unwrap_or(serde_json::json!([])),
     )?;
+    let specs: Vec<Spec> = items
+        .into_iter()
+        .filter(|v| {
+            v.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|k| k == "vless")
+        })
+        .map(serde_json::from_value)
+        .collect::<std::result::Result<_, _>>()?;
     for s in &specs {
         ensure!(s.port > 0 && s.backend > 0, "接入端口无效");
         ensure!(
-            s.kind != Kind::Vless || s.meter.is_some(),
+            s.meter.is_some(),
             "代理缺少鉴权后计量桥，请更新控制台并重新应用"
         );
         if let Some(meter) = &s.meter {
@@ -1857,6 +1852,59 @@ fn metric_rates(
         current.tx.checked_sub(old.tx).map(|n| n as f64 / seconds),
     )
 }
+fn assemble_system_metrics(
+    cpu: Option<(u64, u64)>,
+    rx: u64,
+    tx: u64,
+    memory_total: Option<u64>,
+    memory_used: Option<u64>,
+    load: Option<f64>,
+    listening_ports: std::collections::BTreeSet<u16>,
+    ephemeral_port_range: serde_json::Value,
+) -> serde_json::Value {
+    let current = SystemSample {
+        at: Instant::now(),
+        cpu,
+        rx,
+        tx,
+    };
+    static PREVIOUS: std::sync::OnceLock<Mutex<Option<SystemSample>>> = std::sync::OnceLock::new();
+    let mut previous = PREVIOUS.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    let (cpu_percent, network_rx_bps, network_tx_bps) = metric_rates(previous.as_ref(), &current);
+    *previous = Some(current);
+    drop(previous);
+    let disk = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        (libc::statvfs(c"/".as_ptr(), &mut stat) == 0).then(|| {
+            (
+                u64::from(stat.f_blocks).saturating_mul(stat.f_frsize as u64),
+                u64::from(stat.f_blocks.saturating_sub(stat.f_bfree))
+                    .saturating_mul(stat.f_frsize as u64),
+            )
+        })
+    };
+    serde_json::json!({
+        "agent_version": env!("CARGO_PKG_VERSION"),
+        "gateway_version": 2,
+        "customer_plan_version": 1,
+        "sharing_version": 1,
+        "legacy_config_version": 1,
+        "cpu_percent": cpu_percent,
+        "disk_total": disk.map(|d| d.0),
+        "disk_used": disk.map(|d| d.1),
+        "memory_total": memory_total,
+        "memory_used": memory_used,
+        "load_1m": load,
+        "network_rx": rx,
+        "network_tx": tx,
+        "network_rx_bps": network_rx_bps,
+        "network_tx_bps": network_tx_bps,
+        "listening_ports": listening_ports,
+        "ephemeral_port_range": ephemeral_port_range,
+        "sampled_at": now(),
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn system_metrics() -> serde_json::Value {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
@@ -1905,28 +1953,6 @@ pub fn system_metrics() -> serde_json::Value {
             )
         })
     });
-    let current = SystemSample {
-        at: Instant::now(),
-        cpu,
-        rx,
-        tx,
-    };
-    static PREVIOUS: std::sync::OnceLock<Mutex<Option<SystemSample>>> = std::sync::OnceLock::new();
-    let mut previous = PREVIOUS.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    let (cpu_percent, network_rx_bps, network_tx_bps) = metric_rates(previous.as_ref(), &current);
-    *previous = Some(current);
-    drop(previous);
-    let disk = unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        (libc::statvfs(c"/".as_ptr(), &mut stat) == 0).then(|| {
-            (
-                stat.f_blocks.saturating_mul(stat.f_frsize),
-                stat.f_blocks
-                    .saturating_sub(stat.f_bfree)
-                    .saturating_mul(stat.f_frsize),
-            )
-        })
-    };
     let mut listening_ports = std::collections::BTreeSet::new();
     for table in ["tcp", "tcp6", "udp", "udp6"] {
         let text = std::fs::read_to_string(format!("/proc/net/{table}")).unwrap_or_default();
@@ -1951,7 +1977,16 @@ pub fn system_metrics() -> serde_json::Value {
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"customer_plan_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.saturating_sub(available),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    assemble_system_metrics(
+        cpu,
+        rx,
+        tx,
+        Some(total),
+        Some(total.saturating_sub(available)),
+        load,
+        listening_ports,
+        serde_json::json!(ephemeral),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -2049,28 +2084,9 @@ pub fn system_metrics() -> serde_json::Value {
             libc::freeifaddrs(interfaces);
         }
     }
-    let current = SystemSample {
-        at: Instant::now(),
-        cpu,
-        rx,
-        tx,
-    };
-    static PREVIOUS: std::sync::OnceLock<Mutex<Option<SystemSample>>> = std::sync::OnceLock::new();
-    let mut previous = PREVIOUS.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    let (cpu_percent, network_rx_bps, network_tx_bps) = metric_rates(previous.as_ref(), &current);
-    *previous = Some(current);
-    drop(previous);
-    let (disk, load) = unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        let disk = (libc::statvfs(c"/".as_ptr(), &mut stat) == 0).then(|| {
-            (
-                u64::from(stat.f_blocks).saturating_mul(stat.f_frsize as u64),
-                u64::from(stat.f_blocks.saturating_sub(stat.f_bfree))
-                    .saturating_mul(stat.f_frsize as u64),
-            )
-        });
+    let load = unsafe {
         let mut load = 0.0;
-        (disk, (libc::getloadavg(&mut load, 1) == 1).then_some(load))
+        (libc::getloadavg(&mut load, 1) == 1).then_some(load)
     };
     let mut listening_ports = std::collections::BTreeSet::new();
     for protocol in ["tcp", "udp"] {
@@ -2101,7 +2117,16 @@ pub fn system_metrics() -> serde_json::Value {
     let ephemeral = sysctl::<u32>(c"net.inet.ip.portrange.first")
         .zip(sysctl::<u32>(c"net.inet.ip.portrange.last"))
         .map(|(first, last)| [first, last]);
-    serde_json::json!({"agent_version":env!("CARGO_PKG_VERSION"),"gateway_version":2,"sharing_version":1,"customer_plan_version":1,"legacy_config_version":1,"cpu_percent":cpu_percent,"disk_total":disk.map(|d|d.0),"disk_used":disk.map(|d|d.1),"memory_total":total,"memory_used":total.zip(available).map(|(t,a)|t.saturating_sub(a)),"load_1m":load,"network_rx":rx,"network_tx":tx,"network_rx_bps":network_rx_bps,"network_tx_bps":network_tx_bps,"listening_ports":listening_ports,"ephemeral_port_range":ephemeral,"sampled_at":now()})
+    assemble_system_metrics(
+        cpu,
+        rx,
+        tx,
+        total,
+        total.zip(available).map(|(t, a)| t.saturating_sub(a)),
+        load,
+        listening_ports,
+        serde_json::json!(ephemeral),
+    )
 }
 
 #[cfg(test)]
@@ -2446,12 +2471,11 @@ mod tests {
             id: id(),
             port: 20000,
             backend: 50000,
-            kind: Kind::Forward,
+            kind: Kind::Vless,
             protocol: Protocol::Vless,
             network: "tcp,udp".into(),
             limits,
             tls: Tls::default(),
-            target: "localhost:80".into(),
         }
     }
     #[test]
@@ -2622,7 +2646,7 @@ mod tests {
         assert_eq!(lane.charge(70, true, false).await.unwrap(), 70);
         assert_eq!(lane.charge(70, false, false).await.unwrap(), 30);
         assert!(!lane.available());
-        book.save().unwrap();
+        book.flush().unwrap();
         let reopened = Book::open(temp.path()).unwrap();
         let lane = Lane::new(&s, reopened.clone());
         assert!(!lane.available());
@@ -2853,8 +2877,8 @@ mod tests {
         assert_eq!(&received, b"still-forwarding");
         target.shutdown().await.unwrap();
         job.await.unwrap().unwrap();
-        // Flush fails and surfaces through check_ledger/save, while live traffic stays online.
-        assert!(book.save().is_err());
+        // Flush fails and surfaces through check_ledger/flush, while live traffic stays online.
+        assert!(book.flush().is_err());
         assert!(book.check_ledger().is_err());
         assert!(lane.available());
         assert_eq!(book.snapshot()[&s.id].total_upload, 23);

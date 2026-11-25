@@ -159,32 +159,6 @@ pub fn dispatch(args: &Options) -> Result<bool> {
             );
             fs::write("allowed", "ok")?;
         }
-        Some("nginx-worker") => {
-            let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-            ensure!(socket.local_addr()?.port() == 0, "Nginx 检查实际监听了端口");
-            let mut accept: libc::c_int = -1;
-            let mut length = std::mem::size_of_val(&accept) as libc::socklen_t;
-            ensure!(
-                unsafe {
-                    libc::getsockopt(
-                        socket.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_ACCEPTCONN,
-                        (&mut accept as *mut libc::c_int).cast(),
-                        &mut length,
-                    )
-                } == 0
-                    && accept == 0,
-                "Nginx 检查建立了监听"
-            );
-            let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
-            ensure!(
-                socket
-                    .send_to(b"blocked", "127.0.0.1:9")
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
-                "Nginx 检查允许发送数据"
-            );
-        }
         Some("watcher-owner") => {
             let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
             let mut watcher = std::process::Command::new(&args.trailing[0])

@@ -4,18 +4,24 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
+pub fn label_valid(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+}
+pub fn domain_valid(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.contains('.')
+        && domain.parse::<std::net::IpAddr>().is_err()
+        && domain.split('.').all(label_valid)
+}
 pub fn host_valid(host: &str) -> bool {
     !host.is_empty()
-        && !host
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, '/' | '@' | '?' | '#' | '\\'))
         && (host.parse::<std::net::IpAddr>().is_ok()
-            || (host.len() <= 253
-                && host.split('.').all(|s| {
-                    !s.is_empty()
-                        && s.len() <= 63
-                        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                })))
+            || (host.len() <= 253 && host.split('.').all(label_valid)))
 }
 pub fn target(value: &str) -> Result<(String, u16)> {
     let u = Url::parse(&format!("tcp://{value}"))?;
@@ -102,7 +108,7 @@ pub fn external_outbound(link: &str, tag: &str) -> Result<Value> {
         "tls" => {
             stream["tlsSettings"] =
                 json!({"serverName": get("sni", host), "fingerprint": get("fp", "chrome")});
-            crate::access::external_tls(&mut stream, &u)?;
+            crate::access::external_tls(&mut stream, &u, false)?;
         }
         _ => bail!("外部落地必须使用 TLS 或 REALITY"),
     }
@@ -138,10 +144,6 @@ pub fn external_outbound(link: &str, tag: &str) -> Result<Value> {
     )
 }
 pub fn share(line: &Line, doc: &Document) -> Result<String> {
-    ensure!(
-        line.kind == Kind::Vless,
-        "端口转发使用入口地址，无 VLESS 链接"
-    );
     let h = line.hops.first().context("线路没有入口")?;
     let node = doc
         .nodes
@@ -151,35 +153,14 @@ pub fn share(line: &Line, doc: &Document) -> Result<String> {
     if line.access.protocol != Protocol::Vless {
         return crate::access::share(line, node, udp_supported(line, doc)?);
     }
-    let host = if !line.access.host.is_empty() {
-        &line.access.host
-    } else if line.access.public_host.is_empty() {
-        if matches!(line.access.tls.mode.as_str(), "auto" | "manual") {
-            &line.access.tls.domain
-        } else {
-            &node.host
-        }
-    } else {
-        &line.access.public_host
-    };
-    let mut u = Url::parse(&format!(
-        "vless://{}@{}",
-        h.uuid,
-        address(host, line.access.public_port.unwrap_or(h.port))
-    ))?;
+    let (host, port) = crate::access::endpoint(line, node);
+    let mut u = Url::parse(&format!("vless://{}@{}", h.uuid, address(&host, port)))?;
     let tls = matches!(line.access.tls.mode.as_str(), "auto" | "manual");
     u.query_pairs_mut().extend_pairs([
         ("type", line.access.transport.network.as_str()),
         ("security", if tls { "tls" } else { "reality" }),
         ("encryption", "none"),
-        (
-            "sni",
-            if tls {
-                &line.access.tls.domain
-            } else {
-                line.access.server_name(node)
-            },
-        ),
+        ("sni", line.access.server_name(node)),
         ("fp", "chrome"),
     ]);
     if line.access.transport.network == "tcp" {
@@ -266,21 +247,28 @@ fn vless_out(node: &Node, hop: &Hop, tag: &str) -> Value {
     apply_outbound_keepalive(&mut out);
     out
 }
-fn backend_port(reserved: &mut BTreeSet<(String, u16)>, node: &Node) -> Result<u16> {
+fn backend_port(
+    reserved: &mut BTreeMap<String, BTreeSet<u16>>,
+    legacy_ranges: &BTreeMap<String, Vec<(u16, u16)>>,
+    node: &Node,
+) -> Result<u16> {
     let range = &node.report.system["ephemeral_port_range"];
     let ephemeral = range[0]
         .as_u64()
         .zip(range[1].as_u64())
         .filter(|(low, high)| *low > 0 && low <= high && *high <= 65535)
         .unwrap_or((32768, 60999));
+    let used = reserved.entry(node.id.clone()).or_default();
+    let legacy = legacy_ranges.get(&node.id).map(Vec::as_slice).unwrap_or(&[]);
     // macOS reserves 49152–65535 for outgoing connections; keep Linux's existing choices first.
     let port = (50000..65535).chain(30000..50000)
         .find(|p| {
             !(ephemeral.0..=ephemeral.1).contains(&u64::from(*p))
-                && !reserved.iter().any(|(_, used)| used == p)
+                && !used.contains(p)
+                && !crate::legacy_config::port_in_ranges(legacy, *p)
         })
         .context("没有可供内部接入使用的端口：30000–65534 必须避开已用端口及系统临时端口范围")?;
-    reserved.insert((node.id.clone(), port));
+    used.insert(port);
     Ok(port)
 }
 fn mihomo_config(config: &mut Value) -> &mut Value {
@@ -320,8 +308,16 @@ fn udp_after(udp: bool, protocol: &str, supported: bool, index: usize) -> Result
         })
 }
 pub fn udp_supported(line: &Line, doc: &Document) -> Result<bool> {
-    fn visit(line: &Line, doc: &Document, depth: usize) -> Result<bool> {
-        ensure!(depth < 16, "链式代理不能循环引用或超过 16 层");
+    fn visit(
+        line: &Line,
+        doc: &Document,
+        visited: &mut BTreeSet<String>,
+        cache: &mut BTreeMap<String, (String, bool)>,
+    ) -> Result<bool> {
+        ensure!(
+            visited.len() < 16 && visited.insert(line.id.clone()),
+            "链式代理不能循环引用或超过 16 层"
+        );
         let mut udp = true;
         for (index, reference) in line.proxy_chain().iter().enumerate() {
             let (protocol, supported) = if let Some(id) = reference.strip_prefix("line:") {
@@ -330,36 +326,43 @@ pub fn udp_supported(line: &Line, doc: &Document) -> Result<bool> {
                     .iter()
                     .find(|l| l.id == id)
                     .context("引用的代理不存在")?;
-                (
-                    serde_json::to_value(&next.access.protocol)?
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                    visit(next, doc, depth + 1)?,
-                )
+                let proto = serde_json::to_value(&next.access.protocol)?
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let ok = visit(next, doc, visited, cache)?;
+                (proto, ok)
             } else {
-                let proxy = doc
-                    .externals
-                    .iter()
-                    .find(|e| Some(e.id.as_str()) == reference.strip_prefix("external:"))
-                    .context("外部代理不存在")?;
-                let proxy = crate::external::mihomo(&proxy.url, "capability")?;
-                (
-                    proxy["type"].as_str().unwrap().to_owned(),
-                    proxy["udp"].as_bool().unwrap_or(true),
-                )
+                let id = reference.strip_prefix("external:").context("链式代理引用无效")?;
+                if let Some(cached) = cache.get(id) {
+                    cached.clone()
+                } else {
+                    let proxy = doc
+                        .externals
+                        .iter()
+                        .find(|e| e.id == id)
+                        .context("外部代理不存在")?;
+                    let proxy = crate::external::mihomo(&proxy.url, "capability")?;
+                    let pair = (
+                        proxy["type"].as_str().unwrap().to_owned(),
+                        proxy["udp"].as_bool().unwrap_or(true),
+                    );
+                    cache.insert(id.to_owned(), pair.clone());
+                    pair
+                }
             };
             udp = udp_after(udp, &protocol, supported, index)?;
         }
+        visited.remove(&line.id);
         Ok(udp && line.access.protocol != Protocol::Http)
     }
-    visit(line, doc, 0)
+    visit(line, doc, &mut BTreeSet::new(), &mut BTreeMap::new())
 }
 pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
     fn check_chain(line: &Line, doc: &Document, visited: &mut BTreeSet<String>) -> Result<()> {
         ensure!(
             visited.len() < 16 && visited.insert(line.id.clone()),
-            "链式代理不能循环引用"
+            "链式代理不能循环引用或超过 16 层"
         );
         let chain = line.proxy_chain();
         ensure!(chain.len() <= 8, "最多选择 8 个链式代理");
@@ -374,7 +377,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 let next = doc
                     .lines
                     .iter()
-                    .find(|l| l.id == id && l.kind == Kind::Vless)
+                    .find(|l| l.id == id)
                     .context("引用的代理不存在")?;
                 check_chain(next, doc, visited)?;
             } else {
@@ -394,20 +397,14 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         .collect();
     let mut ports = BTreeSet::new();
     let mut shared_names = BTreeSet::new();
-    let mut websites: BTreeMap<(String, u16), (bool, BTreeSet<String>)> = BTreeMap::new();
     let mut ids = BTreeSet::new();
-    let mut reserved: BTreeSet<(String, u16)> = doc
-        .lines
-        .iter()
-        .flat_map(|l| l.hops.iter().map(|h| (h.node_id.clone(), h.port)))
-        .collect();
-    for profile in doc.legacy_configs.iter().filter(|p| p.enabled) {
-        reserved.extend(
-            crate::legacy_config::ports(&profile.config)?
-                .into_iter()
-                .map(|port| (profile.node_id.clone(), port)),
-        );
+    let mut reserved: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+    for line in &doc.lines {
+        for hop in &line.hops {
+            reserved.entry(hop.node_id.clone()).or_default().insert(hop.port);
+        }
     }
+    let legacy_ranges = crate::legacy_config::node_ranges(doc)?;
     let mut ordered: Vec<_> = doc.lines.iter().collect();
     ordered.sort_by(|a, b| a.id.cmp(&b.id));
     for line in ordered {
@@ -419,10 +416,6 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
         ensure!(
             !line.hops.is_empty() && line.hops.len() <= 8,
             "每条线路需要 1–8 个受管节点"
-        );
-        ensure!(
-            matches!(line.network.as_str(), "tcp" | "udp" | "tcp,udp"),
-            "转发网络无效"
         );
         let mut visited = BTreeSet::new();
         for h in &line.hops {
@@ -436,21 +429,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             ensure!(configs.contains_key(&h.node_id), "线路引用了不存在的节点");
             // Reserve disabled lines too: enabling must not silently steal another line's port.
             let fresh = ports.insert((&h.node_id, h.port));
-            if line.kind == Kind::Website {
-                let key = (h.node_id.clone(), h.port);
-                let tls = matches!(line.access.tls.mode.as_str(), "auto" | "manual");
-                ensure!(
-                    fresh || websites.contains_key(&key),
-                    "网站端口 {} 被其他类型的线路占用",
-                    h.port
-                );
-                let (mode, domains) = websites.entry(key).or_insert((tls, BTreeSet::new()));
-                ensure!(*mode == tls, "同一网站监听端口不能混用 HTTP 和 HTTPS");
-                ensure!(
-                    domains.insert(line.access.tls.domain.to_ascii_lowercase()),
-                    "同一监听端口的网站域名重复"
-                );
-            } else if line.access.shared_port
+            if line.access.shared_port
                 && line
                     .hops
                     .first()
@@ -474,11 +453,6 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 ensure!(fresh, "同一节点端口 {} 被多条线路占用", h.port);
             }
         }
-        let forward = if line.kind == Kind::Forward {
-            Some(target(&line.target)?)
-        } else {
-            None
-        };
         let chain = line.proxy_chain();
         let mut external = Vec::new();
         let mut links = Vec::new();
@@ -519,26 +493,17 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             }
         }
         crate::access::validate_line(line)?;
-        if !line.enabled && line.kind != Kind::Vless {
-            continue;
-        }
         for (i, hop) in line.hops.iter().enumerate() {
             let node = doc.nodes.iter().find(|n| n.id == hop.node_id).unwrap();
             let in_tag = format!("line-{}-in", line.id);
             let out_tag = format!("line-{}-out", line.id);
             let mut meter = None;
-            let mut inbound = if i == 0 && line.kind == Kind::Forward {
-                let (host, port) = forward.as_ref().unwrap();
-                json!({"tag":in_tag,"listen":"0.0.0.0","port":hop.port,"protocol":"dokodemo-door",
-                    "settings":{"address":host,"port":port,"network":line.network}})
-            } else if i == 0 && line.kind == Kind::Vless && line.access.protocol != Protocol::Vless
-            {
+            let mut inbound = if i == 0 && line.access.protocol != Protocol::Vless {
                 crate::access::inbound(line, hop, &in_tag)
             } else {
                 vless_in(node, hop, &in_tag)
             };
             if i == 0
-                && line.kind == Kind::Vless
                 && line.access.protocol == Protocol::Vless
                 && matches!(line.access.tls.mode.as_str(), "auto" | "manual")
             {
@@ -565,7 +530,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
             let config = configs.get_mut(&node.id).unwrap();
             if i + 1 == line.hops.len() && sidecar_chain {
                 // One bridge per chain keeps each hop's dialer and QUIC sessions isolated.
-                let port = backend_port(&mut reserved, node)?;
+                let port = backend_port(&mut reserved, &legacy_ranges, node)?;
                 let sidecar = mihomo_config(config);
                 for (index, (link, original)) in links.iter().zip(&external).enumerate() {
                     let mut proxy =
@@ -582,7 +547,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                         {
                             // QUIC's receive buffer excludes SS2022 overhead. A SOCKS hop strips
                             // that framing before QUIC reads it, including larger PMTU probes.
-                            let bridge_port = backend_port(&mut reserved, node)?;
+                            let bridge_port = backend_port(&mut reserved, &legacy_ranges, node)?;
                             let bridge = format!("{}-udp-bridge", original["tag"].as_str().unwrap());
                             sidecar["listeners"].as_array_mut().unwrap().push(json!({"name":bridge,"type":"socks","listen":"127.0.0.1","port":bridge_port,"udp":true,"proxy":previous["tag"]}));
                             sidecar["proxies"].as_array_mut().unwrap().push(json!({"name":bridge,"type":"socks5","server":"127.0.0.1","port":bridge_port,"udp":true}));
@@ -595,7 +560,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 outbound = json!({"tag":out_tag,"protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":port}]}});
             }
             if i == 0 {
-                if line.kind == Kind::Vless && line.access.protocol == Protocol::Vless {
+                if line.access.protocol == Protocol::Vless {
                     if let Some(reality) = &line.access.reality {
                         if inbound["streamSettings"]["security"] == "reality" {
                             let (private_key, _, short_id) = line.access.reality_credentials(node);
@@ -628,7 +593,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     }
                 }
                 let fallback_port = if !line.access.fallback.is_empty() {
-                    let port = backend_port(&mut reserved, node)?;
+                    let port = backend_port(&mut reserved, &legacy_ranges, node)?;
                     inbound["settings"]["fallbacks"] =
                         json!([{"dest":format!("127.0.0.1:{port}"),"xver":0}]);
                     inbound["streamSettings"]["tlsSettings"]["alpn"] = json!(["h2", "http/1.1"]);
@@ -637,7 +602,7 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                     None
                 };
                 let port = if line.access.shared_port {
-                    let port = backend_port(&mut reserved, node)?;
+                    let port = backend_port(&mut reserved, &legacy_ranges, node)?;
                     if config.get("_ingress").is_none() {
                         config["_ingress"] = json!([]);
                     }
@@ -649,13 +614,11 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 } else {
                     hop.port
                 };
-                let backend = backend_port(&mut reserved, node)?;
+                let backend = backend_port(&mut reserved, &legacy_ranges, node)?;
                 inbound["listen"] = json!("127.0.0.1");
                 inbound["port"] = json!(backend);
-                if matches!(line.access.protocol, Protocol::Tuic | Protocol::Hysteria2)
-                    && line.kind == Kind::Vless
-                {
-                    let socks = backend_port(&mut reserved, node)?;
+                if matches!(line.access.protocol, Protocol::Tuic | Protocol::Hysteria2) {
+                    let socks = backend_port(&mut reserved, &legacy_ranges, node)?;
                     inbound["port"] = json!(socks);
                     let sidecar = mihomo_config(config);
                     let mut listener = json!({"name":in_tag,"type":if line.access.protocol == Protocol::Tuic {"tuic"} else {"hysteria2"},"listen":"127.0.0.1","port":backend,"users":{&hop.uuid:&line.access.password},"certificate":line.access.tls.cert,"private-key":line.access.tls.key,"alpn":["h3"],"proxy":in_tag});
@@ -668,31 +631,26 @@ pub fn compile(doc: &Document) -> Result<BTreeMap<String, Value>> {
                 if config.get("_chain").is_none() {
                     config["_chain"] = json!([]);
                 }
-                if line.kind == Kind::Vless {
-                    meter = Some(crate::meter::Spec {
-                        port: backend_port(&mut reserved, node)?,
-                        backend: backend_port(&mut reserved, node)?,
-                        password: hop.uuid.clone(),
-                    });
-                }
+                meter = Some(crate::meter::Spec {
+                    port: backend_port(&mut reserved, &legacy_ranges, node)?,
+                    backend: backend_port(&mut reserved, &legacy_ranges, node)?,
+                    password: hop.uuid.clone(),
+                });
                 config["_chain"].as_array_mut().unwrap().push(json!({
                     "id":line.id,"port":port,"backend":backend,"kind":line.kind,
-                    "listen":if line.access.shared_port {"127.0.0.1"} else if line.kind == Kind::Website {"0.0.0.0"} else {"::"},
+                    "listen":if line.access.shared_port {"127.0.0.1"} else {"::"},
                     "proxy_protocol":line.access.shared_port,
                     "fallback_port":fallback_port,"fallback_target":line.access.fallback,
-                    "protocol":line.access.protocol,"network":if line.kind == Kind::Forward {line.network.as_str()} else if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
-                    "limits":line.limits,"tls":line.access.tls,"target":line.target,
+                    "protocol":line.access.protocol,"network":if matches!(line.access.protocol,Protocol::Hysteria2|Protocol::Tuic) {"udp"} else if matches!(line.access.protocol,Protocol::Socks|Protocol::Shadowsocks) {"tcp,udp"} else {"tcp"},
+                    "limits":line.limits,"tls":line.access.tls,
                     "enabled":line.enabled,"lease":crate::plans::lease(doc,&line.id).map(Rental::policy),"meter":meter,
                     "multiplier":crate::resources::multiplier(doc,line)?,
                     "resource_ids":crate::resources::pools(doc,line),
                     "access_policy":crate::rules::compile(doc,&line.id)?,
                 }));
-                if line.kind == Kind::Website {
-                    continue;
-                }
             }
             let guard = if inbound["streamSettings"]["security"] == "reality" {
-                Some(backend_port(&mut reserved, node)?)
+                Some(backend_port(&mut reserved, &legacy_ranges, node)?)
             } else { None };
             // Keep the public inbound first for existing consumers of compiled configs.
             let index = config["inbounds"].as_array().unwrap().len();
@@ -763,10 +721,7 @@ mod tests {
                     uuid: id(),
                 })
                 .collect(),
-            external_id: None,
             chain: vec![],
-            target: String::new(),
-            network: "tcp".into(),
             enabled: true,
             access: Access::default(),
             limits: Limits::default(),
@@ -811,18 +766,20 @@ mod tests {
         }
     }
     #[test]
-    fn backend_ports_cannot_collide_with_kernel_ephemeral_connections() {
+    fn backend_ports_cannot_collide_with_kernel_ephemeral_connections_and_stay_node_isolated() {
         let mut d = fixture();
-        let mut reserved = BTreeSet::new();
-        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 61000);
-        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 61001);
+        let mut reserved = BTreeMap::new();
+        let legacy = BTreeMap::new();
+        assert_eq!(backend_port(&mut reserved, &legacy, &d.nodes[0]).unwrap(), 61000);
+        assert_eq!(backend_port(&mut reserved, &legacy, &d.nodes[0]).unwrap(), 61001);
+        assert_eq!(backend_port(&mut reserved, &legacy, &d.nodes[1]).unwrap(), 61000);
         d.nodes[0].report.system = json!({"ephemeral_port_range":[60000,65535]});
-        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 50000);
+        assert_eq!(backend_port(&mut reserved, &legacy, &d.nodes[0]).unwrap(), 50000);
         d.nodes[0].report.system["ephemeral_port_range"] = json!([49152, 65535]);
-        assert_eq!(backend_port(&mut reserved, &d.nodes[0]).unwrap(), 30000);
+        assert_eq!(backend_port(&mut reserved, &legacy, &d.nodes[0]).unwrap(), 30000);
         d.nodes[0].report.system["ephemeral_port_range"] = json!([30000, 65535]);
         assert!(
-            backend_port(&mut reserved, &d.nodes[0])
+            backend_port(&mut reserved, &legacy, &d.nodes[0])
                 .unwrap_err()
                 .to_string()
                 .contains("系统临时端口")
@@ -1169,17 +1126,6 @@ mod tests {
         assert!(compile(&d).is_ok());
     }
     #[test]
-    fn forwarding_keeps_destination_across_chain() {
-        let mut d = fixture();
-        d.lines[0].kind = Kind::Forward;
-        d.lines[0].target = "[::1]:5353".into();
-        d.lines[0].network = "tcp,udp".into();
-        let c = compile(&d).unwrap();
-        assert_eq!(c["a"]["inbounds"][0]["settings"]["address"], "::1");
-        assert_eq!(c["a"]["inbounds"][0]["settings"]["network"], "tcp,udp");
-        assert_eq!(c["b"]["inbounds"][0]["protocol"], "vless");
-    }
-    #[test]
     fn exported_share_roundtrips_and_entry_credentials_stay_stable() {
         let mut d = fixture();
         let before = share(&d.lines[0], &d).unwrap();
@@ -1251,6 +1197,27 @@ mod tests {
         );
         let out = external_outbound(&share(&d.lines[0], &d).unwrap(), "test").unwrap();
         assert_eq!(out["streamSettings"]["security"], "reality");
+    }
+    #[test]
+    fn retired_forward_and_website_entries_do_not_break_legacy_document_load() {
+        let mut raw = serde_json::to_value(fixture()).unwrap();
+        let vless_id = raw["lines"][0]["id"].as_str().unwrap().to_string();
+        raw["lines"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": "retired-web",
+            "name": "旧站点",
+            "kind": "website",
+            "hops": [{"node_id": "a", "port": 8443, "uuid": ""}]
+        }));
+        raw["applied_lines"] = serde_json::json!([{
+            "id": "retired-fwd",
+            "name": "旧转发",
+            "kind": "forward",
+            "hops": [{"node_id": "a", "port": 9000, "uuid": ""}]
+        }]);
+        let doc: Document = serde_json::from_value(raw).unwrap();
+        assert_eq!(doc.lines.len(), 1);
+        assert_eq!(doc.lines[0].id, vless_id);
+        assert!(doc.applied_lines.is_empty());
     }
     #[test]
     fn rejects_plaintext_external_and_bad_destination() {

@@ -73,7 +73,11 @@ fn name(value: &str) -> String {
 }
 
 fn outbound_link(outbound: &Value) -> Result<String> {
-    only(outbound, &["tag", "protocol", "settings", "streamSettings"])?;
+    only(outbound, &["tag", "protocol", "settings", "streamSettings", "mux"])?;
+    ensure!(
+        empty(&outbound["mux"]) || outbound["mux"]["enabled"] == false,
+        "出口 Mux 需要手动配置"
+    );
     ensure!(
         outbound["protocol"] == "vless",
         "仅支持直连或单个 VLESS 出口"
@@ -87,10 +91,10 @@ fn outbound_link(outbound: &Value) -> Result<String> {
         only(server, &["address", "port", "users"])?;
         let users = server["users"].as_array().context("缺少 VLESS 出口用户")?;
         ensure!(users.len() == 1, "多个 VLESS 出口用户需要手动配置");
-        only(&users[0], &["id", "encryption", "flow"])?;
+        only(&users[0], &["id", "encryption", "flow", "level", "email"])?;
         (server, &users[0])
     } else {
-        only(settings, &["address", "port", "id", "encryption", "flow"])?;
+        only(settings, &["address", "port", "id", "encryption", "flow", "level", "email"])?;
         (settings, settings)
     };
     let host = server["address"].as_str().context("VLESS 出口缺少地址")?;
@@ -251,22 +255,35 @@ fn global(config: &Value) -> Result<Option<String>> {
     let out = config["outbounds"].as_array().context("缺少出口配置")?;
     let first = out.first().context("缺少默认出口")?;
     let link = if first["protocol"] == "freedom" {
-        only(first, &["tag", "protocol", "settings", "streamSettings"])?;
+        only(first, &["tag", "protocol", "settings", "streamSettings", "mux"])?;
+        only(&first["settings"], &["domainStrategy", "userLevel", "noises"])?;
         ensure!(
-            empty(&first["settings"]) && empty(&first["streamSettings"]),
+            matches!(text(&first["settings"]["domainStrategy"]), "" | "AsIs" | "UseIP" | "UseIPv4" | "UseIPv6")
+                && empty(&first["settings"]["noises"])
+                && empty(&first["streamSettings"])
+                && (empty(&first["mux"]) || first["mux"]["enabled"] == false),
             "自定义直连出口需要手动配置"
         );
         None
     } else {
         Some(outbound_link(first)?)
     };
+    let blackholes: std::collections::BTreeSet<&str> = out
+        .iter()
+        .skip(1)
+        .filter(|o| o["protocol"] == "blackhole")
+        .filter_map(|o| o["tag"].as_str())
+        .collect();
     only(&config["routing"], &["rules", "domainStrategy"])?;
     for rule in config["routing"]["rules"].as_array().into_iter().flatten() {
-        only(rule, &["type", "inboundTag", "outboundTag"]).context("自定义路由需要手动配置")?;
+        only(rule, &["type", "inboundTag", "outboundTag", "ip"]).context("自定义路由需要手动配置")?;
+        let api_rule = empty(&rule["ip"]) && rule["inboundTag"] == json!(["api"]) && rule["outboundTag"] == "api";
+        let default_exit = empty(&rule["ip"]) && !text(&out[0]["tag"]).is_empty() && rule["outboundTag"] == out[0]["tag"];
+        let private_blackhole = rule["ip"] == json!(["geoip:private"])
+            && rule["outboundTag"].as_str().is_some_and(|tag| blackholes.contains(tag));
         ensure!(
             matches!(text(&rule["type"]), "" | "field")
-                && ((rule["inboundTag"] == json!(["api"]) && rule["outboundTag"] == "api")
-                    || (!text(&out[0]["tag"]).is_empty() && rule["outboundTag"] == out[0]["tag"])),
+                && (api_rule || default_exit || private_blackhole),
             "自定义路由需要手动配置"
         );
     }
@@ -296,12 +313,16 @@ fn convert(
         ],
     )?;
     ensure!(
-        matches!(text(&inbound["listen"]), "" | "0.0.0.0"),
-        "特定地址或 IPv6 监听需要手动配置"
+        matches!(text(&inbound["listen"]), "" | "0.0.0.0" | "::"),
+        "特定地址监听需要手动配置"
     );
+    only(
+        &inbound["sniffing"],
+        &["enabled", "destOverride", "metadataOnly", "routeOnly", "domainsExcluded"],
+    )?;
     ensure!(
-        empty(&inbound["sniffing"]) || inbound["sniffing"]["enabled"] == false,
-        "流量嗅探需要手动配置"
+        inbound["sniffing"]["routeOnly"] != true,
+        "路由级嗅探分流需要手动配置"
     );
     let port = inbound["port"]
         .as_u64()
@@ -377,7 +398,11 @@ fn convert(
         let clients = settings["clients"].as_array().context("缺少客户端配置")?;
         ensure!(clients.len() == 1, "同端口多用户需要手动配置");
         let client = &clients[0];
-        only(client, &["id", "flow", "alterId", "email", "level"])?;
+        only(client, &["id", "flow", "alterId", "email", "level", "security"])?;
+        ensure!(
+            matches!(text(&client["security"]), "" | "auto"),
+            "自定义客户端加密方式需要手动配置"
+        );
         credential = text(&client["id"]).to_owned();
         uuid::Uuid::parse_str(&credential).context("原 UUID 无效")?;
         if access.protocol == Protocol::Vless {
@@ -474,7 +499,7 @@ fn convert(
         }
         "tls" => {
             let tls = &stream["tlsSettings"];
-            only(tls, &["certificates", "serverName", "minVersion"])?;
+            only(tls, &["certificates", "serverName", "minVersion", "alpn"])?;
             ensure!(
                 matches!(text(&tls["minVersion"]), "" | "1.2"),
                 "TLS 最低版本需要手动配置"
@@ -522,10 +547,7 @@ fn convert(
             port,
             uuid: credential,
         }],
-        external_id: None,
         chain: vec![],
-        target: String::new(),
-        network: "tcp".into(),
         enabled: true,
         access,
         limits: Limits::default(),
@@ -580,14 +602,14 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
             })();
             match result {
                 Ok(()) => {
-                    for port in crate::legacy_config::ports(&profile.config)? {
-                        let reality_target = profile.config["inbounds"].as_array().into_iter().flatten()
-                            .find(|i| i["port"].as_u64() == Some(port as u64))
-                            .and_then(|i| {
-                                let r = &i["streamSettings"]["realitySettings"];
-                                r.get("target").filter(|v| !v.is_null()).or_else(|| r.get("dest"))
-                            }).and_then(Value::as_str);
-                        imported.push(json!({"id":id,"name":profile.name,"port":port,"protocol":"原始 Xray 配置",
+                    for inbound in profile.config["inbounds"].as_array().into_iter().flatten() {
+                        let r = &inbound["streamSettings"]["realitySettings"];
+                        let reality_target = r
+                            .get("target")
+                            .filter(|v| !v.is_null())
+                            .or_else(|| r.get("dest"))
+                            .and_then(Value::as_str);
+                        imported.push(json!({"id":id,"name":profile.name,"port":inbound["port"],"protocol":"原始 Xray 配置",
                         "can_share":false,"sni":"","chain":[],"preserved":true,"reality_target":reality_target}));
                     }
                 }
@@ -603,6 +625,25 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
             .cloned()
             .unwrap_or_else(|| vec![Value::Null]);
         ensure!(entries.len() <= 1024, "旧服务入口过多");
+        let source_outbound = if source.error.is_empty() {
+            global(&source.config)
+        } else {
+            Err(anyhow::anyhow!("{}", source.error))
+        };
+        let mut used_ports: std::collections::BTreeSet<u16> = doc
+            .lines
+            .iter()
+            .flat_map(|l| l.hops.iter().filter(|h| h.node_id == request.node_id).map(|h| h.port))
+            .collect();
+        let mut shared_snis: std::collections::BTreeSet<String> = doc
+            .lines
+            .iter()
+            .filter(|l| l.access.shared_port && l.hops.first().is_some_and(|h| h.node_id == request.node_id))
+            .filter_map(|l| doc.nodes.iter().find(|n| n.id == request.node_id).map(|n| l.access.server_name(n).to_ascii_lowercase()))
+            .collect();
+        let legacy_ranges = crate::legacy_config::node_ranges(doc)?
+            .remove(&request.node_id)
+            .unwrap_or_default();
         for (index, entry) in entries.iter().enumerate() {
             if entry["tag"] == "api" && entry["protocol"] == "dokodemo-door" {
                 continue;
@@ -621,10 +662,13 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
             } else {
                 source.name.clone()
             });
-            let before = doc.clone();
+            let lines_len = doc.lines.len();
+            let externals_len = doc.externals.len();
             let result = (|| {
-                ensure!(source.error.is_empty(), "{}", source.error);
-                let outbound = global(&source.config)?;
+                let outbound = match &source_outbound {
+                    Ok(v) => v.clone(),
+                    Err(e) => anyhow::bail!("{e:#}"),
+                };
                 let mut line = convert(
                     doc,
                     &request.node_id,
@@ -634,6 +678,26 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
                     request.shared_443,
                     source.id.starts_with("systemd:") || source.id.starts_with("openrc:"),
                 )?;
+                let port = line.hops[0].port;
+                ensure!(
+                    !crate::legacy_config::port_in_ranges(&legacy_ranges, port),
+                    "端口 {port} 与旧配置冲突"
+                );
+                if line.access.shared_port {
+                    let independent = doc.lines.iter().any(|other| {
+                        !other.access.shared_port
+                            && other.hops.iter().any(|h| h.node_id == request.node_id && h.port == port)
+                    });
+                    ensure!(!independent, "443 已被独立入口占用");
+                    let node = doc.nodes.iter().find(|n| n.id == request.node_id).unwrap();
+                    let sni = line.access.server_name(node).to_ascii_lowercase();
+                    ensure!(
+                        shared_snis.insert(sni.clone()),
+                        "统一 443 的 SNI {sni} 重复；不同传输请使用不同 SNI 或独立端口"
+                    );
+                } else {
+                    ensure!(used_ports.insert(port), "同一节点端口 {port} 被多条线路占用");
+                }
                 if let Some(url) = outbound {
                     let external_id =
                         if let Some(existing) = doc.externals.iter().find(|e| e.url == url) {
@@ -655,7 +719,6 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
                     line.chain = vec![format!("external:{external_id}")];
                 }
                 doc.lines.push(line.clone());
-                compile(doc)?;
                 Ok::<_, anyhow::Error>(line)
             })();
             match result {
@@ -664,13 +727,17 @@ pub fn import(doc: &mut Document, request: &Import) -> Result<Value> {
                     "sni":line.access.server_name(doc.nodes.iter().find(|n| n.id == request.node_id).unwrap()),
                     "reality_target":line.access.reality.as_ref().map(|r| &r.target), "chain":line.chain})),
                 Err(error) => {
-                    *doc = before;
+                    doc.lines.truncate(lines_len);
+                    doc.externals.truncate(externals_len);
                     let item = PendingImport { id, name: title, reason: format!("{error:#}") };
                     pending.push(serde_json::to_value(&item)?);
                     doc.pending_imports.push(item);
                 }
             }
         }
+    }
+    if !imported.is_empty() {
+        compile(doc)?;
     }
     Ok(json!({"imported":imported,"pending":pending}))
 }

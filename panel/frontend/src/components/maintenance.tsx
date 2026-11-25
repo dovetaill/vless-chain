@@ -33,7 +33,6 @@ type Task = {
   core_version?: string;
   before?: Record<string, string>;
   finished?: number;
-  xray_channel?: string;
   after?: Record<string, string>;
   network?: { after: NetworkStatus };
   verification?: { state: string; detail: string };
@@ -62,14 +61,16 @@ export function Maintenance({ state }: { state: PanelState }) {
     prerelease?: boolean;
     security_update?: boolean;
     rollback_safe?: boolean;
-    keep_agent_on_failure?: boolean;
   }>();
 
   const busy =
     submitting ||
     (!!taskId &&
       (!task ||
-        ["queued", "running", "awaiting_verification"].includes(task.state)));
+        ["queued", "running"].includes(task.state)));
+  const awaitingCore =
+    task?.state === "awaiting_verification" ||
+    Boolean(state.core_maintenance?.pending);
 
   useEffect(() => {
     const pending = state.core_maintenance?.pending;
@@ -164,14 +165,22 @@ export function Maintenance({ state }: { state: PanelState }) {
         "task_id" in request &&
         request.task_id
       ) {
-        const original = await api<Task>(
-          `/federation/task?id=${encodeURIComponent(request.task_id)}`,
-        ).catch(() => undefined);
-        if (original && ["succeeded", "failed"].includes(original.state)) {
-          localStorage.setItem(storageKey, original.id);
-          setTaskId(original.id);
-          setTask(original);
-          setConnection("");
+        try {
+          const original = await api<Task>(
+            `/federation/task?id=${encodeURIComponent(request.task_id)}`,
+          );
+          if (original.state !== "not_found") {
+            localStorage.setItem(storageKey, original.id);
+            setTaskId(original.id);
+            setTask(original);
+            setConnection("");
+            return;
+          }
+        } catch {
+          localStorage.setItem(storageKey, request.task_id);
+          setTaskId(request.task_id);
+          setTask(undefined);
+          setConnection("提交结果尚未确认，正在查询原任务；不会重复执行。");
           return;
         }
       }
@@ -186,11 +195,10 @@ export function Maintenance({ state }: { state: PanelState }) {
   }
 
   const supported = !!state.maintenance;
-  const networkAdmin = !state.viewer || state.viewer.role === "admin";
   const upToDate =
     !!release &&
     state.version === release.version &&
-    (!state.agent_version || state.agent_version === release.version);
+    (!state.local_node_id || state.agent_version === release.version);
   const historicalUpgrade = !!task && upgradeVersionReached(task, state);
   const TaskContainer = historicalUpgrade ? "details" : "div";
 
@@ -318,7 +326,7 @@ export function Maintenance({ state }: { state: PanelState }) {
             <Button
               variant="outline"
               disabled={
-                busy || !state.maintenance_actions?.includes("core-upgrade")
+                busy || awaitingCore || !state.maintenance_actions?.includes("core-upgrade")
               }
               onClick={() => setCoreOpen(true)}
             >
@@ -327,7 +335,6 @@ export function Maintenance({ state }: { state: PanelState }) {
             <Button
               variant="outline"
               disabled={
-                !networkAdmin ||
                 busy ||
                 !state.maintenance_actions?.includes("network-tune")
               }
@@ -361,12 +368,8 @@ export function Maintenance({ state }: { state: PanelState }) {
                   </span>
                 ) : null}
               </div>
-              {!networkAdmin ? (
-                <p className="muted">网络算法设置仅管理员可操作。</p>
-              ) : (
-                !state.maintenance_actions?.includes("network-tune") && (
-                  <p className="muted">网络设置需要本机安装新版维护组件。</p>
-                )
+              {!state.maintenance_actions?.includes("network-tune") && (
+                <p className="muted">网络设置需要本机安装新版维护组件。</p>
               )}
             </div>
           </details>
@@ -508,7 +511,6 @@ export function Maintenance({ state }: { state: PanelState }) {
                               action: "core-reject",
                               core: task.core,
                               task_id: task.id,
-                              keep_agent_on_failure: true,
                             })
                           }
                         >
@@ -553,8 +555,8 @@ export function Maintenance({ state }: { state: PanelState }) {
               title="更新本机代理内核"
               close={() => setCoreOpen(false)}
               submit={
-                !busy && /^\d+\.\d+\.\d+$/.test(coreChoice.version)
-                  ? `更新 ${coreChoice.core} ${coreChoice.version}`
+                !busy && coreChoice.version.trim()
+                  ? `更新 ${coreChoice.core} ${coreChoice.version.trim()}`
                   : undefined
               }
               action={() =>
@@ -562,6 +564,7 @@ export function Maintenance({ state }: { state: PanelState }) {
                   id: requestId(),
                   action: "core-upgrade",
                   ...coreChoice,
+                  version: coreChoice.version.trim(),
                 })
               }
             >
@@ -591,7 +594,8 @@ export function Maintenance({ state }: { state: PanelState }) {
               description={
                 confirm.action === "core-confirm"
                   ? "确认已用升级前的原链接完成实际传输验证。"
-                  : confirm.keep_agent_on_failure
+                  : confirm.action === "core-reject" &&
+                      task?.state === "awaiting_verification"
                     ? "将此次验收标记为未通过，Agent 与现有服务保持运行。"
                     : confirm.action === "core-reject"
                       ? "恢复中断的内核切换；缺少安全回退版本时隔离代理内核并保留 Agent 心跳。"

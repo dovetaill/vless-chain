@@ -18,8 +18,6 @@ pub const SHIPPED: &[&str] = &[
     "README.md",
     ".gitignore",
     ".github",
-    "xray-vless-native-v3.sh",
-    "xray-vless-chain-v2.sh",
 ];
 pub const MANIFESTS: &[&str] = &[
     "panel/Cargo.toml",
@@ -184,7 +182,7 @@ pub async fn core(work: &Workspace, name: &str, stage: &Path) -> Result<()> {
     let versions: Value = serde_json::from_str(include_str!("../core-versions.json"))?;
     let directory = work.root.join(format!("download-{name}"));
     fs::create_dir(&directory)?;
-    let meta = cores::download(
+    let _ = cores::download(
         name,
         versions[name].as_str().context("内核版本缺失")?,
         &directory,
@@ -200,7 +198,6 @@ pub async fn core(work: &Workspace, name: &str, stage: &Path) -> Result<()> {
     for path in files(&directory.join("share"))? {
         fs::copy(&path, stage.join("share").join(path.file_name().unwrap()))?;
     }
-    write(&work.root.join(format!("{name}-provenance.json")), &meta)?;
     Ok(())
 }
 
@@ -218,12 +215,7 @@ pub async fn build(args: &Options) -> Result<()> {
         destination.display()
     );
     let mut work = Workspace::new(&args.parent())?;
-    let node = work.output(&root, &strings(&["node", "--version"])).await?;
-    let node = package::version(node.trim_start_matches('v'))?;
-    ensure!(
-        (node[0] == 20 && node >= [20, 19, 0]) || node >= [22, 12, 0],
-        "Vite 需要 Node.js 20.19+ 或 22.12+"
-    );
+    work.require_space(2 * 1024 * 1024 * 1024)?;
     ensure!(
         Path::new(
             &work
@@ -351,10 +343,7 @@ pub async fn build(args: &Options) -> Result<()> {
     )?;
     fs::copy(root.join("panel/README.md"), stage.join("README.md"))?;
     copy_tree(&root.join("panel/docs"), &stage.join("docs"))?;
-    fs::create_dir(stage.join("frontend"))?;
-    for name in ["THEME.md", "frontend/THEME.md"] {
-        fs::copy(root.join("panel/frontend/THEME.md"), stage.join(name))?;
-    }
+    fs::copy(root.join("panel/frontend/THEME.md"), stage.join("docs/THEME.md"))?;
     let mut entries = serde_json::Map::new();
     for path in files(&stage)? {
         let name = path
@@ -409,25 +398,6 @@ pub async fn build(args: &Options) -> Result<()> {
         println!("这是包含未提交修改的本地构建；GitHub 发布前需提交并重新构建。");
     }
     Ok(())
-}
-
-pub async fn build_cores(args: &Options) -> Result<()> {
-    let output = Path::new(args.value("--output")?);
-    ensure!(!output.exists(), "内核输出目录已存在，拒绝覆盖");
-    let mut work = Workspace::new(&args.parent())?;
-    let stage = work.root.join("cores");
-    fs::create_dir(&stage)?;
-    for name in ["xray", "mihomo"] {
-        core(&work, name, &stage).await?;
-    }
-    copy_tree(&stage, output)?;
-    for name in ["xray", "mihomo"] {
-        fs::copy(
-            work.root.join(format!("{name}-provenance.json")),
-            output.join(format!("{name}-provenance.json")),
-        )?;
-    }
-    work.close()
 }
 
 fn prompt(label: &str, default: &str) -> Result<String> {
@@ -594,35 +564,13 @@ pub async fn wizard(push_only: bool) -> Result<()> {
     push(&work, &root, &tag).await
 }
 
-pub async fn github(args: &Options) -> Result<()> {
-    let root = repository();
-    let work = Workspace::new(&args.parent())?;
-    let directory = args
-        .values
-        .get("--directory")
-        .map(PathBuf::from)
-        .unwrap_or(default_output()?);
-    let manifest = read(&directory.join("release.json"))?;
-    let mut status = strings(&["git", "status", "--porcelain", "--"]);
-    status.extend(strings(SHIPPED));
-    ensure!(
-        work.output(&root, &status).await?.is_empty()
-            && manifest["dirty"] == false
-            && manifest["version"] == version(&root)?
-            && manifest["commit"] == git(&work, &root, &["rev-parse", "HEAD"]).await?,
-        "发行包必须来自当前干净提交"
-    );
-    super::delivery::validate_repo(args.value("--repo")?)?;
-    super::delivery::publish_single(args, &work, &directory, &manifest).await
-}
-
 pub async fn menu() -> Result<()> {
     loop {
         println!(
-            "\nChain v{} · Rust 构建发布\n1) 构建发行包\n2) 检查工具与发行流程\n3) 完整验证\n4) 版本与 Git 状态\n5) 设置版本\n6) 创建 Release 草稿\n7) 发布草稿\n8) 本机安装运维\n9) 发布已提交代码\n10) 推送已有版本\n0) 退出",
+            "\nChain v{} · Rust 构建发布\n1) 构建发行包\n2) 检查工具与发行流程\n3) 完整验证\n4) 版本与 Git 状态\n5) 设置版本\n6) 本机安装运维\n7) 发布已提交代码\n8) 推送已有版本\n0) 退出",
             version(&repository())?
         );
-        let choice = prompt("选择", "9")?;
+        let choice = prompt("选择", "7")?;
         let args = match choice.as_str() {
             "0" => return Ok(()),
             "1" => strings(&["build"]),
@@ -630,14 +578,9 @@ pub async fn menu() -> Result<()> {
             "3" => strings(&["check", "--full"]),
             "4" => strings(&["status"]),
             "5" => strings(&["version", "--set", &prompt("新版本 X.Y.Z", "")?]),
-            "6" | "7" => strings(&[
-                if choice == "6" { "draft" } else { "publish" },
-                "--repo",
-                &prompt("GitHub OWNER/REPO", "")?,
-            ]),
-            "8" => strings(&["ops"]),
-            "9" => strings(&["release"]),
-            "10" => strings(&["push"]),
+            "6" => strings(&["ops"]),
+            "7" => strings(&["release"]),
+            "8" => strings(&["push"]),
             _ => continue,
         };
         if let Err(e) = Box::pin(super::main(args)).await {

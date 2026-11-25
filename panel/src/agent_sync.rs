@@ -145,7 +145,7 @@ impl Sync {
                         || last_saved_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)));
                 let saved = if save_due {
                     let book = self.book.clone();
-                    let res = tokio::task::spawn_blocking(move || book.save()).await?;
+                    let res = tokio::task::spawn_blocking(move || book.flush()).await?;
                     if res.is_ok() {
                         last_saved_fp = Some(full_fp.clone());
                         last_saved_state = Some(state_fp);

@@ -21,6 +21,11 @@ export function QR({ value }: { value: string }) {
   useEffect(() => {
     let alive = true;
     setUrl("");
+    setError("");
+    if (!value) {
+      setError("暂无可生成二维码的链接内容。");
+      return;
+    }
     void QRCode.toDataURL(value, {
       width: 232,
       margin: 2,
@@ -29,8 +34,13 @@ export function QR({ value }: { value: string }) {
       .then((url) => {
         if (alive) setUrl(url);
       })
-      .catch(() => {
-        if (alive) setError("链接过长，请直接复制下方文本或下载配置。");
+      .catch((e) => {
+        if (alive)
+          setError(
+            value.length > 2000
+              ? "链接过长，请直接复制下方文本或下载配置。"
+              : `无法生成二维码（${errorText(e)}），请直接复制下方文本或下载配置。`,
+          );
       });
     return () => {
       alive = false;

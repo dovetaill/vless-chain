@@ -78,8 +78,9 @@ pub fn json_config(body: &str) -> Result<Value> {
     Ok(serde_json::from_str(&out)?)
 }
 fn read(path: &Path) -> Result<Vec<u8>> {
+    let meta = fs::metadata(path)?;
     ensure!(
-        fs::metadata(path)?.is_file() && fs::metadata(path)?.len() <= 2 * 1024 * 1024,
+        meta.is_file() && meta.len() <= 2 * 1024 * 1024,
         "配置文件大小或类型无效"
     );
     Ok(fs::read(path)?)
@@ -295,54 +296,64 @@ pub struct Owner {
     pub database: Option<PathBuf>,
 }
 fn openrc_owner(proc: &Path, process: &Path) -> Result<Option<String>> {
-    let checked = || -> Result<Option<String>> {
-        if fs::read_link(process.join("ns/pid"))? != fs::read_link(proc.join("1/ns/pid"))? {
-            return Ok(None);
-        }
-        let text = fs::read_to_string(process.join("status"))?;
-        let ppid = text
-            .lines()
-            .find_map(|s| s.strip_prefix("PPid:"))
-            .context("缺少父进程")?
-            .trim();
-        ppid.parse::<u32>()?;
-        let parent = proc.join(ppid);
-        let supervisor = super::platform::executable("supervise-daemon")
-            .context("缺少 OpenRC supervisor")?
-            .canonicalize()?;
-        if fs::read_link(parent.join("exe"))? != supervisor {
-            return Ok(None);
-        }
-        let bytes = fs::read(parent.join("environ"))?;
-        let env = bytes
-            .split(|c| *c == 0)
-            .filter_map(|s| std::str::from_utf8(s).ok())
-            .filter_map(|s| s.split_once('='))
-            .collect::<BTreeMap<_, _>>();
-        let name = env.get("RC_SVCNAME").context("缺少 OpenRC 归属")?;
-        ensure!(
-            !name.starts_with("chain-")
-                && !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)),
-            "OpenRC 服务名无效"
-        );
-        let cmd = fs::read(parent.join("cmdline"))?;
-        let args = cmd
-            .split(|c| *c == 0)
-            .filter_map(|s| std::str::from_utf8(s).ok())
-            .collect::<Vec<_>>();
-        if args.get(1) != Some(name)
-            || args.get(2) != Some(&"--start")
-            || env.get("RC_SERVICE").copied() != Some(format!("/etc/init.d/{name}").as_str())
-            || !process.join(format!("root/etc/init.d/{name}")).is_file()
-        {
-            return Ok(None);
-        }
-        Ok(Some(name.to_string()))
+    if fs::read_link(process.join("ns/pid")).ok() != fs::read_link(proc.join("1/ns/pid")).ok() {
+        return Ok(None);
+    }
+    let text = match fs::read_to_string(process.join("status")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
-    Ok(checked().unwrap_or(None))
+    let Some(ppid) = text
+        .lines()
+        .find_map(|s| s.strip_prefix("PPid:"))
+        .map(str::trim)
+        .filter(|s| s.parse::<u32>().is_ok_and(|p| p > 1))
+    else {
+        return Ok(None);
+    };
+    let parent = proc.join(ppid);
+    let Some(supervisor) = super::platform::executable("supervise-daemon")
+        .and_then(|p| p.canonicalize().ok())
+    else {
+        return Ok(None);
+    };
+    if fs::read_link(parent.join("exe")).ok().as_ref() != Some(&supervisor) {
+        return Ok(None);
+    }
+    let bytes = match fs::read(parent.join("environ")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let env = bytes
+        .split(|c| *c == 0)
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .filter_map(|s| s.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let Some(&name) = env.get("RC_SVCNAME") else {
+        return Ok(None);
+    };
+    ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)),
+        "OpenRC 服务名无效"
+    );
+    let cmd = fs::read(parent.join("cmdline")).unwrap_or_default();
+    let args = cmd
+        .split(|c| *c == 0)
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .collect::<Vec<_>>();
+    if args.get(1) != Some(&name)
+        || args.get(2) != Some(&"--start")
+        || env.get("RC_SERVICE").copied() != Some(format!("/etc/init.d/{name}").as_str())
+        || !process.join(format!("root/etc/init.d/{name}")).is_file()
+    {
+        return Ok(None);
+    }
+    Ok(Some(name.to_string()))
 }
 pub async fn discover(proc: &Path) -> Result<Vec<Owner>> {
     if !proc.is_dir() {
@@ -407,13 +418,16 @@ pub async fn discover(proc: &Path) -> Result<Vec<Owner>> {
             let host_namespace=fs::read_link(proc.join("1/ns/pid")).ok();
             let matches=containers.iter().filter(|c| c["Id"].as_str().is_some_and(|id|cgroup.contains(id)) || (namespace.is_some() && namespace!=host_namespace && fs::read_link(proc.join(c["State"]["Pid"].as_u64().unwrap_or(0).to_string()).join("ns/pid")).ok()==namespace)).collect::<Vec<_>>();
             let container=if matches.len()==1 {Some(matches[0])} else {None};
+            if exe.starts_with("/opt/chain/") || unit.is_some_and(|u| u.starts_with("chain-")) {
+                return Ok(());
+            }
             let (kind, id) = if let Some(c)=container {
                 let main=fs::read_link(proc.join(c["State"]["Pid"].as_u64().context("容器 PID 无效")?.to_string()).join("exe"))?;
                 let image=c["Config"]["Image"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").split(':').next().unwrap_or("");
                 ensure!(main.file_name().and_then(|n|n.to_str()).is_some_and(proxy) || proxy(image), "容器主进程不是旧代理，保留容器");
                 ("docker".into(),c["Id"].as_str().context("容器 ID 缺失")?.to_owned())
             } else if let Some(unit) = unit.filter(|u| {
-                !u.starts_with("chain-") && !u.starts_with("docker") && !u.starts_with("containerd")
+                !u.starts_with("docker") && !u.starts_with("containerd")
             }) {
                 let main = output(
                     "systemctl",
@@ -433,6 +447,9 @@ pub async fn discover(proc: &Path) -> Result<Vec<Owner>> {
                     ("systemd".into(), unit.to_string())
                 }
             } else if let Some(name)=openrc_owner(proc,&path)? {
+                if name.starts_with("chain-") {
+                    return Ok(());
+                }
                 ("openrc".into(),name)
             } else { ("unmanaged".into(),pid.to_string()) };
             let key = format!("{kind}:{id}");
@@ -582,13 +599,13 @@ pub async fn discover(proc: &Path) -> Result<Vec<Owner>> {
     }
     Ok(owners.into_values().collect())
 }
-pub struct Api {
+struct Api {
     client: reqwest::Client,
     base: String,
     cookie: String,
 }
 impl Api {
-    pub async fn login(m: &Manager) -> Result<Self> {
+    async fn login(m: &Manager) -> Result<Self> {
         let mut addr: std::net::SocketAddr = m.environment("panel")?["CHAIN_LISTEN"].parse()?;
         if addr.ip().is_unspecified() {
             addr.set_ip(if addr.is_ipv6() {
@@ -618,7 +635,7 @@ impl Api {
             cookie,
         })
     }
-    pub async fn call(&self, path: &str, payload: Option<Value>) -> Result<Value> {
+    async fn call(&self, path: &str, payload: Option<Value>) -> Result<Value> {
         let request = if payload.is_some() {
             self.client.post(format!("{}/{path}", self.base))
         } else {
@@ -643,7 +660,7 @@ impl Api {
         );
         Ok(value)
     }
-    pub async fn publish(&self) -> Result<()> {
+    async fn publish(&self) -> Result<()> {
         let job = self.call("publish", Some(json!({}))).await?;
         let id = job["job_id"].as_str().context("缺少发布任务")?;
         for _ in 0..260 {
@@ -703,6 +720,11 @@ fn unchanged(before: &Owner, current: &Owner) -> Result<()> {
 }
 pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
     ensure!(m.live(), "离线树不操作旧服务");
+    let local_node_path = m.path("/var/lib/chain-panel/local-system-node");
+    let local_node = fs::read_to_string(&local_node_path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
     let mut selected = vec![];
     let mut disabled = std::collections::BTreeSet::new();
     for owner in owners {
@@ -721,11 +743,13 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
             );
             continue;
         }
-        let choice = lifecycle::prompt(
-            "IMPORT：备份导入后停用旧服务；DISABLE：仅备份并停用；留空保留",
-            "保留",
-        )?;
-        if choice == "IMPORT" || choice == "DISABLE" {
+        let prompt_label = if local_node.is_some() {
+            "IMPORT：备份导入后停用旧服务；DISABLE：仅备份并停用；留空保留"
+        } else {
+            "DISABLE：备份并停用旧服务；留空保留"
+        };
+        let choice = lifecycle::prompt(prompt_label, "保留")?;
+        if (choice == "IMPORT" && local_node.is_some()) || choice == "DISABLE" {
             if choice == "DISABLE" {
                 disabled.insert(owner.id.clone());
             }
@@ -735,19 +759,6 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
     if selected.is_empty() {
         return Ok(());
     }
-    let api = Api::login(m).await?;
-    let state = api.call("state", None).await?;
-    ensure!(
-        state["lines"].as_array().is_some_and(Vec::is_empty)
-            && state["pending_imports"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
-            && state["nodes"].as_array().is_some_and(|v| v.len() == 1),
-        "自动接管要求新面板，已有代理请在 Web 处理"
-    );
-    let node = fs::read_to_string(m.path("/var/lib/chain-panel/local-system-node"))?
-        .trim()
-        .to_owned();
     stage_assets(m, &mut selected)?;
     let sources = selected
         .iter()
@@ -755,8 +766,14 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
         .flat_map(|o| o.sources.clone())
         .collect::<Vec<_>>();
     let importing = !sources.is_empty();
+    let api = if importing {
+        Some(Api::login(m).await?)
+    } else {
+        None
+    };
+    let node = local_node.unwrap_or_default();
     let request = json!({"node_id":node,"sources":sources,"preview":true,"preserve_config":true});
-    let preview = if importing {
+    let preview = if let Some(api) = &api {
         api.call("legacy-import", Some(request.clone())).await?
     } else {
         json!({"pending":[],"imported":[]})
@@ -820,7 +837,9 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
             "存在无法完整导入的配置，旧服务全部保持运行；继续完成面板安装：{}",
             preview["pending"]
         );
-        let _ = api.call("logout", Some(json!({}))).await;
+        if let Some(api) = &api {
+            let _ = api.call("logout", Some(json!({}))).await;
+        }
         return Ok(());
     }
     let mut changed = vec![];
@@ -837,7 +856,7 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
         }
         let mut request = request.clone();
         request["preview"] = json!(false);
-        let committed = if importing {
+        let committed = if let Some(api) = &api {
             api.call("legacy-import", Some(request)).await?
         } else {
             preview.clone()
@@ -849,9 +868,6 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
             "实际导入与预检不一致，旧服务未停止"
         );
         for (i, o) in selected.iter().enumerate() {
-            for (p, b) in &o.files {
-                ensure!(fs::read(p)? == *b, "旧配置在安装期间被修改，未切换");
-            }
             changed.push(i);
             if o.kind == "docker" {
                 command("docker", &["update", "--restart=no", &o.id], 30).await?;
@@ -900,7 +916,7 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
                 );
             }
         }
-        if importing {
+        if let Some(api) = &api {
             api.publish().await?;
         }
         Ok(())
@@ -966,7 +982,9 @@ pub async fn handover(m: &Manager, owners: Vec<Owner>) -> Result<()> {
             }
         );
     }
-    let _ = api.call("logout", Some(json!({}))).await;
+    if let Some(api) = &api {
+        let _ = api.call("logout", Some(json!({}))).await;
+    }
     Ok(())
 }
 #[cfg(test)]

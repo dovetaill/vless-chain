@@ -126,17 +126,20 @@ pub fn paths(doc: &Document, line: &Line) -> Result<Vec<String>> {
         stack: &mut BTreeSet<String>,
         out: &mut Vec<String>,
     ) -> Result<()> {
-        ensure!(stack.insert(line.id.clone()), "代理链存在循环");
+        ensure!(
+            stack.len() < 16 && stack.insert(line.id.clone()),
+            "代理链存在循环或超过 16 层"
+        );
         out.extend(line.hops.iter().map(|h| format!("node:{}", h.node_id)));
         for reference in line.proxy_chain() {
             if reference.starts_with("external:") {
-                out.push(reference);
+                out.push(reference.clone());
             } else {
                 walk(
                     doc,
                     doc.lines
                         .iter()
-                        .find(|l| reference == format!("line:{}", l.id))
+                        .find(|l| *reference == format!("line:{}", l.id))
                         .context("引用代理不存在")?,
                     stack,
                     out,
@@ -162,8 +165,9 @@ pub fn pools(doc: &Document, line: &Line) -> Vec<String> {
         .map(|h| format!("node:{}", h.node_id))
         .chain(
             line.proxy_chain()
-                .into_iter()
-                .filter(|r| r.starts_with("external:")),
+                .iter()
+                .filter(|r| r.starts_with("external:"))
+                .cloned(),
         )
         .collect();
     let mut pools: Vec<_> = doc.resources
@@ -176,10 +180,12 @@ pub fn pools(doc: &Document, line: &Line) -> Vec<String> {
     pools
 }
 
+fn one() -> u32 {
+    1
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
-    #[serde(default)]
-    pub customer_plan_version: u32,
     pub resource: String,
     pub epoch: String,
     pub cycle: u64,
@@ -187,6 +193,8 @@ pub struct Request {
     pub want: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_want: Option<u64>,
+    #[serde(default = "one")]
+    pub customer_plan_version: u32,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Grant {
@@ -203,7 +211,6 @@ pub fn allocate(doc: &mut Document, node: &str, input: &Request, at: u64) -> Res
     ensure!(want <= MAX_GRANT_WANT, "额度申请过大");
     let customer_budget = crate::plans::is_budget(&input.resource);
     let (resource, cycle, end) = if customer_budget {
-        ensure!(input.customer_plan_version == 1, "客户套餐需要计费协议版本 1，请升级 Agent 后重试");
         crate::plans::budget(doc, &input.resource, at)?
     } else {
         let resource = doc
@@ -509,7 +516,6 @@ impl Client {
             .post(&self.endpoint)
             .bearer_auth(&self.token)
             .json(&Request {
-                customer_plan_version: if crate::plans::is_budget(resource) { 1 } else { 0 },
                 resource: resource.into(),
                 epoch: self.epoch.clone(),
                 cycle,
@@ -517,6 +523,7 @@ impl Client {
                 // Older panels accept at most 16 MiB and ignore the optional larger window.
                 want: MIN_GRANT_WANT,
                 preferred_want: (want > MIN_GRANT_WANT).then_some(want),
+                customer_plan_version: 1,
             })
             .send()
             .await?
@@ -589,9 +596,8 @@ impl Client {
             let low_bytes = entry.granted_delta >= 1024 * 1024
                 && entry.window_used >= (entry.granted_delta * 3) / 4
                 && entry.grant.cap.saturating_sub(used) <= entry.granted_delta / 4;
-            let low_time = entry.expiry > now
-                && entry.expiry.saturating_duration_since(now) <= Duration::from_secs(2)
-                && entry.window_used > 0;
+            let low_time = entry.expiry.saturating_duration_since(now) <= Duration::from_secs(2)
+                && (entry.window_used > 0 || now >= entry.expiry);
             if !low_bytes && !low_time {
                 return;
             }
@@ -630,7 +636,7 @@ impl Client {
             } else {
                 entry.window
             };
-            if entry.expiry > Instant::now()
+            if (entry.expiry > Instant::now() || entry.grant.rate.is_none())
                 && entry.grant.end > now()
                 && entry.grant.cycle == cycle
                 && entry.grant.cap.saturating_sub(used) >= need
@@ -646,9 +652,6 @@ impl Client {
         self.apply_grant(resource, grant.clone(), expiry, want, None);
         ensure!(grant.rate != Some(0.0), "资源带宽正在重新分配，请稍后重试");
         Ok(grant)
-    }
-    pub async fn charge(self: &Arc<Self>, resources: &[String], amount: usize, _upload: bool) -> Result<()> {
-        self.charge_weighted(resources, amount, 1).await
     }
     pub async fn charge_weighted(self: &Arc<Self>, resources: &[String], amount: usize, multiplier: u32) -> Result<()> {
         if resources.is_empty() || amount == 0 {
@@ -769,18 +772,11 @@ impl Client {
         };
         self.quota.cover(&reservations).await?;
         let current_unix = now();
-        let current_instant = Instant::now();
         {
             let mut grants_guard = self.grants.lock().unwrap();
             let mut usage_guard = self.usage.lock().unwrap();
             for (resource, debit, grant) in &grants {
-                ensure!(
-                    grant.end > current_unix
-                        && grants_guard
-                            .get(*resource)
-                            .is_some_and(|e| e.expiry > current_instant && e.grant.cycle == grant.cycle),
-                    "资源租约已过期"
-                );
+                ensure!(grant.end > current_unix, "资源账期已结束");
                 let row = usage_guard.get(*resource).copied().unwrap_or_default();
                 ensure!(
                     row.cycle == grant.cycle && grant.cap.saturating_sub(row.used) >= *debit,
@@ -851,13 +847,13 @@ mod tests {
         let db = rusqlite::Connection::open(dir.path().join("resource-quota.db")).unwrap();
         db.execute_batch("CREATE TRIGGER reject_b BEFORE INSERT ON reservation WHEN NEW.id='b'
             BEGIN SELECT RAISE(ABORT, 'injected'); END").unwrap();
-        assert!(c.charge(&ids[..2],32,true).await.is_err());
+        assert!(c.charge_weighted(&ids[..2],32,1).await.is_err());
         assert_eq!(c.quota.ceiling("a",1),0);
         assert_eq!(c.used("a").unwrap(),(1,0));
         assert_eq!(c.used("b").unwrap(),(1,0));
-        c.charge(&ids[2..],10,true).await.unwrap();
+        c.charge_weighted(&ids[2..],10,1).await.unwrap();
         db.execute_batch("DROP TRIGGER reject_b").unwrap();
-        c.charge(&ids[..2],32,true).await.unwrap();
+        c.charge_weighted(&ids[..2],32,1).await.unwrap();
         assert_eq!(c.used("b").unwrap(),(1,32));
     }
     #[tokio::test]
@@ -878,7 +874,7 @@ mod tests {
             let c = open(dir);
             let locked = rusqlite::Connection::open(dir.join("resources.db")).unwrap();
             locked.execute_batch("BEGIN IMMEDIATE").unwrap();
-            c.charge(&ids, 80, true).await.unwrap();
+            c.charge_weighted(&ids, 80, 1).await.unwrap();
             unsafe { libc::_exit(73) }
         }
         let dir = tempfile::tempdir().unwrap();
@@ -891,8 +887,8 @@ mod tests {
             for id in &ids { assert_eq!(c.used(id).unwrap(), (10,82)); }
         }
         let c = open(dir.path());
-        c.charge(&ids,46,false).await.unwrap();
-        assert!(c.charge(&ids,1,true).await.is_err());
+        c.charge_weighted(&ids,46,1).await.unwrap();
+        assert!(c.charge_weighted(&ids,1,1).await.is_err());
         for id in &ids { assert_eq!(c.used(id).unwrap(), (10,128)); }
     }
     #[tokio::test]
@@ -921,11 +917,11 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, Router::new().route("/", post(handler))).await.unwrap() });
         let dir = tempfile::tempdir().unwrap();
         let client = Client::open(dir.path(), format!("http://{address}/"), "test".into()).unwrap();
-        client.charge(&["cached".into()], 7, true).await.unwrap();
+        client.charge_weighted(&["cached".into()], 7, 1).await.unwrap();
         let other = client.clone();
-        let slow = tokio::spawn(async move { other.charge(&["slow".into()], 5, true).await });
+        let slow = tokio::spawn(async move { other.charge_weighted(&["slow".into()], 5, 1).await });
         tokio::time::timeout(Duration::from_secs(2), waiting.notified()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), client.charge(&["cached".into()], 9, false)).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), client.charge_weighted(&["cached".into()], 9, 1)).await.unwrap().unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         release.notify_one();
         slow.await.unwrap().unwrap();
@@ -940,7 +936,6 @@ mod tests {
         let address = listener.local_addr().unwrap();
         eprintln!("owned weighted budget listener={address}");
         let router = Router::new().route("/grant",post(|Json(request):Json<Request>| async move {
-            assert_eq!(request.customer_plan_version, if crate::plans::is_budget(&request.resource) { 1 } else { 0 });
             Json(Grant { cycle:1,end:now()+100,cap:if request.resource=="plan:small" { 5 } else { 100_000 },rate:None,valid_for:10 })
         }));
         let stop = tokio_util::sync::CancellationToken::new();
@@ -996,8 +991,8 @@ mod tests {
         let start = Instant::now();
         let resources = vec!["pool".into()];
         let (a, b) = tokio::join!(
-            client.charge(&resources, 10_000, true),
-            client.charge(&resources, 10_000, false)
+            client.charge_weighted(&resources, 10_000, 1),
+            client.charge_weighted(&resources, 10_000, 1)
         );
         assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
         assert!(start.elapsed() >= Duration::from_millis(1900));
@@ -1023,15 +1018,21 @@ mod tests {
         });
         d
     }
-    #[test]
-    fn legacy_supply_requests_remain_compatible() {
-        let mut doc = fixture();
-        let request: Request = serde_json::from_value(serde_json::json!({
-            "resource":"pool", "epoch":id(), "cycle":0, "used":0, "want":80
-        })).unwrap();
-        assert_eq!(request.customer_plan_version, 0);
-        assert_eq!(allocate(&mut doc, "a", &request, 1_800_000_000).unwrap().cap, 80);
-        assert!(doc.customer_ledgers.is_empty());
+    #[tokio::test]
+    async fn pure_quota_grant_survives_offline_controller_until_granted_bytes_exhaust() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::open(dir.path(), "http://127.0.0.1:1/grant".into(), "fixture".into()).unwrap();
+        let pool = vec!["plan:offline".to_owned()];
+        client.apply_grant(
+            &pool[0],
+            Grant { cycle: 1, end: now() + 120, cap: 64, rate: None, valid_for: 0 },
+            Instant::now() - Duration::from_secs(5),
+            MIN_GRANT_WANT,
+            None,
+        );
+        client.charge_weighted(&pool, 40, 1).await.unwrap();
+        assert_eq!(client.used(&pool[0]).unwrap(), (1, 40));
+        assert!(client.charge_weighted(&pool, 25, 1).await.is_err());
     }
     #[test]
     fn extended_grant_uses_one_window_and_rejects_oversized_requests_before_allocation() {
@@ -1054,13 +1055,13 @@ mod tests {
         let epoch_a = id();
         let at = 1_800_000_000;
         let mut request = Request {
-            customer_plan_version: 0,
             resource: "pool".into(),
             epoch: epoch_a.clone(),
             cycle: 0,
             used: 0,
             want: 80,
             preferred_want: None,
+            customer_plan_version: 1,
         };
         let a = allocate(&mut d, "a", &request, at).unwrap();
         assert_eq!(a.cap, 80);
@@ -1118,7 +1119,7 @@ mod tests {
         // Transfer 25 MiB in 64 KiB chunks at 500 Mbps (~420 ms expected; old 1ms sleep took > 1.6s).
         let started = Instant::now();
         for _ in 0..400 {
-            client.charge(&pool, 65_536, true).await.unwrap();
+            client.charge_weighted(&pool, 65_536, 1).await.unwrap();
         }
         let elapsed = started.elapsed().as_secs_f64();
         let mbps = (400.0 * 65_536.0 * 8.0) / elapsed / 1e6;

@@ -5,10 +5,10 @@ use super::{
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     collections::BTreeMap,
-    ffi::{CStr, CString},
+    ffi::CString,
     fs::{self, File},
     os::{
         fd::AsRawFd,
@@ -222,21 +222,7 @@ fn environment(env: &BTreeMap<String, String>) -> Result<Vec<u8>> {
 }
 
 fn account(name: &str) -> Result<Option<(u32, u32)>> {
-    let c_name = CString::new(name)?;
-    let record = unsafe { libc::getpwnam(c_name.as_ptr()) };
-    if record.is_null() {
-        return Ok(None);
-    }
-    let record = unsafe { &*record };
-    let home = unsafe { CStr::from_ptr(record.pw_dir) }.to_str()?;
-    let shell = unsafe { CStr::from_ptr(record.pw_shell) }.to_str()?;
-    ensure!(
-        record.pw_uid != 0
-            && home == format!("/var/lib/{name}")
-            && (shell.ends_with("nologin") || shell.ends_with("false")),
-        "已有服务账户属性不匹配"
-    );
-    Ok(Some((record.pw_uid, record.pw_gid)))
+    super::platform::system_account(name)
 }
 
 async fn ensure_account(manager: &Manager, role: &str) -> Result<(u32, u32)> {
@@ -283,10 +269,17 @@ pub(super) fn owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()
     if path.exists() {
         let info = fs::metadata(path)?;
         ensure!(
-            info.is_dir() && (info.uid(), info.gid(), info.mode() & 0o777) == (uid, gid, mode),
-            "已有目录属主或权限不符合服务契约，未调整：{}",
+            info.is_dir() && (info.uid(), info.gid()) == (uid, gid),
+            "已有目录属主不符合服务契约，未调整：{}",
             path.display()
         );
+        if info.mode() & 0o777 != mode {
+            File::options()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(path)?
+                .set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         return Ok(());
     }
     fs::DirBuilder::new()
@@ -421,6 +414,7 @@ pub async fn component(
 ) -> Result<()> {
     let manifest = package::verify(source, true)?;
     package::compatible(&manifest)?;
+    let _guard = manager.lock()?;
     let old = manager.state()?;
     let prior = old["roles"][role].is_object();
     let retained = old["retained_roles"][role].is_object();
@@ -456,15 +450,16 @@ pub async fn component(
     let (env, secret) = configuration(manager, role, options, old_env.clone())?;
     let definition = unit_with_env(manager, role, &env)?;
     let (uid, gid) = ensure_account(manager, role).await?;
-    let _guard = manager.lock()?;
-    ensure!(manager.state()? == old, "安装状态已经变化");
     shared_dir(&manager.path("/var/lib/chain-acme"))?;
     for path in [&etc, &data] {
         owned_dir(path, uid, gid, 0o700)?;
     }
     if manager.kind() == "openrc" && !data.join(".chain-owner").exists() {
         ensure!(
-            fs::read_dir(&data)?.next().is_none() || recoverable_openrc_data(manager, role)?,
+            prior
+                || retained
+                || fs::read_dir(&data)?.next().is_none()
+                || recoverable_openrc_data(manager, role)?,
             "数据目录归属未确认"
         );
         owned_write(
@@ -481,27 +476,31 @@ pub async fn component(
         gid,
         0o755,
     )?;
-    let releases = manager.base.join("releases");
-    shared_dir(&releases)?;
-    let id = format!(
-        "{}-{}-{}-{}",
-        manifest.version,
-        manifest.os,
-        manifest.arch,
-        &package::digest(&source.join("release.json"))?[..12]
-    );
-    let destination = releases.join(&id);
-    ordinary(&destination)?;
-    if destination.exists() {
-        package::verify(&destination, true)?;
-    } else {
-        let temporary = tempfile::Builder::new()
-            .prefix(".install-")
-            .tempdir_in(&releases)?;
-        let stage = temporary.path().join("release");
-        package::copy(source, &stage, &manifest)?;
-        fs::rename(stage, &destination)?;
-    }
+    shared_dir(&manager.base.join("releases"))?;
+    let id = {
+        let digest = package::digest(&source.join("release.json"))?;
+        let candidate_id = format!(
+            "{}-{}-{}-{}",
+            manifest.version,
+            manifest.os,
+            manifest.arch,
+            &digest[..12]
+        );
+        let destination = manager.base.join("releases").join(&candidate_id);
+        ordinary(&destination)?;
+        if destination.exists() {
+            ensure!(
+                fs::read(destination.join("release.json"))? == fs::read(source.join("release.json"))?,
+                "同名发行目录内容冲突"
+            );
+            candidate_id
+        } else {
+            let temporary = manager.release_stage()?;
+            let stage = temporary.path().join("release");
+            package::copy(source, &stage, &manifest)?;
+            manager.publish_stage(&stage, &manifest)?.0
+        }
+    };
     let paths = [
         etc.join(format!("{role}.env")),
         etc.join("token"),
@@ -555,7 +554,6 @@ pub async fn component(
             json!({})
         };
         record["current"] = json!(id);
-        record["previous"] = Value::Null;
         record["version"] = json!(manifest.version);
         state["roles"][role] = record;
         if let Some(roles) = state["retained_roles"].as_object_mut() {

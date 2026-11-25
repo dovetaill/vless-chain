@@ -3,11 +3,8 @@ const assert = require('node:assert/strict');
 const {chromium} = require(process.env.CHAIN_TEST_BROWSER);
 const [base, tokenFile, remote] = process.argv.slice(2);
 (async () => {
-  const server = await chromium.launchServer({headless:true, executablePath:process.env.CHAIN_TEST_CHROMIUM, args:['--no-sandbox']});
-  console.log('BROWSER pid='+server.process().pid);
-  let browser;
+  const browser = await chromium.launch({headless:true, executablePath:process.env.CHAIN_TEST_CHROMIUM});
   try {
-    browser = await chromium.connect(server.wsEndpoint());
     const page = await browser.newPage();
     const errors=[];page.on('pageerror', e=>errors.push(e.message));
     const button = name=>page.getByRole('button',{name,exact:true});
@@ -51,9 +48,7 @@ const [base, tokenFile, remote] = process.argv.slice(2);
     assert.deepEqual(errors,[]);
     console.log('PASS real remote UI: resources CRUD, bandwidth wording, timezone label, built-in apply, access policy save/reopen');
   } finally {
-    if(browser)await browser.close();
-    await server.close();
-    assert(server.process().exitCode!==null || server.process().signalCode!==null);
+    await browser.close();
     console.log('CLEANUP browser stopped');
   }
 })().catch(e=>{console.error(e);process.exitCode=1;});

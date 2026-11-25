@@ -25,11 +25,21 @@ impl LogPolicy {
     fn age(&self) -> Duration { Duration::from_secs(self.retention_hours * 3600) }
     fn budget(&self) -> u64 { self.max_mib * 1024 * 1024 }
 }
-fn log_policy(dir: &Path) -> LogPolicy {
-    std::fs::read(dir.join("log-policy.json")).ok()
-        .and_then(|bytes| serde_json::from_slice::<LogPolicy>(&bytes).ok())
-        .filter(|policy| policy.validate().is_ok())
-        .unwrap_or(LogPolicy {retention_hours:AGE.as_secs()/3600, max_mib:BUDGET/1024/1024})
+fn log_policy(dir: &Path) -> Result<LogPolicy> {
+    let path = dir.join("log-policy.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let policy: LogPolicy = serde_json::from_slice(&bytes)
+                .context("log-policy.json 解析失败")?;
+            policy.validate()?;
+            Ok(policy)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(LogPolicy {
+            retention_hours: AGE.as_secs() / 3600,
+            max_mib: BUDGET / 1024 / 1024,
+        }),
+        Err(e) => Err(anyhow::Error::from(e).context("读取 log-policy.json 失败")),
+    }
 }
 
 pub fn logging_enabled(dir: &Path) -> bool {
@@ -49,6 +59,105 @@ fn set_logging(dir: &Path, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+fn mask_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        let scheme_start = rest[..pos]
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.')
+            .map_or(0, |i| i + 1);
+        let scheme = rest[scheme_start..pos].to_ascii_lowercase();
+        let prefix_end = pos + 3;
+        out.push_str(&rest[..prefix_end]);
+        rest = &rest[prefix_end..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>'))
+            .unwrap_or(rest.len());
+        let url_part = &rest[..end];
+        let authority_end = url_part.find(['/', '?', '#']).unwrap_or(url_part.len());
+        if let Some(at) = url_part[..authority_end].rfind('@') {
+            out.push_str("[已隐藏]@");
+            out.push_str(&url_part[at + 1..authority_end]);
+        } else if matches!(
+            scheme.as_str(),
+            "vmess" | "vless" | "trojan" | "ss" | "ssr" | "hysteria2" | "hy2" | "tuic" | "mihomo" | "wg" | "wireguard"
+        ) {
+            out.push_str("[已隐藏]");
+        } else {
+            out.push_str(&url_part[..authority_end]);
+        }
+        let tail = &url_part[authority_end..];
+        if let Some(qpos) = tail.find('?') {
+            out.push_str(&tail[..qpos + 1]);
+            let after_q = &tail[qpos + 1..];
+            let (query, frag) = match after_q.find('#') {
+                Some(h) => (&after_q[..h], &after_q[h..]),
+                None => (after_q, ""),
+            };
+            let masked_pairs: Vec<String> = query
+                .split('&')
+                .map(|pair| {
+                    if let Some((k, _)) = pair.split_once('=')
+                        && matches!(
+                            k.to_ascii_lowercase().as_str(),
+                            "pbk" | "sid" | "password" | "pass" | "token" | "obfs-password" | "key"
+                        )
+                    {
+                        format!("{k}=[已隐藏]")
+                    } else {
+                        pair.to_string()
+                    }
+                })
+                .collect();
+            out.push_str(&masked_pairs.join("&"));
+            out.push_str(frag);
+        } else {
+            out.push_str(tail);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn mask_token_after(line: &str, keyword: &str, replacement_prefix: &str) -> String {
+    let mut current = line.to_string();
+    let needle = keyword.to_ascii_lowercase();
+    let mut search_from = 0;
+    while search_from < current.len() {
+        let lower = current.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(&needle) else { break };
+        let idx = search_from + rel;
+        let before_ok = idx == 0
+            || !current.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                && current.as_bytes()[idx - 1] != b'_';
+        let val_start_raw = idx + needle.len();
+        if !before_ok {
+            search_from = val_start_raw;
+            continue;
+        }
+        let after = &current[val_start_raw..];
+        let trimmed = after.trim_start_matches([' ', '\t']);
+        if trimmed.is_empty() || trimmed.starts_with("[已隐藏]") {
+            search_from = val_start_raw;
+            continue;
+        }
+        let ws_len = after.len() - trimmed.len();
+        let val_start = val_start_raw + ws_len;
+        let val_len = if let Some(quote) = trimmed.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+            trimmed[1..].find(quote).map(|n| n + 2).unwrap_or(trimmed.len())
+        } else {
+            trimmed
+                .find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ')' | ']' | '}'))
+                .unwrap_or(trimmed.len())
+        };
+        let rep = format!("{replacement_prefix}[已隐藏]");
+        current.replace_range(idx..val_start + val_len, &rep);
+        search_from = idx + rep.len();
+    }
+    current
+}
+
 pub fn redact(text: &str) -> String {
     text.lines().map(|line| {
         let lower = line.to_ascii_lowercase();
@@ -63,10 +172,33 @@ pub fn redact(text: &str) -> String {
                 return format!("[认证错误类别：{category}；其余字段已隐藏]");
             }
         }
-        if (line.contains("://") && line.contains('@')) || ["privatekey", "private_key", "password", "authorization", "bearer ", "token=", "token:", "token\"", "secret", "private-key", "shortid", "short-id", "\"id\":", "\"uuid\"", "vless://", "vmess://", "trojan://", "ss://"].iter().any(|key| lower.contains(key)) {
-            return "[已隐藏含认证信息的日志行]".to_string();
+        let mut masked = mask_url_credentials(line);
+        for (kw, prefix) in [
+            ("bearer ", "Bearer "),
+            ("basic ", "Basic "),
+            ("authorization:", "Authorization: "),
+            ("password:", "password: "),
+            ("password=", "password="),
+            ("\"password\":", "\"password\":"),
+            ("privatekey:", "privateKey: "),
+            ("private_key:", "private_key: "),
+            ("private-key:", "private-key: "),
+            ("\"privatekey\":", "\"privateKey\":"),
+            ("\"private_key\":", "\"private_key\":"),
+            ("\"private-key\":", "\"private-key\":"),
+            ("token=", "token="),
+            ("token:", "token: "),
+            ("\"token\":", "\"token\":"),
+            ("api_key=", "api_key="),
+            ("api_key:", "api_key: "),
+            ("api-key:", "api-key: "),
+            ("\"api_key\":", "\"api_key\":"),
+            ("dns_cloudflare_api_token=", "dns_cloudflare_api_token="),
+            ("dns_cloudflare_api_token =", "dns_cloudflare_api_token = "),
+        ] {
+            masked = mask_token_after(&masked, kw, prefix);
         }
-        line.chars().filter(|c| !c.is_control() || *c == '\t').take(8192).collect()
+        masked.chars().filter(|c| !c.is_control() || *c == '\t').take(8192).collect()
     }).collect::<Vec<String>>().join("\n")
 }
 fn root(path: &Path) -> &Path {
@@ -114,8 +246,9 @@ fn segment_time(path: &Path, modified: SystemTime) -> SystemTime {
     }
     modified
 }
-fn prune(dir: &Path, budget: u64) -> Result<()> {
-    let age = log_policy(dir).age();
+fn prune(dir: &Path, policy: &LogPolicy) -> Result<()> {
+    let age = policy.age();
+    let budget = policy.budget();
     let mut files: Vec<_> = sources(dir).into_iter().flat_map(|(_,p)| segments(&p)).filter_map(|p| {
         let m = std::fs::metadata(&p).ok()?; Some((segment_time(&p,m.modified().ok()?), p, m.len()))
     }).collect();
@@ -130,15 +263,15 @@ fn prune(dir: &Path, budget: u64) -> Result<()> {
 }
 pub fn maintain(dir: &Path) -> Result<()> {
     let _guard = WRITE.lock().unwrap();
-    let policy = log_policy(dir);
-    prune(dir, policy.budget())?;
+    let policy = log_policy(dir)?;
+    prune(dir, &policy)?;
     for (_, path) in sources(dir) {
         if regular(&path) {
             let since = segment_time(&path, std::fs::metadata(&path)?.modified()?);
             if log_day(since) != log_day(SystemTime::now()) { compress(&path, since)?; }
         }
     }
-    prune(dir, policy.budget())
+    prune(dir, &policy)
 }
 fn log_day(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).format("%Y-%m-%d").to_string()
@@ -159,9 +292,11 @@ fn compress(path: &Path, since: SystemTime) -> Result<()> {
 pub fn append(path: &Path, text: &str) -> Result<()> {
     let _guard = WRITE.lock().unwrap();
     if !logging_enabled(root(path)) { return Ok(()); }
-    let policy = log_policy(root(path));
     if path.symlink_metadata().is_ok() { ensure!(regular(path), "拒绝写入日志符号链接"); }
-    if std::fs::metadata(path).is_ok_and(|m| segment_time(path,m.modified().unwrap_or(SystemTime::now())).elapsed().unwrap_or_default() > policy.age()) {
+    let policy = log_policy(root(path)).ok();
+    if let Some(policy) = &policy
+        && std::fs::metadata(path).is_ok_and(|m| segment_time(path,m.modified().unwrap_or(SystemTime::now())).elapsed().unwrap_or_default() > policy.age())
+    {
         std::fs::remove_file(path)?;
     }
     if std::fs::metadata(path).is_ok_and(|m| m.len() >= SEGMENT || log_day(segment_time(path,m.modified().unwrap_or(SystemTime::now()))) != log_day(SystemTime::now())) {
@@ -172,7 +307,10 @@ pub fn append(path: &Path, text: &str) -> Result<()> {
     let mut file = std::fs::OpenOptions::new().create(true).append(true).custom_flags(libc::O_NOFOLLOW).mode(0o600).open(path)?;
     writeln!(file, "{} {}", crate::model::now(), redact(text))?;
     drop(file);
-    prune(root(path), policy.budget())
+    if let Some(policy) = &policy {
+        prune(root(path), policy)?;
+    }
+    Ok(())
 }
 pub fn capture<R: tokio::io::AsyncRead + Unpin + Send + 'static>(mut reader: R, path: PathBuf, secrets: Vec<String>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -220,13 +358,19 @@ pub fn read(dir: &Path, request: &LogRequest) -> Result<Value> {
     let path = available.iter().find(|(s,_)| s == &request.source).context("日志来源尚未创建")?.1.clone();
     if let Some(enabled) = request.enabled { set_logging(dir, enabled)?; }
     let _guard = WRITE.lock().unwrap();
-    let mut policy = log_policy(dir);
+    let mut policy = log_policy(dir).unwrap_or(LogPolicy {
+        retention_hours: AGE.as_secs() / 3600,
+        max_mib: BUDGET / 1024 / 1024,
+    });
     if request.retention_hours.is_some() || request.max_mib.is_some() {
         if let Some(hours) = request.retention_hours { policy.retention_hours = hours; }
         if let Some(mib) = request.max_mib { policy.max_mib = mib; }
         crate::runtime::atomic_write(&dir.join("log-policy.json"), &serde_json::to_vec(&policy)?)?;
     }
-    prune(dir, policy.budget())?;
+    if dir.join("log-policy.json").exists() {
+        policy = log_policy(dir)?;
+    }
+    prune(dir, &policy)?;
     let mut files = if request.archive { segments(&path) } else { vec![path] };
     files.retain(|p| regular(p));
     files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH));
@@ -288,6 +432,18 @@ mod tests {
         let request: LogRequest = serde_json::from_value(json!({"source":"agent"})).unwrap();
         let value = serde_json::to_value(request).unwrap();
         for key in ["enabled", "retention_hours", "max_mib"] { assert!(value.get(key).is_none()); }
+    }
+    #[test]
+    fn redacts_base64_share_links_and_basic_auth_headers() {
+        let vmess = "vmess://eyJhZGQiOiIxOTguNTEuMTAwLjEiLCJpZCI6InNlY3JldC11dWlkIn0=#node";
+        let mihomo = "mihomo://eyJ0eXBlIjoid2lyZWd1YXJkIiwicHJpdmF0ZS1rZXkiOiJzZWNyZXQtd2cifQ==";
+        let basic = "Authorization: Basic dXNlcjpzZWNyZXQtdG9rZW4=";
+        let masked = redact(&format!("{vmess}\n{mihomo}\n{basic}"));
+        assert!(!masked.contains("eyJhZGQi"), "{masked}");
+        assert!(!masked.contains("eyJ0eXBl"), "{masked}");
+        assert!(!masked.contains("dXNlcjpzZWNyZXQ"), "{masked}");
+        assert!(masked.contains("vmess://[已隐藏]"), "{masked}");
+        assert!(masked.contains("mihomo://[已隐藏]"), "{masked}");
     }
     #[test]
     fn log_policy_rotates_days_compresses_and_enforces_time_and_size() {
@@ -356,8 +512,10 @@ mod tests {
             }
             assert_eq!(redact(&result), result, "Stored logs are redacted again on read");
         }
-        assert_eq!(redact("password: hunter2"), "[已隐藏含认证信息的日志行]");
-        assert_eq!(redact("Bearer hidden-token"), "[已隐藏含认证信息的日志行]");
+        assert_eq!(redact("password: hunter2"), "password: [已隐藏]");
+        assert_eq!(redact("connection failed (Bearer hidden-token): timeout"), "connection failed (Bearer [已隐藏]): timeout");
+        assert_eq!(redact("ACME authorization pending for id: 123"), "ACME authorization pending for id: 123");
+        assert_eq!(redact("vless://secret-uuid@example.com:443?pbk=pub&sni=example.com"), "vless://[已隐藏]@example.com:443?pbk=[已隐藏]&sni=example.com");
         assert_eq!(redact("connection refused"), "connection refused");
         assert_eq!(redact("invalid password: hunter2\nconnection refused").lines().count(), 2);
     }
@@ -413,7 +571,7 @@ mod tests {
         let value = read(dir.path(), &request).unwrap(); assert!(value["text"].as_str().unwrap().contains("first run"));
         assert!(!redact("password: secret-value").contains("secret-value"));
         assert!(LogRequest {source:"../../admin-token".into(), ..request.clone()}.validate().is_err());
-        prune(dir.path(), 1).unwrap(); assert!(!path.exists());
+        prune(dir.path(), &LogPolicy { retention_hours: 1, max_mib: 0 }).unwrap(); assert!(!path.exists());
         std::os::unix::fs::symlink(dir.path().join("secret"), &path).unwrap();
         assert!(append(&path, "x").is_err());
     }
@@ -451,7 +609,7 @@ pub async fn clock_status() -> Value {
     value
 }
 
-fn cdn_provider(evidence: &str) -> Option<&'static str> {
+pub(crate) fn cdn_provider(evidence: &str) -> Option<&'static str> {
     let evidence = evidence.to_ascii_lowercase();
     if evidence.contains("cf-ray:") || evidence.contains("server: cloudflare") { Some("Cloudflare") }
     else if evidence.contains(".akamaiedge.net") || evidence.contains(".edgekey.net") || evidence.contains(".edgesuite.net") || evidence.contains("server: akamaighost") { Some("Akamai") }
@@ -494,17 +652,32 @@ async fn reality_cdn(input: &crate::model::RealityTarget) -> Value {
 }
 
 async fn fallback_tls(endpoint: &str, sni: Option<&str>) -> &'static str {
-    let mut command = tokio::process::Command::new("openssl");
-    command.args(["s_client", "-connect", endpoint, "-tls1_3", "-brief"]);
-    if let Some(sni) = sni { command.args(["-servername", sni]); } else { command.arg("-noservername"); }
-    command.stdin(std::process::Stdio::null()).kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(3), command.output()).await {
-        Ok(Ok(output)) => {
-            let text = String::from_utf8_lossy(&output.stderr);
-            if text.contains("CONNECTION ESTABLISHED") { "accepted" }
-            else if !output.status.success() && (text.contains("unexpected eof") || text.contains("errno=104") || text.contains("Connection reset by peer")) { "rejected" }
-            else { "unverified" }
-        },
+    let endpoint = endpoint.to_owned();
+    let sni = sni.map(str::to_owned);
+    let check = tokio::task::spawn_blocking(move || -> &'static str {
+        let Ok(addr) = endpoint.parse::<std::net::SocketAddr>() else { return "unverified" };
+        let Ok(tcp) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)) else {
+            return "unverified";
+        };
+        let _ = tcp.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = tcp.set_write_timeout(Some(Duration::from_secs(3)));
+        let Ok(mut builder) = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()) else {
+            return "unverified";
+        };
+        let _ = builder.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3));
+        builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+        let Ok(mut cfg) = builder.build().configure() else { return "unverified" };
+        cfg.set_verify_hostname(false);
+        cfg.set_use_server_name_indication(sni.is_some());
+        match cfg.connect(sni.as_deref().unwrap_or(""), tcp) {
+            Ok(_) => "accepted",
+            Err(openssl::ssl::HandshakeError::Failure(_)) => "rejected",
+            Err(openssl::ssl::HandshakeError::SetupFailure(_)) => "unverified",
+            Err(openssl::ssl::HandshakeError::WouldBlock(_)) => "unverified",
+        }
+    });
+    match tokio::time::timeout(Duration::from_secs(4), check).await {
+        Ok(Ok(status)) => status,
         _ => "unverified",
     }
 }
@@ -530,7 +703,7 @@ pub async fn reality(binary: &Path, input: &crate::model::RealityTarget) -> Resu
     let marker = id(); let response_marker = marker.clone();
     let echo_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        if let Ok((mut socket,_)) = echo.accept().await {
+        while let Ok((mut socket,_)) = echo.accept().await {
             let mut buf = [0;4096]; let _ = socket.read(&mut buf).await;
             let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response_marker.len(), response_marker);
             let _ = socket.write_all(response.as_bytes()).await;
@@ -553,11 +726,40 @@ pub async fn reality(binary: &Path, input: &crate::model::RealityTarget) -> Resu
         let server_file = temp.path().join("server.json"); let client_file = temp.path().join("client.json");
         atomic_write(&server_file, &serde_json::to_vec(&server)?)?; atomic_write(&client_file, &serde_json::to_vec(&client)?)?;
         validate(binary, &server_file).await?; validate(binary, &client_file).await?;
-        server_child = Some(spawn_xray(binary, &server_file, &temp.path().join("server.log"))?);
-        client_child = Some(spawn_xray(binary, &client_file, &temp.path().join("client.log"))?);
-        tokio::time::sleep(Duration::from_secs(6)).await;
-        let response = reqwest::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))?).timeout(Duration::from_secs(10)).build()?.get(format!("http://127.0.0.1:{echo_port}/")).send().await?;
-        ensure!(response.status().is_success() && response.text().await? == marker, "REALITY 数据验证失败");
+        server_child = Some(spawn_xray(binary, &server_file, &temp.path().join("server.log"), &server)?);
+        client_child = Some(spawn_xray(binary, &client_file, &temp.path().join("client.log"), &client)?);
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+        loop {
+            if server_child.as_mut().unwrap().try_wait()?.is_some() || client_child.as_mut().unwrap().try_wait()?.is_some() {
+                anyhow::bail!("临时 REALITY 进程提前退出");
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", server_port)).await.is_ok()
+                && tokio::net::TcpStream::connect(("127.0.0.1", socks_port)).await.is_ok()
+            {
+                break;
+            }
+            ensure!(tokio::time::Instant::now() < ready_deadline, "临时 REALITY 进程监听超时");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        let http_client = reqwest::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))?).timeout(Duration::from_secs(10)).build()?;
+        let mut verified_data = false;
+        let mut last_err = None;
+        for _ in 0..8 {
+            match http_client.get(format!("http://127.0.0.1:{echo_port}/")).send().await {
+                Ok(response) if response.status().is_success() => {
+                    if response.text().await? == marker {
+                        verified_data = true;
+                        break;
+                    }
+                }
+                Ok(response) => last_err = Some(anyhow::anyhow!("HTTP {}", response.status())),
+                Err(e) => last_err = Some(e.into()),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !verified_data {
+            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("REALITY 数据验证失败")));
+        }
         let endpoint = format!("127.0.0.1:{server_port}");
         let wrong = format!("{}.invalid", id());
         let (allowed, other, missing) = tokio::join!(fallback_tls(&endpoint, Some(&input.server_name)), fallback_tls(&endpoint, Some(&wrong)), fallback_tls(&endpoint, None));
@@ -576,18 +778,44 @@ pub async fn reality(binary: &Path, input: &crate::model::RealityTarget) -> Resu
 
 
 pub fn secrets(value: &Value) -> Vec<String> {
-    fn visit(value:&Value, output:&mut Vec<String>) {
+    fn push_secret(output: &mut Vec<String>, text: &str) {
+        if text.len() >= 6 || uuid::Uuid::parse_str(text).is_ok() {
+            output.push(text.to_string());
+        }
+    }
+    fn visit(value: &Value, in_client: bool, output: &mut Vec<String>) {
         match value {
-            Value::Object(map) => for (key,value) in map {
-                if ["id","uuid","password","pass","privatekey","private_key","token","shortid","shortids"].contains(&key.to_ascii_lowercase().as_str()) {
-                    if let Some(text)=value.as_str().filter(|v| !v.is_empty()) { output.push(text.to_string()); }
-                    if let Some(items)=value.as_array() { for text in items.iter().filter_map(Value::as_str).filter(|s|!s.is_empty()) { output.push(text.to_string()); } }
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let lower = key.to_ascii_lowercase();
+                    let sensitive = matches!(
+                        lower.as_str(),
+                        "uuid" | "password" | "pass" | "privatekey" | "private_key" | "private-key" | "token" | "shortid" | "shortids" | "short-id"
+                    ) || (in_client && lower == "id");
+                    if sensitive {
+                        if let Some(text) = value.as_str() {
+                            push_secret(output, text);
+                        }
+                        if let Some(items) = value.as_array() {
+                            for text in items.iter().filter_map(Value::as_str) {
+                                push_secret(output, text);
+                            }
+                        }
+                    }
+                    visit(value, in_client || matches!(lower.as_str(), "clients" | "users" | "accounts"), output);
                 }
-                visit(value,output);
-            },
-            Value::Array(values) => for value in values { visit(value,output); },
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, in_client, output);
+                }
+            }
             _ => (),
         }
     }
-    let mut output=vec![];visit(value,&mut output);output.sort_by_key(|v|std::cmp::Reverse(v.len()));output.dedup();output
+    let mut output = vec![];
+    visit(value, false, &mut output);
+    output.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    output.dedup();
+    output
 }

@@ -2,23 +2,21 @@
 
 日常安装、接入和运维请先看 [上手指南](../README.md)。本页面向维护者、自动化调用和手工部署。
 
-个人自用的本机代理 Web 管理台。Rust 控制台负责线路编排、SQLite 状态与应用任务；Rust Agent 管理独立的 Xray 子进程以及入口网关，执行限速、配额和网站反代；React + TypeScript 前端使用已购买的 Metronic Tailwind 主题组件与布局。
+自托管代理管理控制台与本机 Agent 运行架构说明。Rust 控制台负责线路编排、SQLite 状态、客户与共享套餐账务、多机总控与应用任务；Rust Agent 管理 Xray / Mihomo 子进程以及入口计量网关，执行鉴权载荷统计、聚合限速、硬额度预留与 TLS 回落；React + TypeScript 前端使用已购买的 Metronic Tailwind 主题组件与布局。
 
-本目录是新增功能。不会读取、导入、覆盖或停止原有 SSH 脚本创建的服务。没有复制 3x-ui 源码，也不依赖 3x-ui 运行。
+没有复制 3x-ui 源码，也不依赖 3x-ui 运行；Linux 交互安装向导支持检测并备份导入常见旧服务配置。
 
 ## 当前能力
 
-- 同时管理多条独立 VLESS + REALITY + Vision 线路，每条 1–8 个受管节点，可共享物理节点，入口端口、UUID 和路径分别保存。
-- 本机代理按顺序引用外部代理或其他本机代理，支持链式出网与循环检查。
-- 受管 HTTP、SOCKS5、SS2022、Trojan/TLS 代理；外部可导入 HTTP(S)、SOCKS5、Shadowsocks、Trojan TCP/TLS 和 VLESS TCP/raw、XHTTP TLS/REALITY 链接。
-- 原生 HTTP/HTTPS 网站反代、同端口多域名、WebSocket、手工证书和 Rust ACME webroot 自动申请/续期。
-- 默认保存并应用，支持草稿、端口冲突和循环检查、影响范围确认、逐节点应用、运行确认与失败恢复。每个 Agent 管理一个独立 Xray，多条线路共享进程；修改可能使其相关连接短暂重连。仅限速/额度变动支持在线更新。
-- 真实入口 HTTP/HTTPS 探测，以及 TCP/UDP 回显探测。后两者要求目标运行回显服务，不把端口连通当作整链成功。
-- 二维码、协议分享链接、完整 Mihomo YAML / 节点 YAML、可撤销订阅，支持导入单节点 Mihomo YAML / JSON。
-- 入口字节计量、UTC 月额度、上传/下载聚合限速、日流量、服务器指标与告警。限速覆盖整条线路的并发连接，不修改宿主机 qdisc。
-- 管理员密钥轮换、TOTP 与一次性恢复码、WebAuthn Passkey、同源 Cookie 会话、节点专属令牌与本地登录恢复。
+- 管理多协议代理入口：VLESS（REALITY / TLS，TCP + Vision / XHTTP）、Shadowsocks（SS2022 及常用 AEAD）、Trojan/TLS、VMess AEAD、Hysteria 2、TUIC v5、HTTP 与 SOCKS5（含 UDP Associate）。
+- 本机代理按顺序引用外部代理或其他本机代理，支持链式出网、UDP 整链能力检查与循环引用拦截。
+- 支持 TLS 内置回落主页或指定回落站点、手工 PEM 证书、Rust ACME webroot 自动申请/续期，以及 Nginx `ssl_preread` 统一 443 SNI 分流。
+- 默认保存并应用，支持草稿、端口冲突检查、影响范围确认、逐节点应用与失败快照恢复；仅启停、限速、额度与租期等运营变更支持在线热更新而不重建内核。
+- 支持真实入口 HTTP/HTTPS 探测与自动分段故障诊断、二维码、协议分享链接、Mihomo 单节点 YAML、可撤销订阅及批量导入外部代理。
+- 鉴权业务载荷计量、北京时间自然月/开通锚日周期、单线与客户共享套餐额度、供应侧共享资源额度与带宽租约、严格域名白名单与端口/连接数限制。
+- 管理员密钥轮换、TOTP 与一次性恢复码、WebAuthn Passkey、多角色成员密钥（管理员 / 运维 / 财务 / 只读）、多机总控与一次性免密跳转。
 
-没有套餐、计费、租户、自动选路或自动故障切换。当前受管入口监听 IPv4；公网 ACME 签发、跨公网路径、IPv6 入站、外部 XHTTP 的所有扩展参数和所有客户端版本没有在本机集成测试中覆盖。实际防火墙和 DNS 由使用者配置。完整数据目录包含代理凭据、证书私钥和 TOTP 密钥，权限为 700，备份保持私有。计量范围、持久化窗口和更换入口机器的账本限制见[图文手册](../README.md#8-流量月额度与带宽上限)。
+完整数据目录包含代理凭据、证书私钥和 TOTP 密钥，权限为 700，备份须保持私有。计量范围、持久化窗口和账本说明见[使用说明](../README.md#流量计量与运营操作)。
 
 ## 构建
 
@@ -74,7 +72,7 @@ NAT 环境通过 `--local-host` 明确公网入站地址。需要固定后端端
 
 构建支持 Linux/macOS 的 x86_64 与 aarch64；Linux 使用静态 musl 目标，macOS 使用原生 apple-darwin 目标（最低 macOS 14），执行 TypeScript/Vite 构建后生成 release 二进制。`build` 只构建打包，Rust 单元测试及 SSH/REALITY 回归通过 `verify` 单独执行。按 `panel/src/core-versions.json` 下载固定的 Xray/Mihomo 并检查官方附件 SHA256，打包程序、安装器、版本清单和许可说明。不会包含运行数据、原始购买 ZIP、node_modules 或 Cargo target。原始 Xray 许可随包保留；Metronic 主题许可沿用购买授权。
 
-产物默认放在 `release-output/v0.1.0-linux-x86_64/`（依当前版本、系统、架构变化，macOS 的系统名为 `darwin`）。包含 `chain-panel-0.1.0-linux-x86_64.tar.gz`、`release.json`、`SHA256SUMS`。这是有意保留的最终交付目录；临时源码副本、npm 缓存和 Cargo target 在成功、失败或中断后自动清理，下一次构建会重新编译。输出目录已存在时不会覆盖，请传入新的 `--output` 或更新版本。
+产物默认放在 `release-output/vVERSION-linux-x86_64/`（依当前版本、系统、架构变化，macOS 的系统名为 `darwin`）。包含 `chain-panel-VERSION-linux-x86_64.tar.gz`、`release.json`、`SHA256SUMS`。这是有意保留的最终交付目录；临时源码副本和启动目录在成功、失败或中断后自动清理。输出目录已存在时不会覆盖，请传入新的 `--output` 或更新版本。
 
 ```bash
 ./scripts/version-release.sh build --work-parent /大容量磁盘 --output /新的发行目录
@@ -92,7 +90,7 @@ NAT 环境通过 `--local-host` 明确公网入站地址。需要固定后端端
 安装会优先选择本地发行包，没有本地包时自动下载最新正式版本。`chainctl update` 默认下载最新正式包；本地包可显式指定：
 
 ```bash
-sudo ./scripts/install-server.sh install --package /发行目录/chain-panel-0.1.0-linux-x86_64.tar.gz
+sudo ./scripts/install-server.sh install --package /发行目录/chain-panel-VERSION-linux-x86_64.tar.gz
 # 同目录必须保留 SHA256SUMS。
 ```
 
@@ -101,11 +99,11 @@ sudo ./scripts/install-server.sh install --package /发行目录/chain-panel-0.1
 ```bash
 sha256sum -c SHA256SUMS
 mkdir chain-package
-tar -xzf chain-panel-0.1.0-linux-x86_64.tar.gz -C chain-package
-sudo bash chain-package/scripts/install-server.sh install
+tar -xzf chain-panel-VERSION-linux-x86_64.tar.gz -C chain-package
+sudo sh chain-package/scripts/install-server.sh install
 ```
 
-SHA256 用于完整性校验，发行包应从自己控制的渠道获取。安装器默认启用并启动新服务；控制台安装后显示登录信息，也可用 `sudo chainctl token` 查看。自动 HTTPS 已设置安全 Cookie；手工反向代理部署增加 `--secure-cookie 1`，并保留包含端口的请求 Host。原有 SSH 管理的 Xray 服务不会被接管。
+SHA256 用于完整性校验，发行包应从自己控制的渠道获取。安装器默认启用并启动新服务；控制台安装后显示登录信息，也可用 `sudo chainctl token` 查看。自动 HTTPS 已设置安全 Cookie；手工反向代理部署增加 `--secure-cookie 1`，并保留包含端口的请求 Host。
 
 ```bash
 sudo chainctl status                         # 默认控制台
@@ -114,11 +112,10 @@ sudo chainctl restart --component panel
 sudo chainctl stop --component agent
 sudo chainctl start --component agent
 sudo chainctl backup --component panel
-sudo chainctl update --component panel --package /新发行目录/chain-panel-0.2.0-linux-x86_64.tar.gz
-sudo chainctl rollback --component panel
+sudo chainctl update --component panel --package /新发行目录/chain-panel-VERSION-linux-x86_64.tar.gz
 ```
 
-升级保留监听地址、令牌、线路数据库及节点配置；修改参数时显式传入对应选项。升级和备份会短暂停止所选组件，以获得一致的私有备份；Agent 停止会使其转发连接重连。备份位于 `/var/backups/chain-panel/`，权限 600。启动检查失败会恢复升级前的程序链接与配置；运行数据和备份保留。`rollback` 回滚程序版本，不将数据库回退到旧备份。Agent 的进程启动检查通过后，还应在 Web 确认心跳。
+升级保留监听地址、令牌、线路数据库及节点配置；修改参数时显式传入对应选项。升级和备份会短暂停止所选组件，以获得一致的私有备份；Agent 停止会使其转发连接重连。备份位于 `/var/backups/chain-panel/`，权限 600。启动检查失败会恢复升级前的程序链接与配置；运行数据和备份保留。Agent 的进程启动检查通过后，还应在 Web 确认心跳。
 
 推荐通过 `.github/workflows/release.yml` 发布：提交版本改动后推送 `vX.Y.Z` 标签，Actions 分别在 Linux x86_64/ARM64、macOS Apple Silicon runner 构建，校验标签与 Cargo/npm 四份版本文件一致。三个平台组合均成功后合并 `SHA256SUMS`，创建草稿、上传并重新下载校验全部附件，最后公开正式 Release；不再构建或要求 macOS Intel 包。安装器不读取 Actions 中间产物。任一平台组合失败都不会公开半套包；中间 artifact 在工作流结束时删除，Cargo/npm 临时缓存由构建器清理。
 
@@ -128,24 +125,14 @@ sudo chainctl rollback --component panel
 
 选择不推送或仅推送失败后，可选 **10「单独推送已有版本」**，或运行 `./scripts/version-release.sh push`；只推送 `main` 和当前版本标签，不递增版本、不创建新提交。标签必须指向当前提交，不会自动移动已有标签。再次选择 9 也会识别未推送的当前版本并进入推送步骤。其他失败保留现场，需先检查 `git status`。向导不代替测试，必须等 Actions 构建成功并公开正式 Release 后，服务器才能通过 `sudo chainctl update` 获取新版。也可用 `./scripts/version-release.sh release` 直接进入创建版本向导。
 
-需要手工操作时：
+需要手工打标签推送时（由 GitHub Actions 自动完成三平台构建、聚合校验与正式发布）：
 
 ```bash
-git tag v0.1.0
-git push origin main v0.1.0
+git tag vVERSION
+git push origin main vVERSION
 ```
 
-手工上传发行包需要安装并登录 `gh`。本地构建与安装不会自动推送 Git、上传附件或发布版本；上述一键向导通过推送标签触发 Actions，以下命令则直接操作指定远端的 Release（手工脚本一次发布一个架构，多平台完整发布应使用 Actions）：
-
-```bash
-# 先提交并推送对应源码，然后从干净的发行输入重新构建。
-./scripts/version-release.sh draft --repo OWNER/REPO --directory /发行目录
-./scripts/version-release.sh publish --repo OWNER/REPO --directory /发行目录
-```
-
-草稿命令将发行包绑定到清单中的已推送提交；发布命令再次下载并校验草稿附件，与本地产物一致后才正式发布。未提交的本地构建可安装，不能上传为正式草稿。无 GitHub Actions 隐式触发流程。
-
-审核安装文件而不操作系统时，可执行 `install --root /临时审核目录 --package ...`。此模式只生成离线安装树，不创建系统用户、操作服务管理器或启动服务；测试使用该模式验证升级、回滚与数据保留。
+审核安装文件而不操作系统时，可执行 `install --root /临时审核目录 --package ...`。此模式只生成离线安装树，不创建系统用户、操作服务管理器或启动服务；测试使用该模式验证升级与数据保留。
 
 ## 启动控制台
 
@@ -207,17 +194,15 @@ Rust 集成测试使用本机独立控制台、三个 Agent、真实 Xray、TLS 
 
 ## Agent 入口网关与数据
 
-编译配置的 `_chain` 元数据记录公共入口、限速、额度、网站与证书；Agent 在传给 Xray 前移除此字段。代理/转发的内核入口绑定 127.0.0.1 的内部端口，公共端口由 Agent 网关监听。原生节点间中转使用 Xray 的 VLESS/REALITY；Hysteria 2、TUIC 接入和包含 Hysteria 2、TUIC、Shadowsocks、HTTPS 的出网链由 Agent 管理的 Mihomo 执行。
+编译配置的 `_chain` 元数据记录公共入口、限速、额度、回落与证书；Agent 在传给 Xray 前移除此字段。受管代理的内核入口绑定 127.0.0.1 的内部端口，公共端口由 Agent 网关监听。原生节点间中转使用 Xray 的 VLESS/REALITY；Hysteria 2、TUIC 接入和包含 Hysteria 2、TUIC、Shadowsocks、HTTPS 的出网链由 Agent 管理的 Mihomo 执行。
 
-`traffic.json` 持久化线路计量，约每 2 秒写入并在正常退出前保存；`active.json` 保存已应用版本。Agent 上报网关能力、已占用 TCP/UDP 端口及系统临时连接端口范围；内部端口优先使用 50000–65534，必要时回退到 30000–49999，避开 macOS 默认的 49152–65535 临时范围及已有监听；防止与出站连接或 TIME_WAIT 冲突。旧 Agent 未上报范围时按 Linux 默认 32768–60999 处理。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
+`traffic.db` 持久化线路计量（约每 5 秒合并刷盘并在正常退出前结算，`traffic.json` 保留旧统计一次性导入兼容），`line-quota.db` / `resource-quota.db` 持久化硬额度预留，`active.json` 保存已应用版本。Agent 上报网关能力、已占用 TCP/UDP 端口及系统临时连接端口范围；内部端口优先使用 50000–65534，必要时回退到 30000–49999，避开 macOS 默认的 49152–65535 临时范围及已有监听；防止与出站连接或 TIME_WAIT 冲突。旧 Agent 未上报范围时按 Linux 默认 32768–60999 处理。端口采样与实际绑定之间仍可能发生竞争，应用失败时保留占用者并回滚。控制台拒绝向未支持入口网关的旧 Agent 应用新规则，升级时先更新 Agent 再更新控制台。
 
-自动证书在 Agent 数据目录的 `acme/` 下，Rust ACME 使用独立账户、挑战及证书版本目录，以 Agent 用户执行；不再使用 `CHAIN_CERTBOT_BIN`。安装器安装 Nginx，由独立 ACME 站点将验证请求路由至 `/var/lib/chain-acme/{agent,panel}`；`CHAIN_ACME_WEBROOT` 指定对应目录，Agent 无需监听 TCP 80。手工部署未设置此变量时仍使用独立挑战监听。HTTP-01 挑战结束会删除验证文件，独立 SSH 安装器也支持 Cloudflare DNS-01 并清理本次创建的 TXT。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
+自动证书在 Agent 数据目录的 `acme/` 下，Rust ACME 使用独立账户、挑战及证书版本目录，以 Agent 用户执行；不再使用 `CHAIN_CERTBOT_BIN`。安装器安装 Nginx，由独立 ACME 站点将验证请求路由至 `/var/lib/chain-acme/{agent,panel}`；`CHAIN_ACME_WEBROOT` 指定对应目录，Agent 无需监听 TCP 80。手工部署未设置此变量时仍使用独立挑战监听。HTTP-01 挑战结束会删除验证文件。HTTPS 端口可以自定义。已有网站可以使用手工证书或在外层 Nginx 终止 TLS。
 
 控制台订阅 token 和恢复码只保存哈希；TOTP 秘钥和业务证书需要在私有数据目录中保留原文。Passkey 使用 webauthn-rs 的挑战、来源、用户验证和签名检查，挑战有有效期且单次使用。管理员密钥轮换会退出全部会话；本地 `chainctl reset-auth` 先备份并停止控制台，再清除登录二步验证配置，保留业务数据。
 
 主题来源及保留组件见 [主题来源与许可](../frontend/THEME.md)。四个原始购买 ZIP 保持原样。
-
-本轮调研与设计取舍见[功能设计与参考](design-notes.md)。
 
 ## 引导安装与自动更新
 

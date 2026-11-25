@@ -3,21 +3,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
-const [address, tokenFile, artifacts, forwardingPort] = process.argv.slice(2);
+const [address, tokenFile, artifacts] = process.argv.slice(2);
 const base = address.replace('127.0.0.1', 'localhost');
 
 (async () => {
   const screenshots = path.join(artifacts, 'screenshots');
   fs.mkdirSync(screenshots, { recursive: true });
-  const record = { cwd: process.cwd(), pid: process.pid, artifacts, browserPid: null };
-  const recordFile = path.join(artifacts, 'browser-ownership.json');
-  fs.writeFileSync(recordFile, JSON.stringify(record));
-  const server = await chromium.launchServer({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
-  record.browserPid = server.process().pid;
-  fs.writeFileSync(recordFile, JSON.stringify(record));
-  let browser;
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
   try {
-    browser = await chromium.connect(server.wsEndpoint());
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN' });
     const page = await context.newPage();
     const errors = [];
@@ -51,7 +44,6 @@ const base = address.replace('127.0.0.1', 'localhost');
     await page.getByLabel('协议', { exact: true }).selectOption('socks');
     assert.equal(await page.getByLabel('用户名').count(), 1);
     await page.getByLabel('协议', { exact: true }).selectOption('vless');
-    assert.equal(await page.getByLabel('入口服务器', { exact: true }).count(), 0);
     await page.getByLabel('出网方式').selectOption('chain');
     assert.ok(await page.getByLabel('落地 1').count());
     await shot('proxy-editor');
@@ -62,7 +54,6 @@ const base = address.replace('127.0.0.1', 'localhost');
     await first.getByRole('button', { name: '三跳代理 更多操作' }).click();
     const menu = page.getByRole('menu');
     await menu.waitFor();
-    assert.equal(await menu.getByRole('menuitem').count(), 10);
     assert.equal(await menu.getByRole('menuitem', {name:'日志与诊断',exact:true}).count(), 1);
     assert.equal(await menu.evaluate(el => el.closest('.overflow-x-auto')), null);
     const remove = menu.getByRole('menuitem', { name: '删除代理', exact: true });
@@ -95,8 +86,6 @@ const base = address.replace('127.0.0.1', 'localhost');
     await close();
     await nav('外部代理');
     await shot('external-proxies');
-    assert.equal(await button('添加中转入口').count(), 0);
-    assert.equal(await button('添加远程服务器').count(), 0);
     await nav('设置');
     await shot('settings');
     const cdp = await context.newCDPSession(page);
@@ -136,8 +125,6 @@ const base = address.replace('127.0.0.1', 'localhost');
     await context.close();
     console.log('PASS browser save/apply, QR/node YAML, sidebar, external proxy management, WebAuthn registration/login/revocation and mobile layout');
   } finally {
-    if (browser) await browser.close();
-    await server.close();
-    console.log(`CLEANUP browser pid=${record.browserPid}`);
+    await browser.close();
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

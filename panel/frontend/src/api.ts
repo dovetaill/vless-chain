@@ -21,12 +21,7 @@ export async function api<T>(path: string, method = 'GET', body?: unknown, signa
   try { result = JSON.parse(text); }
   catch { throw new ApiError(`服务器返回了无法读取的响应 (${response.status})`, response.status); }
   if (!response.ok) {
-    if (response.status === 401 && path !== '/login') window.dispatchEvent(new Event('session-expired'));
     throw new ApiError(result.error || `请求失败 (${response.status})`, response.status);
   }
   return result;
-}
-
-export async function publishChecked(request: typeof api = api) {
-  return request('/publish', 'POST', {});
 }

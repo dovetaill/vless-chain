@@ -1,11 +1,4 @@
 /* Metronic v9.5.0 Demo 1 Shell & Form Primitives */
-@theme {
-  --text-2sm: 0.8125rem;
-  --text-2sm--line-height: calc(1.125 / 0.8125);
-  --text-2xs: 0.6875rem;
-  --text-2xs--line-height: calc(0.875 / 0.6875);
-}
-
 :root {
   font-family:
     Inter,
@@ -316,78 +309,6 @@ body {
 
   .details-inline[open] > summary::after {
     transform: rotate(90deg);
-  }
-
-  .row-menu-trigger {
-    display: inline-flex;
-    width: 2rem;
-    height: 2rem;
-    align-items: center;
-    justify-content: center;
-    border-radius: 0.375rem;
-    border: 1px solid transparent;
-    cursor: pointer;
-    color: var(--muted-foreground);
-    transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-  }
-
-  .row-menu-trigger:hover {
-    background: var(--accent);
-    color: var(--foreground);
-  }
-
-  .row-menu-trigger[data-state="open"] {
-    background: color-mix(in srgb, var(--primary) 12%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 25%, transparent);
-    color: var(--primary);
-  }
-
-  .row-menu-content {
-    z-index: 60;
-    min-width: 12.5rem;
-    padding: 0.375rem;
-    border: 1px solid var(--border);
-    border-radius: 0.625rem;
-    background: var(--popover);
-    color: var(--popover-foreground);
-    box-shadow: 0 12px 32px -4px rgba(15, 23, 42, 0.16);
-  }
-
-  .dark .row-menu-content {
-    box-shadow: 0 14px 36px -4px rgba(0, 0, 0, 0.55);
-  }
-
-  .row-menu-content [role="menuitem"] {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    border-radius: 0.375rem;
-    padding: 0.45rem 0.625rem;
-    text-align: left;
-    font-size: 0.8125rem;
-    line-height: 1.25rem;
-    white-space: nowrap;
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .row-menu-content [role="menuitem"] svg {
-    width: 0.95rem;
-    height: 0.95rem;
-    flex-shrink: 0;
-    opacity: 0.7;
-  }
-
-  .row-menu-content [role="menuitem"][data-highlighted] {
-    outline: none;
-    background: var(--accent);
-  }
-
-  .row-menu-content [role="menuitem"][data-disabled] {
-    opacity: 0.4;
-    cursor: default;
-    pointer-events: none;
   }
 }
 
@@ -708,7 +629,7 @@ nav .nav-item {
     display: none;
   }
 
-  .fleet-responsive button:not(.row-menu-trigger) {
+  .fleet-responsive button:not([data-slot="dropdown-menu-trigger"]) {
     min-height: 36px;
   }
 
@@ -731,9 +652,4 @@ nav .nav-item {
   .proxy-responsive .data-table td:last-child {
     grid-row: 3;
   }
-}
-
-.proxy-responsive.proxy-readonly .data-table th:first-child,
-.proxy-responsive.proxy-readonly .data-table td:first-child {
-  display: none;
 }

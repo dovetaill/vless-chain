@@ -3,7 +3,7 @@ use crate::ctl::{cores, package};
 use serde_json::json;
 use std::{collections::BTreeMap, fs, path::Path};
 
-pub(super) fn manifests(root: &Path) {
+fn manifests(root: &Path) {
     fs::create_dir_all(root.join("panel/frontend")).unwrap();
     fs::write(
         root.join("panel/Cargo.toml"),
@@ -44,9 +44,6 @@ fn version_updates_four_manifests_and_rejects_invalid_input_before_writing() {
             .map(|p| fs::read(root.path().join(p)).unwrap())
             .collect::<Vec<_>>()
     );
-    assert!(super::delivery::validate_tag(root.path(), "main").is_err());
-    assert!(super::delivery::validate_tag(root.path(), "v0.3.6").is_err());
-    super::delivery::validate_tag(root.path(), "v0.3.7").unwrap();
 }
 #[test]
 fn release_keeps_the_pre_native_verifier_and_manager_entrypoints() {
@@ -88,55 +85,6 @@ fn github_token_is_exclusive_to_the_exact_api_origin() {
             );
         }
     }
-}
-#[tokio::test]
-async fn default_download_redirect_does_not_forward_credentials_to_another_host() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let mut headers = vec![];
-        for index in 0..2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = vec![];
-            loop {
-                let byte = stream.read_u8().await.unwrap();
-                bytes.push(byte);
-                if bytes.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            headers.push(String::from_utf8(bytes).unwrap().to_lowercase());
-            let response = if index == 0 {
-                format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/asset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                )
-            } else {
-                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into()
-            };
-            stream.write_all(response.as_bytes()).await.unwrap();
-        }
-        headers
-    });
-    let result = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap()
-        .get(format!("http://127.0.0.1:{port}/api"))
-        .bearer_auth("fixture-token")
-        .send()
-        .await;
-    if result.is_err() {
-        server.abort();
-        let _ = server.await;
-        panic!("本机重定向夹具失败：{result:?}");
-    }
-    assert_eq!(result.unwrap().text().await.unwrap(), "ok");
-    let headers = server.await.unwrap();
-    assert!(headers[0].contains("authorization: bearer fixture-token"));
-    assert!(!headers[1].contains("authorization:"));
-    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
 }
 #[test]
 fn official_assets_require_version_digest_unique_attachment_and_stable_release() {

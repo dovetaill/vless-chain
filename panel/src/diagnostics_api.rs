@@ -30,13 +30,6 @@ async fn reality(State(app): State<App>, Path(id): Path<String>, Json(input): Js
     Ok(Json(dispatch(&app, &id, json!({"operation":"reality","request":input}), 55).await?))
 }
 async fn reality_candidates(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    {
-        let store = app.store.lock().unwrap();
-        let node = store.doc.nodes.iter().find(|n| n.id == id).context("节点不存在")?;
-        if node.report.system["reality_candidates_version"] != 1 {
-            return Err(error(StatusCode::BAD_REQUEST, "请先升级该节点 Agent，以支持 REALITY 目标推荐"));
-        }
-    }
     Ok(Json(dispatch(&app, &id, json!({"operation":"reality-candidates"}), 55).await?))
 }
 #[derive(Deserialize)]
@@ -50,8 +43,14 @@ pub async fn dispatch(app: &App, id: &str, request: Value, seconds: u64) -> Resu
     {
         let s = app.store.lock().unwrap();
         let node = s.doc.nodes.iter().find(|n| n.id == id).context("节点不存在")?;
-        ensure!(now().saturating_sub(node.seen) < 30, "Agent 离线，无法读取新日志；历史日志保留在该 VPS");
-        ensure!(node.report.system["diagnostics_version"] == 1, "请先升级该 Agent，以支持 Web 日志");
+        let action = match request["operation"].as_str() {
+            Some("logs") => "读取实时日志（历史日志仍保留在该 VPS）",
+            Some("reality") => "执行 REALITY 目标检查",
+            Some("reality-candidates") => "获取 REALITY 推荐目标",
+            Some("path") => "执行链路分段检查",
+            _ => "执行节点诊断",
+        };
+        ensure!(now().saturating_sub(node.seen) < 60, "Agent 离线，暂时无法{action}");
     }
     app.diagnostics.request(id, request, Duration::from_secs(seconds)).await
 }
@@ -84,7 +83,7 @@ impl Broker {
                 } else {
                     ensure!(queue.len() < 64, "诊断任务繁忙，请稍后重试；这不表示节点离线");
                     let (tx, rx) = watch::channel(None);
-                    let job = model_id();
+                    let job = id();
                     let expires = std::time::Instant::now() + timeout;
                     queue.insert(node.to_string(), Pending { id: job.clone(), request: request.clone(), expires, reply: tx, delivered: false });
                     (job, rx, true, expires)
@@ -94,7 +93,7 @@ impl Broker {
             let deadline = if shared { expires } else { expires.min(wait_until) };
             let result = tokio::time::timeout_at(deadline.into(), waiting.reply.changed()).await;
             if shared {
-                result.context("Agent 诊断响应超时，请检查节点服务和网络；未返回旧日志")?.context("诊断请求已结束，请重试")?;
+                result.context("Agent 诊断响应超时，请检查节点服务和网络")?.context("诊断请求已结束，请重试")?;
                 let value = waiting.reply.borrow().clone().context("诊断未返回结果")?;
                 if let Some(e) = value["error"].as_str() { anyhow::bail!("{e}"); }
                 return Ok(value);
@@ -108,7 +107,7 @@ impl Broker {
         if let Some(p) = queue.get_mut(node) {
             if p.expires <= std::time::Instant::now() { queue.remove(node); }
             else if reply.id == p.id {
-                ensure!(serde_json::to_vec(&reply.result)?.len() <= 300_000, "日志响应过大");
+                ensure!(serde_json::to_vec(&reply.result)?.len() <= 300_000, "诊断响应过大");
                 p.reply.send_replace(Some(reply.result));
                 queue.remove(node);
             } else {
@@ -120,7 +119,6 @@ impl Broker {
     }
 }
 
-fn model_id() -> String { chain_panel::model::id() }
 #[derive(Deserialize)]
 struct Reply { #[serde(default)] id: String, #[serde(default)] result: Value }
 async fn exchange(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(reply): Json<Reply>) -> ApiResult<Json<Value>> {
@@ -133,62 +131,9 @@ async fn exchange(State(app): State<App>, Path(id): Path<String>, headers: Heade
     Ok(Json(app.diagnostics.exchange(&id, reply)?))
 }
 
-pub fn targets(config: &Value) -> BTreeSet<(String, String)> {
-    let mut result = BTreeSet::new();
-    if let Some(inbounds) = config["inbounds"].as_array() {
-        for inbound in inbounds {
-            if inbound["streamSettings"]["security"] != "reality" { continue; }
-            let reality = &inbound["streamSettings"]["realitySettings"];
-            if let Some(target) = reality["target"].as_str().or_else(|| reality["dest"].as_str()) {
-                let guard_tag = format!("{}-reality-target", inbound["tag"].as_str().unwrap_or(""));
-                let target = config["outbounds"].as_array().and_then(|items| items.iter()
-                    .find(|item| item["tag"] == guard_tag && item["protocol"] == "freedom"))
-                    .and_then(|item| item["settings"]["redirect"].as_str()).unwrap_or(target);
-                if let Some(names) = reality["serverNames"].as_array() {
-                    for name in names.iter().filter_map(Value::as_str) { result.insert((target.into(),name.into())); }
-                }
-            }
-        }
-    }
-    if let Some(profiles) = config["_legacy"].as_array() {
-        for profile in profiles { result.extend(targets(&profile["config"])); }
-    }
-    result
-}
-fn require_verified(result: &Value) -> Result<()> {
-    ensure!(result["ok"] == true && result["cloudflare_checked"] == true
-        && result["fallback"]["status"] == "verified",
-        "REALITY 检查未全部通过，已保留草稿并阻止发布：{}", result["detail"].as_str().unwrap_or("缺少验证结果"));
-    Ok(())
-}
-pub async fn preflight(app: &App) -> Result<BTreeMap<String,Value>> {
-    let (configs, nodes) = { let s = app.store.lock().unwrap(); (compile(&s.doc)?, s.doc.nodes.clone()) };
-    for node in nodes {
-        let Some(config) = configs.get(&node.id) else { continue; };
-        if node.desired.as_ref().is_some_and(|d| &d.config == config) { continue; }
-        for (target, server_name) in targets(config) {
-            ensure!(node.report.system["reality_preflight_version"] == 1, "{}：请升级 Agent 后再发布 REALITY；草稿已保留", node.name);
-            let result = dispatch(app, &node.id, json!({"operation":"reality-preflight","request":{"target":target,"server_name":server_name}}), 70).await
-                .with_context(|| format!("{}：REALITY 发布检查未完成，草稿已保留", node.name))?;
-            require_verified(&result).with_context(|| format!("{}：{target} / {server_name}", node.name))?;
-        }
-    }
-    Ok(configs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn reality_publication_requires_every_check() {
-        let verified = json!({"ok":true,"cloudflare_checked":true,"fallback":{"status":"verified"}});
-        require_verified(&verified).unwrap();
-        for key in ["ok", "cloudflare_checked", "fallback"] {
-            let mut missing = verified.clone(); missing.as_object_mut().unwrap().remove(key);
-            assert!(require_verified(&missing).is_err());
-        }
-        assert!(require_verified(&json!({"ok":false,"status":"unverified"})).is_err());
-    }
     fn log_request(source: &str) -> Value {
         json!({"operation":"logs","request":{"source":source}})
     }
@@ -266,24 +211,6 @@ mod tests {
         broker.0.lock().unwrap().get_mut("node").unwrap().expires = std::time::Instant::now();
         assert_eq!(poll_agent(&broker), Value::Null);
         assert!(broker.0.lock().unwrap().is_empty());
-    }
-    #[test]
-    fn diagnostics_targets_keep_each_hop_sni_separate() {
-        let config = json!({"inbounds":[
-            {"streamSettings":{"security":"reality","realitySettings":{"target":"one.example:443","serverNames":["one.example"]}}},
-            {"streamSettings":{"security":"reality","realitySettings":{"target":"two.example:443","serverNames":["two.example"]}}}
-        ]});
-        let targets = targets(&config);
-        assert_eq!(targets.len(),2);
-        assert!(targets.contains(&("two.example:443".into(),"two.example".into())));
         assert!(!chain_panel::management::machine_route("POST","/api/diagnostics/../../logs"));
-    }
-    #[test]
-    fn diagnostics_targets_unwrap_guard_destination() {
-        let mut config = chain_panel::compiler::empty_config();
-        let mut inbound = json!({"tag":"line-test-in","streamSettings":{"security":"reality","realitySettings":{"target":"cover.example:8443","serverNames":["cover.example"]}}});
-        chain_panel::compiler::guard_reality(&mut config, &mut inbound, 61000).unwrap();
-        config["inbounds"].as_array_mut().unwrap().push(inbound);
-        assert_eq!(targets(&config), BTreeSet::from([("cover.example:8443".into(), "cover.example".into())]));
     }
 }

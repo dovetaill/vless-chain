@@ -140,8 +140,6 @@ Linux 交互向导可识别已有代理服务，提供备份导入、备份停�
 
 80 / 443 被其他服务占用时，按向导选择独立端口或手工证书。使用手工面板证书时，需让原续期工具在更新后重载 `chain-panel-https`。已有 HTTPS 网站需要与代理共用 443 时，参阅[网站回落与统一 443](panel/README.md#网站回落与统一-443)，不要直接覆盖已有站点配置。
 
-原有 SSH 脚本和 Web 面板各自管理所属服务，只有明确选择导入接管时才切换旧服务；继续使用原脚本请看 [SSH 指南](SSH-GUIDE.md)。
-
 </details>
 
 ## 开始使用
@@ -212,26 +210,11 @@ Linux 交互向导可识别已有代理服务，提供备份导入、备份停�
 | 重启面板 / Agent | `sudo chainctl restart` / `sudo chainctl restart --component agent` |
 | 恢复登录二步验证设置 | `sudo chainctl reset-auth` |
 
-升级会保留配置与数据，标准安装会同时更新已安装的本机 Agent。更新不再自动生成备份包；成功后清理 `/opt/chain/releases` 中已有的历史版本，只保留各组件当前使用的版本。仍被进程占用、校验失败或归属不明的目录会保留并提示，下次更新重试。更新失败仍恢复此前程序链接与配置；更新成功后不保留用于 `rollback` 的历史版本。升级、重启 Agent 以及 Agent 备份会短暂中断代理连接，请选择合适时间。独立部署的 Agent 应与控制台保持版本一致；从早期版本升级时先阅读对应的[更新说明](https://github.com/dovetaill/vless-chain/releases)。
+升级会保留配置与数据，标准安装会同时更新已安装的本机 Agent。更新不再自动生成备份包；成功后清理 `/opt/chain/releases` 中已有的历史版本，只保留各组件当前使用的版本。仍被进程占用、校验失败或归属不明的目录会保留并提示，下次更新重试。更新失败仍恢复此前程序链接与配置。升级、重启 Agent 以及 Agent 备份会短暂中断代理连接，请选择合适时间。独立部署的 Agent 应与控制台保持版本一致；从早期版本升级时先阅读对应的[更新说明](https://github.com/dovetaill/vless-chain/releases)。
 
 首次从旧安装器迁移时，旧 `chainctl` 进程仍执行原来的升级逻辑；请安装新版后再执行一次 `chainctl update`，或直接使用新版安装脚本执行更新，以应用历史版本清理规则。已有备份包不自动删除，手工 `backup` 仍可使用。
 
-备份保存在 `/var/backups/chain-panel/`，包含连接凭据，应私下保存。面板和 Agent 需要分别备份；手工备份 Agent 时，应停止 Agent 并复制完整数据目录，不能只保存 `traffic.json` 或单独复制 `traffic.db` 而遗漏 WAL 文件。`chainctl rollback` 只回滚程序版本，不恢复旧数据库，不能当作数据恢复命令。
-
-### 本地升级命令报错时修复
-
-如果 `chainctl update` 报 `ModuleNotFoundError: No module named 'chain_time'`，说明本地安装器引用了未安装的配套模块。旧安装器使用固定文件列表复制新版管理脚本时，可能漏掉新版新增模块；报错发生在下载之前，重复运行同一命令不能修复。
-
-直接下载完整安装器并显式执行升级，可绕过损坏的本地入口：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dovetaill/vless-chain/main/scripts/install-server.sh \
-  | sudo sh -s -- update --non-interactive
-```
-
-请完整复制两行，保留第一行末尾的 `\`；root 用户可去掉 `sudo`。仅安装 Agent 的机器在末尾加 `--component agent`。此命令使用最新安装器安装最新正式 Release，保留已有配置与数据，并重启受影响组件；不代表源码中尚未发布的 Rust 迁移已经生效。
-
-不带 `update` 参数的安装命令默认执行 `setup`；安装已完成时只显示登录信息，不更新本地管理器。确认上述升级成功后，再使用日常的 `chainctl update`。
+备份保存在 `/var/backups/chain-panel/`，包含连接凭据，应私下保存。面板和 Agent 需要分别备份；手工备份 Agent 时，应停止 Agent 并复制完整数据目录，不能只保存 `traffic.json` 或单独复制 `traffic.db` 而遗漏 WAL 文件。
 
 ### 卸载与重装
 
@@ -278,7 +261,6 @@ sudo chainctl uninstall
 | [完整使用手册](panel/README.md) | 协议设置、链式代理、客户查询、计量、租期及多机管理细节 |
 | [高级部署与开发](panel/docs/advanced.md) | 本地发行包、源码构建、环境变量、手工部署与验证 |
 | [版本更新](https://github.com/dovetaill/vless-chain/releases) | 正式发行包、版本变更和升级说明 |
-| [原有 SSH 脚本指南](SSH-GUIDE.md) | 使用命令行脚本管理原有服务 |
 | [主题来源与许可](panel/frontend/THEME.md) | Metronic 组件来源及使用条件；原始主题 ZIP 不随发行包分发 |
 
 遇到问题或有功能建议，可提交 [GitHub Issue](https://github.com/dovetaill/vless-chain/issues)。请附上面板与 Agent 版本、操作系统及架构、复现步骤、错误信息和脱敏截图；不要上传管理员密钥、代理密码、私钥、完整分享链接或备份文件。

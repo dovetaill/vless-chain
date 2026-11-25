@@ -18,15 +18,19 @@ pub fn private_dir(path: &Path, owner: &str) -> Result<()> {
     let marker = path.join(".chain-owner");
     if marker.exists() {
         ensure!(
-            std::fs::read_to_string(&marker)? == owner,
+            std::fs::read_to_string(&marker)?.trim() == owner.trim(),
             "数据目录属于其他组件"
         );
     } else {
-        ensure!(
-            std::fs::read_dir(path)?.next().is_none(),
-            "拒绝使用非空且不属于本程序的数据目录: {}",
-            path.display()
-        );
+        let benign = ["lost+found", "service.log", ".core-upgrade-blocked", "process.lock"];
+        for entry in std::fs::read_dir(path)? {
+            let name = entry?.file_name();
+            ensure!(
+                name.to_str().is_some_and(|n| benign.contains(&n)),
+                "拒绝使用非空且不属于本程序的数据目录: {}",
+                path.display()
+            );
+        }
         atomic_write(&marker, owner.as_bytes())?;
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
@@ -117,17 +121,14 @@ pub async fn check_reality(input: &RealityTarget) -> Result<Value> {
         "detail":if !valid {"TLS 1.3 握手或证书/SNI 验证失败"} else if !h2 {"证书与 SNI 匹配，但目标未协商 H2"} else {"TLS 1.3、证书/SNI 与 H2 检查通过"}}),
     )
 }
-pub fn spawn_xray(binary: &Path, config: &Path, log: &Path) -> Result<Child> {
+pub fn spawn_xray(binary: &Path, config: &Path, log: &Path, value: &Value) -> Result<Child> {
     let mut cmd = Command::new(binary);
     cmd.args(["run", "-config"]).arg(config);
-    spawn_core(cmd, log)
+    spawn_core(cmd, log, value)
 }
 static LOG_TASKS: std::sync::Mutex<std::collections::BTreeMap<u32, Vec<tokio::task::JoinHandle<()>>>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-fn spawn_core(mut cmd: Command, log: &Path) -> Result<Child> {
-    let args: Vec<_> = cmd.as_std().get_args().collect();
-    let secrets = args.windows(2).find(|args| args[0] == "-config" || args[0] == "-f")
-        .and_then(|args| std::fs::read(args[1]).ok()).and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .map(|value| crate::diagnostics::secrets(&value)).unwrap_or_default();
+fn spawn_core(mut cmd: Command, log: &Path, config: &Value) -> Result<Child> {
+    let secrets = crate::diagnostics::secrets(config);
     if let Err(error) = crate::diagnostics::append(log, "代理组件启动；此前日志保留") {
         eprintln!("代理诊断日志写入失败: {error}");
     }
@@ -422,7 +423,8 @@ impl ManagedXray {
         };
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
-    pub async fn open(binary: PathBuf, dir: PathBuf) -> Result<Self> {
+    #[cfg(test)]
+    async fn open(binary: PathBuf, dir: PathBuf) -> Result<Self> {
         let mut x = Self::new(binary, dir)?;
         if let Some(saved) = x.saved_config()? { x.apply(&saved).await?; }
         Ok(x)
@@ -471,11 +473,10 @@ impl ManagedXray {
             }
         }
     }
-    fn xray_config(&self, config: &Value) -> Result<Value> {
+    fn xray_config(&self, config: &Value, specs: &[crate::gateway::Spec]) -> Result<Value> {
         let mut value = crate::gateway::xray_config(config);
-        for spec in crate::gateway::specs(config)? {
-            if spec.kind == Kind::Vless
-                && matches!(spec.protocol, Protocol::Vless | Protocol::Hysteria2)
+        for spec in specs {
+            if matches!(spec.protocol, Protocol::Vless | Protocol::Hysteria2)
                 && spec.tls.mode == "auto"
             {
                 let live = crate::website::core_cert_dir(&self.dir, &spec.tls.domain);
@@ -496,11 +497,11 @@ impl ManagedXray {
         }
         Ok(value)
     }
-    fn mihomo_config(&self, config: &Value) -> Result<Option<Value>> {
+    fn mihomo_config(&self, config: &Value, specs: &[crate::gateway::Spec]) -> Result<Option<Value>> {
         let Some(mut value) = config.get("_mihomo").cloned() else {
             return Ok(None);
         };
-        for spec in crate::gateway::specs(config)?.iter().filter(|s| {
+        for spec in specs.iter().filter(|s| {
             matches!(s.protocol, Protocol::Tuic | Protocol::Hysteria2) && s.tls.mode == "auto"
         }) {
             // An upgrade may first restore a saved Xray Hysteria listener before the next publish.
@@ -526,30 +527,27 @@ impl ManagedXray {
         }
         Ok(Some(value))
     }
-    async fn start_config(&mut self, config: &Value) -> Result<()> {
+    async fn start_config(&mut self, config: &Value, specs: Vec<crate::gateway::Spec>) -> Result<()> {
         let path = self.dir.join("xray.json");
-        atomic_write(
-            &path,
-            &serde_json::to_vec_pretty(&self.xray_config(config)?)?,
-        )?;
-        self.child = Some(spawn_xray(&self.binary, &path, &self.dir.join("xray.log"))?);
-        for profile in crate::legacy_config::profiles(config)? {
+        let xray_cfg = self.xray_config(config, &specs)?;
+        atomic_write(&path, &serde_json::to_vec_pretty(&xray_cfg)?)?;
+        self.child = Some(spawn_xray(&self.binary, &path, &self.dir.join("xray.log"), &xray_cfg)?);
+        let profiles = crate::legacy_config::profiles(config)?;
+        for profile in &profiles {
             let dir = self.dir.join(format!("legacy-{}", profile.id));
             private_dir(&dir, "chain-legacy-config")?;
             let path = dir.join("config.json");
-            atomic_write(
-                &path,
-                &serde_json::to_vec_pretty(&crate::legacy_config::runtime_config(&profile))?,
-            )?;
+            let legacy_cfg = crate::legacy_config::runtime_config(profile);
+            atomic_write(&path, &serde_json::to_vec_pretty(&legacy_cfg)?)?;
             let mut command = Command::new(&self.binary);
             command.args(["run", "-config"]).arg(&path);
             if !profile.asset_dir.is_empty() {
                 command.env("XRAY_LOCATION_ASSET", &profile.asset_dir);
             }
             self.legacy
-                .push(Some(spawn_core(command, &dir.join("xray.log"))?));
+                .push(Some(spawn_core(command, &dir.join("xray.log"), &legacy_cfg)?));
         }
-        if let Some(value) = self.mihomo_config(config)? {
+        if let Some(value) = self.mihomo_config(config, &specs)? {
             let dir = self.dir.join("mihomo");
             std::fs::create_dir_all(&dir)?;
             let path = dir.join("config.json");
@@ -557,6 +555,7 @@ impl ManagedXray {
             self.mihomo = Some(spawn_core(
                 mihomo_command(&self.binary, &path, &dir),
                 &dir.join("mihomo.log"),
+                &value,
             )?);
         }
         // shortcut: Xray 26.3.27 samples REALITY targets for 5s; replace with a core readiness signal when available.
@@ -574,11 +573,7 @@ impl ManagedXray {
         .await;
         if !self.running() {
             let mut names = vec!["xray.log".to_owned(), "mihomo/mihomo.log".to_owned()];
-            names.extend(
-                crate::legacy_config::profiles(config)?
-                    .iter()
-                    .map(|p| format!("legacy-{}/xray.log", p.id)),
-            );
+            names.extend(profiles.iter().map(|p| format!("legacy-{}/xray.log", p.id)));
             let logs: Vec<_> = names
                 .iter()
                 .filter_map(|name| {
@@ -610,7 +605,7 @@ impl ManagedXray {
         }
         self.gateway = Some(
             crate::gateway::Gateway::start(
-                crate::gateway::specs(config)?,
+                specs,
                 self.traffic.clone(),
                 self.dir.clone(),
             )
@@ -699,6 +694,19 @@ impl ManagedXray {
         Ok(())
     }
     pub async fn apply(&mut self, desired: &Desired) -> Result<()> {
+        let specs = crate::gateway::specs(&desired.config)?;
+        if self.active.as_ref().is_some_and(|old| {
+            crate::gateway::xray_config(&old.config) == crate::gateway::xray_config(&desired.config)
+                && old.config.get("_mihomo") == desired.config.get("_mihomo")
+                && old.config.get("_legacy") == desired.config.get("_legacy")
+        }) && self.running()
+            && self.gateway.as_ref().is_some_and(|g| g.limits_only(&specs))
+        {
+            atomic_write(&self.dir.join("active.json"), &serde_json::to_vec(desired)?)?;
+            self.gateway.as_mut().unwrap().update_limits(&specs);
+            self.active = Some(desired.clone());
+            return Ok(());
+        }
         for profile in crate::legacy_config::profiles(&desired.config)? {
             let directory = tempfile::tempdir_in(&self.dir)?;
             let candidate = directory.path().join("config.json");
@@ -710,36 +718,25 @@ impl ManagedXray {
                 .await
                 .with_context(|| format!("旧配置 {} 预检失败", profile.name))?;
         }
-        let specs = crate::gateway::specs(&desired.config)?;
-        let existing_challenge = self
-            .active
-            .as_ref()
-            .and_then(|d| crate::gateway::specs(&d.config).ok())
-            .is_some_and(|s| {
-                s.iter()
-                    .any(|s| s.kind == Kind::Website && s.port == 80)
-            });
         // Native TLS/QUIC listeners need certificates before core validation.
         let native_tls = specs.iter().any(|s| {
-            s.kind == Kind::Vless
-                && matches!(
-                    s.protocol,
-                    Protocol::Vless | Protocol::Hysteria2 | Protocol::Tuic
-                )
-                && s.tls.mode == "auto"
+            matches!(
+                s.protocol,
+                Protocol::Vless | Protocol::Hysteria2 | Protocol::Tuic
+            ) && s.tls.mode == "auto"
         });
         if native_tls {
-            crate::website::prepare(&specs, &self.dir, existing_challenge).await?;
+            crate::website::prepare(&specs, &self.dir).await?;
         }
         let candidate = self.dir.join("candidate.json");
         atomic_write(
             &candidate,
-            &serde_json::to_vec_pretty(&self.xray_config(&desired.config)?)?,
+            &serde_json::to_vec_pretty(&self.xray_config(&desired.config, &specs)?)?,
         )?;
         let result = validate(&self.binary, &candidate).await;
         let _ = std::fs::remove_file(&candidate);
         result?;
-        if let Some(value) = self.mihomo_config(&desired.config)? {
+        if let Some(value) = self.mihomo_config(&desired.config, &specs)? {
             let dir = self.dir.join("mihomo");
             std::fs::create_dir_all(&dir)?;
             let candidate = dir.join("candidate.json");
@@ -748,28 +745,19 @@ impl ManagedXray {
             let _ = std::fs::remove_file(&candidate);
             result?;
         }
-        if self.active.as_ref().is_some_and(|old| {
-            crate::gateway::xray_config(&old.config) == crate::gateway::xray_config(&desired.config)
-                && old.config.get("_mihomo") == desired.config.get("_mihomo")
-                && old.config.get("_legacy") == desired.config.get("_legacy")
-        }) && self.running()
-        {
-            if self.gateway.as_ref().is_some_and(|g| g.limits_only(&specs)) {
-                atomic_write(&self.dir.join("active.json"), &serde_json::to_vec(desired)?)?;
-                self.gateway.as_mut().unwrap().update_limits(&specs);
-                self.active = Some(desired.clone());
-                return Ok(());
-            }
-        }
         if !native_tls {
-            crate::website::prepare(&specs, &self.dir, existing_challenge).await?;
+            crate::website::prepare(&specs, &self.dir).await?;
         }
         let old = self.active.clone();
+        let old_specs = old
+            .as_ref()
+            .and_then(|d| crate::gateway::specs(&d.config).ok())
+            .unwrap_or_default();
         self.stop_all().await;
-        if let Err(error) = self.start_config(&desired.config).await {
+        if let Err(error) = self.start_config(&desired.config, specs).await {
             self.stop_all().await;
             if let Some(old) = old {
-                if let Err(restore) = self.start_config(&old.config).await {
+                if let Err(restore) = self.start_config(&old.config, old_specs).await {
                     bail!("应用失败: {error}; 恢复失败: {restore}");
                 }
             }
@@ -780,7 +768,7 @@ impl ManagedXray {
         {
             self.stop_all().await;
             if let Some(old) = old {
-                self.start_config(&old.config)
+                self.start_config(&old.config, old_specs)
                     .await
                     .context("写入版本失败，恢复旧配置也失败")?;
             }
@@ -830,8 +818,39 @@ fn probe_share(line: &Line, doc: &Document, local: bool) -> Result<String> {
     // A NAT host may not be able to reach its own public address.
     let mut line = line.clone();
     line.access.host = "127.0.0.1".into();
-    line.access.public_port = Some(line.hops.first().context("无入口")?.port);
     compiler::share(&line, doc)
+}
+
+fn validate_probe_url(raw: &str) -> Result<url::Url> {
+    let url = url::Url::parse(raw).context("请输入 HTTP/HTTPS 探测地址")?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none(),
+        "探测地址必须为 HTTP/HTTPS 且不含凭据"
+    );
+    Ok(url)
+}
+
+async fn wait_local_socks(child: &mut Child, port: u16, label: &str) -> Result<reqwest::Client> {
+    let mut ready = false;
+    for _ in 0..40 {
+        if child.try_wait()?.is_some() {
+            bail!("{label}提前退出");
+        }
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    ensure!(ready, "{label}本地 SOCKS 监听未在 2 秒内就绪");
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()?)
 }
 
 pub async fn probe(
@@ -896,22 +915,17 @@ fn probe_label(line: &Line, doc: &Document, request: &ProbeRequest, local_node: 
     let entry = line.hops.first().context("无入口")?;
     let node = doc.nodes.iter().find(|n| n.id == entry.node_id).context("入口节点不存在")?;
     let local = local_node == Some(node.id.as_str());
-    let (endpoint, sni) = if line.kind == Kind::Vless && request.mode == "http" {
+    let (endpoint, sni) = if request.mode == "http" {
         let proxy = crate::external::mihomo(&probe_share(line, doc, local)?, "probe")?;
         (compiler::address(proxy["server"].as_str().context("入口地址为空")?, proxy["port"].as_u64().context("入口端口为空")? as u16),
          proxy["servername"].as_str().or_else(|| proxy["sni"].as_str()).unwrap_or("").to_string())
-    } else if line.kind == Kind::Website && request.mode == "http" {
-        (compiler::address(&line.access.tls.domain, entry.port), line.access.tls.domain.clone())
     } else {
         (compiler::address(if local { "127.0.0.1" } else { &node.host }, entry.port), String::new())
     };
-    let target = if request.mode == "http" && line.kind == Kind::Website {
-        format!("{}://{}/", if matches!(line.access.tls.mode.as_str(), "auto" | "manual") { "https" } else { "http" }, compiler::address(&line.access.tls.domain, entry.port))
-    } else { request.url.clone() };
     Ok(format!("{}：{} {endpoint}{}{}", line.name,
-        if local && line.kind != Kind::Website { "本机入口" } else { "公网入口" },
+        if local { "本机入口" } else { "公网入口" },
         if sni.is_empty() { String::new() } else { format!(" · SNI {sni}") },
-        if target.is_empty() { String::new() } else { format!(" → {target}") }))
+        if request.url.is_empty() { String::new() } else { format!(" → {}", request.url) }))
 }
 
 async fn probe_inner(
@@ -933,104 +947,20 @@ async fn probe_inner(
         .context("入口节点不存在")?;
     let local = local_node == Some(node.id.as_str());
     let endpoint = compiler::address(if local { "127.0.0.1" } else { &node.host }, entry.port);
-    let marker = format!("chain-probe-{}", id()).into_bytes();
     let detail = match request.mode.as_str() {
-        "udp_echo" => {
-            ensure!(
-                line.kind == Kind::Forward && line.network.contains("udp"),
-                "此线路没有 UDP 转发入口"
-            );
-            let addr = tokio::net::lookup_host(&endpoint)
-                .await?
-                .next()
-                .context("无法解析入口")?;
-            let socket = UdpSocket::bind(if addr.is_ipv6() {
-                "[::]:0"
-            } else {
-                "0.0.0.0:0"
-            })
-            .await?;
-            socket.connect(addr).await?;
-            socket.send(&marker).await?;
-            let mut buf = vec![0; 2048];
-            let n = socket.recv(&mut buf).await?;
-            ensure!(
-                buf[..n] == marker,
-                "目标未返回原始探测内容（此模式要求目标为 UDP 回显服务）"
-            );
-            "UDP 回显数据已经过实际入口和完整转发路径".to_string()
-        }
-        "tcp_echo" => {
-            ensure!(
-                line.kind == Kind::Forward && line.network.contains("tcp"),
-                "此线路没有 TCP 转发入口"
-            );
-            let mut s = TcpStream::connect(&endpoint).await?;
-            s.write_all(&marker).await?;
-            let mut buf = vec![0; marker.len()];
-            s.read_exact(&mut buf).await?;
-            ensure!(
-                buf == marker,
-                "目标未返回原始探测内容（此模式要求目标为 TCP 回显服务）"
-            );
-            "TCP 回显数据已经过实际入口和完整转发路径".to_string()
-        }
         "tcp" => {
             tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&endpoint)).await??;
             "入口 TCP 可以建立连接；未验证代理认证或业务响应".into()
         }
-        "http" if line.kind == Kind::Website => {
-            let scheme = if matches!(line.access.tls.mode.as_str(), "auto" | "manual") {
-                "https"
-            } else {
-                "http"
-            };
-            let url = format!(
-                "{scheme}://{}/",
-                compiler::address(&line.access.tls.domain, entry.port)
-            );
-            let mut response = reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(12))
-                .build()?
-                .get(url)
-                .send()
-                .await?;
-            ensure!(
-                response.status().is_success(),
-                "网站返回 HTTP {}",
-                response.status()
-            );
-            if core_check.is_some() { received_http(&mut response).await?; }
-            format!("网站入口返回 HTTP {}", response.status())
-        }
         "http" => {
-            ensure!(
-                line.kind == Kind::Vless || line.network.contains("tcp"),
-                "HTTP 探测需要 TCP"
-            );
-            let url = url::Url::parse(&request.url).context("请输入 HTTP/HTTPS 探测地址")?;
-            ensure!(
-                matches!(url.scheme(), "http" | "https")
-                    && url.username().is_empty()
-                    && url.password().is_none(),
-                "探测地址必须为 HTTP/HTTPS 且不含凭据"
-            );
+            let url = validate_probe_url(&request.url)?;
             let temp = tempfile::tempdir()?;
             // Reserve a random local port, then start the short-lived SOCKS probe process.
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let port = listener.local_addr()?.port();
             drop(listener);
-            let share = if line.kind == Kind::Vless {
-                probe_share(line, doc, local)?
-            } else {
-                String::new()
-            };
-            let outbound = if line.kind == Kind::Vless {
-                compiler::external_outbound(&share, "probe")?
-            } else {
-                json!({"tag":"probe","protocol":"freedom","settings":{"redirect":endpoint}})
-            };
+            let share = probe_share(line, doc, local)?;
+            let outbound = compiler::external_outbound(&share, "probe")?;
             let sidecar = compiler::needs_mihomo(&outbound);
             let mut config = if sidecar {
                 let proxy = crate::external::mihomo(&share, "probe")?;
@@ -1046,27 +976,14 @@ async fn probe_inner(
                 spawn_core(
                     mihomo_command(binary, &file, temp.path()),
                     &temp.path().join("probe.log"),
+                    &config,
                 )?
             } else {
                 validate(binary, &file).await?;
-                spawn_xray(binary, &file, &temp.path().join("probe.log"))?
+                spawn_xray(binary, &file, &temp.path().join("probe.log"), &config)?
             });
             let result = async {
-                for _ in 0..40 {
-                    if child.as_mut().unwrap().try_wait()?.is_some() {
-                        bail!("探测 Xray 提前退出");
-                    }
-                    if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                let client = reqwest::Client::builder()
-                    .no_proxy()
-                    .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
-                    .timeout(Duration::from_secs(12))
-                    .redirect(reqwest::redirect::Policy::limited(5))
-                    .build()?;
+                let client = wait_local_socks(child.as_mut().unwrap(), port, "探测内核").await?;
                 let mut response = match client.get(url).send().await {
                     Ok(response) => response,
                     Err(error) if core_check.is_some() => {
@@ -1149,11 +1066,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let config = dir.path().join("socks.json");
-        atomic_write(&config, &serde_json::to_vec(&json!({"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks",
-            "settings":{"auth":"noauth","udp":true}}],"outbounds":[{"protocol":"freedom"}]}))?)?;
+        let socks_cfg = json!({"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks",
+            "settings":{"auth":"noauth","udp":true}}],"outbounds":[{"protocol":"freedom"}]});
+        atomic_write(&config, &serde_json::to_vec(&socks_cfg)?)?;
         let dns = UdpSocket::bind("127.0.0.1:0").await?;
         let std::net::SocketAddr::V4(address) = dns.local_addr()? else { unreachable!() };
-        let mut child = Some(spawn_xray(&binary,&config,&dir.path().join("core.log"))?);
+        let mut child = Some(spawn_xray(&binary,&config,&dir.path().join("core.log"),&socks_cfg)?);
         let server = tokio::spawn(async move {
             for valid in [true, false] {
                 let mut buf = [0u8;512];
@@ -1251,12 +1169,19 @@ mod tests {
                 let _ = stream.write_all(format!("{response}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
             }
         });
+        let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let proxy_cfg = json!({"inbounds":[{"listen":"127.0.0.1","port":proxy_port,"protocol":"socks","settings":{"auth":"password","accounts":[{"user":"u","pass":"p"}]}}],"outbounds":[{"protocol":"freedom"}]});
+        let proxy_file = dir.path().join("entry.json");
+        atomic_write(&proxy_file, &serde_json::to_vec(&proxy_cfg)?)?;
+        let mut entry_child = Some(spawn_xray(&binary, &proxy_file, &dir.path().join("entry.log"), &proxy_cfg)?);
         let node: Node = serde_json::from_value(json!({"id":"node","name":"fixture","host":"127.0.0.1",
             "token_hash":"test","reality":Reality::new("example.com:443".into(), "example.com".into())}))?;
-        let line: Line = serde_json::from_value(json!({"id":id(),"name":"redirect fixture","kind":"forward","network":"tcp",
-            "hops":[{"node_id":"node","port":address.port(),"uuid":id()}]}))?;
+        let line: Line = serde_json::from_value(json!({"id":id(),"name":"redirect fixture","kind":"vless",
+            "hops":[{"node_id":"node","port":proxy_port,"uuid":id()}],
+            "access":{"protocol":"socks","username":"u","password":"p"}}))?;
         let doc = Document { nodes:vec![node], lines:vec![line.clone()], ..Default::default() };
         let result = async {
+            wait_local_socks(entry_child.as_mut().unwrap(), proxy_port, "测试入口").await?;
             let request = |path| ProbeRequest { mode:"http".into(), url:format!("http://{address}/{path}") };
             let passed = probe(&binary, &line, &doc, &request("start"), None).await?;
             ensure!(passed["ok"] == true && passed["detail"].as_str().unwrap().contains("HTTP 200"), "redirect must reach its final response");
@@ -1269,6 +1194,7 @@ mod tests {
             ensure!(outbound["result"]["ok"] == true, "outbound diagnosis must follow redirects too");
             Ok::<_, anyhow::Error>(())
         }.await;
+        stop(&mut entry_child).await;
         server.abort();
         let _ = server.await;
         let _released = std::net::TcpListener::bind(address)?;
@@ -1399,8 +1325,7 @@ mod tests {
         let mut line: Line = serde_json::from_value(json!({
             "id":"line", "name":"line", "kind":"vless",
             "hops":[{"node_id":"local", "port":443, "uuid":id()}],
-            "access":{"host":"public.example.com", "public_host":"nat.example.com",
-                      "public_port":24443, "password":"test-password"}
+            "access":{"host":"public.example.com", "password":"test-password"}
         }))
         .unwrap();
         for protocol in [Protocol::Vless, Protocol::Vmess, Protocol::Hysteria2] {
@@ -1425,7 +1350,7 @@ mod tests {
             assert!(!label.contains(&line.hops[0].uuid));
             assert!(!label.contains("test-password"));
             assert!(!label.contains(&doc.nodes[0].reality.short_id));
-            assert!(probe_label(&line, &doc, &request, None).unwrap().contains("公网入口 public.example.com:24443"));
+            assert!(probe_label(&line, &doc, &request, None).unwrap().contains("公网入口 public.example.com:443"));
         }
     }
 
@@ -1454,29 +1379,31 @@ mod tests {
         };
         let mut config = json!({
             "inbounds":[{"tag":"line-test-in","protocol":"hysteria","streamSettings":{"security":"tls"}}],
-            "_chain":[{"id":"test","port":20000,"backend":50000,"meter":{"port":20001,"backend":50001,"password":"test-secret"},"kind":"vless","protocol":"hysteria2","network":"udp","target":"","limits":{},"tls":{"mode":"auto","domain":"cert.example.com"}}],
+            "_chain":[{"id":"test","port":20000,"backend":50000,"meter":{"port":20001,"backend":50001,"password":"test-secret"},"kind":"vless","protocol":"hysteria2","network":"udp","limits":{},"tls":{"mode":"auto","domain":"cert.example.com"}}],
             "_mihomo":{"listeners":[],"proxies":[]}
         });
+        let specs = crate::gateway::specs(&config).unwrap();
         let cert = dir
             .path()
             .join("tls-live/cert.example.com/fullchain.pem");
-        let legacy = runtime.xray_config(&config).unwrap();
+        let legacy = runtime.xray_config(&config, &specs).unwrap();
         assert_eq!(
             legacy["inbounds"][0]["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"],
             json!(cert)
         );
         assert!(
-            runtime.mihomo_config(&config).unwrap().unwrap()["listeners"]
+            runtime.mihomo_config(&config, &specs).unwrap().unwrap()["listeners"]
                 .as_array()
                 .unwrap()
                 .is_empty()
         );
         config["inbounds"][0] = json!({"tag":"line-test-in","protocol":"socks"});
         config["_mihomo"]["listeners"] = json!([{"name":"line-test-in","type":"hysteria2"}]);
-        let current = runtime.xray_config(&config).unwrap();
+        let specs = crate::gateway::specs(&config).unwrap();
+        let current = runtime.xray_config(&config, &specs).unwrap();
         assert!(current["inbounds"][0].get("streamSettings").is_none());
         assert_eq!(
-            runtime.mihomo_config(&config).unwrap().unwrap()["listeners"][0]["certificate"],
+            runtime.mihomo_config(&config, &specs).unwrap().unwrap()["listeners"][0]["certificate"],
             json!(cert)
         );
     }
@@ -1485,8 +1412,7 @@ mod tests {
 /// Probe only the applied outbound route, keeping the live listener and accounting bridge intact.
 pub async fn diagnose_path(binary: &Path, dir: &Path, line: &str, target: &str) -> Result<Value> {
     uuid::Uuid::parse_str(line)?;
-    let url = url::Url::parse(target)?;
-    ensure!(matches!(url.scheme(), "http" | "https") && url.username().is_empty() && url.password().is_none(), "请输入不含凭据的 HTTP/HTTPS 地址");
+    let url = validate_probe_url(target)?;
     let config: Value = serde_json::from_slice(&std::fs::read(dir.join("xray.json"))?)?;
     let tag = format!("line-{line}-out");
     ensure!(config["outbounds"].as_array().is_some_and(|o| o.iter().any(|o| o["tag"] == tag)), "该节点没有此代理的已应用出口");
@@ -1497,14 +1423,10 @@ pub async fn diagnose_path(binary: &Path, dir: &Path, line: &str, target: &str) 
     let path = temporary.path().join("probe.json"); atomic_write(&path, &serde_json::to_vec(&isolated)?)?;
     validate(binary, &path).await?;
     let log = temporary.path().join("probe.log");
-    let mut child = Some(spawn_xray(binary, &path, &log)?);
+    let mut child = Some(spawn_xray(binary, &path, &log, &isolated)?);
     let result = async {
-        for _ in 0..40 {
-            if child.as_mut().unwrap().try_wait()?.is_some() { bail!("诊断内核提前退出"); }
-            if TcpStream::connect(("127.0.0.1",port)).await.is_ok() { break; }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let response = reqwest::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?).timeout(Duration::from_secs(12)).redirect(reqwest::redirect::Policy::limited(5)).build()?.get(url).send().await?;
+        let client = wait_local_socks(child.as_mut().unwrap(), port, "诊断内核").await?;
+        let response = client.get(url).send().await?;
         ensure!(response.status().is_success(), "目标返回 HTTP {}",response.status());
         Ok::<_,anyhow::Error>(format!("出口实际收到 HTTP {}；没有验证公网入口或本机计量转发桥",response.status()))
     }.await;

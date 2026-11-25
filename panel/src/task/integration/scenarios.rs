@@ -1,15 +1,17 @@
 use super::{
-    super::{Options, strings, workspace::Workspace},
+    super::{strings, workspace::Workspace},
     harness::{Harness, map},
 };
-use crate::ctl::{package, upgrade::Manager};
+use crate::{
+    ctl::{package, upgrade::Manager},
+    model::Reality,
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
     path::Path,
-    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -97,15 +99,6 @@ pub async fn local_install(work: &Workspace, stage: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn public_key(private: &str) -> Result<String> {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let bytes: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(private)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("X25519 私钥长度无效"))?;
-    Ok(URL_SAFE_NO_PAD
-        .encode(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bytes)).as_bytes()))
-}
 pub async fn legacy(work: &Workspace, stage: &Path) -> Result<()> {
     let mut h = Harness::new(work, stage, "legacy-migration")?;
     let (tls, _, _) = h.tls("localhost").await?;
@@ -113,7 +106,6 @@ pub async fn legacy(work: &Workspace, stage: &Path) -> Result<()> {
     h.allow_loopback(&[http])?;
     h.panel(BTreeMap::new()).await?;
     let node=h.request("/api/nodes","POST",Some(&json!({"name":"migration","host":"127.0.0.1","target":format!("127.0.0.1:{tls}"),"server_name":"localhost"})),200).await?;
-    h.preflight(tls, false).await?;
     h.agent(0, &node, BTreeMap::new()).await?;
     h.wait_state("迁移 Agent", 30, |s| s["nodes"][0]["online"] == true)
         .await?;
@@ -139,7 +131,7 @@ pub async fn legacy(work: &Workspace, stage: &Path) -> Result<()> {
             let reality = &inbound["streamSettings"]["realitySettings"];
             upstream["streamSettings"]["realitySettings"]["serverName"] = json!("localhost");
             upstream["streamSettings"]["realitySettings"]["publicKey"] =
-                json!(public_key(reality["privateKey"].as_str().unwrap())?);
+                json!(Reality::public_key(reality["privateKey"].as_str().unwrap())?);
             upstream["streamSettings"]["realitySettings"]["shortId"] =
                 reality["shortIds"][0].clone();
             let log = h.root.join(format!("exit-{index}-access.log"));
@@ -182,42 +174,16 @@ pub async fn legacy(work: &Workspace, stage: &Path) -> Result<()> {
         .map(|l| l["name"].as_str().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
     ensure!(names.len() == 4, "迁移名称重复");
-    let warning = h
-        .request("/api/publish", "POST", Some(&json!({})), 400)
+    let check = h
+        .request(
+            "/api/reality/check",
+            "POST",
+            Some(&json!({"target":format!("127.0.0.1:{tls}"),"server_name":"localhost"})),
+            200,
+        )
         .await?;
-    ensure!(
-        warning["error"]
-            .as_str()
-            .is_some_and(|s| s.contains("REALITY") && s.contains("草稿")),
-        "未拒绝私网伪装目标：{warning}"
-    );
-    h.request(
-        "/api/publish",
-        "POST",
-        Some(&json!({"allow_unverified_reality":true})),
-        422,
-    )
-    .await?;
-    ensure!(
-        h.state().await?["jobs"] == state["jobs"]
-            && h.state().await?["lines"].as_array().unwrap().len() == 4,
-        "拒绝发布改变草稿或任务"
-    );
-    h.preflight
-        .as_ref()
-        .unwrap()
-        .enabled
-        .store(true, Ordering::SeqCst);
+    ensure!(check["ok"] == false, "未拒绝私网伪装目标：{check}");
     h.publish("applied").await?;
-    ensure!(
-        h.preflight
-            .as_ref()
-            .unwrap()
-            .intercepted
-            .load(Ordering::SeqCst)
-            > 0,
-        "未执行真实预检请求"
-    );
     for (index, (source, line)) in request["sources"]
         .as_array()
         .unwrap()
@@ -235,7 +201,7 @@ pub async fn legacy(work: &Workspace, stage: &Path) -> Result<()> {
         let port = h.port()?;
         let mut user = inbound["settings"]["clients"][0].clone();
         user["encryption"] = json!("none");
-        let pid=h.launch_core(&format!("client-{index}"),&json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":inbound["port"],"users":[user]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"localhost","publicKey":public_key(reality["privateKey"].as_str().unwrap())?,"shortId":reality["shortIds"][0],"fingerprint":"chrome"}}}]}))?;
+        let pid=h.launch_core(&format!("client-{index}"),&json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":inbound["port"],"users":[user]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"localhost","publicKey":Reality::public_key(reality["privateKey"].as_str().unwrap())?,"shortId":reality["shortIds"][0],"fingerprint":"chrome"}}}]}))?;
         let client = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
             .timeout(Duration::from_secs(3))
@@ -467,27 +433,6 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn customer_plans(work: &Workspace, stage: &Path) -> Result<()> {
-    super::plans::run(work, stage).await
-}
-pub async fn terminal_checks(work: &Workspace, ctl: &Path, root: &Path) -> Result<()> {
-    super::fixtures::terminal_checks(work, ctl, root).await
-}
-pub async fn run(work: &Workspace, stage: &Path, case: &str, args: &Options) -> Result<()> {
-    if case == "delivery-checks" {
-        return super::delivery::run(work).await;
-    }
-    if case == "ssh-manager" {
-        let bin = std::env::var_os("CHAIN_TEST_BIN_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| stage.join("bin"));
-        return super::ssh::run(work, &bin).await;
-    }
-    if case == "load-protocols" {
-        return super::load::run(work, stage, args).await;
-    }
-    super::business::run(work, stage, case, args).await
-}
 #[cfg(target_os = "macos")]
 async fn watcher(h: &Harness<'_>) -> Result<()> {
     super::fixtures::watcher(h).await

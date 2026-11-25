@@ -68,6 +68,7 @@ export function Resources({
   const [modal, setModal] = useState<ReactNode>(null);
   const load = async () => {
     setData(await api<ResourceState>("/resources"));
+    setError("");
   };
   useEffect(() => {
     void load().catch((e) => setError(errorText(e)));
@@ -409,7 +410,10 @@ export function RulesLibrary() {
   const [busy, setBusy] = useState("");
   const [modal, setModal] = useState<ReactNode>(null);
 
-  const load = async () => setSources(await api<Source[]>("/rules"));
+  const load = async () => {
+    setSources(await api<Source[]>("/rules"));
+    setError("");
+  };
   useEffect(() => {
     void load().catch((e) => setError(errorText(e)));
   }, []);
@@ -787,6 +791,7 @@ export function AccessPolicyEditor({
   request?: typeof api;
 }) {
   const [policy, setPolicy] = useState<AccessPolicy | null>(null);
+  const [domainsText, setDomainsText] = useState("");
   const [sources, setSources] = useState<Source[]>([]);
   const [filter, setFilter] = useState("");
   const [error, setError] = useState("");
@@ -798,6 +803,7 @@ export function AccessPolicyEditor({
     ])
       .then(([p, s]) => {
         setPolicy(p);
+        setDomainsText(p.domains.join("\n"));
         setSources(s);
       })
       .catch((e) => setError(errorText(e)));
@@ -824,7 +830,7 @@ export function AccessPolicyEditor({
           ? async (data) => {
               await request(`/access/${line.id}`, "POST", {
                 ...policy,
-                domains: field(data, "domains").split(/\s+/).filter(Boolean),
+                domains: domainsText.split(/\s+/).filter(Boolean),
                 denied_ports: ports(field(data, "denied")),
                 udp_ports: ports(field(data, "udp_ports")),
                 max_connections: number(data, "connections"),
@@ -932,18 +938,11 @@ export function AccessPolicyEditor({
                   name="domains"
                   className="textarea mono"
                   rows={3}
-                  defaultValue={policy.domains.join("\n")}
+                  value={domainsText}
+                  onChange={(e) => setDomainsText(e.target.value)}
                 />
               </Field>
             </div>
-          )}
-
-          {!policy.restricted && (
-            <input
-              type="hidden"
-              name="domains"
-              value={policy.domains.join("\n")}
-            />
           )}
 
           <div className="grid gap-3.5 sm:grid-cols-2">
@@ -1047,15 +1046,23 @@ export function AutoGroups({
       action={
         loaded
           ? async () => {
-              for (const item of items) {
-                const choice = choices[item.host];
-                if (choice === "skip") continue;
-                await api("/resources/groups", "POST", {
-                  ids: item.ids,
-                  group: choice === "new" ? null : choice,
-                  name: choice === "new" ? item.host : "",
-                  automatic: true,
-                });
+              let changed = false;
+              try {
+                for (const item of [...items]) {
+                  const choice = choices[item.host];
+                  if (choice === "skip") continue;
+                  await api("/resources/groups", "POST", {
+                    ids: item.ids,
+                    group: choice === "new" ? null : choice,
+                    name: choice === "new" ? item.host : "",
+                    automatic: true,
+                  });
+                  changed = true;
+                  setItems((old) => old.filter((c) => c.host !== item.host));
+                }
+              } catch (e) {
+                if (changed) await saved();
+                throw e;
               }
               await saved();
               close();

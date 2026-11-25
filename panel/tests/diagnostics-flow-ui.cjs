@@ -6,9 +6,7 @@ const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
 const assets = path.resolve(process.argv[2]);
 const root = process.env.CHAIN_TEST_ROOT;
 (async () => {
-  const server = await chromium.launchServer({ headless:true, executablePath:process.env.CHAIN_TEST_CHROMIUM });
-  fs.writeFileSync(path.join(root,'diagnostics-flow-browser.json'),JSON.stringify({pid:process.pid,pgid:Number(fs.readFileSync('/proc/self/stat','utf8').split(') ')[1].split(' ')[2]),browser:server.process().pid,endpoint:server.wsEndpoint(),artifacts:root}));
-  const browser = await chromium.connect(server.wsEndpoint());
+  const browser = await chromium.launch({ headless:true, executablePath:process.env.CHAIN_TEST_CHROMIUM });
   try {
     const page = await browser.newPage({viewport:{width:1440,height:1000},timezoneId:'America/New_York'});
     page.setDefaultTimeout(10000);
@@ -26,7 +24,7 @@ const root = process.env.CHAIN_TEST_ROOT;
       if(url.hostname!=='localhost') return route.abort();
       if(!url.pathname.startsWith('/api/')) {
         const file=path.join(assets,url.pathname==='/admin'?'index.html':url.pathname);
-        return route.fulfill({body:fs.readFileSync(file),contentType:{'.html':'text/html','.js':'text/javascript','.css':'text/css'}[path.extname(file)]||'application/octet-stream'});
+        return fs.existsSync(file)?route.fulfill({body:fs.readFileSync(file),contentType:{'.html':'text/html','.js':'text/javascript','.css':'text/css'}[path.extname(file)]||'application/octet-stream'}):route.fulfill({status:404});
       }
       let result={};
       if(url.pathname==='/api/state') result=state;
@@ -115,5 +113,5 @@ const root = process.env.CHAIN_TEST_ROOT;
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Overview fits narrow screen');
     assert.deepEqual(errors,[]);
     console.log('PASS diagnostics journey: specific overview reasons, skew-safe rates, panel default, source serialization, pause/resume, manual refresh, time failure detail, cancel, desktop/mobile, close cleanup');
-  } finally {await browser.close();await server.close();}
+  } finally {await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

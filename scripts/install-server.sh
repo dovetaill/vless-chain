@@ -63,16 +63,24 @@ free_kib() {
 }
 requested_package=$local_package
 archive=
+url_base=
 if [ -n "$package_url" ]; then
-  archive=${package_url##*/}
-  case "$archive" in chain-panel-*-$platform-$arch.tar.gz) ;; *) echo '发行包名称或平台架构不匹配' >&2; exit 1;; esac
+  url_path=${package_url%%[?#]*}
+  archive=${url_path##*/}
+  url_base=${url_path%/*}
+  case "$archive" in
+    ''|.|..|*/*|-*) echo '发行包名称无效' >&2; exit 1;;
+    *.tar.gz) ;;
+    *) echo '发行包必须为 .tar.gz 压缩包' >&2; exit 1;;
+  esac
 elif [ -n "$local_package" ]; then
   [ -f "$local_package" ] || { echo '本地发行包不存在' >&2; exit 1; }
   package_parent=$(CDPATH= cd -- "$(dirname -- "$local_package")" && pwd)
   archive=$(basename -- "$local_package")
   [ -f "$package_parent/SHA256SUMS" ] || { echo '请将 SHA256SUMS 与发行包放在同一目录' >&2; exit 1; }
 fi
-for bootstrap_parent in "${TMPDIR:-/tmp}" /var/tmp; do
+fallback_parent=${CHAIN_BOOTSTRAP_FALLBACK:-/var/tmp}
+for bootstrap_parent in "${TMPDIR:-/tmp}" "$fallback_parent"; do
   [ -d "$bootstrap_parent" ] && [ -w "$bootstrap_parent" ] || continue
   available=$(free_kib "$bootstrap_parent") || continue
   # Leave room for the checksum, filesystem metadata and error reporting.
@@ -86,12 +94,13 @@ for bootstrap_parent in "${TMPDIR:-/tmp}" /var/tmp; do
     tag=${latest##*/}; version=${tag#v}
     case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo '正式版本信息无效' >&2; exit 1;; esac
     case "$version" in *[!0-9.]*|*..*|.*|*.) echo '版本号无效' >&2; exit 1;; esac
-    [ "$(printf '%s' "$version" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ] || exit 1
+    [ "$(printf '%s' "$version" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ] || { echo '版本号无效' >&2; exit 1; }
     archive=chain-panel-$version-$platform-$arch.tar.gz
-    package_url=$repo/releases/download/$tag/$archive
+    url_base=$repo/releases/download/$tag
+    package_url=$url_base/$archive
   fi
   if [ -n "$package_url" ]; then
-    curl --proto '=https' --proto-redir '=https' -fSL --max-time 30 --max-filesize 65536 "${package_url%/*}/SHA256SUMS" -o "$bootstrap_dir/SHA256SUMS"
+    curl --proto '=https' --proto-redir '=https' -fSL --max-time 30 --max-filesize 65536 "$url_base/SHA256SUMS" -o "$bootstrap_dir/SHA256SUMS"
     if curl --proto '=https' --proto-redir '=https' -fSL --max-time 180 --max-filesize "$limit" "$package_url" -o "$bootstrap_dir/$archive"; then :
     else
       code=$?
@@ -111,19 +120,23 @@ for bootstrap_parent in "${TMPDIR:-/tmp}" /var/tmp; do
   else actual=$(shasum -a 256 "$bootstrap_dir/$archive"); fi
   [ "${actual%% *}" = "$expected" ] || { echo '发行包校验失败' >&2; exit 1; }
   # Only the verified chainctl member is expanded here. Native installation stages on the release filesystem.
-  bytes=$(tar -xOzf "$bootstrap_dir/$archive" bin/chainctl | wc -c)
+  if ! tar -xOzf "$bootstrap_dir/$archive" bin/chainctl > "$bootstrap_dir/chainctl" 2>/dev/null; then
+    available=$(free_kib "$bootstrap_parent") || available=0
+    if [ "$available" -lt 1024 ]; then rm -rf -- "$bootstrap_dir"; bootstrap_dir=; continue; fi
+    echo '发行包缺少原生 chainctl 或提取失败' >&2
+    exit 1
+  fi
+  bytes=$(wc -c < "$bootstrap_dir/chainctl")
   [ "$bytes" -gt 0 ] || { echo '发行包缺少原生 chainctl' >&2; exit 1; }
   available=$(free_kib "$bootstrap_parent") || available=0
-  if [ "$available" -lt $(((bytes + 1023) / 1024 + 1024)) ]; then
+  if [ "$available" -lt 1024 ]; then
     rm -rf -- "$bootstrap_dir"; bootstrap_dir=; continue
   fi
-  tar -xOzf "$bootstrap_dir/$archive" bin/chainctl > "$bootstrap_dir/chainctl"
-  [ "$(wc -c < "$bootstrap_dir/chainctl")" -eq "$bytes" ] || exit 1
   chmod 700 "$bootstrap_dir/chainctl"
   break
 done
 [ -n "$bootstrap_dir" ] || {
-  printf '安装临时空间不足或不可用（已检查 %s、/var/tmp）；需要容纳本次压缩包和 chainctl。\n' "${TMPDIR:-/tmp}" >&2
+  printf '安装临时空间不足或不可用（已检查 %s、%s）；需要容纳本次压缩包和 chainctl。\n' "${TMPDIR:-/tmp}" "$fallback_parent" >&2
   exit 1
 }
 if [ "$bootstrap_parent" != "${TMPDIR:-/tmp}" ]; then

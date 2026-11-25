@@ -3,15 +3,6 @@ use chain_panel::ctl;
 use anyhow::{Context, Result, bail, ensure};
 use std::path::PathBuf;
 
-fn panel_domain(public_url: &str) -> Result<String> {
-    let url = ctl::install::url(public_url)?;
-    ensure!(
-        url.scheme() == "https" && url.port_or_known_default() == Some(443),
-        "面板安装必须使用域名和 HTTPS 443"
-    );
-    ctl::nginx::domain(url.host_str().context("缺少面板域名")?)
-}
-
 #[derive(Clone, Debug)]
 struct Args {
     action: String,
@@ -100,7 +91,6 @@ impl Args {
                     args.local_target = words.next().context("--local-target 缺少地址")?
                 }
                 "--domain" => args.domain = Some(words.next().context("--domain 缺少域名")?),
-                "--latest" => (),
                 "--follow" | "-f" => args.follow = true,
                 "--log-source" => {
                     args.log_source = words.next().context("--log-source 缺少日志来源")?
@@ -142,12 +132,9 @@ impl Args {
                     | "ingress-disable"
                     | "internal-ingress-apply"
                     | "internal-ingress-watch"
-                    | "internal-nginx-reload"
                     | "internal-cert-renew"
                     | "internal-adopt"
                     | "internal-prune"
-                    | "internal-render-site"
-                    | "internal-render-acme"
                     | "update"
                     | "status"
                     | "start"
@@ -159,7 +146,6 @@ impl Args {
                     | "sync-time"
                     | "logs"
                     | "backup"
-                    | "rollback"
                     | "reset-auth"
             ),
             "不支持的命令，请运行 chainctl help"
@@ -168,33 +154,22 @@ impl Args {
             !args.latest_xray || args.action == "update",
             "--xray-channel latest 仅用于主动 update"
         );
-        args.validate_install()?;
-        Ok(args)
-    }
-
-    fn validate_install(&mut self) -> Result<()> {
-        if matches!(self.action.as_str(), "install" | "setup")
-            && self.component.as_deref().unwrap_or("panel") == "panel"
-            && self.root.canonicalize()? == std::path::Path::new("/")
-        {
-            self.root = "/".into();
-            if let Some(domain) = self.domain.as_deref() {
-                self.domain = Some(ctl::nginx::domain(domain)?);
-            }
-            if let Some(public_url) = self.install.public_url.as_deref() {
-                let domain = panel_domain(public_url)?;
-                ensure!(
-                    self.domain.as_ref().is_none_or(|value| value == &domain),
-                    "--domain 与 --public-url 域名不一致"
-                );
-                self.domain = Some(domain);
-            }
-            ensure!(
-                !self.non_interactive || self.domain.is_some(),
-                "面板安装必须明确指定 --domain 域名，使用 HTTPS 443；不复用旧访问地址"
-            );
+        if let Some(domain) = args.domain.as_deref() {
+            args.domain = Some(ctl::nginx::domain(domain)?);
         }
-        Ok(())
+        if let Some(public_url) = args.install.public_url.as_deref() {
+            if !public_url.is_empty() {
+                let parsed = ctl::install::url(public_url)?;
+                if let Some(domain) = args.domain.as_deref() {
+                    let host = parsed.host_str().context("缺少面板域名")?;
+                    ensure!(
+                        ctl::nginx::domain(host).ok().as_deref() == Some(domain),
+                        "--domain 与 --public-url 域名不一致"
+                    );
+                }
+            }
+        }
+        Ok(args)
     }
 }
 
@@ -218,21 +193,6 @@ async fn run() -> Result<()> {
         };
         println!("{}",if changed{"renewed"}else{"reused"});
         println!("{}",chain_panel::acme::paths(config,&words[2]).display());
-        return Ok(());
-    }
-    if std::env::args().nth(1).as_deref()==Some("internal-legacy") {
-        return ctl::legacy::run(&std::env::args().skip(2).collect::<Vec<_>>());
-    }
-    if std::env::args().nth(1).as_deref() == Some("internal-render-routes") {
-        use std::io::Read;
-        let mut body = String::new();
-        std::io::stdin().take(65537).read_to_string(&mut body)?;
-        ensure!(body.len() <= 65536, "路由输入过大");
-        let value: serde_json::Value = serde_json::from_str(&body)?;
-        print!(
-            "{}",
-            ctl::ingress::routes(&value["routes"], &value["blocked"])?
-        );
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("internal-core-worker") {
@@ -284,7 +244,6 @@ async fn run() -> Result<()> {
 13 同步系统时间
 14 停止服务
 15 启动服务
-16 回滚程序版本
 0 退出"
         );
         args.action = match ctl::lifecycle::prompt("选择", "4")?.as_str() {
@@ -307,7 +266,6 @@ async fn run() -> Result<()> {
             "13" => "sync-time",
             "14" => "stop",
             "15" => "start",
-            "16" => "rollback",
             _ => {
                 eprintln!("无效选择");
                 continue;
@@ -356,13 +314,12 @@ async fn dispatch(args: Args, menu: bool) -> Result<()> {
 }
 
 async fn dispatch_action(mut args: Args, menu: bool) -> Result<()> {
-    args.validate_install()?;
     if args.action == "maintenance" {
         return ctl::maintenance::serve().await;
     }
     if args.action == "sync-time" {
         ensure!(
-            args.root == std::path::Path::new("/") && unsafe { libc::geteuid() } == 0,
+            args.root.canonicalize()? == std::path::Path::new("/") && unsafe { libc::geteuid() } == 0,
             "时间同步仅用于实际系统的管理员操作"
         );
         println!("{}", ctl::time::synchronize().await?);
@@ -373,57 +330,19 @@ async fn dispatch_action(mut args: Args, menu: bool) -> Result<()> {
             "chainctl — Rust 原生安装与运维
 
 install / setup / update / status / start / stop / restart / access / token
-logs / backup / rollback / reset-auth / uninstall
+logs / backup / reset-auth / uninstall
 --component panel|agent  --package 文件.tar.gz  --root 离线安装树
---connection-code 接入码  --listen IP:端口  --panel-only
---domain 域名  --non-interactive
+--connection-code 接入码  --listen IP:端口  --public-url 访问地址  --panel-only
+--domain 域名  --allow-http  --non-interactive
 
-面板安装必须明确填写域名并使用 HTTPS 443，不复用旧域名或 IP 入口。
+指定 --domain 时自动签发证书并配置 Nginx HTTPS 443；修复安装默认复用既有访问配置。
 uninstall 交互选择只删除程序或删除全部数据；非交互删除全部数据使用 --purge。
-update 默认更新本机全部组件；--component agent 仅更新 Agent。"
+update 默认更新本机全部组件；--component panel|agent 仅更新指定组件。"
         );
-        return Ok(());
-    }
-    if matches!(
-        args.action.as_str(),
-        "internal-render-site" | "internal-render-acme"
-    ) {
-        let root = args.root.canonicalize()?;
-        let manager = ctl::upgrade::Manager {
-            base: root.join("opt/chain"),
-            root,
-        };
-        if args.action == "internal-render-acme" {
-            print!("{}", ctl::https::proxy_acme_config(&manager));
-        } else {
-            let domain = ctl::nginx::domain(args.domain.as_deref().context("缺少域名")?)?;
-            let listen: std::net::SocketAddr = args
-                .install
-                .listen
-                .as_deref()
-                .context("缺少监听地址")?
-                .parse()?;
-            print!(
-                "{}",
-                ctl::https::site(&manager, &domain, listen.port(), true)
-            );
-        }
         return Ok(());
     }
     if matches!(args.action.as_str(), "install" | "setup") {
         let role = args.component.as_deref().unwrap_or("panel");
-        if role == "panel" && args.root == std::path::Path::new("/") && args.domain.is_none() {
-            loop {
-                let domain = ctl::lifecycle::prompt("面板域名（必填，使用 HTTPS 443）", "")?;
-                match ctl::nginx::domain(&domain) {
-                    Ok(domain) => {
-                        args.domain = Some(domain);
-                        break;
-                    }
-                    Err(error) => eprintln!("{error}；请输入域名，不能留空或填写 IP。"),
-                }
-            }
-        }
         let manager = ctl::lifecycle::open(&args.root)?;
         let state = manager.state()?;
         if args.action == "setup"
@@ -470,6 +389,26 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
                 .install
                 .secure_cookie
                 .or_else(|| existing.get("CHAIN_SECURE_COOKIE").cloned());
+            if manager.live()
+                && args.domain.is_none()
+                && args.install.public_url.is_none()
+                && !args.install.allow_http
+            {
+                ensure!(
+                    !args.non_interactive,
+                    "面板安装请指定 --domain 域名（自动配置 HTTPS 443），或显式指定 --public-url / --allow-http"
+                );
+                loop {
+                    let domain = ctl::lifecycle::prompt("面板域名（使用 HTTPS 443）", "")?;
+                    match ctl::nginx::domain(&domain) {
+                        Ok(domain) => {
+                            args.domain = Some(domain);
+                            break;
+                        }
+                        Err(error) => eprintln!("{error}；请输入有效域名。"),
+                    }
+                }
+            }
         }
         if role == "panel" && args.install.listen.is_none() {
             let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -500,39 +439,27 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
         };
         let local_host = match args.local_host {
             Some(host) => host,
-            None if role == "panel" && manager.live() => ctl::https::public_ipv4().await?,
+            None if role == "panel" && manager.live() => ctl::https::public_ipv4()
+                .await
+                .unwrap_or_else(|_| args.domain.clone().unwrap_or_else(|| "127.0.0.1".into())),
             None => "127.0.0.1".into(),
         };
         let mut https_previous = None;
-        let mut manual_https = state["roles"]["panel"]["manual_https"].clone();
-        if manual_https.is_null() && !manager.live() {
-            manual_https = state["retained_roles"]["panel"]["manual_https"].clone();
-        }
-        if let Some(domain) = args.domain.as_deref().filter(|s| !s.is_empty()) {
-            let domain = ctl::nginx::domain(domain)?;
+        if let Some(domain) = args.domain.as_deref() {
             let listen: std::net::SocketAddr = args
                 .install
                 .listen
                 .as_deref()
                 .context("缺少监听")?
                 .parse()?;
-            ensure!(
-                !manager.live() || manual_https.is_null() || manual_https["port"] == 443,
-                "已有独立 HTTPS 端口不符合 443 要求；请先选择仅卸载程序、保留数据，再重新安装；未切换现有服务"
-            );
-            if manual_https.is_null() {
-                let previous =
-                    ctl::https::activate(&manager, &domain, listen.port(), &local_host).await?;
+            if manager.live() {
+                let previous = ctl::https::activate(&manager, domain, listen.port()).await?;
                 let path = ctl::nginx::site_directory(&ctl::nginx::main_path(&manager))?
                     .join("chain-panel.conf");
                 https_previous = Some((path, previous));
             }
             args.install.listen = Some(format!("127.0.0.1:{}", listen.port()));
-            args.install.public_url = Some(if manual_https.is_null() {
-                format!("https://{domain}")
-            } else {
-                format!("https://{domain}:{}", manual_https["port"])
-            });
+            args.install.public_url = Some(format!("https://{domain}"));
             args.install.secure_cookie = Some("1".into());
         } else if role == "panel" && args.install.public_url.is_none() {
             let listen: std::net::SocketAddr = args.install.listen.as_deref().unwrap().parse()?;
@@ -556,24 +483,11 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             let _lock = manager.lock()?;
             let mut state = manager.state()?;
             state["roles"][role]["setup_complete"] = false.into();
-            state["roles"][role]["manual_https"] = manual_https.clone();
             ctl::upgrade::atomic(
                 &manager.base.join(".chain-install.json"),
                 &serde_json::to_vec_pretty(&state)?,
                 0o600,
             )?;
-        }
-        if role == "panel" && !manual_https.is_null() {
-            let env = manager.environment("panel")?;
-            let url = ctl::install::url(&env["CHAIN_PUBLIC_URL"])?;
-            let listen: std::net::SocketAddr = env["CHAIN_LISTEN"].parse()?;
-            ctl::https::manual(
-                &manager,
-                url.host_str().context("缺少面板域名")?,
-                listen.port(),
-                &manual_https,
-            )
-            .await?;
         }
         if https_previous.is_some() {
             ctl::https::renewal(&manager, args.domain.as_deref().unwrap()).await?;
@@ -596,7 +510,6 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             let mut state = manager.state()?;
             state["roles"][role]["setup_complete"] = true.into();
             state["roles"][role]["panel_only"] = args.panel_only.into();
-            state["roles"][role]["manual_https"] = manual_https;
             ctl::upgrade::atomic(
                 &manager.base.join(".chain-install.json"),
                 &serde_json::to_vec_pretty(&state)?,
@@ -634,9 +547,6 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
     }
     if args.action == "internal-ingress-watch" {
         return ctl::ingress::watch(&manager).await;
-    }
-    if args.action == "internal-nginx-reload" {
-        return ctl::nginx::reload(&manager).await;
     }
     if args.action == "internal-cert-renew" {
         ensure!(manager.live(), "离线树不会续期");
@@ -696,13 +606,7 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             "登录信息仅用于控制台"
         );
         if args.action == "access" {
-            let env = manager.environment("panel")?;
-            println!(
-                "控制台：{}",
-                env.get("CHAIN_PUBLIC_URL")
-                    .or(env.get("CHAIN_LISTEN"))
-                    .context("未配置访问地址")?
-            );
+            return ctl::lifecycle::access(&manager);
         }
         println!(
             "{}",
@@ -723,7 +627,6 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
             return ctl::operations::logs(&manager, selected, &args.log_source, args.follow).await;
         }
         "backup" => return ctl::operations::backup_stopped(&manager, selected).await,
-        "rollback" => return ctl::operations::rollback(&manager, selected).await,
         "reset-auth" => {
             ensure!(selected == "panel", "登录恢复仅用于控制台");
             return ctl::operations::reset_auth(&manager, args.non_interactive).await;
@@ -732,7 +635,7 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
     }
     let _lock = manager.lock()?;
     let mut failures = vec![];
-    for role in roles.into_iter().filter(|role| menu || role == selected) {
+    for role in roles.into_iter().filter(|role| menu || args.component.is_some() || role == selected) {
         if args.action == "status" {
             println!(
                 "chain-{role} · {} · {}",
@@ -745,10 +648,8 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
                     "服务未运行"
                 }
             );
-        } else {
-            if let Err(error) = manager.service(&args.action, &role).await {
-                failures.push(format!("chain-{role}: {error:#}"));
-            }
+        } else if let Err(error) = manager.service(&args.action, &role).await {
+            failures.push(format!("chain-{role}: {error:#}"));
         }
     }
     ensure!(failures.is_empty(), "{}", failures.join("；"));
@@ -759,30 +660,21 @@ update 默认更新本机全部组件；--component agent 仅更新 Agent。"
 mod tests {
     use super::*;
     #[test]
-    fn panel_install_requires_explicit_domain_and_https_443() {
-        let mut menu = Args::parse(["--domain", ""].map(str::to_owned)).unwrap();
-        menu.action = "install".into();
-        assert!(menu.validate_install().is_err());
+    fn install_validates_domains_and_public_urls_without_locking_topology() {
         for words in [
-            vec!["setup", "--non-interactive"],
-            vec!["install", "--non-interactive"],
             vec!["install", "--domain", ""],
             vec!["install", "--domain", "204.138.145.91"],
-            vec!["install", "--public-url", "http://panel.test"],
-            vec!["install", "--public-url", "https://panel.test:8443"],
-            vec!["install", "--public-url", "https://204.138.145.91"],
             vec!["install", "--domain", "panel.test", "--public-url", "https://other.test"],
+            vec!["install", "--public-url", "https://u:p@panel.test"],
         ] {
             assert!(Args::parse(words.into_iter().map(str::to_owned)).is_err());
         }
+        let args = Args::parse(["install", "--domain", "Panel.Test", "--non-interactive"].map(str::to_owned)).unwrap();
+        assert_eq!(args.domain.as_deref(), Some("panel.test"));
         for words in [
-            vec!["install", "--domain", "Panel.Test", "--non-interactive"],
-            vec!["setup", "--public-url", "https://panel.test:443", "--non-interactive"],
-        ] {
-            let args = Args::parse(words.into_iter().map(str::to_owned)).unwrap();
-            assert_eq!(args.domain.as_deref(), Some("panel.test"));
-        }
-        for words in [
+            vec!["install", "--public-url", "https://panel.test:8443", "--non-interactive"],
+            vec!["install", "--public-url", "https://204.138.145.91", "--non-interactive"],
+            vec!["install", "--allow-http", "--non-interactive"],
             vec!["update", "--non-interactive"],
             vec!["install", "--component", "agent", "--non-interactive"],
             vec!["uninstall", "--non-interactive", "--purge"],

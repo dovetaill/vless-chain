@@ -2,8 +2,6 @@ use super::*;
 use chain_panel::rental;
 use serde::Serialize;
 
-macro_rules! ensure {($condition:expr,$($message:tt)*)=>{if !$condition {return Err(anyhow::anyhow!($($message)*).into());}};}
-
 #[derive(Deserialize)]
 pub struct CustomerInput {
     id: Option<String>,
@@ -52,9 +50,21 @@ pub async fn delete_customer(
 ) -> ApiResult<Json<Value>> {
     edit(&app, |doc| {
         ensure!(doc.customers.iter().any(|c| c.id == id), "客户不存在");
+        doc.rentals.retain(|k, _| {
+            doc.lines.iter().any(|l| &l.id == k) || doc.customer_plans.iter().any(|p| p.key() == *k)
+        });
         ensure!(
-            !doc.rentals.values().any(|r| r.customer_id == id),
-            "客户仍有关联代理，请先处理这些代理"
+            !doc.rentals.values().any(|r| r.customer_id == id)
+                && !doc.customer_plans.iter().any(|p| p.customer_id == id),
+            "客户仍有关联代理或套餐，请先处理这些代理或套餐"
+        );
+        ensure!(
+            !doc.rental_orders.iter().any(|o| {
+                o.confirmed_at == 0
+                    && o.cancelled_at == 0
+                    && o.items.iter().any(|i| i.customer_id == id)
+            }),
+            "客户仍有待确认订单，请先取消或处理订单"
         );
         doc.customers.retain(|c| c.id != id);
         Ok(())
@@ -84,17 +94,7 @@ pub async fn save_rental(
             doc.customers.iter().any(|c| c.id == input.customer_id),
             "请选择已有客户"
         );
-        ensure!(
-            [
-                input.prices.monthly,
-                input.prices.quarterly,
-                input.prices.yearly
-            ]
-            .iter()
-            .flatten()
-            .all(|v| *v <= rental::MAX_PRICE),
-            "报价超出有效金额范围"
-        );
+        input.prices.validate()?;
         let r = doc.rentals.entry(id.clone()).or_default();
         ensure!(
             r.started_at == 0 || r.customer_id.is_empty() || r.customer_id == input.customer_id,
@@ -173,13 +173,96 @@ fn target_lines(doc: &Document, ids: &[String]) -> Result<Vec<String>> {
     ensure!(lines.iter().all(|id| doc.lines.iter().any(|line| line.id == *id)), "关联代理已删除，请核对服务范围");
     Ok(lines.into_iter().collect())
 }
-fn renew_selected(doc: &mut Document, input: &RenewalInput, at: u64) -> Result<Vec<Payment>> {
+struct ResolvedRenewalItem {
+    line_id: String,
+    line_name: String,
+    customer_id: String,
+    customer_name: String,
+    quoted_fen: u64,
+    amount_fen: u64,
+    lease: Rental,
+}
+
+fn validate_renewal_request(input: &RenewalInput) -> Result<String> {
     ensure!(
         !input.request_id.is_empty() && input.request_id.len() <= 120,
         "续费请求标识无效"
     );
     ensure!(input.note.len() <= 2000, "续费备注过长");
-    let hash = digest(&serde_json::to_string(input)?);
+    Ok(digest(&serde_json::to_string(input)?))
+}
+
+fn resolve_renewal(doc: &Document, input: &RenewalInput) -> Result<(u32, Vec<ResolvedRenewalItem>)> {
+    selection(doc, &input.line_ids)?;
+    ensure!(
+        input.amounts.keys().all(|id| input.line_ids.contains(id)),
+        "实收金额包含未选中的代理"
+    );
+    let months = rental::term_months(&input.term)?;
+    let mut items = Vec::with_capacity(input.line_ids.len());
+    for line_id in &input.line_ids {
+        let (name, current) = billing_target(doc, line_id)?;
+        let customer = doc
+            .customers
+            .iter()
+            .find(|c| c.id == current.customer_id)
+            .context("客户不存在")?;
+        let quoted_fen = rental::price(&current.prices, &input.term)?;
+        let amount_fen = input.amounts.get(line_id).copied().unwrap_or(quoted_fen);
+        ensure!(amount_fen <= rental::MAX_PRICE, "实收金额超出有效范围");
+        items.push(ResolvedRenewalItem {
+            line_id: line_id.clone(),
+            line_name: name.into(),
+            customer_id: customer.id.clone(),
+            customer_name: customer.name.clone(),
+            quoted_fen,
+            amount_fen,
+            lease: current.clone(),
+        });
+    }
+    Ok((months, items))
+}
+
+fn apply_resolved_renewal(
+    doc: &mut Document,
+    input: &RenewalInput,
+    hash: String,
+    months: u32,
+    items: Vec<ResolvedRenewalItem>,
+    at: u64,
+) -> Result<Vec<Payment>> {
+    let mut records = Vec::with_capacity(items.len());
+    let mut updates = Vec::with_capacity(items.len());
+    for mut item in items {
+        let previous = rental::renew(&mut item.lease, &input.term, at)?;
+        records.push(Payment {
+            id: id(),
+            request_id: input.request_id.clone(),
+            request_hash: hash.clone(),
+            line_id: item.line_id.clone(),
+            customer_id: item.customer_id,
+            line_name: item.line_name,
+            customer_name: item.customer_name,
+            term: input.term.clone(),
+            months,
+            amount_fen: item.amount_fen,
+            created: at,
+            previous_expires_at: previous,
+            expires_at: item.lease.expires_at,
+            note: input.note.clone(),
+        });
+        updates.push((item.line_id, item.lease));
+    }
+    for (id, lease) in updates {
+        doc.rentals.insert(id, lease);
+    }
+    doc.payments.extend(records.clone());
+    schedule(doc, &input.line_ids)?;
+    Ok(records)
+}
+
+fn renew_selected(doc: &mut Document, input: &RenewalInput, at: u64) -> Result<Vec<Payment>> {
+    let hash = validate_renewal_request(input)?;
     let old: Vec<_> = doc
         .payments
         .iter()
@@ -193,59 +276,16 @@ fn renew_selected(doc: &mut Document, input: &RenewalInput, at: u64) -> Result<V
         );
         return Ok(old);
     }
-    selection(doc, &input.line_ids)?;
-    ensure!(
-        input.amounts.keys().all(|id| input.line_ids.contains(id)),
-        "实收金额包含未选中的代理"
-    );
-    let months = rental::term_months(&input.term)?;
-    let mut records = vec![];
-    let mut updates = vec![];
-    for line_id in &input.line_ids {
-        let (name, current) = billing_target(doc, line_id)?;
-        let mut lease = current.clone();
-        let customer = doc
-            .customers
-            .iter()
-            .find(|c| c.id == lease.customer_id)
-            .context("客户不存在")?;
-        let quoted = rental::price(&lease.prices, &input.term)?;
-        let amount = input.amounts.get(line_id).copied().unwrap_or(quoted);
-        ensure!(amount <= rental::MAX_PRICE, "实收金额超出有效范围");
-        let previous = rental::renew(&mut lease, &input.term, at)?;
-        records.push(Payment {
-            id: id(),
-            request_id: input.request_id.clone(),
-            request_hash: hash.clone(),
-            line_id: line_id.clone(),
-            customer_id: customer.id.clone(),
-            line_name: name.into(),
-            customer_name: customer.name.clone(),
-            term: input.term.clone(),
-            months,
-            amount_fen: amount,
-            created: at,
-            previous_expires_at: previous,
-            expires_at: lease.expires_at,
-            note: input.note.clone(),
-        });
-        updates.push((line_id.clone(), lease));
-    }
-    for (id, lease) in updates {
-        doc.rentals.insert(id, lease);
-    }
-    doc.payments.extend(records.clone());
-    schedule(doc, &input.line_ids)?;
-    Ok(records)
+    let (months, items) = resolve_renewal(doc, input)?;
+    apply_resolved_renewal(doc, input, hash, months, items, at)
 }
 pub async fn renew(
     State(app): State<App>,
-    headers: HeaderMap,
     axum::Extension(actor): axum::Extension<chain_panel::security::Actor>,
     Json(input): Json<RenewalInput>,
 ) -> ApiResult<Json<Value>> {
     let value = edit(&app, |doc| {
-        let payments = renew_ordered(doc, &input, now(), &billing_session(&headers), Some(&actor))?;
+        let payments = renew_ordered(doc, &input, now(), Some(&actor))?;
         let mut value = results(doc, &input.line_ids);
         value["payments"] = json!(payments);
         Ok(value)
@@ -253,68 +293,104 @@ pub async fn renew(
     Ok(Json(value))
 }
 
-fn billing_session(headers: &HeaderMap) -> String {
-    digest(&format!("rental-ui:{}", cookie(headers)))
-}
-
-pub async fn context(headers: HeaderMap) -> Json<Value> {
-    Json(json!({"scope":billing_session(&headers)}))
-}
-
-fn pending_order(doc: &mut Document, input: &RenewalInput, at: u64, session: &str, actor: Option<&chain_panel::security::Actor>) -> Result<RentalOrder> {
-    ensure!(!input.request_id.is_empty() && input.request_id.len() <= 120, "订单请求标识无效");
-    ensure!(input.note.len() <= 2000, "订单备注过长");
-    let hash = digest(&serde_json::to_string(input)?);
+fn pending_order(doc: &mut Document, input: &RenewalInput, at: u64, actor: Option<&chain_panel::security::Actor>) -> Result<RentalOrder> {
+    let hash = validate_renewal_request(input)?;
     if let Some(order) = doc.rental_orders.iter().find(|o| o.request_id == input.request_id) {
         ensure!(order.request_hash == hash, "该请求已用于另一张订单，请核对原订单");
         return Ok(order.clone());
     }
     ensure!(!doc.payments.iter().any(|p| p.request_id == input.request_id), "该请求已有历史收款，请核对收款记录");
-    selection(doc, &input.line_ids)?;
-    ensure!(input.amounts.keys().all(|id| input.line_ids.contains(id)), "金额包含未选中的代理");
-    let mut items = Vec::new();
-    for line_id in &input.line_ids {
-        let (name, lease) = billing_target(doc, line_id)?;
-        let customer = doc.customers.iter().find(|c| c.id == lease.customer_id).context("客户不存在")?;
-        let quoted_fen = rental::price(&lease.prices, &input.term)?;
-        let amount_fen = input.amounts.get(line_id).copied().unwrap_or(quoted_fen);
-        ensure!(amount_fen <= rental::MAX_PRICE, "订单金额超出有效范围");
-        items.push(RentalOrderItem { line_id: line_id.clone(), customer_id: customer.id.clone(),
-            line_name: name.into(), customer_name: customer.name.clone(), quoted_fen, amount_fen,
-            started_at: lease.started_at, expires_at: lease.expires_at });
-    }
-    let order = RentalOrder { id: id(), request_id: input.request_id.clone(), request_hash: hash,
-        created: at, confirmed_at: 0, cancelled_at: 0, term: input.term.clone(), amounts: input.amounts.clone(),
-        note: input.note.clone(), items, created_session: session.into(), confirmed_session: String::new(), cancelled_session: String::new(),
-        created_by: actor.cloned(), confirmed_by: None, cancelled_by: None };
+    let (_, resolved) = resolve_renewal(doc, input)?;
+    let items = resolved
+        .into_iter()
+        .map(|item| RentalOrderItem {
+            line_id: item.line_id,
+            customer_id: item.customer_id,
+            line_name: item.line_name,
+            customer_name: item.customer_name,
+            quoted_fen: item.quoted_fen,
+            amount_fen: item.amount_fen,
+            started_at: item.lease.started_at,
+            expires_at: item.lease.expires_at,
+        })
+        .collect();
+    let order = RentalOrder {
+        id: id(),
+        request_id: input.request_id.clone(),
+        request_hash: hash,
+        created: at,
+        confirmed_at: 0,
+        cancelled_at: 0,
+        term: input.term.clone(),
+        amounts: input.amounts.clone(),
+        note: input.note.clone(),
+        items,
+        created_by: actor.cloned(),
+        confirmed_by: None,
+        cancelled_by: None,
+    };
     doc.rental_orders.push(order.clone());
     Ok(order)
 }
 
-fn renew_ordered(doc: &mut Document, input: &RenewalInput, at: u64, session: &str, actor: Option<&chain_panel::security::Actor>) -> Result<Vec<Payment>> {
+fn renew_ordered(doc: &mut Document, input: &RenewalInput, at: u64, actor: Option<&chain_panel::security::Actor>) -> Result<Vec<Payment>> {
     // Historical receipts keep their original identity; a retry must not invent an old order.
     if doc.payments.iter().any(|p| p.request_id == input.request_id) {
         return renew_selected(doc, input, at);
     }
-    let order = pending_order(doc, input, at, session, actor)?;
-    ensure!(order.cancelled_at == 0, "订单已取消，不能确认收款");
-    for item in &order.items {
-        let (_, lease) = billing_target(doc, &item.line_id)?;
-        ensure!(lease.customer_id == item.customer_id, "订单客户归属已变化，请取消订单后重新核对");
-        ensure!(rental::price(&lease.prices, &order.term)? == item.quoted_fen, "订单报价已变化，请取消订单后重新核对");
-        ensure!(lease.started_at == item.started_at && lease.expires_at == item.expires_at,
-            "订单权益已变化，请先核对是否已收款或续费，再取消重建");
-    }
-    let payments = renew_selected(doc, input, at)?;
-    let saved = doc.rental_orders.iter_mut().find(|o| o.id == order.id).unwrap();
+    let hash = validate_renewal_request(input)?;
+    let (months, resolved) = resolve_renewal(doc, input)?;
+    let order_id = if let Some(existing) = doc.rental_orders.iter().find(|o| o.request_id == input.request_id) {
+        ensure!(existing.request_hash == hash, "该请求已用于另一张订单，请核对原订单");
+        ensure!(existing.cancelled_at == 0, "订单已取消，不能确认收款");
+        for (item, current) in existing.items.iter().zip(resolved.iter()) {
+            ensure!(current.lease.customer_id == item.customer_id, "订单客户归属已变化，请取消订单后重新核对");
+            ensure!(current.quoted_fen == item.quoted_fen, "订单报价已变化，请取消订单后重新核对");
+            ensure!(current.lease.started_at == item.started_at && current.lease.expires_at == item.expires_at,
+                "订单权益已变化，请先核对是否已收款或续费，再取消重建");
+        }
+        existing.id.clone()
+    } else {
+        let items = resolved
+            .iter()
+            .map(|item| RentalOrderItem {
+                line_id: item.line_id.clone(),
+                customer_id: item.customer_id.clone(),
+                line_name: item.line_name.clone(),
+                customer_name: item.customer_name.clone(),
+                quoted_fen: item.quoted_fen,
+                amount_fen: item.amount_fen,
+                started_at: item.lease.started_at,
+                expires_at: item.lease.expires_at,
+            })
+            .collect();
+        let id = id();
+        doc.rental_orders.push(RentalOrder {
+            id: id.clone(),
+            request_id: input.request_id.clone(),
+            request_hash: hash.clone(),
+            created: at,
+            confirmed_at: 0,
+            cancelled_at: 0,
+            term: input.term.clone(),
+            amounts: input.amounts.clone(),
+            note: input.note.clone(),
+            items,
+            created_by: actor.cloned(),
+            confirmed_by: None,
+            cancelled_by: None,
+        });
+        id
+    };
+    let payments = apply_resolved_renewal(doc, input, hash, months, resolved, at)?;
+    let saved = doc.rental_orders.iter_mut().find(|o| o.id == order_id).unwrap();
     saved.confirmed_at = at;
-    saved.confirmed_session = session.into();
     saved.confirmed_by = actor.cloned();
     Ok(payments)
 }
 
-pub async fn create_order(State(app): State<App>, headers: HeaderMap, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>, Json(input): Json<RenewalInput>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(edit(&app, |doc| pending_order(doc, &input, now(), &billing_session(&headers), Some(&actor)))?)))
+pub async fn create_order(State(app): State<App>, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>, Json(input): Json<RenewalInput>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(edit(&app, |doc| pending_order(doc, &input, now(), Some(&actor)))?)))
 }
 
 pub async fn order_by_request(State(app): State<App>, Path(request_id): Path<String>) -> ApiResult<Json<Value>> {
@@ -324,22 +400,22 @@ pub async fn order_by_request(State(app): State<App>, Path(request_id): Path<Str
     Ok(Json(json!(order)))
 }
 
-pub async fn confirm_order(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>) -> ApiResult<Json<Value>> {
+pub async fn confirm_order(State(app): State<App>, Path(id): Path<String>, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>) -> ApiResult<Json<Value>> {
     let value = edit(&app, |doc| {
         let order = doc.rental_orders.iter().find(|o| o.id == id).context("订单不存在")?.clone();
         let input = RenewalInput { line_ids: order.items.iter().map(|i| i.line_id.clone()).collect(),
             term: order.term, amounts: order.amounts, note: order.note, request_id: order.request_id };
-        let payments = renew_ordered(doc, &input, now(), &billing_session(&headers), Some(&actor))?;
+        let payments = renew_ordered(doc, &input, now(), Some(&actor))?;
         Ok(json!({"ok":true,"payments":payments}))
     })?;
     Ok(Json(value))
 }
 
-pub async fn cancel_order(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>) -> ApiResult<Json<Value>> {
+pub async fn cancel_order(State(app): State<App>, Path(id): Path<String>, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>) -> ApiResult<Json<Value>> {
     edit(&app, |doc| {
         let order = doc.rental_orders.iter_mut().find(|o| o.id == id).context("订单不存在")?;
         ensure!(order.confirmed_at == 0, "已收款订单不能取消，请登记退款或金额纠错");
-        if order.cancelled_at == 0 { order.cancelled_at = now(); order.cancelled_session = billing_session(&headers); order.cancelled_by = Some(actor.clone()); }
+        if order.cancelled_at == 0 { order.cancelled_at = now(); order.cancelled_by = Some(actor.clone()); }
         Ok(())
     })?;
     Ok(Json(json!({"ok":true})))
@@ -359,7 +435,7 @@ pub struct AdjustmentInput {
     request_id: String,
 }
 
-fn adjust_payment(doc: &mut Document, input: &AdjustmentInput, at: u64, session: &str, actor: Option<&chain_panel::security::Actor>) -> Result<PaymentAdjustment> {
+fn adjust_payment(doc: &mut Document, input: &AdjustmentInput, at: u64, actor: Option<&chain_panel::security::Actor>) -> Result<PaymentAdjustment> {
     ensure!(!input.request_id.is_empty() && input.request_id.len() <= 120, "调整请求标识无效");
     ensure!(!input.note.trim().is_empty() && input.note.len() <= 2000, "请填写不超过 2000 字节的原因或凭据");
     let hash = digest(&serde_json::to_string(input)?);
@@ -402,13 +478,13 @@ fn adjust_payment(doc: &mut Document, input: &AdjustmentInput, at: u64, session:
     }
     let adjustment = PaymentAdjustment { id: id(), payment_id: payment.id, request_id: input.request_id.clone(),
         request_hash: hash, kind: input.kind.clone(), delta_fen: delta, created: at, note: input.note.trim().into(),
-        disable_line: input.disable_line, affected_line_ids, session: session.into(), operator: actor.cloned() };
+        disable_line: input.disable_line, affected_line_ids, operator: actor.cloned() };
     doc.payment_adjustments.push(adjustment.clone());
     Ok(adjustment)
 }
 
-pub async fn adjust(State(app): State<App>, headers: HeaderMap, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>, Json(input): Json<AdjustmentInput>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(edit(&app, |doc| adjust_payment(doc, &input, now(), &billing_session(&headers), Some(&actor)))?)))
+pub async fn adjust(State(app): State<App>, axum::Extension(actor): axum::Extension<chain_panel::security::Actor>, Json(input): Json<AdjustmentInput>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(edit(&app, |doc| adjust_payment(doc, &input, now(), Some(&actor)))?)))
 }
 
 pub async fn adjustment_by_request(State(app): State<App>, Path(request_id): Path<String>) -> ApiResult<Json<Value>> {
@@ -419,13 +495,14 @@ pub async fn adjustment_by_request(State(app): State<App>, Path(request_id): Pat
 }
 
 fn results(doc: &Document, ids: &[String]) -> Value {
+    let at = now();
     json!({"ok":true,"results":ids.iter().map(|id| {
         let status = if let Some(plan) = doc.customer_plans.iter().find(|p| p.key() == *id) {
             let states: Vec<_> = plan.lines().map(|line| doc.lines.iter().find(|l| l.id == *line)
-                .map(|l| rental::sync_status(doc,l)).unwrap_or("pending")).collect();
+                .map(|l| rental::sync_status(doc, l, at)).unwrap_or("pending")).collect();
             if states.contains(&"error") { "error" } else if states.contains(&"unpublished") { "unpublished" }
             else if states.is_empty() || states.contains(&"pending") { "pending" } else { "synced" }
-        } else { doc.lines.iter().find(|l| l.id == *id).map(|l| rental::sync_status(doc,l)).unwrap_or("pending") };
+        } else { doc.lines.iter().find(|l| l.id == *id).map(|l| rental::sync_status(doc, l, at)).unwrap_or("pending") };
         json!({"id":id,"sync_status":status})
     }).collect::<Vec<_>>()})
 }
@@ -491,8 +568,13 @@ pub struct OperationInput {
 }
 fn remove_selected(doc: &mut Document, ids: &[String]) -> Result<()> {
     selection(doc, ids)?;
-    ensure!(ids.iter().all(|id| !id.starts_with("plan:") && chain_panel::plans::for_line(doc, id).is_none()),
-        "套餐及成员线路需保留历史归属，请使用手动停用");
+    ensure!(ids.iter().all(|id| !id.starts_with("plan:")), "请通过客户套餐入口删除套餐");
+    for id in ids {
+        if chain_panel::plans::for_line(doc, id).is_some() {
+            let enabled = doc.lines.iter().find(|l| l.id == *id).is_some_and(|l| l.enabled);
+            ensure!(!enabled, "启用中的套餐成员线路不能直接删除；请先停用该线路或从套餐移出");
+        }
+    }
     ensure!(
         !doc.lines
             .iter()
@@ -503,7 +585,38 @@ fn remove_selected(doc: &mut Document, ids: &[String]) -> Result<()> {
                     .is_some_and(|id| ids.iter().any(|selected| selected == id)))),
         "所选代理仍被其他链式代理引用，请先移除引用并应用"
     );
-    let mut active = Document {
+    let mut updated_plans = doc.customer_plans.clone();
+    let mut updated_rentals = doc.rentals.clone();
+    let mut removed_plan_prefixes = Vec::new();
+    for plan in &mut updated_plans {
+        let plan_id = plan.id.clone();
+        for member in &mut plan.members {
+            let was_present = member.line_ids.iter().any(|id| ids.contains(id));
+            member.line_ids.retain(|id| !ids.contains(id));
+            if was_present && member.line_ids.is_empty() {
+                removed_plan_prefixes.push(format!("member:{plan_id}:{}", member.id));
+            }
+        }
+        plan.members.retain(|m| !m.line_ids.is_empty());
+        if plan.members.is_empty() {
+            let key = plan.key();
+            ensure!(
+                !doc.rental_orders.iter().any(|o| {
+                    o.confirmed_at == 0
+                        && o.cancelled_at == 0
+                        && o.items.iter().any(|i| i.line_id == key)
+                }),
+                "套餐仍有待确认订单，请先取消订单后再删除最后一条线路"
+            );
+            updated_rentals.remove(&key);
+            removed_plan_prefixes.push(key);
+        }
+    }
+    updated_plans.retain(|p| !p.members.is_empty());
+    for id in ids {
+        updated_rentals.remove(id);
+    }
+    let active = Document {
         nodes: doc.applied_nodes.clone(),
         lines: doc
             .applied_lines
@@ -512,17 +625,14 @@ fn remove_selected(doc: &mut Document, ids: &[String]) -> Result<()> {
             .cloned()
             .collect(),
         externals: doc.applied_externals.clone(),
-        rentals: doc.rentals.clone(),
-        customer_plans: doc.customer_plans.clone(),
+        rentals: updated_rentals.clone(),
+        customer_plans: updated_plans.clone(),
         customer_ledgers: doc.customer_ledgers.clone(),
         resources: doc.resources.clone(),
         rule_sources: doc.rule_sources.clone(),
         access_policies: doc.access_policies.clone(),
         ..Default::default()
     };
-    for id in ids {
-        active.rentals.remove(id);
-    }
     let configs = compile(&active)?;
     for node in &mut doc.nodes {
         if let Some(config) = configs.get(&node.id) {
@@ -538,10 +648,14 @@ fn remove_selected(doc: &mut Document, ids: &[String]) -> Result<()> {
             }
         }
     }
+    doc.customer_plans = updated_plans;
+    doc.rentals = updated_rentals;
+    for key in removed_plan_prefixes {
+        doc.customer_query_tokens.remove(&key);
+    }
     doc.lines.retain(|l| !ids.contains(&l.id));
     doc.applied_lines.retain(|l| !ids.contains(&l.id));
     for id in ids {
-        doc.rentals.remove(id);
         doc.checks.remove(id);
     }
     for s in &mut doc.subscriptions {
@@ -699,20 +813,19 @@ mod tests {
     fn pending_order_does_not_grant_service_and_confirmation_is_idempotent() {
         let mut doc = fixture();
         let actor = chain_panel::security::Actor { id: "operator".into(), name: "财务".into(), role: chain_panel::security::Role::Finance };
-        let order = pending_order(&mut doc, &input(), 1_800_000_000, "session-a", Some(&actor)).unwrap();
-        let again = pending_order(&mut doc, &input(), 1_800_000_001, "session-a", Some(&actor)).unwrap();
+        let order = pending_order(&mut doc, &input(), 1_800_000_000, Some(&actor)).unwrap();
+        let again = pending_order(&mut doc, &input(), 1_800_000_001, Some(&actor)).unwrap();
         assert_eq!(order.id, again.id);
         assert_eq!(doc.rental_orders.len(), 1);
         assert_eq!(doc.rentals["a"].started_at, 0);
         assert!(doc.payments.is_empty());
-        let paid = renew_ordered(&mut doc, &input(), 1_800_000_100, "session-b", Some(&actor)).unwrap();
+        let paid = renew_ordered(&mut doc, &input(), 1_800_000_100, Some(&actor)).unwrap();
         let lease = serde_json::to_value(&doc.rentals["a"]).unwrap();
-        let retried = renew_ordered(&mut doc, &input(), 1_800_000_200, "session-c", None).unwrap();
+        let retried = renew_ordered(&mut doc, &input(), 1_800_000_200, None).unwrap();
         assert_eq!(paid[0].id, retried[0].id);
         assert_eq!(doc.payments.len(), 1);
         assert_eq!(serde_json::to_value(&doc.rentals["a"]).unwrap(), lease);
         assert_eq!(doc.rental_orders[0].confirmed_at, 1_800_000_100);
-        assert_eq!(doc.rental_orders[0].confirmed_session, "session-b");
         assert_eq!(doc.rental_orders[0].confirmed_by.as_ref().unwrap().id, actor.id);
         assert_eq!(doc.rental_orders[0].created_by.as_ref().unwrap().name, actor.name);
     }
@@ -721,7 +834,7 @@ mod tests {
     fn pending_order_rejects_customer_price_and_entitlement_changes() {
         for change in ["customer", "price", "term", "cancel"] {
             let mut doc = fixture();
-            pending_order(&mut doc, &input(), 1_800_000_000, "session", None).unwrap();
+            pending_order(&mut doc, &input(), 1_800_000_000, None).unwrap();
             match change {
                 "customer" => doc.rentals.get_mut("a").unwrap().customer_id = "another".into(),
                 "price" => doc.rentals.get_mut("a").unwrap().prices.monthly = Some(3000),
@@ -729,7 +842,7 @@ mod tests {
                 _ => doc.rental_orders[0].cancelled_at = 1_800_000_001,
             }
             let before = serde_json::to_value(&doc.rentals).unwrap();
-            assert!(renew_ordered(&mut doc, &input(), 1_800_000_100, "session", None).is_err(), "{change}");
+            assert!(renew_ordered(&mut doc, &input(), 1_800_000_100, None).is_err(), "{change}");
             assert!(doc.payments.is_empty());
             assert_eq!(serde_json::to_value(&doc.rentals).unwrap(), before);
         }
@@ -771,7 +884,7 @@ mod tests {
         assert!(loaded.customer_query_tokens.is_empty());
         assert!(loaded.operator_members.is_empty());
         assert!(loaded.operator_audit.is_empty());
-        renew_ordered(&mut loaded, &input(), 1_800_000_100, "new-session", None).unwrap();
+        renew_ordered(&mut loaded, &input(), 1_800_000_100, None).unwrap();
         assert!(loaded.rental_orders.is_empty());
         let after = serde_json::to_value(&loaded).unwrap();
         for key in ["payments", "rentals", "lines", "applied_lines", "nodes", "applied_nodes", "subscriptions", "customers"] {
@@ -790,11 +903,11 @@ mod tests {
     #[test]
     fn refunds_are_idempotent_bounded_and_preserve_original_receipts_and_rights() {
         let mut doc = fixture();
-        let payment = renew_ordered(&mut doc, &input(), 1_800_000_000, "session", None).unwrap().remove(0);
+        let payment = renew_ordered(&mut doc, &input(), 1_800_000_000, None).unwrap().remove(0);
         let before = serde_json::to_value(&doc.rentals).unwrap();
         let request = refund(&payment);
-        let first = adjust_payment(&mut doc, &request, 1_800_000_100, "session", None).unwrap();
-        let retry = adjust_payment(&mut doc, &request, 1_800_000_200, "session", None).unwrap();
+        let first = adjust_payment(&mut doc, &request, 1_800_000_100, None).unwrap();
+        let retry = adjust_payment(&mut doc, &request, 1_800_000_200, None).unwrap();
         assert_eq!(first.id, retry.id);
         assert_eq!(doc.payment_adjustments.len(), 1);
         assert_eq!(doc.payments[0].amount_fen, 2000);
@@ -803,22 +916,22 @@ mod tests {
         excess.request_id = "refund-2".into();
         excess.expected_net_fen = 1500;
         excess.amount_fen = 1501;
-        assert!(adjust_payment(&mut doc, &excess, 1_800_000_300, "session", None).is_err());
+        assert!(adjust_payment(&mut doc, &excess, 1_800_000_300, None).is_err());
         excess.amount_fen = 1500;
         excess.expected_net_fen = 2000;
-        assert!(adjust_payment(&mut doc, &excess, 1_800_000_300, "session", None).is_err());
+        assert!(adjust_payment(&mut doc, &excess, 1_800_000_300, None).is_err());
         assert_eq!(doc.payment_adjustments.len(), 1);
     }
 
     #[test]
     fn corrections_are_not_new_receipts_and_cannot_erase_refunded_money() {
         let mut doc = fixture();
-        let payment = renew_ordered(&mut doc, &input(), 1_800_000_000, "session", None).unwrap().remove(0);
+        let payment = renew_ordered(&mut doc, &input(), 1_800_000_000, None).unwrap().remove(0);
         let before = serde_json::to_value(&doc.rentals).unwrap();
-        adjust_payment(&mut doc, &refund(&payment), 1_800_000_100, "session", None).unwrap();
+        adjust_payment(&mut doc, &refund(&payment), 1_800_000_100, None).unwrap();
         let mut correction = AdjustmentInput { payment_id: payment.id, kind: "correction".into(), amount_fen: 3000,
             expected_net_fen: 1500, note: "实际到账30元，原录入20元".into(), disable_line: false, expected_line_ids: None, request_id: "correction-1".into() };
-        let record = adjust_payment(&mut doc, &correction, 1_800_000_200, "session", None).unwrap();
+        let record = adjust_payment(&mut doc, &correction, 1_800_000_200, None).unwrap();
         assert_eq!(record.delta_fen, 1000);
         assert_eq!(doc.payments.len(), 1);
         assert_eq!(doc.payments[0].amount_fen, 2000);
@@ -826,7 +939,7 @@ mod tests {
         correction.request_id = "correction-2".into();
         correction.expected_net_fen = 2500;
         correction.amount_fen = 499;
-        assert!(adjust_payment(&mut doc, &correction, 1_800_000_300, "session", None).is_err());
+        assert!(adjust_payment(&mut doc, &correction, 1_800_000_300, None).is_err());
         assert_eq!(doc.payment_adjustments.len(), 2);
     }
 
@@ -835,11 +948,11 @@ mod tests {
         let mut doc = fixture();
         doc.lines[0].enabled = true;
         doc.lines[0].limits.monthly_gib = Some(100.0);
-        let payment = renew_ordered(&mut doc, &input(), 1_800_000_000, "session", None).unwrap().remove(0);
+        let payment = renew_ordered(&mut doc, &input(), 1_800_000_000, None).unwrap().remove(0);
         let before = serde_json::to_value(&doc.rentals).unwrap();
         let mut request = refund(&payment);
         request.disable_line = true;
-        adjust_payment(&mut doc, &request, 1_800_000_100, "session", None).unwrap();
+        adjust_payment(&mut doc, &request, 1_800_000_100, None).unwrap();
         assert!(!doc.lines[0].enabled);
         assert_eq!(doc.lines[0].limits.monthly_gib, Some(100.0));
         assert_eq!(serde_json::to_value(&doc.rentals).unwrap(), before);
@@ -854,7 +967,7 @@ mod tests {
         for (i, line) in doc.lines.iter_mut().enumerate() {
             line.enabled = i == 0;
             let node_id = format!("node-{i}");
-            line.hops = serde_json::from_value(json!([{"node_id":node_id,"port":24443,"uuid":format!("credential-{i}")}])).unwrap();
+            line.hops = serde_json::from_value(json!([{"node_id":node_id,"port":24443,"uuid":format!("00000000-0000-4000-8000-00000000000{}", i + 1)}])).unwrap();
             let node: Node = serde_json::from_value(json!({"id":node_id,"name":"入口","host":"proxy.example","token_hash":"test",
                 "reality":{"target":"origin.example:443","server_name":"origin.example","private_key":"private","public_key":"public","short_id":"abcd"},
                 "desired":{"revision":"before","config":{"_chain":[{"id":line.id,"lease":null,"resource_ids":[],"unchanged":"original-path"}]}}})).unwrap();
@@ -881,7 +994,7 @@ mod tests {
         let ledger = serde_json::to_value(&doc.customer_ledgers).unwrap();
         doc.lines[0].chain = vec!["external:draft".into()];
         doc.resources.resources.push(chain_panel::resources::Resource { id: "draft-only".into(), members: vec!["external:draft".into()], ..Default::default() });
-        let receipts = renew_ordered(&mut doc, &request, 1_800_000_000, "session", None).unwrap();
+        let receipts = renew_ordered(&mut doc, &request, 1_800_000_000, None).unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].line_id, request.line_ids[0]);
         assert_eq!(receipts[0].line_name, "共享团队套餐");
@@ -898,30 +1011,40 @@ mod tests {
     }
 
     #[test]
-    fn plan_member_cannot_bypass_shared_lease_or_remove_historical_membership() {
-        let (mut doc, _) = plan_fixture();
+    fn plan_member_cannot_bypass_shared_lease_and_disabled_lines_can_retire_cleanly() {
+        let (mut doc, request) = plan_fixture();
+        renew_ordered(&mut doc, &request, 1_800_000_000, None).unwrap();
         let before = serde_json::to_value(&doc).unwrap();
         assert!(renew_selected(&mut doc, &input(), 1_800_000_000).is_err());
-        assert!(pending_order(&mut doc, &input(), 1_800_000_000, "session", None).is_err());
+        assert!(pending_order(&mut doc, &input(), 1_800_000_000, None).is_err());
         assert!(unlimited(&mut doc, &["a".into()], 1_800_000_000).is_err());
-        assert!(remove_selected(&mut doc, &["a".into()]).is_err());
+        assert!(remove_selected(&mut doc, &["a".into()]).is_err(), "启用中的套餐线路不能直接删除");
         assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+
+        // Disabled line "b" can be deleted without deadlocking, and once "a" is disabled & removed, historical payment remains intact.
+        remove_selected(&mut doc, &["b".into()]).unwrap();
+        assert_eq!(doc.customer_plans[0].members[0].line_ids, vec!["a"]);
+        doc.lines[0].enabled = false;
+        remove_selected(&mut doc, &["a".into()]).unwrap();
+        assert!(doc.customer_plans.is_empty());
+        assert!(doc.rentals.is_empty());
+        assert_eq!(doc.payments.len(), 1, "历史收款快照必须完整保留");
     }
 
     #[test]
     fn plan_refund_requires_complete_scope_and_keeps_shared_lease_and_ledger() {
         let (mut doc, request) = plan_fixture();
-        let payment = renew_ordered(&mut doc, &request, 1_800_000_000, "session", None).unwrap().remove(0);
+        let payment = renew_ordered(&mut doc, &request, 1_800_000_000, None).unwrap().remove(0);
         let lease = serde_json::to_value(&doc.rentals).unwrap();
         let ledger = serde_json::to_value(&doc.customer_ledgers).unwrap();
         let mut adjustment = refund(&payment);
         adjustment.disable_line = true;
-        assert!(adjust_payment(&mut doc, &adjustment, 1_800_000_100, "session", None).is_err());
+        assert!(adjust_payment(&mut doc, &adjustment, 1_800_000_100, None).is_err());
         adjustment.expected_line_ids = Some(vec!["a".into()]);
-        assert!(adjust_payment(&mut doc, &adjustment, 1_800_000_100, "session", None).is_err());
+        assert!(adjust_payment(&mut doc, &adjustment, 1_800_000_100, None).is_err());
         assert!(doc.lines[0].enabled);
         adjustment.expected_line_ids = Some(vec!["b".into(), "a".into()]);
-        let record = adjust_payment(&mut doc, &adjustment, 1_800_000_100, "session", None).unwrap();
+        let record = adjust_payment(&mut doc, &adjustment, 1_800_000_100, None).unwrap();
         assert_eq!(record.affected_line_ids, vec!["a", "b"]);
         assert!(doc.lines.iter().all(|line| !line.enabled));
         assert_eq!(serde_json::to_value(&doc.rentals).unwrap(), lease);

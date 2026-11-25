@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ['panel/**', 'scripts/**', '.github/workflows/**', 'xray-vless-native-v3.sh', 'xray-vless-chain-v2.sh']
+    paths: ['panel/**', 'scripts/**', '.github/workflows/**']
   pull_request:
     branches: [main]
-    paths: ['panel/**', 'scripts/**', '.github/workflows/**', 'xray-vless-native-v3.sh', 'xray-vless-chain-v2.sh']
+    paths: ['panel/**', 'scripts/**', '.github/workflows/**']
   workflow_dispatch:
 
 permissions:
@@ -68,8 +68,8 @@ jobs:
             build-v2-${{ matrix.runner }}-${{ matrix.arch }}-rust1.96.0-node22.23.3-
       - name: Check installer syntax
         run: |
-          bash -n scripts/version-release.sh scripts/install-server.sh
-          sh -n scripts/repair-native-services.sh
+          bash -n scripts/version-release.sh
+          sh -n scripts/install-server.sh
       - name: Build native release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -36,7 +36,6 @@ function connectionHost(value: string) {
 
 export function LineEditor({
   line,
-  kind,
   state,
   initialChain,
   pendingImport,
@@ -49,7 +48,6 @@ export function LineEditor({
   defaultHost = location.hostname.replace(/^\[|\]$/g, ""),
 }: {
   line?: Line;
-  kind: Line["kind"];
   state: PanelState;
   initialChain?: string[];
   pendingImport?: { id: string; name: string };
@@ -71,20 +69,17 @@ export function LineEditor({
   );
   const address = connectionHost(host);
   const [chain, setChain] = useState<string[]>(
-    line?.chain?.length
-      ? line.chain
-      : line?.external_id
-        ? [`external:${line.external_id}`]
-        : initialChain || [],
+    line?.chain?.length ? line.chain : initialChain || [],
   );
   const domain =
-    Boolean(address) && !/[\s:/?#@]/.test(address) && !/^[\d.]+$/.test(address);
+    Boolean(address) &&
+    !/[\s:/?#@]/.test(address) &&
+    !/^[\d.]+$/.test(address) &&
+    !address.includes(":");
   const choices = [
     ...state.externals.map((e) => ({ id: `external:${e.id}`, name: e.name })),
     ...state.lines
-      .filter(
-        (l) => l.kind === "vless" && l.id !== line?.id && l.enabled && l.published,
-      )
+      .filter((l) => l.id !== line?.id && l.enabled && l.published)
       .map((l) => ({ id: `line:${l.id}`, name: `${l.name}（本机代理）` })),
   ];
   const available = choices.find((c) => !chain.includes(c.id));
@@ -92,7 +87,16 @@ export function LineEditor({
     line?.access.protocol || "vless",
   );
   const [certificate, setCertificate] = useState(
-    line?.access.tls.mode || (protocol === "vless" ? "off" : "auto"),
+    line?.access.tls.mode ||
+      (protocol === "vless"
+        ? "off"
+        : ["trojan", "hysteria2", "tuic"].includes(protocol)
+          ? domain
+            ? "auto"
+            : "manual"
+          : domain
+            ? "auto"
+            : "off"),
   );
   const [method, setMethod] = useState(
     line?.access.method || "2022-blake3-aes-128-gcm",
@@ -106,8 +110,9 @@ export function LineEditor({
     "hysteria2",
     "tuic",
   ].includes(protocol);
-  const tls = supportsTls && (protocol === "vless" || domain) ? certificate : "off";
-  const showTls = supportsTls && (domain || (protocol === "vless" && certificate !== "off"));
+  const tls = supportsTls ? certificate : "off";
+  const showTls =
+    supportsTls && (protocol !== "vless" || certificate !== "off");
   const [batch, setBatch] = useState(false);
   const [combinations, setCombinations] = useState(["tcp-reality"]);
   const [transport, setTransport] = useState(
@@ -162,7 +167,7 @@ export function LineEditor({
     setCertificate(
       value.endsWith("reality")
         ? "off"
-        : certificate === "manual"
+        : certificate === "manual" || !domain
           ? "manual"
           : "auto",
     );
@@ -198,15 +203,16 @@ export function LineEditor({
         if (!address || /[\s/?#@]/.test(address))
           throw new Error("请输入有效的本机 IP、域名或完整的 HTTP/HTTPS 地址。");
         if (batchError) throw new Error(batchError);
-        if (usesTls && !domain)
+        const tlsMode = certificate === "manual" ? "manual" : "auto";
+        if ((usesTls ? tlsMode === "auto" : tls === "auto") && !domain)
           throw new Error(
-            "TLS 方案需要解析到本机的域名，请修改连接地址；不会自动切换为 REALITY。",
+            "自动申请证书需要解析到本机的域名；使用 IP 地址请改选「手动粘贴 PEM 证书」。",
           );
         if (usesReality && (!realityTarget.trim() || !sni.trim()))
           throw new Error("请选择检测通过的推荐，或填写 REALITY 目标与 SNI。");
-        if (["trojan", "hysteria2", "tuic"].includes(protocol) && !domain)
+        if (["trojan", "hysteria2", "tuic"].includes(protocol) && tls === "off")
           throw new Error(
-            `${protocolNames[protocol]} 需要 TLS，请填写解析到本机的域名。`,
+            `${protocolNames[protocol]} 需要启用 TLS（域名自动签发或手动粘贴 PEM 证书）。`,
           );
         if (chain.some((id) => !id)) throw new Error("请选择链式代理的落地。");
         const node = line ? existing : await ensureLocalServer(address);
@@ -214,10 +220,11 @@ export function LineEditor({
         const changedProtocol = line && line.access.protocol !== protocol;
         const uuid = usesUuid ? field(data, "uuid") : "";
         const credential = uuid ? { uuid } : {};
+        const tlsDomain = domain ? address : line?.access.tls.domain || "";
         const payload = {
           pending_import_id: pendingImport?.id,
           id: line?.id,
-          kind,
+          kind: "vless" as const,
           name:
             field(data, "name").trim() ||
             `${protocolNames[protocol]} ${address}`.slice(0, 80),
@@ -235,10 +242,7 @@ export function LineEditor({
                   ...credential,
                 },
               ],
-          external_id: null,
           chain,
-          target: "",
-          network: "tcp",
           access: {
             transport: {
               network: protocol === "vless" ? transport : "tcp",
@@ -256,17 +260,15 @@ export function LineEditor({
             shared_port: protocol === "vless" && shared,
             fallback: usesTls && transport === "tcp" ? field(data, "fallback") : "",
             host: address,
-            protocol: kind === "vless" ? protocol : "vless",
+            protocol,
             username: field(data, "username") || line?.access.username || "",
             password:
               String(data.get("password") || "") ||
               (changedProtocol ? "" : line?.access.password || ""),
             method: protocol === "shadowsocks" ? method : "",
-            public_host: "",
-            public_port: null,
             tls: {
               mode: supportsTls ? tls : "off",
-              domain: showTls && tls !== "off" ? address : "",
+              domain: tls !== "off" ? tlsDomain : "",
               cert: tls === "manual" ? field(data, "cert") : "",
               key: tls === "manual" ? field(data, "key") : "",
             },
@@ -295,10 +297,10 @@ export function LineEditor({
                 tls:
                   security === "tls"
                     ? {
-                        mode: certificate === "manual" ? "manual" : "auto",
-                        domain: address,
-                        cert: field(data, "cert"),
-                        key: field(data, "key"),
+                        mode: tlsMode,
+                        domain: tlsDomain,
+                        cert: tlsMode === "manual" ? field(data, "cert") : "",
+                        key: tlsMode === "manual" ? field(data, "key") : "",
                       }
                     : { mode: "off", domain: "", cert: "", key: "" },
                 fallback:
@@ -329,26 +331,35 @@ export function LineEditor({
             maxLength={80}
           />
         </Field>
-        {kind === "vless" && (
-          <Field label="协议">
-            <select
-              className="select"
-              value={protocol}
-              onChange={(e) => {
-                setProtocol(e.target.value as Protocol);
-                setBatch(false);
-                setShared(false);
-                setCertificate(e.target.value === "vless" ? "off" : "auto");
-              }}
-            >
-              {Object.entries(protocolNames).map(([id, label]) => (
-                <option key={id} value={id}>
-                  {id === "vless" ? "VLESS" : label}
-                </option>
-              ))}
-            </select>
-          </Field>
-        )}
+        <Field label="协议">
+          <select
+            className="select"
+            value={protocol}
+            onChange={(e) => {
+              const next = e.target.value as Protocol;
+              setProtocol(next);
+              setBatch(false);
+              setShared(false);
+              setCertificate(
+                next === "vless"
+                  ? "off"
+                  : ["trojan", "hysteria2", "tuic"].includes(next)
+                    ? domain
+                      ? "auto"
+                      : "manual"
+                    : domain
+                      ? "auto"
+                      : "off",
+              );
+            }}
+          >
+            {Object.entries(protocolNames).map(([id, label]) => (
+              <option key={id} value={id}>
+                {id === "vless" ? "VLESS" : label}
+              </option>
+            ))}
+          </select>
+        </Field>
       </div>
 
       {protocol === "vless" && (
@@ -419,7 +430,7 @@ export function LineEditor({
                           value.endsWith("tls") &&
                           certificate === "off"
                         )
-                          setCertificate("auto");
+                          setCertificate(domain ? "auto" : "manual");
                       }
                     }}
                   />
@@ -764,10 +775,14 @@ export function LineEditor({
                   setCertificate(e.target.value);
                 }}
               >
-                <option value="auto">自动申请与续期证书</option>
+                <option value="auto">自动申请与续期证书（需域名）</option>
                 <option value="manual">手动粘贴 PEM 证书</option>
-                {protocol === "vmess" && (
-                  <option value="off">VMess AEAD（不启用 TLS）</option>
+                {["vmess", "http"].includes(protocol) && (
+                  <option value="off">
+                    {protocol === "vmess"
+                      ? "VMess AEAD（不启用 TLS）"
+                      : "不启用 TLS"}
+                  </option>
                 )}
               </select>
             </Field>
@@ -812,82 +827,80 @@ export function LineEditor({
           </Field>
         )}
 
-      {kind === "vless" && (
-        <section
-          key={protocol}
-          className="space-y-3 rounded-xl border border-border bg-muted/20 p-4"
-        >
-          <div className="flex items-center gap-1.5">
-            <h3 className="text-xs font-semibold text-foreground">认证凭据</h3>
-            {line && (
-              <InfoTip>
-                留空保留原凭据；修改 UUID、密码或加密算法后需同步更新客户端配置。
-              </InfoTip>
-            )}
-          </div>
-          {protocol === "shadowsocks" && (
-            <Field label="Shadowsocks 加密方式">
-              <select
-                className="select"
-                value={method}
-                onChange={(e) => setMethod(e.target.value)}
-              >
-                <option value="2022-blake3-aes-128-gcm">
-                  2022-blake3-aes-128-gcm（推荐）
-                </option>
-                <option value="2022-blake3-aes-256-gcm">
-                  2022-blake3-aes-256-gcm
-                </option>
-                <option value="aes-128-gcm">aes-128-gcm</option>
-                <option value="aes-256-gcm">aes-256-gcm</option>
-                <option value="chacha20-ietf-poly1305">
-                  chacha20-ietf-poly1305
-                </option>
-              </select>
+      <section
+        key={protocol}
+        className="space-y-3 rounded-xl border border-border bg-muted/20 p-4"
+      >
+        <div className="flex items-center gap-1.5">
+          <h3 className="text-xs font-semibold text-foreground">认证凭据</h3>
+          {line && (
+            <InfoTip>
+              留空保留原凭据；修改 UUID、密码或加密算法后需同步更新客户端配置。
+            </InfoTip>
+          )}
+        </div>
+        {protocol === "shadowsocks" && (
+          <Field label="Shadowsocks 加密方式">
+            <select
+              className="select"
+              value={method}
+              onChange={(e) => setMethod(e.target.value)}
+            >
+              <option value="2022-blake3-aes-128-gcm">
+                2022-blake3-aes-128-gcm（推荐）
+              </option>
+              <option value="2022-blake3-aes-256-gcm">
+                2022-blake3-aes-256-gcm
+              </option>
+              <option value="aes-128-gcm">aes-128-gcm</option>
+              <option value="aes-256-gcm">aes-256-gcm</option>
+              <option value="chacha20-ietf-poly1305">
+                chacha20-ietf-poly1305
+              </option>
+            </select>
+          </Field>
+        )}
+        <div className="grid gap-3.5 sm:grid-cols-2">
+          {usesUuid && (
+            <Field label="UUID">
+              <Input
+                name="uuid"
+                defaultValue={line?.hops[0]?.uuid}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={line ? "留空保留原 UUID" : "留空自动生成"}
+              />
             </Field>
           )}
-          <div className="grid gap-3.5 sm:grid-cols-2">
-            {usesUuid && (
-              <Field label="UUID">
-                <Input
-                  name="uuid"
-                  defaultValue={line?.hops[0]?.uuid}
-                  autoComplete="off"
-                  spellCheck={false}
-                  placeholder={line ? "留空保留原 UUID" : "留空自动生成"}
-                />
-              </Field>
-            )}
-            {["http", "socks"].includes(protocol) && (
-              <Field label="用户名">
-                <Input
-                  name="username"
-                  defaultValue={line?.access.username}
-                  autoComplete="off"
-                  placeholder="默认 chain"
-                />
-              </Field>
-            )}
-            {!["vless", "vmess"].includes(protocol) && (
-              <Field
-                label="连接密码"
-                tooltip={
-                  protocol === "shadowsocks" && method.startsWith("2022-")
-                    ? `此算法需要 ${method === "2022-blake3-aes-128-gcm" ? 16 : 32} 字节 Base64 密钥；留空自动生成或保留。`
-                    : undefined
-                }
-              >
-                <Input
-                  name="password"
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder={line ? "留空保留原密码" : "留空自动生成"}
-                />
-              </Field>
-            )}
-          </div>
-        </section>
-      )}
+          {["http", "socks"].includes(protocol) && (
+            <Field label="用户名">
+              <Input
+                name="username"
+                defaultValue={line?.access.username}
+                autoComplete="off"
+                placeholder="默认 chain"
+              />
+            </Field>
+          )}
+          {!["vless", "vmess"].includes(protocol) && (
+            <Field
+              label="连接密码"
+              tooltip={
+                protocol === "shadowsocks" && method.startsWith("2022-")
+                  ? `此算法需要 ${method === "2022-blake3-aes-128-gcm" ? 16 : 32} 字节 Base64 密钥；留空自动生成或保留。`
+                  : undefined
+              }
+            >
+              <Input
+                name="password"
+                type="password"
+                autoComplete="new-password"
+                placeholder={line ? "留空保留原密码" : "留空自动生成"}
+              />
+            </Field>
+          )}
+        </div>
+      </section>
 
       <section className="space-y-3 rounded-xl border border-border bg-muted/20 p-4">
         <Field

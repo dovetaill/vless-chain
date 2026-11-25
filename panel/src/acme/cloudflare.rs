@@ -53,27 +53,49 @@ impl Challenges {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.context("Cloudflare 请求失败")?;
-        ensure!(
-            response.status().is_success(),
-            "Cloudflare 请求失败（HTTP {}）",
-            response.status()
-        );
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Cloudflare 请求失败：{}", e.without_url()))?;
+        let status = response.status();
         ensure!(
             response.content_length().is_none_or(|n| n <= 1024 * 1024),
             "Cloudflare 响应过大"
         );
         let bytes = response.bytes().await?;
         ensure!(bytes.len() <= 1024 * 1024, "Cloudflare 响应过大");
-        let value: Value = serde_json::from_slice(&bytes).context("Cloudflare 响应无效")?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"success": false}));
+        let detail: Vec<String> = value["errors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let msg = item["message"].as_str()?;
+                match item["code"].as_u64() {
+                    Some(code) => Some(format!("{code}: {msg}")),
+                    None => Some(msg.to_string()),
+                }
+            })
+            .collect();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!("：{}", detail.join("; "))
+        };
         ensure!(
-            value["success"] == true,
-            "Cloudflare 操作失败，请检查 token 权限"
+            status.is_success() && value["success"] == true,
+            "Cloudflare 操作失败（HTTP {status}）{suffix}"
         );
         Ok(value["result"].clone())
     }
     pub async fn create(&mut self, domain: &str, value: &str) -> Result<()> {
-        let mut zone_name = domain;
+        let safe_id = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+        };
+        let mut zone_name = domain.strip_prefix("*.").unwrap_or(domain);
         let zone = loop {
             let zones = self
                 .request(
@@ -95,18 +117,13 @@ impl Challenges {
                 .context("未找到域名对应的 Cloudflare zone")?
                 .1;
         };
-        ensure!(
-            zone.len() == 32 && zone.bytes().all(|c| c.is_ascii_hexdigit()),
-            "Cloudflare zone ID 无效"
-        );
-        let record=self.request(reqwest::Method::POST,&format!("/zones/{zone}/dns_records"),Some(json!({"type":"TXT","name":format!("_acme-challenge.{domain}"),"content":value,"ttl":120}))).await?;
+        ensure!(safe_id(&zone), "Cloudflare zone ID 无效");
+        let bare = domain.strip_prefix("*.").unwrap_or(domain);
+        let record=self.request(reqwest::Method::POST,&format!("/zones/{zone}/dns_records"),Some(json!({"type":"TXT","name":format!("_acme-challenge.{bare}"),"content":value,"ttl":120}))).await?;
         let id = record["id"]
             .as_str()
             .context("Cloudflare DNS 记录缺少 ID")?;
-        ensure!(
-            id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()),
-            "Cloudflare DNS 记录 ID 无效"
-        );
+        ensure!(safe_id(id), "Cloudflare DNS 记录 ID 无效");
         self.records.push((zone, id.into()));
         Ok(())
     }

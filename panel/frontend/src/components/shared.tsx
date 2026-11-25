@@ -36,16 +36,6 @@ export const bytes = (n: number) => {
   const i = n > 0 ? Math.max(0, Math.min(4, Math.floor(Math.log(n) / Math.log(1024)))) : 0;
   return `${(n / 1024 ** i).toFixed(i ? 1 : 0)} ${["B", "KiB", "MiB", "GiB", "TiB"][i]}`;
 };
-import { endpoint } from "../lib/business";
-export { endpoint };
-export function splitAddress(s: string): [string, string] {
-  try {
-    const u = new URL(`tcp://${s}`);
-    return [u.hostname.replace(/^\[|\]$/g, ""), u.port];
-  } catch {
-    return [s, ""];
-  }
-}
 export const protocolNames = {
   vless: "VLESS",
   http: "HTTP 代理",
@@ -334,11 +324,7 @@ export function PathView({ line, state }: { line: Line; state: PanelState }) {
   const names = line.hops.map(
     (h) => state.nodes.find((n) => n.id === h.node_id)?.name || "已移除节点",
   );
-  const chain = line.chain?.length
-    ? line.chain
-    : line.external_id
-      ? [`external:${line.external_id}`]
-      : [];
+  const chain = line.chain || [];
   names.push(
     ...chain.map((reference) => {
       const [kind, id] = reference.split(":");
@@ -398,10 +384,16 @@ export function Empty({
   );
 }
 
-export function download(name: string, content: string) {
-  const url = URL.createObjectURL(
-    new Blob([content], { type: "text/yaml;charset=utf-8" }),
-  );
+export function download(
+  name: string,
+  content: string,
+  type = name.endsWith(".csv")
+    ? "text/csv;charset=utf-8"
+    : /\.ya?ml$/i.test(name)
+      ? "text/yaml;charset=utf-8"
+      : "text/plain;charset=utf-8",
+) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
   const a = document.createElement("a");
   a.href = url;
   a.download = name;

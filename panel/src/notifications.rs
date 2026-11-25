@@ -1,5 +1,5 @@
 use crate::management::Channels;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     io::{Read, Write},
@@ -8,18 +8,36 @@ use std::{
 };
 
 pub async fn telegram(channels: &Channels, message: &str) -> Result<()> {
-    let response = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none()).build()?
-        .post(format!("https://api.telegram.org/bot{}/sendMessage", channels.telegram_token))
+    channels.validate()?;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            channels.telegram_token
+        ))
         .json(&serde_json::json!({"chat_id":channels.telegram_chat,"text":message.chars().take(4000).collect::<String>()}))
-        .send().await.map_err(|_| anyhow::anyhow!("Telegram 请求失败，请检查连接和 Bot 配置"))?;
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Telegram 请求失败：{}", e.without_url()))?;
+    let status = response.status();
+    let result: serde_json::Value = response
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let detail = result["description"].as_str().unwrap_or("");
     ensure!(
-        response.status().is_success(),
-        "Telegram 拒绝通知（HTTP {}）",
-        response.status().as_u16()
+        status.is_success() && result["ok"] == true,
+        "Telegram 拒绝通知（HTTP {}{}）",
+        status.as_u16(),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!("：{detail}")
+        }
     );
-    let result: serde_json::Value = response.json().await.context("Telegram 响应无效")?;
-    ensure!(result["ok"] == true, "Telegram 未接受通知");
     Ok(())
 }
 
@@ -54,11 +72,25 @@ fn command(stream: &mut (impl Read + Write), text: &str, expected: u16) -> Resul
 
 pub fn email(channels: &Channels, message: &str) -> Result<()> {
     channels.validate()?;
-    let address = (channels.smtp_host.as_str(), channels.smtp_port)
+    let addresses: Vec<_> = (channels.smtp_host.as_str(), channels.smtp_port)
         .to_socket_addrs()?
-        .next()
-        .context("SMTP 主机无地址")?;
-    let mut tcp = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
+        .collect();
+    ensure!(!addresses.is_empty(), "SMTP 主机无地址");
+    let mut last_err = None;
+    let mut connected = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, Duration::from_secs(10)) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let mut tcp = match connected {
+        Some(stream) => stream,
+        None => return Err(last_err.unwrap().into()),
+    };
     tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(15)))?;
     if channels.smtp_starttls {

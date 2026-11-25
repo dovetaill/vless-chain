@@ -49,11 +49,11 @@ export function ProbeEditor({
             <option value="http">HTTP / HTTPS 完整链路</option>
           </select>
         </Field>
-        {mode === "http" && line.kind !== "website" && (
+        {mode === "http" && (
           <Field label="检查网址">
             <Input
               name="url"
-              defaultValue={line.kind === "vless" ? "https://example.com" : ""}
+              defaultValue="https://example.com"
               placeholder="https://example.com"
               required
             />

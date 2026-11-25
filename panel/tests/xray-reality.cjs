@@ -20,6 +20,19 @@ const freePort = async () => {
   const server = net.createServer(); const port = await listen(server);
   await new Promise(resolve => server.close(resolve)); return port;
 };
+const tcpReady = port => new Promise(resolve => {
+  const socket = net.connect(port, '127.0.0.1');
+  socket.once('connect', () => { socket.destroy(); resolve(true); });
+  socket.once('error', () => { socket.destroy(); resolve(false); });
+});
+const waitReady = async (pair, serverPort, socksPort) => {
+  const deadline = Date.now() + 6500;
+  while (Date.now() < deadline) {
+    if (pair.some(child => child.exitCode !== null || child.signalCode !== null)) break;
+    if (/Certificate:\s*\d+/.test(pair[0].log) && await tcpReady(serverPort) && await tcpReady(socksPort)) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+};
 const stop = async child => {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const done = new Promise(resolve => child.once('exit', resolve));
@@ -59,7 +72,7 @@ async function probe(binary, target, name) {
       children.push(child); pair.push(child);
     }
     fs.writeFileSync(path.join(root, 'processes.json'), JSON.stringify({ pid: process.pid, cwd: root, children: children.map(p => p.pid), ports }));
-    await new Promise(resolve => setTimeout(resolve, 6500));
+    await waitReady(pair, serverPort, socksPort);
     const result = await new Promise((resolve, reject) => {
       const child = spawn('curl', ['--silent', '--show-error', '--max-time', '15', '--noproxy', '',
         '--socks5-hostname', `127.0.0.1:${socksPort}`, `http://127.0.0.1:${echoPort}/`]);
@@ -100,11 +113,6 @@ async function probe(binary, target, name) {
   await Promise.all(children.map(stop));
   for (const socket of sockets) socket.destroy();
   await Promise.all(servers.filter(s => s.listening).map(s => new Promise(resolve => s.close(resolve))));
-  for (const port of new Set(ports)) {
-    const released = net.createServer();
-    await new Promise((resolve, reject) => released.once('error', reject).listen(port, '127.0.0.1', resolve));
-    await new Promise(resolve => released.close(resolve));
-  }
-  fs.rmSync(root, { recursive: true });
+  fs.rmSync(root, { recursive: true, force: true });
   console.log('Cleaned test processes, loopback listeners and files:', root);
 });

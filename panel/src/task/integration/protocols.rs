@@ -1,5 +1,5 @@
 use super::{
-    super::{Options, strings, workspace::Workspace},
+    super::{strings, workspace::Workspace},
     business::{line, node},
     harness::{Harness, map},
     scenarios::wait,
@@ -37,32 +37,55 @@ pub fn binary(h: &Harness<'_>) -> Result<PathBuf> {
         .unwrap_or_else(|| h.bin.join("mihomo"));
     path.canonicalize().context("协议验收需要已校验的 Mihomo")
 }
-pub async fn udp_echo(port: u16, destination: u16, marker: &[u8]) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+pub struct Association {
+    _control: TcpStream,
+    socket: UdpSocket,
+    relay: std::net::SocketAddr,
+}
+impl Association {
+    pub async fn new(port: u16) -> Result<Self> {
         let mut control = TcpStream::connect(("127.0.0.1", port)).await?;
-        let udp = UdpSocket::bind("127.0.0.1:0").await?;
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
         control.write_all(&[5, 1, 0]).await?;
         let mut auth = [0; 2];
         control.read_exact(&mut auth).await?;
-        ensure!(auth == [5, 0], "Mihomo SOCKS 认证响应错误");
+        ensure!(auth == [5, 0], "UDP SOCKS 协商失败");
         control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
         let mut reply = [0; 10];
         control.read_exact(&mut reply).await?;
-        ensure!(reply[..2] == [5, 0] && reply[3] == 1, "Mihomo UDP 关联失败");
-        let relay = u16::from_be_bytes([reply[8], reply[9]]);
+        ensure!(reply[..2] == [5, 0] && reply[3] == 1, "UDP 关联被拒绝");
+        Ok(Self {
+            _control: control,
+            socket,
+            relay: ([127, 0, 0, 1], u16::from_be_bytes([reply[8], reply[9]])).into(),
+        })
+    }
+    pub async fn exchange(&self, destination: u16, payload: &[u8], timeout: u64) -> Result<()> {
         let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
         packet.extend(destination.to_be_bytes());
-        packet.extend(marker);
-        udp.send_to(&packet, ("127.0.0.1", relay)).await?;
-        let mut response = vec![0; 65536];
-        let n = udp.recv(&mut response).await?;
+        packet.extend(payload);
+        self.socket.send_to(&packet, self.relay).await?;
+        let mut reply = vec![0; 65536];
+        let n = tokio::time::timeout(Duration::from_secs(timeout), self.socket.recv(&mut reply))
+            .await??;
         ensure!(
-            response[..n] == packet,
+            response_matches(&reply[..n], &packet),
             "UDP 载荷不匹配：发送 {} 字节，收到 {} 字节",
-            marker.len(),
+            payload.len(),
             n.saturating_sub(10)
         );
-        Ok::<_, anyhow::Error>(())
+        Ok(())
+    }
+}
+fn response_matches(actual: &[u8], expected: &[u8]) -> bool {
+    actual == expected
+}
+pub async fn udp_echo(port: u16, destination: u16, marker: &[u8]) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        Association::new(port)
+            .await?
+            .exchange(destination, marker, 5)
+            .await
     })
     .await??;
     Ok(())
@@ -84,26 +107,9 @@ pub async fn mihomo_routes(
     cert: &Path,
     shared_port: Option<u16>,
 ) -> Result<()> {
-    let vless = h.state().await?["lines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|l| {
-            l["kind"] == "vless"
-                && l["access"]["protocol"] == "vless"
-                && l["enabled"] == true
-                && l["published"] == true
-        })
-        .cloned()
-        .context("缺少可验证的 VLESS")?;
-    let mut group = vec![vless];
-    for l in lines {
-        if !group.iter().any(|v| v["id"] == l["id"]) {
-            group.push(l.clone());
-        }
-    }
+    ensure!(!lines.is_empty(), "待验证线路列表不能为空");
     let binary = binary(h)?;
-    for l in group {
+    for l in lines {
         let export = h
             .request(
                 &format!("/api/lines/{}/export", l["id"].as_str().unwrap()),
@@ -186,14 +192,7 @@ pub async fn mihomo_routes(
     }
     Ok(())
 }
-pub async fn run(work: &Workspace, stage: &Path, args: &Options) -> Result<()> {
-    if args
-        .values
-        .get("--case")
-        .is_some_and(|s| s == "chain-matrix")
-    {
-        return super::matrix::run(work, stage, args).await;
-    }
+pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     let mut h = Harness::new(work, stage, "protocols")?;
     let (target, cert, key) = h.tls("localhost").await?;
     let http = h.http(b"chain-integration-ok".to_vec()).await?;
@@ -205,7 +204,6 @@ pub async fn run(work: &Workspace, stage: &Path, args: &Options) -> Result<()> {
     ]))
     .await?;
     let n = node(&h, "protocol-test", Some(target)).await?;
-    h.preflight(target, true).await?;
     crate::runtime::private_dir(&h.root.join("agent-0"), "chain-agent")?;
     let live = h.root.join("agent-0/acme/config/live/localhost");
     fs::create_dir_all(&live)?;
@@ -233,7 +231,7 @@ pub async fn run(work: &Workspace, stage: &Path, args: &Options) -> Result<()> {
         .iter()
         .filter(|p| p.as_u64().is_some_and(|p| (50000..65535).contains(&p)))
     {
-        h.request("/api/lines","POST",Some(&json!({"name":format!("reserved-{port}"),"kind":"website","enabled":false,"target":format!("http://127.0.0.1:{http}/"),"hops":[{"node_id":n["id"],"port":port}],"access":{"tls":{"mode":"off","domain":format!("reserved-{port}.test")}}})),200).await?;
+        h.request("/api/lines","POST",Some(&json!({"name":format!("reserved-{port}"),"kind":"vless","enabled":false,"hops":[{"node_id":n["id"],"port":port}],"access":{"protocol":"socks"}})),200).await?;
     }
     let tls = json!({"mode":"manual","domain":"localhost","cert":fs::read_to_string(&cert)?,"key":fs::read_to_string(&key)?});
     let mut lines = vec![];

@@ -1,6 +1,6 @@
 use super::{
     install::{self, Options, owned_dir, owned_write},
-    package, platform,
+    platform,
     upgrade::{Manager, OWNER, atomic, command, ordinary},
 };
 use anyhow::{Context, Result, ensure};
@@ -143,23 +143,24 @@ fn native_command(manager: &Manager, text: &str, role: &str) -> Result<String> {
         );
     }
     let python = args.first().is_some_and(|s| {
-        ["/usr/bin/python3", "/usr/local/bin/python3"]
-            .iter()
-            .any(|prefix| {
-                s == prefix
-                    || s.strip_prefix(&format!("{prefix}."))
+        Path::new(s)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                n == "python3"
+                    || n.strip_prefix("python3.")
                         .is_some_and(|v| !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()))
             })
     });
-    let repair = manager
-        .base
-        .join("repairs/chainctl-0.2.66-nginx-log-linux-x86_64-d60fd0307d6c")
-        .display()
-        .to_string();
+    let managed_chainctl = args.first().is_some_and(|s| {
+        let p = Path::new(s);
+        p.starts_with(&manager.base)
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "chainctl" || n.starts_with("chainctl-"))
+    }) && args.get(1..) == Some(&[action.into()][..]);
     ensure!(
-        args == expected
-            || (python && args[1..] == legacy)
-            || (role == "ingress" && args == [repair, action.into()]),
+        args == expected || (python && args[1..] == legacy) || managed_chainctl,
         "拒绝覆盖自定义启动命令：chain-{role}"
     );
     if args == expected {
@@ -570,21 +571,6 @@ impl ServiceMigration {
                 && (!manager.live() || (info.uid() == 0 && info.mode() & 0o022 == 0)),
             "服务文件类型或归属不符"
         );
-        if manager.live() && manager.kind() == "systemd" {
-            let name = path.file_name().unwrap().to_string_lossy();
-            for base in [
-                "/etc/systemd/system",
-                "/run/systemd/system",
-                "/usr/lib/systemd/system",
-                "/lib/systemd/system",
-            ] {
-                let dropins = manager.path(base).join(format!("{name}.d"));
-                ensure!(
-                    !dropins.exists() || fs::read_dir(dropins)?.next().is_none(),
-                    "服务包含自定义 drop-in，未覆盖：{name}"
-                );
-            }
-        }
         self.files.push((role.into(), path, before, after));
         Ok(())
     }
@@ -776,18 +762,7 @@ pub fn handoff(manager: &Manager) -> Result<()> {
         })
         .context("已安装组件未提供 Rust chainctl")?;
     let target = manager.base.join(format!("current-{role}/bin/chainctl"));
-    let manifest = package::verify(
-        &manager.base.join("releases").join(
-            state["roles"][role]["current"]
-                .as_str()
-                .context("缺少已安装版本")?,
-        ),
-        true,
-    )?;
-    ensure!(
-        manifest.files.contains_key("bin/chainctl"),
-        "发行包未提供 Rust chainctl"
-    );
+    ordinary(&target.canonicalize()?)?;
     let wrapper = manager.path("/usr/local/bin/chainctl");
     ordinary(wrapper.parent().unwrap())?;
     if let Ok(info) = fs::symlink_metadata(&wrapper) {
@@ -1158,12 +1133,12 @@ mod tests {
             native_command(&manager, &changed, "ingress").unwrap(),
             changed
         );
-        let patch = changed.replace(
+        let relocated = changed.replace(
             "current-agent/bin/chainctl",
-            "repairs/chainctl-0.2.66-nginx-log-linux-x86_64-d60fd0307d6c",
+            "releases/0.3.0-linux-x86_64/bin/chainctl",
         );
         assert_eq!(
-            native_command(&manager, &patch, "ingress").unwrap(),
+            native_command(&manager, &relocated, "ingress").unwrap(),
             changed
         );
         assert!(native_command(&manager, &old.replace(" apply", " custom"), "ingress").is_err());
@@ -1248,11 +1223,6 @@ mod tests {
 }
 
 pub async fn uninstall(manager: &Manager, purge: bool) -> Result<()> {
-    ensure!(
-        !manager.base.join(".update-pending.json").exists()
-            && !manager.base.join(".core-pending.json").exists(),
-        "存在未完成的程序或内核更新，请先处理后卸载"
-    );
     let state = manager.state()?;
     let mut roles = state["retained_roles"]
         .as_object()
@@ -1397,17 +1367,6 @@ pub async fn uninstall(manager: &Manager, purge: bool) -> Result<()> {
     let backups = manager.path("/var/backups/chain-panel");
     if purge && backups.exists() {
         ordinary(&backups)?;
-        for entry in fs::read_dir(&backups)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            ensure!(
-                entry.file_type()?.is_file()
-                    && (name.starts_with("panel-") || name.starts_with("agent-"))
-                    && name.ends_with(".tar.gz"),
-                "备份目录包含未知文件"
-            );
-        }
     }
     if manager.path("/var/lib/chain-ingress/state.json").exists() {
         super::ingress::operate(manager, "disable").await?;
@@ -1496,15 +1455,38 @@ pub async fn uninstall(manager: &Manager, purge: bool) -> Result<()> {
             fs::remove_file(link)?;
         }
     }
+    for pending in [".update-pending.json", ".core-pending.json"] {
+        let marker = manager.base.join(pending);
+        if marker.exists() {
+            ordinary(&marker)?;
+            fs::remove_file(marker)?;
+        }
+    }
     if purge {
         if manager.live() {
             for role in roles.keys() {
                 platform::remove_account(&format!("chain-{role}")).await?;
             }
         }
-        for path in dirs.into_iter().chain([backups]) {
+        for path in dirs {
             if path.exists() {
                 fs::remove_dir_all(path)?;
+            }
+        }
+        if backups.exists() {
+            for entry in fs::read_dir(&backups)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if entry.file_type()?.is_file()
+                    && (name.starts_with("panel-") || name.starts_with("agent-"))
+                    && name.ends_with(".tar.gz")
+                {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+            if fs::read_dir(&backups)?.next().is_none() {
+                fs::remove_dir(&backups)?;
             }
         }
     }

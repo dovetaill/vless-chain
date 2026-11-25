@@ -42,13 +42,33 @@ fn identifier(name: &str) -> Result<()> {
             && name.len() <= 253
             && name
                 .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c))
+                .all(|c| c.is_ascii_alphanumeric() || b".-_".contains(&c))
             && !name.starts_with('.')
             && !name.ends_with('.')
             && !name.contains(".."),
-        "证书名称或域名无效"
+        "证书名称无效"
     );
     Ok(())
+}
+
+fn domain_identifier(domain: &str, allow_wildcard: bool) -> Result<()> {
+    let bare = if allow_wildcard {
+        domain.strip_prefix("*.").unwrap_or(domain)
+    } else {
+        domain
+    };
+    ensure!(
+        domain.len() <= 253 && crate::compiler::domain_valid(bare),
+        "证书域名无效"
+    );
+    Ok(())
+}
+
+pub(crate) fn pem_not_after_unix(pem: &[u8]) -> Result<u64> {
+    let cert = X509::from_pem(pem)?;
+    let epoch = Asn1Time::from_unix(0)?;
+    let difference = epoch.diff(cert.not_after())?;
+    Ok((i64::from(difference.days) * 86400 + i64::from(difference.secs)).max(0) as u64)
 }
 
 fn ordinary(path: &Path) -> Result<()> {
@@ -103,7 +123,7 @@ fn save(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn remaining(config: &Path, name: &str, domain: &str) -> Result<Option<i64>> {
     identifier(name)?;
-    identifier(domain)?;
+    domain_identifier(domain, true)?;
     let directory = paths(config, name);
     let cert = directory.join("fullchain.pem");
     let key = directory.join("privkey.pem");
@@ -112,7 +132,7 @@ pub fn remaining(config: &Path, name: &str, domain: &str) -> Result<Option<i64>>
     }
     ensure!(
         cert.is_file() && key.is_file(),
-        "已有证书或私钥缺失，拒绝覆盖"
+        "已有证书或私钥缺失"
     );
     let chain = X509::stack_from_pem(&fs::read(&cert)?)?;
     let leaf = chain.first().context("证书链为空")?;
@@ -121,6 +141,19 @@ pub fn remaining(config: &Path, name: &str, domain: &str) -> Result<Option<i64>>
     let remaining = validate_leaf(leaf, domain)?;
     Ok(Some(remaining))
 }
+fn reusable(config: &Path, name: &str, domain: &str, allow_wildcard: bool) -> Result<bool> {
+    identifier(name)?;
+    domain_identifier(domain, allow_wildcard)?;
+    ordinary(config)?;
+    match remaining(config, name, domain) {
+        Ok(Some(seconds)) => Ok(seconds > 30 * 86400),
+        Ok(None) => Ok(false),
+        Err(e) => {
+            eprintln!("现有证书 {name} 不可复用（{e:#}），将在新归档目录重新签发");
+            Ok(false)
+        }
+    }
+}
 fn validate_leaf(leaf: &openssl::x509::X509Ref, domain: &str) -> Result<i64> {
     let names = leaf.subject_alt_names().context("已有证书缺少域名")?;
     ensure!(
@@ -128,19 +161,24 @@ fn validate_leaf(leaf: &openssl::x509::X509Ref, domain: &str) -> Result<i64> {
             .iter()
             .filter_map(|n| n.dnsname())
             .any(|n| n.eq_ignore_ascii_case(domain)
-                || n.strip_prefix("*.").is_some_and(|suffix| domain
-                    .split_once('.')
-                    .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(suffix)))),
+                || (!domain.starts_with("*.")
+                    && n.strip_prefix("*.").is_some_and(|suffix| domain
+                        .split_once('.')
+                        .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(suffix))))),
         "已有证书域名不匹配"
     );
-    let now = Asn1Time::days_from_now(0)?;
-    ensure!(leaf.not_before() <= now.as_ref(), "已有证书尚未生效");
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let now = Asn1Time::from_unix(now_ts)?;
+    let skew_grace = Asn1Time::from_unix(now_ts + 300)?;
+    ensure!(leaf.not_before() <= skew_grace.as_ref(), "已有证书尚未生效");
     let diff = now.diff(leaf.not_after())?;
     Ok(i64::from(diff.days) * 86400 + i64::from(diff.secs))
 }
 
 pub async fn obtain(config: &Path, name: &str, domain: &str, webroot: &Path) -> Result<bool> {
-    if remaining(config, name, domain)?.is_some_and(|seconds| seconds > 30 * 86400) {
+    if reusable(config, name, domain, false)? {
         return Ok(false);
     }
     tokio::time::timeout(
@@ -183,7 +221,7 @@ pub async fn obtain_dns(
     domain: &str,
     credentials: &Path,
 ) -> Result<bool> {
-    if remaining(config, name, domain)?.is_some_and(|s| s > 30 * 86400) {
+    if reusable(config, name, domain, true)? {
         return Ok(false);
     }
     tokio::time::timeout(
@@ -201,6 +239,36 @@ pub async fn obtain_dns(
     .await
     .context("DNS 证书申请超时")?
 }
+
+async fn wait_dns_propagation(record_host: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut dig_available = true;
+    while tokio::time::Instant::now() < deadline {
+        if dig_available {
+            let mut cmd = tokio::process::Command::new("dig");
+            cmd.args(["+time=2", "+tries=1", "+short", "TXT", record_host, "@1.1.1.1"])
+                .kill_on_drop(true);
+            match tokio::time::timeout(Duration::from_secs(3), cmd.output()).await {
+                Ok(Ok(output)) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if stdout.contains(expected) {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        return;
+                    }
+                }
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    dig_available = false;
+                }
+                _ => {}
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+}
+
 async fn issue_with(
     config: &Path,
     name: &str,
@@ -211,7 +279,7 @@ async fn issue_with(
     directory: &str,
 ) -> Result<bool> {
     identifier(name)?;
-    identifier(domain)?;
+    domain_identifier(domain, credentials.is_some())?;
     private_dir(config)?;
     let config = config.canonicalize()?;
     let root = config.join("rust");
@@ -291,9 +359,10 @@ async fn issue_with(
                 .challenge(kind)
                 .context("CA 不支持所需验证方式")?;
             if let Some(dns) = dns.as_mut() {
-                dns.create(domain, &challenge.key_authorization().dns_value())
-                    .await?;
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                let bare = domain.strip_prefix("*.").unwrap_or(domain);
+                let txt = challenge.key_authorization().dns_value();
+                dns.create(bare, &txt).await?;
+                wait_dns_propagation(&format!("_acme-challenge.{bare}"), &txt).await;
                 challenge.set_ready().await?;
                 continue;
             }

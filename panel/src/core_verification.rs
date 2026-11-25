@@ -22,49 +22,38 @@ async fn inputs(app: &App, remote: Option<&Remote>) -> Result<(Value, Document)>
     Ok((state, serde_json::from_value(document)?))
 }
 
+fn legacy_enabled(state: &Value) -> bool {
+    state["published_legacy_enabled"].as_bool().unwrap_or_else(|| {
+        state["legacy_configs"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|p| p["enabled"] != false && p["published"] != false))
+    })
+}
+
 fn fingerprint(state: &Value, doc: &Document) -> Result<String> {
     let local = state["local_node_id"]
         .as_str()
         .context("本机 Agent 身份待确认")?;
-    let legacy = state["legacy_configs"]
+    state["legacy_configs"]
         .as_array()
         .context("缺少原生配置状态")?;
-    ensure!(
-        !state["published_legacy_enabled"]
-            .as_bool()
-            .unwrap_or(!legacy.is_empty()),
-        "原生配置需要使用其原客户端验证"
-    );
     let mut links = BTreeMap::new();
     for line in &doc.lines {
-        let endpoint = match line.kind {
-            Kind::Vless => share(line, doc)?,
-            Kind::Website => {
-                let port = line.hops.first().context("网站缺少入口")?.port;
-                let scheme = if matches!(line.access.tls.mode.as_str(), "auto" | "manual") {
-                    "https"
-                } else {
-                    "http"
-                };
-                format!("{scheme}://{}", address(&line.access.tls.domain, port))
-            }
-            Kind::Forward => anyhow::bail!("{}：端口转发需要业务协议的实际响应", line.name),
-        };
+        let endpoint = share(line, doc)?;
         ensure!(
             links.insert(&line.id, endpoint).is_none(),
             "已发布线路 ID 重复"
         );
     }
     // Store only a digest of the pre-upgrade links, never credentials in task receipts.
-    Ok(digest(&serde_json::to_string(&(local, links))?))
+    Ok(digest(&serde_json::to_string(&(
+        local,
+        legacy_enabled(state),
+        links,
+    ))?))
 }
 
 pub(super) async fn prepare(app: &App, remote: Option<&Remote>) -> Result<CoreVerification> {
-    let capabilities = task_request(app, remote, json!({"action":"core-status","id":id()})).await?;
-    ensure!(
-        capabilities["verification_failure_keeps_agent"] == true,
-        "该机当前维护程序会在验收失败时停掉 Agent，请先升级这台的程序"
-    );
     let before = async {
         let (state, doc) = inputs(app, remote).await?;
         fingerprint(&state, &doc)
@@ -156,7 +145,13 @@ async fn verify(app: &App, remote: Option<&Remote>, task: &Value, baseline: &str
         )));
     }
     ensure!(applied(node, &doc), "等待 Agent 应用目标配置");
+    let has_legacy = legacy_enabled(&state);
     if doc.lines.is_empty() {
+        if has_legacy {
+            return Ok(Proof::Manual(
+                "目标内核、新心跳和配置已自动核对；原生配置仍需使用其原客户端人工确认".into(),
+            ));
+        }
         return Ok(Proof::Passed(
             "目标内核、新心跳和配置已核对，当前无可用代理线路".into(),
         ));
@@ -166,7 +161,7 @@ async fn verify(app: &App, remote: Option<&Remote>, task: &Value, baseline: &str
         .context("缺少传输探测地址")?;
     let mut udp_count = 0;
     for line in &doc.lines {
-        let udp = line.kind == Kind::Vless && udp_supported(line, &doc)?;
+        let udp = udp_supported(line, &doc)?;
         let result = tokio::time::timeout(
             Duration::from_secs(40),
             probe_core_link(&app.xray, line, &doc, url, udp),
@@ -192,10 +187,16 @@ async fn verify(app: &App, remote: Option<&Remote>, task: &Value, baseline: &str
         }
         udp_count += usize::from(udp);
     }
-    Ok(Proof::Passed(format!(
+    let scope = format!(
         "目标内核、新心跳和配置已核对，{} 条升级前的入口通过 HTTP 传输，{udp_count} 条通过 UDP DNS 应答",
         doc.lines.len()
-    )))
+    );
+    if has_legacy {
+        return Ok(Proof::Manual(format!(
+            "{scope}；原生配置仍需使用其原客户端人工确认"
+        )));
+    }
+    Ok(Proof::Passed(scope))
 }
 
 pub(super) fn summary(check: &CoreVerification) -> Value {
@@ -269,25 +270,6 @@ async fn advance(
         Proof::Failed(detail) => ("core-reject", detail),
         Proof::Passed(detail) => ("core-confirm", detail),
     };
-    // A manual resolution or a config publish can race a slow transfer test.
-    let original = task_request(app, remote, json!({"action":"status","id":task["id"]})).await?;
-    ensure!(
-        original["state"] == "awaiting_verification"
-            && original["id"] == task["id"]
-            && original["action"] == task["action"]
-            && original["core"] == task["core"]
-            && original["version"] == task["version"],
-        "原任务状态已变化，正在重新查询"
-    );
-    let (current, doc) = inputs(app, remote).await?;
-    ensure!(
-        fingerprint(&current, &doc)? == baseline,
-        "探测期间已发布入口发生变化"
-    );
-    let node = ready(&current, task)?;
-    if action == "core-confirm" {
-        ensure!(applied(node, &doc), "探测期间 Agent 配置状态发生变化");
-    }
     if !matches!(check.state.as_str(), "confirming" | "rejecting") {
         check.waiting_since = Some(now());
     }

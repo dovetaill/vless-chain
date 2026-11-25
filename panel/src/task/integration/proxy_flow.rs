@@ -2,6 +2,7 @@ use super::{
     super::workspace::Workspace,
     business::line,
     harness::{Harness, map},
+    rentals::used,
 };
 use crate::ctl::{https::proxy_acme_config, upgrade::Manager};
 use anyhow::{Result, ensure};
@@ -207,10 +208,6 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     let local=line(&h,&nodes,"Local reference",&[0],json!({"access":{"protocol":"socks","host":"127.0.0.1"},"chain":[format!("line:{}",a["id"].as_str().unwrap())]}),200).await?;
     h.publish("applied").await?;
     let state = h.state().await?;
-    let used = |l: &Value| {
-        l["traffic"]["upload"].as_u64().unwrap_or(0)
-            + l["traffic"]["download"].as_u64().unwrap_or(0)
-    };
     let before = state["lines"]
         .as_array()
         .unwrap()
@@ -244,22 +241,9 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
         400,
     )
     .await?;
-    for (field, value) in [
-        (
-            "chain",
-            json!([format!("line:{}", local["id"].as_str().unwrap())]),
-        ),
-        ("kind", json!("forward")),
-        ("access", {
-            let mut access = a["access"].clone();
-            access["public_host"] = json!("relay.example");
-            access
-        }),
-    ] {
-        let mut invalid = a.clone();
-        invalid[field] = value;
-        h.request("/api/lines", "POST", Some(&invalid), 400).await?;
-    }
+    let mut invalid = a.clone();
+    invalid["chain"] = json!([format!("line:{}", local["id"].as_str().unwrap())]);
+    h.request("/api/lines", "POST", Some(&invalid), 400).await?;
     h.close().await?;
     println!("PASS 旧本机身份恢复、共享 HTTP-01、自动证书复用、有序出口真实流量与循环/删除保护");
     Ok(())

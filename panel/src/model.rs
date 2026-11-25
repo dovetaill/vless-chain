@@ -51,6 +51,13 @@ impl Reality {
             short_id: secret()[..16].into(),
         }
     }
+    pub fn public_key(private: &str) -> anyhow::Result<String> {
+        let bytes: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(private)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("X25519 私钥长度无效"))?;
+        Ok(URL_SAFE_NO_PAD.encode(PublicKey::from(&StaticSecret::from(bytes)).as_bytes()))
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -97,12 +104,11 @@ pub struct External {
     pub url: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    #[default]
     Vless,
-    Forward,
-    Website,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
@@ -151,10 +157,6 @@ pub struct Access {
     pub password: String,
     #[serde(default)]
     pub method: String,
-    #[serde(default)]
-    pub public_host: String,
-    #[serde(default)]
-    pub public_port: Option<u16>,
     #[serde(default)]
     pub tls: Tls,
 }
@@ -226,7 +228,11 @@ impl Access {
 
     pub fn server_name<'a>(&'a self, node: &'a Node) -> &'a str {
         if matches!(self.tls.mode.as_str(), "auto" | "manual") {
-            &self.tls.domain
+            if self.tls.domain.is_empty() {
+                &node.host
+            } else {
+                &self.tls.domain
+            }
         } else {
             self.reality
                 .as_ref()
@@ -273,27 +279,81 @@ impl Traffic {
     pub fn used(&self) -> u64 { self.charged.unwrap_or_else(|| self.upload.saturating_add(self.download)) }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Hop {
     pub node_id: String,
     pub port: u16,
     pub uuid: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Deserialize)]
+struct LineWire {
+    id: String,
+    name: String,
+    #[serde(default)]
+    kind: Kind,
+    hops: Vec<Hop>,
+    #[serde(default)]
+    external_id: Option<String>,
+    #[serde(default)]
+    chain: Vec<String>,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    access: Access,
+    #[serde(default)]
+    limits: Limits,
+}
+
+impl From<LineWire> for Line {
+    fn from(raw: LineWire) -> Self {
+        let chain = if raw.chain.is_empty() {
+            raw.external_id
+                .filter(|id| !id.is_empty())
+                .into_iter()
+                .map(|id| format!("external:{id}"))
+                .collect()
+        } else {
+            raw.chain
+        };
+        Self {
+            id: raw.id,
+            name: raw.name,
+            kind: raw.kind,
+            hops: raw.hops,
+            chain,
+            enabled: raw.enabled,
+            access: raw.access,
+            limits: raw.limits,
+        }
+    }
+}
+
+fn deserialize_lines<'de, D>(deserializer: D) -> std::result::Result<Vec<Line>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items: Vec<Value> = Deserialize::deserialize(deserializer)?;
+    items
+        .into_iter()
+        .filter(|v| {
+            v.get("kind")
+                .and_then(Value::as_str)
+                .is_none_or(|k| k == "vless")
+        })
+        .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+        .collect()
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(from = "LineWire")]
 pub struct Line {
     pub id: String,
     pub name: String,
     pub kind: Kind,
     pub hops: Vec<Hop>,
     #[serde(default)]
-    pub external_id: Option<String>,
-    #[serde(default)]
     pub chain: Vec<String>,
-    #[serde(default)]
-    pub target: String,
-    #[serde(default = "default_network")]
-    pub network: String,
     #[serde(default = "yes")]
     pub enabled: bool,
     #[serde(default)]
@@ -303,16 +363,17 @@ pub struct Line {
 }
 
 impl Line {
-    pub fn proxy_chain(&self) -> Vec<String> {
-        if self.chain.is_empty() {
-            self.external_id
-                .iter()
-                .map(|id| format!("external:{id}"))
-                .collect()
-        } else {
-            self.chain.clone()
-        }
+    pub fn proxy_chain(&self) -> &[String] {
+        &self.chain
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredPasskey {
+    pub id: String,
+    pub name: String,
+    pub created: u64,
+    pub credential: webauthn_rs::prelude::Passkey,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -326,7 +387,7 @@ pub struct Security {
     #[serde(default)]
     pub origin: String,
     #[serde(default)]
-    pub passkeys: Vec<Value>,
+    pub passkeys: Vec<StoredPasskey>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -385,6 +446,7 @@ pub struct Job {
     pub before: BTreeMap<String, Option<Desired>>,
     pub target: BTreeMap<String, Desired>,
     pub order: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_lines")]
     pub lines: Vec<Line>,
     pub nodes: Vec<Node>,
     pub externals: Vec<External>,
@@ -453,7 +515,9 @@ pub struct Document {
     pub renewal_contact: String,
     pub nodes: Vec<Node>,
     pub externals: Vec<External>,
+    #[serde(default, deserialize_with = "deserialize_lines")]
     pub lines: Vec<Line>,
+    #[serde(default, deserialize_with = "deserialize_lines")]
     pub applied_lines: Vec<Line>,
     pub applied_nodes: Vec<Node>,
     pub applied_externals: Vec<External>,
@@ -463,6 +527,8 @@ pub struct Document {
     pub security: Security,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -478,6 +544,18 @@ pub struct Prices {
     pub monthly: Option<u64>,
     pub quarterly: Option<u64>,
     pub yearly: Option<u64>,
+}
+impl Prices {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            [self.monthly, self.quarterly, self.yearly]
+                .into_iter()
+                .flatten()
+                .all(|v| v <= crate::rental::MAX_PRICE),
+            "报价超出有效金额范围"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
@@ -546,9 +624,6 @@ pub struct RentalOrder {
     pub amounts: BTreeMap<String, u64>,
     pub note: String,
     pub items: Vec<RentalOrderItem>,
-    pub created_session: String,
-    pub confirmed_session: String,
-    pub cancelled_session: String,
     #[serde(default)]
     pub created_by: Option<crate::security::Actor>,
     #[serde(default)]
@@ -570,7 +645,6 @@ pub struct PaymentAdjustment {
     pub disable_line: bool,
     #[serde(default)]
     pub affected_line_ids: Vec<String>,
-    pub session: String,
     #[serde(default)]
     pub operator: Option<crate::security::Actor>,
 }

@@ -29,7 +29,7 @@ export function Dashboard({
   manage?: (line: Line) => void;
 }) {
   const billing = !state.viewer || ["admin", "finance"].includes(state.viewer.role);
-  const lines = state.lines.filter((line) => line.kind === "vless");
+  const lines = state.lines;
   const days: Record<string, [number, number]> = {};
   for (const line of lines)
     for (const [day, traffic] of Object.entries(line.traffic?.days || {})) {

@@ -49,16 +49,6 @@ pub fn validate(v: &Value) -> Result<()> {
                 "原任务 ID 无效"
             );
         }
-        Some("core-rollback") => ensure!(
-            !has(&[
-                "version",
-                "security_update",
-                "rollback_safe",
-                "prerelease",
-                "task_id"
-            ]),
-            "回退使用保存的安全版本"
-        ),
         _ => anyhow::bail!("内核操作无效"),
     };
     Ok(())
@@ -203,6 +193,9 @@ pub fn replace(stage: &Path, core: &str, source: &Path, meta: &Value) -> Result<
     }
     manifest[core] = meta["version"].clone();
     manifest[format!("{core}_selected")] = json!(true);
+    if !meta["channel"].is_null() {
+        manifest[format!("{core}_channel")] = meta["channel"].clone();
+    }
     for key in ["source", "archive_sha256", "prerelease"] {
         manifest[format!("{core}_{key}")] = meta[key].clone();
     }
@@ -214,7 +207,7 @@ pub fn replace(stage: &Path, core: &str, source: &Path, meta: &Value) -> Result<
     package::verify(stage, true)?;
     Ok(())
 }
-pub fn preserve(manager: &Manager, stage: &Path) -> Result<()> {
+pub fn preserve(manager: &Manager, stage: &Path, skip_xray: bool) -> Result<()> {
     let state = manager.state()?;
     if let Some(id) = state["roles"]["agent"]["current"].as_str() {
         super::upgrade::release_name(id)?;
@@ -226,10 +219,32 @@ pub fn preserve(manager: &Manager, stage: &Path) -> Result<()> {
             ensure!(id == exact, "现用发行目录 {id} 缺失，须先恢复对应发行包及此前独立更新的内核");
             return Ok(());
         }
-        package::verify(&source, false)?;
         let old: Value = serde_json::from_slice(&fs::read(source.join("release.json"))?)?;
         for core in ["xray", "mihomo"] {
+            if skip_xray && core == "xray" {
+                continue;
+            }
             if old[format!("{core}_selected")] == true {
+                let license = if core == "xray" {
+                    "Xray-LICENSE"
+                } else {
+                    "Mihomo-LICENSE"
+                };
+                let valid = [format!("bin/{core}"), format!("share/{license}")]
+                    .into_iter()
+                    .all(|name| {
+                        package::digest(&source.join(&name))
+                            .ok()
+                            .as_deref()
+                            == old["files"][&name]["sha256"].as_str()
+                    });
+                if !valid {
+                    ensure!(
+                        !state["core_blocked"].is_null(),
+                        "现用内核文件校验失败：{core}"
+                    );
+                    continue;
+                }
                 replace(
                     stage,
                     core,
@@ -273,11 +288,12 @@ fn configs(env: &BTreeMap<String, String>, core: &str) -> Result<Vec<(PathBuf, S
     Ok(result)
 }
 fn snapshot(env: &BTreeMap<String, String>, core: &str) -> Result<Value> {
+    let agent_dir = env.get("CHAIN_AGENT_DIR").context("缺少 Agent 数据目录")?;
     let mut paths = configs(env, core)?
         .into_iter()
         .map(|p| p.0)
         .collect::<Vec<_>>();
-    paths.push(Path::new(&env["CHAIN_AGENT_DIR"]).join("active.json"));
+    paths.push(Path::new(agent_dir).join("active.json"));
     let mut result = serde_json::Map::new();
     for path in paths {
         ordinary(&path)?;
@@ -308,7 +324,7 @@ pub fn status(manager: &Manager) -> Result<Value> {
         Value::Null
     };
     Ok(
-        json!({"supported":true,"verification_failure_keeps_agent":true,"versions":{"xray":m["xray"],"mihomo":m["mihomo"]},"recommended":serde_json::from_str::<Value>(include_str!("../core-versions.json"))?,"history":state["core_history"],"blocked":state["core_blocked"],"pending":pending}),
+        json!({"supported":true,"verification_failure_keeps_agent":true,"versions":{"xray":m["xray"],"mihomo":m["mihomo"]},"recommended":serde_json::from_str::<Value>(include_str!("../core-versions.json"))?,"blocked":state["core_blocked"],"pending":pending}),
     )
 }
 async fn block(
@@ -318,7 +334,8 @@ async fn block(
     id: &str,
     env: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let path = Path::new(&env["CHAIN_AGENT_DIR"]).join(".core-upgrade-blocked");
+    let agent_dir = env.get("CHAIN_AGENT_DIR").context("缺少 Agent 数据目录")?;
+    let path = Path::new(agent_dir).join(".core-upgrade-blocked");
     ordinary(&path)?;
     if path.exists() {
         ensure!(
@@ -362,7 +379,7 @@ async fn share_panel(
     let releases = manager.base.join("releases");
     let program = |id: &str| -> Result<Value> {
         let root = releases.join(id);
-        package::verify(&root, true)?;
+        ordinary(&root)?;
         let mut m: Value = serde_json::from_slice(&fs::read(root.join("release.json"))?)?;
         let files = m["files"].as_object_mut().context("发行清单缺少文件")?;
         for name in [
@@ -396,7 +413,6 @@ async fn share_panel(
             manager.healthy("panel".into()).await?;
         }
         state["roles"]["panel"]["current"] = json!(agent);
-        state["roles"]["panel"]["previous"] = Value::Null;
         save(manager, state)
     }.await;
     if let Err(error) = result {
@@ -415,13 +431,18 @@ async fn recover(manager: &Manager, j: &Value) -> Result<String> {
     let env: BTreeMap<String, String> = serde_json::from_value(j["env"].clone())?;
     let core = j["core"].as_str().context("缺少内核名")?;
     let services = super::lifecycle::ServiceMigration::prepare(manager, &["agent".into()])?;
+    let old = &j["before"];
+    let rollback_release = (j["rollback_allowed"] == true)
+        .then(|| old["current"].as_str())
+        .flatten()
+        .filter(|release| {
+            super::upgrade::release_name(release).is_ok()
+                && snapshot(&env, core).is_ok_and(|s| s == j["config_snapshot"])
+                && package::verify(&manager.base.join("releases").join(release), false).is_ok()
+        });
     manager.service("stop", "agent").await?;
     services.ingress(manager, "stop").await?;
-    let detail = if j["rollback_allowed"] == true && snapshot(&env, core)? == j["config_snapshot"] {
-        let old = &j["before"];
-        let release = old["current"].as_str().context("缺少原版本")?;
-        super::upgrade::release_name(release)?;
-        package::verify(&manager.base.join("releases").join(release), false)?;
+    let detail = if let Some(release) = rollback_release {
         manager.link("agent", release)?;
         state["roles"]["agent"] = old.clone();
         save(manager, &state)?;
@@ -541,7 +562,7 @@ async fn identity(
     } else {
         group_id(&group)?
     };
-    let data = fs::metadata(&env["CHAIN_AGENT_DIR"])?;
+    let data = fs::metadata(env.get("CHAIN_AGENT_DIR").context("缺少 Agent 数据目录")?)?;
     ensure!(
         uid != 0 && (data.uid(), data.gid()) == (uid, gid),
         "Agent 数据归属与服务身份不匹配"
@@ -552,60 +573,10 @@ async fn identity(
     }
     groups.sort_unstable();
     groups.dedup();
-    let binary = manager
-        .base
-        .join("current-agent/bin/chain-agent")
-        .canonicalize()?;
-    for p in fs::read_dir("/proc")? {
-        let p = p?.path();
-        if !p
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .bytes()
-            .all(|c| c.is_ascii_digit())
-        {
-            continue;
-        }
-        if fs::read_link(p.join("exe")).ok().as_ref() != Some(&binary) {
-            continue;
-        }
-        let body = match fs::read_to_string(p.join("status")) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-        };
-        let fields = body
-            .lines()
-            .filter_map(|s| s.split_once(':'))
-            .collect::<BTreeMap<_, _>>();
-        ensure!(
-            fields
-                .get("Uid")
-                .and_then(|v| v.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u32>().ok())
-                == Some(uid)
-                && fields
-                    .get("Gid")
-                    .and_then(|v| v.split_whitespace().nth(1))
-                    .and_then(|v| v.parse::<u32>().ok())
-                    == Some(gid),
-            "Agent 实际身份不匹配"
-        );
-        let mut actual = fields
-            .get("Groups")
-            .context("缺少进程组")?
-            .split_whitespace()
-            .map(str::parse::<u32>)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        actual.sort_unstable();
-        actual.dedup();
-        ensure!(actual == groups, "Agent 实际补充组不匹配");
-    }
     Ok((uid, gid, groups))
 }
 #[cfg(target_os = "linux")]
-fn sandbox(directory: &Path, nginx_check: bool) -> Result<()> {
+fn sandbox(directory: &Path) -> Result<()> {
     use std::os::fd::AsRawFd;
     #[repr(C)]
     struct Rules {
@@ -616,24 +587,37 @@ fn sandbox(directory: &Path, nginx_check: bool) -> Result<()> {
         access: u64,
         parent: i32,
     }
+    ensure!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
+        "无法设置预检权限边界"
+    );
     let abi = unsafe { libc::syscall(444, 0, 0, 1) };
-    ensure!(abi >= 3, "预检需要 Landlock ABI 3+，未执行候选内核");
-    let access = (1u64 << 1) | (4..=14).map(|b| 1u64 << b).sum::<u64>();
-    let attr = Rules { access };
-    let fd = unsafe { libc::syscall(444, &attr, std::mem::size_of::<Rules>(), 0) } as i32;
-    ensure!(fd >= 0, "无法创建隔离规则");
-    let parent = fs::File::open(directory)?;
-    let rule = Rule {
-        access,
-        parent: parent.as_raw_fd(),
-    };
-    let result = unsafe {
-        libc::syscall(445, fd, 1, &rule, 0) == 0
-            && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
-            && libc::syscall(446, fd, 0) == 0
-    };
-    unsafe { libc::close(fd) };
-    ensure!(result, "无法启用写入隔离");
+    if abi >= 1 {
+        let max_bit = match abi {
+            1 => 12,
+            2 => 13,
+            _ => 14,
+        };
+        let access = (1u64 << 1) | (4..=max_bit).map(|b| 1u64 << b).sum::<u64>();
+        let attr = Rules { access };
+        let fd = unsafe { libc::syscall(444, &attr, std::mem::size_of::<Rules>(), 0) } as i32;
+        ensure!(fd >= 0, "无法创建隔离规则");
+        let parent = fs::File::open(directory)?;
+        let rule = Rule {
+            access,
+            parent: parent.as_raw_fd(),
+        };
+        let result =
+            unsafe { libc::syscall(445, fd, 1, &rule, 0) == 0 && libc::syscall(446, fd, 0) == 0 };
+        unsafe { libc::close(fd) };
+        ensure!(result, "无法启用写入隔离");
+    } else {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        ensure!(
+            matches!(errno, libc::ENOSYS | libc::EOPNOTSUPP),
+            "查询 Landlock 状态失败：{errno}"
+        );
+    }
     let (arch, denied): (u32, &[u32]) = if cfg!(target_arch = "x86_64") {
         (
             0xc000003e,
@@ -661,16 +645,6 @@ fn sandbox(directory: &Path, nginx_check: bool) -> Result<()> {
     if cfg!(target_arch = "x86_64") {
         code.extend([f(0x45, 0, 1, 0x40000000), f(0x06, 0, 0, 0x80000000)]);
     }
-    // Nginx -t initializes listeners; acknowledge bind/listen without opening host ports.
-    if nginx_check {
-        for nr in if cfg!(target_arch = "x86_64") {
-            [49, 50]
-        } else {
-            [200, 201]
-        } {
-            code.extend([f(0x15, 0, 1, nr), f(0x06, 0, 0, 0x50000)]);
-        }
-    }
     for &nr in denied {
         code.extend([
             f(0x15, 0, 1, nr),
@@ -689,7 +663,7 @@ fn sandbox(directory: &Path, nginx_check: bool) -> Result<()> {
     Ok(())
 }
 #[cfg(target_os = "macos")]
-fn sandbox(directory: &Path, nginx_check: bool) -> Result<()> {
+fn sandbox(directory: &Path) -> Result<()> {
     #[link(name = "sandbox")]
     unsafe extern "C" {
         fn sandbox_init(
@@ -700,13 +674,8 @@ fn sandbox(directory: &Path, nginx_check: bool) -> Result<()> {
         fn sandbox_free_error(error: *mut libc::c_char);
     }
     let directory = serde_json::to_string(directory.to_str().context("隔离路径无效")?)?;
-    let listeners = if nginx_check {
-        "(allow network-bind)(allow network-inbound)"
-    } else {
-        ""
-    };
     let profile = std::ffi::CString::new(format!(
-        "(version 1)(allow default)(deny network*){listeners}(deny file-write*)(allow file-write* (subpath {directory}))"
+        "(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write* (subpath {directory}))"
     ))?;
     let mut error = std::ptr::null_mut();
     let result = unsafe { sandbox_init(profile.as_ptr(), 0, &mut error) };
@@ -726,7 +695,7 @@ pub fn worker(directory: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let directory = directory.canonicalize()?;
     let request: Value = serde_json::from_slice(&fs::read(directory.join("request.json"))?)?;
-    sandbox(&directory, request["nginx_check"] == true)?;
+    sandbox(&directory)?;
     let limit = libc::rlimit {
         rlim_cur: 8 * 1024 * 1024,
         rlim_max: 8 * 1024 * 1024,
@@ -786,6 +755,7 @@ async fn preflight(
     let target = root.join(core);
     fs::copy(binary, &target)?;
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+    let agent_dir = env.get("CHAIN_AGENT_DIR").context("缺少 Agent 数据目录")?;
     if core == "mihomo" {
         for name in [
             "GeoSite.dat",
@@ -794,7 +764,7 @@ async fn preflight(
             "ASN.mmdb",
             "geoip.metadb",
         ] {
-            let path = Path::new(&env["CHAIN_AGENT_DIR"]).join("mihomo").join(name);
+            let path = Path::new(agent_dir).join("mihomo").join(name);
             if path.is_file() {
                 ordinary(&path)?;
                 fs::copy(path, root.join(name))?;
@@ -853,7 +823,7 @@ async fn preflight(
         }
     }
     for (i, (args, assets)) in checks.into_iter().enumerate() {
-        let child_env = json!({"PATH":super::platform::PATH,"HOME":root,"TMPDIR":root,"SAFE_PATHS":Path::new(&env["CHAIN_AGENT_DIR"]).join("acme/config"),"XRAY_LOCATION_ASSET":if assets.is_empty(){root.to_string_lossy().into_owned()}else{assets}});
+        let child_env = json!({"PATH":super::platform::PATH,"HOME":root,"TMPDIR":root,"SAFE_PATHS":Path::new(agent_dir).join("acme/config"),"XRAY_LOCATION_ASSET":if assets.is_empty(){root.to_string_lossy().into_owned()}else{assets}});
         let req = serde_json::to_vec(&json!({"args":args,"env":child_env}))?;
         super::install::owned_write(&root.join("request.json"), &req, 0o600, uid, gid)?;
         let log = fs::File::create(root.join("check.log"))?;
@@ -900,8 +870,12 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         let receipt = directory.join(format!("{}.json", job["task_id"].as_str().unwrap()));
         ordinary(&receipt)?;
         let mut original: Value = serde_json::from_slice(&fs::read(&receipt)?)?;
-        ensure!(original["id"] == job["task_id"] && original["core"] == core
-            && matches!(original["action"].as_str(), Some("core-upgrade" | "core-rollback")), "原内核回执不匹配");
+        ensure!(
+            original["id"] == job["task_id"]
+                && original["core"] == core
+                && original["action"] == "core-upgrade",
+            "原内核回执不匹配"
+        );
         let mut j: Value = serde_json::from_slice(&fs::read(&journal)?)?;
         ensure!(
             j["task_id"] == job["task_id"] && j["core"] == core,
@@ -922,31 +896,48 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
             "Agent 链接与状态不一致"
         );
         let env = serde_json::from_value(j["env"].clone())?;
-        let verification_failed = action == "core-reject" && current == &j["target"]
-            && (original["state"] == "awaiting_verification" || original["verification_failed"] == true);
-        ensure!(job["keep_agent_on_failure"] != true || verification_failed, "原任务未处于连接验收阶段，请核对原任务");
+        let verification_failed = action == "core-reject"
+            && current == &j["target"]
+            && (original["state"] == "awaiting_verification"
+                || original["verification_failed"] == true);
         let detail = if verification_failed {
             share_panel(manager, &mut state, &journal, &mut j).await?;
-            // A rollback approved for an earlier upgrade cannot authorize undoing this one.
-            if let Some(history) = state["core_history"].as_object_mut() && history.remove(core).is_some() {
-                save(manager, &state)?;
-            }
             original["verification_failed"] = json!(true);
             "原链接验收未通过，Agent 和现有服务继续运行。可修复线路或提交新的内核升级。".into()
         } else if action == "core-reject" {
-            ensure!(matches!(original["state"].as_str(), Some("failed" | "unknown"))
-                || (original["state"] == "awaiting_verification" && current == &j["before"]["current"] && j["rollback_allowed"] == true),
-                "原任务未处于中断恢复阶段");
+            ensure!(
+                matches!(original["state"].as_str(), Some("failed" | "unknown"))
+                    || (original["state"] == "awaiting_verification"
+                        && current == &j["before"]["current"]
+                        && j["rollback_allowed"] == true),
+                "原任务未处于中断恢复阶段"
+            );
             recover(manager, &j).await?
         } else {
-            ensure!(original["state"] == "awaiting_verification" || original["state"] == "succeeded", "原任务尚未完成切换");
+            ensure!(
+                original["state"] == "awaiting_verification" || original["state"] == "succeeded",
+                "原任务尚未完成切换"
+            );
             ensure!(
                 snapshot(&env, core)? == j["config_snapshot"],
                 "配置已变化，未确认旧检查结果"
             );
-            manager.healthy("agent".into()).await?;
+            if manager.live() {
+                ensure!(manager.active("agent").await?, "Agent 未运行");
+                if manager.kind() != "launchd" {
+                    let pid = super::lifecycle::service_process(manager, "agent")
+                        .await?
+                        .context("未取得 Agent 进程")?;
+                    ensure!(
+                        super::lifecycle::process_matches(
+                            pid,
+                            &manager.base.join("current-agent/bin/chain-agent")
+                        )?,
+                        "Agent 进程与目标发行版不匹配"
+                    );
+                }
+            }
             share_panel(manager, &mut state, &journal, &mut j).await?;
-            if let Some(history) = state["core_history"].as_object_mut() { history.remove(core); }
             state.as_object_mut().unwrap().remove("core_blocked");
             save(manager, &state)?;
             "内核及实际连接已确认；原配置保持不变".into()
@@ -958,14 +949,16 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         });
         original["detail"] = json!(detail);
         atomic(&receipt, &serde_json::to_vec(&original)?, 0o600)?;
-        if verification_failed || action == "core-confirm" { fs::remove_file(&journal)?; }
+        if verification_failed || action == "core-confirm" {
+            fs::remove_file(&journal)?;
+        }
         if let Err(error) = manager.prune_locked().await {
             eprintln!("已记录内核验收结果，旧目录清理延后：{error:#}");
         }
         return Ok(json!({"state":"succeeded","detail":detail}));
     }
     ensure!(!journal.exists(), "请先确认或恢复上次内核升级");
-    if action == "core-upgrade" { manager.prune_locked().await?; }
+    manager.prune_locked().await?;
     let mut state = manager.state()?;
     let before = state["roles"]["agent"].clone();
     let id = before["current"].as_str().context("本机尚未安装 Agent")?;
@@ -978,15 +971,22 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
     let manifest = package::verify(&source, true)?;
     let old: Value = serde_json::from_slice(&fs::read(source.join("release.json"))?)?;
     let env = manager.environment("agent")?;
+    let agent_dir = env.get("CHAIN_AGENT_DIR").context("缺少 Agent 数据目录")?;
+    if let Some(xray_bin) = env.get("CHAIN_XRAY_BIN") {
+        ensure!(
+            Path::new(xray_bin).canonicalize()? == source.join("bin/xray").canonicalize()?,
+            "自定义内核路径不支持替换"
+        );
+    }
+    if let Some(mihomo_bin) = env.get("CHAIN_MIHOMO_BIN") {
+        let managed = source.join("bin/mihomo");
+        ensure!(
+            managed.exists() && Path::new(mihomo_bin).canonicalize()? == managed.canonicalize()?,
+            "自定义内核路径不支持替换"
+        );
+    }
     ensure!(
-        Path::new(&env["CHAIN_XRAY_BIN"]).canonicalize()?
-            == source.join("bin/xray").canonicalize()?
-            && !env.contains_key("CHAIN_MIHOMO_BIN"),
-        "自定义内核路径不支持替换"
-    );
-    ensure!(
-        fs::read_to_string(Path::new(&env["CHAIN_AGENT_DIR"]).join(".chain-owner"))?
-            == "chain-agent",
+        fs::read_to_string(Path::new(agent_dir).join(".chain-owner"))?.trim() == "chain-agent",
         "Agent 数据归属不匹配"
     );
     let baseline = snapshot(&env, core)?;
@@ -1001,10 +1001,29 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
     let candidate = manager.release_stage()?;
     let stage = candidate.path().join("release");
     package::copy_release(&source, &stage, &manifest, true)?;
-    let preparation:Result<Value>=async{
-  let (download,meta)=if action=="core-rollback"{ensure!(state["core_blocked"].is_null(),"停用后必须明确选择安全版本");let history=&state["core_history"][core];ensure!(history["safe"]==true,"没有确认安全的上一版");let id=history["release"].as_str().context("缺少回退记录")?;super::upgrade::release_name(id)?;let path=manager.base.join("releases").join(id);package::verify(&path,true)?;let m:Value=serde_json::from_slice(&fs::read(path.join("release.json"))?)?;(path,json!({"version":m[core],"source":m[format!("{core}_source")],"archive_sha256":m[format!("{core}_archive_sha256")],"prerelease":m[format!("{core}_prerelease")]}))}else{let path=work.path().join("download");fs::create_dir(&path)?;let meta=download(core,job["version"].as_str().unwrap(),&path,job["prerelease"]==true).await?;(path,meta)};
-  preflight(manager,&env,core,&download.join(format!("bin/{core}")),meta["version"].as_str().context("缺少候选版本")?).await?;ensure!(snapshot(&env,core)?==baseline,"预检期间配置已变化");replace(&stage,core,&download,&meta)?;Ok(meta)
- }.await;
+    let preparation: Result<Value> = async {
+        let download_dir = work.path().join("download");
+        fs::create_dir(&download_dir)?;
+        let meta = download(
+            core,
+            job["version"].as_str().unwrap(),
+            &download_dir,
+            job["prerelease"] == true,
+        )
+        .await?;
+        preflight(
+            manager,
+            &env,
+            core,
+            &download_dir.join(format!("bin/{core}")),
+            meta["version"].as_str().context("缺少候选版本")?,
+        )
+        .await?;
+        ensure!(snapshot(&env, core)? == baseline, "预检期间配置已变化");
+        replace(&stage, core, &download_dir, &meta)?;
+        Ok(meta)
+    }
+    .await;
     // Preparation has not switched kernels; preserve the existing service and any prior block.
     let meta = preparation.context("内核准备失败，未切换内核，原服务及停用状态保持不变")?;
     let (release, _) = manager.publish_stage(&stage, &manifest)?;
@@ -1019,7 +1038,7 @@ pub async fn operate(manager: &Manager, job: &Value, directory: &Path) -> Result
         state["roles"]["agent"]["current"] = json!(release);
         state.as_object_mut().unwrap().remove("core_blocked");
         save(manager, &state)?;
-        let marker = Path::new(&env["CHAIN_AGENT_DIR"]).join(".core-upgrade-blocked");
+        let marker = Path::new(agent_dir).join(".core-upgrade-blocked");
         ordinary(&marker)?;
         if marker.exists() {
             ensure!(
@@ -1144,15 +1163,12 @@ mod tests {
         let task = json!({"id":original,"action":"core-upgrade","core":"mihomo","state":"awaiting_verification","core_version":"1.19.34"});
         fs::write(&record, serde_json::to_vec(&task).unwrap()).unwrap();
         fs::write(&journal, serde_json::to_vec(&json!({"task_id":original,"core":"mihomo","target":"old","rollback_allowed":false,"env":env})).unwrap()).unwrap();
-        let mut expected = m.state().unwrap();
-        expected["core_history"] = json!({"mihomo":{"safe":true,"release":"obsolete"},"xray":{"safe":true,"release":"old"}});
-        save(&m,&expected).unwrap();
-        let reject = json!({"id":uuid::Uuid::new_v4().to_string(),"action":"core-reject","task_id":original,"core":"mihomo","keep_agent_on_failure":true});
+        let expected = m.state().unwrap();
+        let reject = json!({"id":uuid::Uuid::new_v4().to_string(),"action":"core-reject","task_id":original,"core":"mihomo"});
         assert_eq!(operate(&m, &reject, root.path()).await.unwrap()["state"], "succeeded");
         let receipt: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
         assert_eq!(receipt["state"], "failed");
         assert_eq!(receipt["verification_failed"], true);
-        expected["core_history"].as_object_mut().unwrap().remove("mihomo");
         assert_eq!(m.state().unwrap(), expected);
         assert!(!journal.exists());
         assert!(!Path::new(&env["CHAIN_AGENT_DIR"]).join(".core-upgrade-blocked").exists());
@@ -1259,7 +1275,7 @@ mod tests {
         fs::write(old.join("release.json"), serde_json::to_vec(&v).unwrap()).unwrap();
         let stage = root.path().join("stage");
         package::tests::fixture(&stage);
-        preserve(&m, &stage).unwrap();
+        preserve(&m, &stage, false).unwrap();
         let updated: Value =
             serde_json::from_slice(&fs::read(stage.join("release.json")).unwrap()).unwrap();
         assert_eq!(updated["xray"], "26.10.21");

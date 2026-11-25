@@ -1,5 +1,4 @@
 use super::*;
-macro_rules! ensure {($condition:expr,$($message:tt)*)=>{if !$condition {return Err(anyhow::anyhow!($($message)*).into());}};}
 
 fn applied(doc: &Document) -> Document {
     Document {
@@ -16,10 +15,6 @@ pub async fn export(State(app): State<App>, Path(id): Path<String>) -> ApiResult
         .iter()
         .find(|l| l.id == id && l.enabled)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "请先应用并启用此线路"))?;
-    ensure!(
-        line.kind == Kind::Vless,
-        "此规则使用入口地址，无代理客户端配置"
-    );
     let node = chain_panel::access::mihomo_node(line, &doc)?;
     Ok(Json(
         json!({"share":share(line,&doc)?,"node":format!("- {}\n", serde_json::to_string(&node)?)}),
@@ -123,20 +118,17 @@ pub fn alerts(doc: &Document) -> Vec<Value> {
         if node.report.system["certificate"]["ok"] == false {
             alerts.push(json!({"id":format!("cert-{}",node.id),"level":"error","message":format!("{}：证书续期失败，请检查域名、80 端口和 Agent 日志",node.name)}));
         }
-        if now().saturating_sub(node.seen) >= 15 {
+        if at.saturating_sub(node.seen) >= 15 {
             alerts.push(json!({"id":format!("node-{}",node.id),"level":"warning","message":format!("{}：服务器离线或尚未接入",node.name)}));
         } else if !node.report.error.is_empty() {
             alerts.push(json!({"id":format!("node-{}",node.id),"level":"error","message":format!("{}：{}",node.name,node.report.error)}));
         }
     }
     for line in &doc.lines {
-        let traffic = chain_panel::rental::safe_traffic(
-            chain_panel::plans::lease(doc, &line.id), chain_panel::rental::traffic(doc, line), at);
-        if let (Some(t), Some(q)) = (traffic, line.limits.monthly_gib) {
-            let ratio = t.used() as f64 / (q * 1073741824.0);
-            if ratio >= 0.8 {
-                alerts.push(json!({"id":format!("quota-{}",line.id),"level":if ratio>=1.0 {"error"} else {"warning"},"message":format!("{}：{}，本周期额度已使用 {:.1}%",line.name,if ratio>=1.0 {"额度用尽"} else if ratio>=0.95 {"接近流量上限"} else {"流量提醒"},ratio*100.0)}));
-            }
+        if let Some(ratio) = chain_panel::rental::quota_ratio(doc, line, at)
+            && ratio >= 0.8
+        {
+            alerts.push(json!({"id":format!("quota-{}",line.id),"level":if ratio>=1.0 {"error"} else {"warning"},"message":format!("{}：{}，本周期额度已使用 {:.1}%",line.name,if ratio>=1.0 {"额度用尽"} else if ratio>=0.95 {"接近流量上限"} else {"流量提醒"},ratio*100.0)}));
         }
         if let Some(check) = doc.checks.get(&line.id) {
             if check["ok"] == false {

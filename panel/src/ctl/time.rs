@@ -1,5 +1,5 @@
 use super::upgrade::{command, output};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, time::Duration};
 
 const UNITS: [&str; 6] = [
@@ -37,7 +37,7 @@ pub async fn prepare(manager: &super::upgrade::Manager) {
         return;
     }
     println!("检查系统时间同步状态，保持现有时区。");
-    if available("chronyc")
+    if super::platform::executable("chronyc").is_some()
         && output("chronyc", &["waitsync", "1", "0.1", "0", "0.1"], 3)
             .await
             .is_ok_and(|result| result.status.success())
@@ -103,31 +103,11 @@ pub async fn synchronize() -> Result<String> {
         "检测到多个运行中的时间服务，请先解决冲突"
     );
     if units.is_empty() {
-        if available("apt-get") {
-            command(
-                "env",
-                &["DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
-                300,
-            )
-            .await?;
-            command(
-                "env",
-                &[
-                    "DEBIAN_FRONTEND=noninteractive",
-                    "apt-get",
-                    "install",
-                    "-y",
-                    "chrony",
-                ],
-                300,
-            )
-            .await?;
+        super::https::packages(&["chrony"]).await?;
+        let refreshed = output("systemctl", &args, 10).await?;
+        units = installed(&String::from_utf8_lossy(&refreshed.stdout));
+        if units.is_empty() {
             units.push("chrony.service");
-        } else if available("dnf") {
-            command("dnf", &["install", "-y", "chrony"], 300).await?;
-            units.push("chronyd.service");
-        } else {
-            bail!("未找到时间服务及支持的包管理器，请先安装系统 NTP 服务");
         }
     }
     let unit = active.first().or(units.first()).unwrap();
@@ -144,10 +124,6 @@ pub async fn synchronize() -> Result<String> {
         let mut synced = false;
         for _ in 0..30 {
             let clock = status().await?;
-            ensure!(
-                clock.get("Timezone") == before.get("Timezone"),
-                "时区发生并发变化；本操作未修改时区"
-            );
             if clock.get("NTPSynchronized").is_some_and(|v| v == "yes") {
                 synced = true;
                 break;
@@ -156,22 +132,7 @@ pub async fn synchronize() -> Result<String> {
         }
         ensure!(synced, "时间服务已启用，但 60 秒内尚未确认同步");
     }
-    ensure!(
-        status().await?.get("Timezone") == before.get("Timezone"),
-        "时区发生并发变化；本操作未修改时区"
-    );
     Ok(format!("时间同步已确认，时区保持 {}", before["Timezone"]))
-}
-
-fn available(name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            dir.join(name)
-                .metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-    })
 }
 
 #[cfg(test)]

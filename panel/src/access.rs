@@ -1,6 +1,6 @@
 //! Client-facing protocols and exports. Internal hops remain managed automatically.
 use crate::{
-    compiler::{address, host_valid},
+    compiler::{address, domain_valid, host_valid},
     model::*,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -24,7 +24,7 @@ pub(crate) fn b64(s: &str) -> Result<String> {
         .or_else(|_| STANDARD_NO_PAD.decode(s.trim_end_matches('=')))?;
     Ok(String::from_utf8(bytes)?)
 }
-pub fn external_tls(stream: &mut Value, url: &Url) -> Result<()> {
+pub fn external_tls(stream: &mut Value, url: &Url, allow_insecure: bool) -> Result<()> {
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "allowInsecure" | "insecure" => {
@@ -32,10 +32,14 @@ pub fn external_tls(stream: &mut Value, url: &Url) -> Result<()> {
                     matches!(value.as_ref(), "true" | "false" | "1" | "0"),
                     "allowInsecure 参数无效"
                 );
+                let skip = matches!(value.as_ref(), "true" | "1");
                 ensure!(
-                    matches!(value.as_ref(), "false" | "0"),
-                    "当前 Xray 不支持跳过证书验证，请使用有效证书并设置 skip-cert-verify: false"
+                    allow_insecure || !skip,
+                    "当前 Xray 出站不支持跳过证书验证；如需使用自签证书请改为 Mihomo 节点"
                 );
+                if skip {
+                    stream["tlsSettings"]["allowInsecure"] = json!(true);
+                }
             }
             "alpn" => {
                 stream["tlsSettings"]["alpn"] = json!(value.split(',').collect::<Vec<_>>());
@@ -134,18 +138,19 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
     ensure!(port > 0, "端口必须大于 0");
     let user = decode(u.username())?;
     let pass = decode(u.password().unwrap_or_default())?;
-    for (key, value) in u.query_pairs().filter(|(key, _)| key == "udp") {
+    let q: std::collections::BTreeMap<String, String> = u.query_pairs().into_owned().collect();
+    if let Some(value) = q.get("udp") {
         ensure!(
-            matches!(value.as_ref(), "true" | "false" | "1" | "0"),
-            "{key} 参数无效"
+            matches!(value.as_str(), "true" | "false" | "1" | "0"),
+            "udp 参数无效"
         );
     }
     let mut result = match u.scheme() {
         "hysteria2" | "hy2" | "tuic" => {
-            let q: std::collections::BTreeMap<_, _> = u.query_pairs().into_owned().collect();
             for key in q.keys() {
                 ensure!(
-                    ["sni", "alpn", "insecure", "allowInsecure", "udp"].contains(&key.as_str())
+                    ["sni", "fp", "alpn", "insecure", "allowInsecure", "udp"]
+                        .contains(&key.as_str())
                         || (u.scheme() == "tuic"
                             && ["congestion_control", "udp_relay_mode"].contains(&key.as_str())),
                     "暂不支持此 QUIC 参数：{key}"
@@ -154,7 +159,7 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
             let sni = q.get("sni").map(String::as_str).unwrap_or(host);
             ensure!(host_valid(sni), "TLS server name 无效");
             let mut stream = json!({"network":"hysteria","security":"tls","tlsSettings":{"serverName":sni,"alpn":["h3"]},"hysteriaSettings":{"version":2,"auth":if u.password().is_some() {format!("{user}:{pass}")} else {user.clone()}}});
-            external_tls(&mut stream, &u)?;
+            external_tls(&mut stream, &u, true)?;
             if u.scheme() == "tuic" {
                 let uuid = uuid::Uuid::parse_str(&user)?;
                 ensure!(!pass.is_empty(), "TUIC v5 密码不能为空");
@@ -171,12 +176,17 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
                         && matches!(relay, "native" | "quic"),
                     "TUIC 参数无效"
                 );
+                let skip = stream["tlsSettings"]["allowInsecure"].as_bool().unwrap_or(false);
+                let mut settings = json!({"type":"tuic","server":host,"port":port,"uuid":uuid,"password":pass,"sni":sni,"alpn":stream["tlsSettings"]["alpn"],"skip-cert-verify":skip,"udp":!matches!(q.get("udp").map(String::as_str),Some("false" | "0")),"congestion-controller":congestion,"udp-relay-mode":relay});
+                if let Some(fp) = stream["tlsSettings"].get("fingerprint") {
+                    settings["client-fingerprint"] = fp.clone();
+                }
                 return Ok(
-                    json!({"tag":tag,"protocol":"tuic","settings":{"type":"tuic","server":host,"port":port,"uuid":uuid,"password":pass,"sni":sni,"alpn":stream["tlsSettings"]["alpn"],"skip-cert-verify":false,"udp":!matches!(q.get("udp").map(String::as_str),Some("false" | "0")),"congestion-controller":congestion,"udp-relay-mode":relay}}),
+                    json!({"tag":tag,"protocol":"tuic","settings":settings}),
                 );
             }
             ensure!(!user.is_empty(), "Hysteria 2 密码不能为空");
-            json!({"tag":tag,"protocol":"hysteria","settings":{"version":2,"address":host,"port":port},"streamSettings":stream})
+            return Ok(json!({"tag":tag,"protocol":"hysteria","settings":{"version":2,"address":host,"port":port},"streamSettings":stream}));
         }
         "http" | "https" | "socks" | "socks5" => {
             let mut server = json!({"address":host,"port":port});
@@ -185,11 +195,7 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
             }
             let mut value = json!({"tag":tag,"protocol":if u.scheme().starts_with("http") {"http"} else {"socks"},"settings":{"servers":[server]}});
             if u.scheme() == "https" {
-                let sni = u
-                    .query_pairs()
-                    .find(|(key, _)| key == "sni")
-                    .map(|(_, v)| v.into_owned())
-                    .unwrap_or_else(|| host.into());
+                let sni = q.get("sni").map(String::as_str).unwrap_or(host);
                 value["streamSettings"] =
                     json!({"network":"tcp","security":"tls","tlsSettings":{"serverName":sni}});
             }
@@ -200,7 +206,6 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
                 !user.is_empty() && u.password().is_none(),
                 "Trojan 链接密码无效"
             );
-            let q: std::collections::BTreeMap<_, _> = u.query_pairs().into_owned().collect();
             let network = q.get("type").map(String::as_str).unwrap_or("tcp");
             ensure!(
                 matches!(network, "tcp" | "raw"),
@@ -214,8 +219,8 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
         }
         "ss" => {
             ensure!(
-                u.query_pairs()
-                    .all(|(key, value)| matches!(key.as_ref(), "tfo" | "udp")
+                q.iter()
+                    .all(|(key, value)| matches!(key.as_str(), "tfo" | "udp")
                         || (key == "type" && value == "tcp")),
                 "暂不支持该 Shadowsocks 参数；仅支持 type=tcp、tfo 和 udp"
             );
@@ -237,20 +242,18 @@ pub fn external(link: &str, tag: &str) -> Result<Value> {
         _ => bail!("不支持此代理协议"),
     };
     if result["streamSettings"]["security"] == "tls" {
-        external_tls(&mut result["streamSettings"], &u)?;
+        external_tls(&mut result["streamSettings"], &u, u.scheme() == "https")?;
     }
-    for (key, value) in u.query_pairs() {
-        if key == "tfo" {
-            ensure!(
-                matches!(value.as_ref(), "true" | "false" | "1" | "0"),
-                "tfo 参数无效"
-            );
-            if result.get("streamSettings").is_none() {
-                result["streamSettings"] = json!({});
-            }
-            result["streamSettings"]["sockopt"] =
-                json!({"tcpFastOpen":matches!(value.as_ref(), "true" | "1")});
+    if let Some(value) = q.get("tfo") {
+        ensure!(
+            matches!(value.as_str(), "true" | "false" | "1" | "0"),
+            "tfo 参数无效"
+        );
+        if result.get("streamSettings").is_none() {
+            result["streamSettings"] = json!({});
         }
+        result["streamSettings"]["sockopt"] =
+            json!({"tcpFastOpen":matches!(value.as_str(), "true" | "1")});
     }
     Ok(result)
 }
@@ -272,171 +275,129 @@ pub fn validate_line(line: &Line) -> Result<()> {
             .is_none_or(|q| q.is_finite() && q > 0.0 && q <= 1_000_000_000.0),
         "月额度须为正数 GiB；留空表示不限量"
     );
+    let a = &line.access;
     ensure!(
-        line.access.public_host.is_empty() || host_valid(&line.access.public_host),
-        "外部入口地址无效"
+        matches!(a.transport.network.as_str(), "tcp" | "xhttp"),
+        "仅支持 TCP / XHTTP 传输"
     );
     ensure!(
-        line.access.public_port.is_none_or(|p| p > 0),
-        "外部入口端口无效"
+        a.transport.network == "tcp" || a.protocol == Protocol::Vless,
+        "XHTTP 传输仅用于 VLESS"
     );
-    ensure!(
-        line.access.public_host.is_empty() == line.access.public_port.is_none(),
-        "购买的中转入口需要同时填写地址和端口"
-    );
-    if line.kind == Kind::Vless {
-        let a = &line.access;
+    if a.transport.network == "xhttp" {
         ensure!(
-            matches!(a.transport.network.as_str(), "tcp" | "xhttp"),
-            "仅支持 TCP / XHTTP 传输"
+            a.transport.path.starts_with('/')
+                && a.transport.path.len() <= 256
+                && !a
+                    .transport
+                    .path
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '?' | '#')),
+            "XHTTP 路径必须以 / 开头，不含查询、片段或控制字符"
         );
         ensure!(
-            a.transport.network == "tcp" || a.protocol == Protocol::Vless,
-            "XHTTP 传输仅用于 VLESS"
+            a.transport.host.is_empty() || host_valid(&a.transport.host),
+            "XHTTP Host 无效"
         );
-        if a.transport.network == "xhttp" {
+        ensure!(
+            matches!(
+                a.transport.mode.as_str(),
+                "auto" | "packet-up" | "stream-up" | "stream-one"
+            ),
+            "XHTTP 模式无效"
+        );
+    }
+    if let Some(r) = &a.reality {
+        crate::compiler::target(&r.target)?;
+        ensure!(host_valid(&r.server_name), "REALITY SNI 无效");
+        if let Some(keys) = &r.credentials {
+            let private: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(&keys.private_key)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("REALITY 私钥长度无效"))?;
+            let public =
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private));
             ensure!(
-                a.transport.path.starts_with('/')
-                    && a.transport.path.len() <= 256
-                    && !a
-                        .transport
-                        .path
-                        .chars()
-                        .any(|c| c.is_control() || matches!(c, '?' | '#')),
-                "XHTTP 路径必须以 / 开头，不含查询、片段或控制字符"
+                URL_SAFE_NO_PAD.encode(public.as_bytes()) == keys.public_key,
+                "REALITY 公私钥不匹配"
             );
             ensure!(
-                a.transport.host.is_empty() || host_valid(&a.transport.host),
-                "XHTTP Host 无效"
+                keys.short_id.len() <= 16
+                    && keys.short_id.len() % 2 == 0
+                    && keys.short_id.bytes().all(|c| c.is_ascii_hexdigit()),
+                "REALITY short ID 无效"
             );
-            ensure!(
-                matches!(
-                    a.transport.mode.as_str(),
-                    "auto" | "packet-up" | "stream-up" | "stream-one"
-                ),
-                "XHTTP 模式无效"
-            );
-        }
-        if let Some(r) = &a.reality {
-            crate::compiler::target(&r.target)?;
-            ensure!(host_valid(&r.server_name), "REALITY SNI 无效");
-            if let Some(keys) = &r.credentials {
-                let private: [u8; 32] = URL_SAFE_NO_PAD
-                    .decode(&keys.private_key)?
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("REALITY 私钥长度无效"))?;
-                let public =
-                    x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private));
-                ensure!(
-                    URL_SAFE_NO_PAD.encode(public.as_bytes()) == keys.public_key,
-                    "REALITY 公私钥不匹配"
-                );
-                ensure!(
-                    keys.short_id.len() <= 16
-                        && keys.short_id.len() % 2 == 0
-                        && keys.short_id.bytes().all(|c| c.is_ascii_hexdigit()),
-                    "REALITY short ID 无效"
-                );
-            }
-        }
-        if a.shared_port {
-            ensure!(
-                a.protocol == Protocol::Vless && line.hops.first().is_some_and(|h| h.port == 443),
-                "统一 443 入口仅用于 VLESS，监听端口必须为 443"
-            );
-        }
-        if !a.fallback.is_empty() {
-            ensure!(
-                a.protocol == Protocol::Vless
-                    && a.transport.network == "tcp"
-                    && matches!(a.tls.mode.as_str(), "auto" | "manual"),
-                "网站回落用于 VLESS TCP + TLS；REALITY 自动回落到目标站点"
-            );
-            if a.fallback != "builtin" {
-                let url = Url::parse(&a.fallback)?;
-                ensure!(
-                    matches!(url.scheme(), "http" | "https")
-                        && url.host_str().is_some()
-                        && url.username().is_empty()
-                        && url.password().is_none()
-                        && url.query().is_none()
-                        && url.fragment().is_none(),
-                    "回落网站需为不含认证、查询和片段的 HTTP/HTTPS 地址"
-                );
-            }
-        }
-        match line.access.protocol {
-            Protocol::Http | Protocol::Socks => {
-                ensure!(
-                    !line.access.username.is_empty() && !line.access.password.is_empty(),
-                    "HTTP/SOCKS5 入口需要用户名和密码"
-                );
-                ensure!(
-                    line.access.username.len() <= 128 && line.access.password.len() <= 128,
-                    "用户名和密码最长 128 字节"
-                );
-            }
-            Protocol::Shadowsocks => {
-                ensure!(
-                    SS_METHODS.contains(&line.access.method.as_str()),
-                    "不支持此 Shadowsocks 加密方式"
-                );
-                if line.access.method.starts_with("2022-") {
-                    let size = if line.access.method == "2022-blake3-aes-128-gcm" { 16 } else { 32 };
-                    ensure!(STANDARD.decode(&line.access.password).is_ok_and(|key| key.len() == size),
-                        "此 SS2022 加密方式的密钥须为 {size} 字节的 Base64");
-                } else {
-                    ensure!(!line.access.password.is_empty(), "Shadowsocks 密码不能为空");
-                }
-            }
-            Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic => {
-                ensure!(!line.access.password.is_empty(), "代理密码不能为空");
-                ensure!(
-                    matches!(line.access.tls.mode.as_str(), "auto" | "manual"),
-                    "Trojan / Hysteria 2 / TUIC 需要 TLS 证书"
-                );
-            }
-            _ => {}
         }
     }
-    if line.kind == Kind::Website {
+    if a.shared_port {
         ensure!(
-            line.hops.len() == 1 && line.external_id.is_none(),
-            "网站反代请选择一台入口服务器"
+            a.protocol == Protocol::Vless && line.hops.first().is_some_and(|h| h.port == 443),
+            "统一 443 入口仅用于 VLESS，监听端口必须为 443"
         );
-        let u = Url::parse(&line.target).context("网站后端必须为 HTTP/HTTPS URL")?;
+    }
+    if !a.fallback.is_empty() {
         ensure!(
-            matches!(u.scheme(), "http" | "https")
-                && u.username().is_empty()
-                && u.password().is_none()
-                && u.host_str().is_some()
-                && u.query().is_none()
-                && u.fragment().is_none(),
-            "网站后端必须为不含认证、查询和片段的 HTTP/HTTPS 地址"
+            a.protocol == Protocol::Vless
+                && a.transport.network == "tcp"
+                && matches!(a.tls.mode.as_str(), "auto" | "manual"),
+            "网站回落用于 VLESS TCP + TLS；REALITY 自动回落到目标站点"
         );
-        ensure!(host_valid(&line.access.tls.domain), "请填写网站访问域名");
+        if a.fallback != "builtin" {
+            let url = Url::parse(&a.fallback)?;
+            ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
+                "回落网站需为不含认证、查询和片段的 HTTP/HTTPS 地址"
+            );
+        }
+    }
+    match line.access.protocol {
+        Protocol::Http | Protocol::Socks => {
+            ensure!(
+                !line.access.username.is_empty() && !line.access.password.is_empty(),
+                "HTTP/SOCKS5 入口需要用户名和密码"
+            );
+            ensure!(
+                line.access.username.len() <= 128 && line.access.password.len() <= 128,
+                "用户名和密码最长 128 字节"
+            );
+        }
+        Protocol::Shadowsocks => {
+            ensure!(
+                SS_METHODS.contains(&line.access.method.as_str()),
+                "不支持此 Shadowsocks 加密方式"
+            );
+            if line.access.method.starts_with("2022-") {
+                let size = if line.access.method == "2022-blake3-aes-128-gcm" { 16 } else { 32 };
+                ensure!(STANDARD.decode(&line.access.password).is_ok_and(|key| key.len() == size),
+                    "此 SS2022 加密方式的密钥须为 {size} 字节的 Base64");
+            } else {
+                ensure!(!line.access.password.is_empty(), "Shadowsocks 密码不能为空");
+            }
+        }
+        Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic => {
+            ensure!(!line.access.password.is_empty(), "代理密码不能为空");
+            ensure!(
+                matches!(line.access.tls.mode.as_str(), "auto" | "manual"),
+                "Trojan / Hysteria 2 / TUIC 需要 TLS 证书"
+            );
+        }
+        _ => {}
     }
     let tls = &line.access.tls;
     ensure!(
         matches!(tls.mode.as_str(), "" | "off" | "auto" | "manual"),
         "TLS 模式无效"
     );
-    if line.kind == Kind::Forward {
-        ensure!(
-            tls.mode.is_empty() || tls.mode == "off",
-            "原始转发不应终止 TLS"
-        );
-    }
-    if matches!(tls.mode.as_str(), "manual" | "auto") {
-        ensure!(host_valid(&tls.domain), "TLS 域名无效");
-        if tls.mode == "auto" {
-            ensure!(
-                tls.domain.parse::<std::net::IpAddr>().is_err(),
-                "自动证书需要公网域名"
-            );
-        } else {
-            crate::website::tls_config(&tls.cert, &tls.key)?;
-        }
+    if tls.mode == "auto" {
+        ensure!(domain_valid(&tls.domain), "自动证书需要公网域名");
+    } else if tls.mode == "manual" {
+        ensure!(tls.domain.is_empty() || host_valid(&tls.domain), "TLS 域名或地址无效");
+        crate::website::tls_config(&tls.cert, &tls.key)?;
     }
     Ok(())
 }
@@ -489,24 +450,23 @@ pub fn endpoint(line: &Line, node: &Node) -> (String, u16) {
     (
         if !line.access.host.is_empty() {
             line.access.host.clone()
-        } else if line.access.public_host.is_empty() {
-            if matches!(line.access.tls.mode.as_str(), "auto" | "manual") {
-                line.access.tls.domain.clone()
-            } else {
-                node.host.clone()
-            }
+        } else if matches!(line.access.tls.mode.as_str(), "auto" | "manual")
+            && !line.access.tls.domain.is_empty()
+        {
+            line.access.tls.domain.clone()
         } else {
-            line.access.public_host.clone()
+            node.host.clone()
         },
-        line.access.public_port.unwrap_or(line.hops[0].port),
+        line.hops[0].port,
     )
 }
 pub fn share(line: &Line, node: &Node, udp: bool) -> Result<String> {
     let a = &line.access;
     let (host, port) = endpoint(line, node);
+    let sni = a.server_name(node);
     if a.protocol == Protocol::Vmess {
         return vmess_link(
-            &json!({"name":line.name,"server":host,"port":port,"uuid":line.hops[0].uuid,"tls":matches!(a.tls.mode.as_str(),"auto"|"manual"),"servername":a.tls.domain,"udp":udp}),
+            &json!({"name":line.name,"server":host,"port":port,"uuid":line.hops[0].uuid,"tls":matches!(a.tls.mode.as_str(),"auto"|"manual"),"servername":sni,"udp":udp}),
         );
     }
     let scheme = match a.protocol {
@@ -522,17 +482,20 @@ pub fn share(line: &Line, node: &Node, udp: bool) -> Result<String> {
     let mut u = Url::parse(&format!("{scheme}://{}", address(&host, port)))?;
     match a.protocol {
         Protocol::Http | Protocol::Socks => {
-            u.set_username(&a.username).ok();
-            u.set_password(Some(&a.password)).ok();
+            u.set_username(&a.username)
+                .map_err(|_| anyhow::anyhow!("代理用户名无效"))?;
+            u.set_password(Some(&a.password))
+                .map_err(|_| anyhow::anyhow!("代理密码无效"))?;
             if scheme == "https" {
-                u.query_pairs_mut().append_pair("sni", &a.tls.domain);
+                u.query_pairs_mut().append_pair("sni", sni);
             }
         }
         Protocol::Trojan => {
-            u.set_username(&a.password).ok();
+            u.set_username(&a.password)
+                .map_err(|_| anyhow::anyhow!("Trojan 密码无效"))?;
             u.query_pairs_mut().extend_pairs([
                 ("security", "tls"),
-                ("sni", a.tls.domain.as_str()),
+                ("sni", sni),
                 ("type", "tcp"),
             ]);
         }
@@ -551,13 +514,13 @@ pub fn share(line: &Line, node: &Node, udp: bool) -> Result<String> {
                     .append_pair("udp_relay_mode", "native");
             }
             u.query_pairs_mut()
-                .append_pair("sni", &a.tls.domain)
+                .append_pair("sni", sni)
                 .append_pair("alpn", "h3")
                 .append_pair("insecure", "0");
         }
         Protocol::Shadowsocks => {
             u.set_username(&URL_SAFE_NO_PAD.encode(format!("{}:{}", a.method, a.password)))
-                .ok();
+                .map_err(|_| anyhow::anyhow!("Shadowsocks 凭据无效"))?;
         }
         _ => {}
     }
@@ -577,7 +540,6 @@ pub fn vmess_link(node: &Value) -> Result<String> {
 }
 
 pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
-    ensure!(line.kind == Kind::Vless, "此规则不使用代理客户端配置");
     let node = doc
         .nodes
         .iter()
@@ -585,6 +547,7 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
         .context("入口不存在")?;
     let (host, port) = endpoint(line, node);
     let a = &line.access;
+    let sni = a.server_name(node);
     let mut v = json!({"name":line.name,"server":host,"port":port});
     match a.protocol {
         Protocol::Vless => {
@@ -601,10 +564,8 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
                 v["xhttp-opts"] = json!({"path":a.transport.path,"host":a.transport.host,"mode":a.transport.mode});
             }
             v["client-fingerprint"] = json!("chrome");
-            if matches!(a.tls.mode.as_str(), "auto" | "manual") {
-                v["servername"] = json!(a.tls.domain);
-            } else {
-                v["servername"] = json!(a.server_name(node));
+            v["servername"] = json!(sni);
+            if !matches!(a.tls.mode.as_str(), "auto" | "manual") {
                 let (_, public_key, short_id) = a.reality_credentials(node);
                 v["reality-opts"] = json!({"public-key":public_key,"short-id":short_id});
             }
@@ -622,7 +583,7 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
             }
             if matches!(a.tls.mode.as_str(), "auto" | "manual") {
                 v["tls"] = json!(true);
-                v["sni"] = json!(a.tls.domain);
+                v["sni"] = json!(sni);
             }
         }
         Protocol::Shadowsocks => {
@@ -634,7 +595,7 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
         Protocol::Trojan => {
             v["type"] = json!("trojan");
             v["password"] = json!(a.password);
-            v["sni"] = json!(a.tls.domain);
+            v["sni"] = json!(sni);
             v["udp"] = json!(true);
         }
         Protocol::Vmess => {
@@ -646,7 +607,7 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
             v["udp"] = json!(true);
             v["tls"] = json!(matches!(a.tls.mode.as_str(), "auto" | "manual"));
             if v["tls"] == true {
-                v["servername"] = json!(a.tls.domain);
+                v["servername"] = json!(sni);
             }
         }
         Protocol::Hysteria2 | Protocol::Tuic => {
@@ -656,7 +617,7 @@ pub fn mihomo_node(line: &Line, doc: &Document) -> Result<Value> {
                 "hysteria2"
             });
             v["password"] = json!(a.password);
-            v["sni"] = json!(a.tls.domain);
+            v["sni"] = json!(sni);
             v["alpn"] = json!(["h3"]);
             v["skip-cert-verify"] = json!(false);
             v["udp"] = json!(true);
@@ -676,7 +637,7 @@ pub fn mihomo(lines: &[Line], doc: &Document) -> Result<String> {
     let mut names = std::collections::BTreeSet::new();
     let proxies: Vec<Value> = lines
         .iter()
-        .filter(|l| l.enabled && l.kind == Kind::Vless)
+        .filter(|l| l.enabled)
         .map(|l| {
             let mut n = mihomo_node(l, doc)?;
             let name = if names.insert(l.name.clone()) {
@@ -802,7 +763,8 @@ mod tests {
             };
             let link = format!("{scheme}://{auth}@proxy.example:443?sni=origin.example");
             assert!(external(&link, "test").is_ok());
-            assert!(external(&format!("{link}&insecure=1"), "test").is_err());
+            assert_eq!(crate::external::mihomo(&format!("{link}&insecure=1"), "test").unwrap()["skip-cert-verify"], true);
+            assert!(external(&format!("{link}&insecure=invalid"), "test").is_err());
             assert!(external(&format!("{link}&obfs=unknown"), "test").is_err());
         }
     }

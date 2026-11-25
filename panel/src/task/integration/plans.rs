@@ -84,7 +84,7 @@ pub async fn echo(line: &Value, target: u16, payload: &[u8]) -> Result<()> {
     .await??;
     Ok(())
 }
-pub fn database(path: &Path, query: &str) -> Result<Vec<Value>> {
+fn database(path: &Path, query: &str) -> Result<Vec<Value>> {
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut statement = db.prepare(query)?;
     let columns = statement.column_count();
@@ -124,7 +124,7 @@ fn consumption(h: &Harness<'_>) -> Result<Vec<Vec<Value>>> {
         })
         .collect()
 }
-pub async fn create(h: &Harness<'_>, nodes: &[Value], name: &str, path: &[usize]) -> Result<Value> {
+async fn create(h: &Harness<'_>, nodes: &[Value], name: &str, path: &[usize]) -> Result<Value> {
     let hops = path
         .iter()
         .map(|i| Ok(json!({"node_id":nodes[*i]["id"],"port":h.port()?})))
@@ -219,7 +219,6 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
     ]);
     let controller = h.panel(control_env.clone()).await?;
     let admin_token = fs::read_to_string(h.root.join("control/admin-token"))?;
-    h.preflight(tls, true).await?;
     let mut nodes = vec![];
     let mut agents = vec![];
     let mut agent_envs = vec![];
@@ -236,13 +235,10 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
         agents.push(pid);
         agent_envs.push(env);
     }
-    h.wait_state("具备套餐能力的 Agent", 30, |s| {
-        s["nodes"].as_array().is_some_and(|a| {
-            a.len() == 2
-                && a.iter().all(|n| {
-                    n["online"] == true && n["report"]["system"]["customer_plan_version"] == 1
-                })
-        })
+    h.wait_state("套餐 Agent 上线", 30, |s| {
+        s["nodes"]
+            .as_array()
+            .is_some_and(|a| a.len() == 2 && a.iter().all(|n| n["online"] == true))
     })
     .await?;
     let customer=h.request("/api/customers","POST",Some(&json!({"name":"private-customer","contact":"private-contact","notes":"private-notes"})),200).await?;
@@ -641,15 +637,7 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
             h.current(line).await?["enabled"] == false,
             "完整退款未停用成员"
         );
-        let mut connection = TcpStream::connect((
-            "127.0.0.1",
-            line["hops"][0]["port"].as_u64().unwrap() as u16,
-        ))
-        .await?;
-        let _ = connection.write_all(&[5, 1, 2]).await;
-        let mut bytes = [0; 2];
-        let result = connection.read(&mut bytes).await;
-        ensure!(result.is_err() || result? == 0, "退款成员仍接受连接");
+        super::rentals::blocked(line).await?;
     }
     echo(&old, echo_port, b"independent-rights").await?;
     h.request(

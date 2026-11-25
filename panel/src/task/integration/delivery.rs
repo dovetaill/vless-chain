@@ -453,9 +453,13 @@ async fn online_bootstrap(work: &Workspace, stage: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
     }
     let source = fs::read_to_string(repository().join("scripts/install-server.sh"))?;
-    let source = source.replacen("PATH=/opt", &format!("PATH={}:/opt", mocks.display()), 1);
+    let patched = source.replacen("PATH=/opt", &format!("PATH={}:/opt", mocks.display()), 1);
+    ensure!(
+        patched != source,
+        "install-server.sh PATH 锚点变化，离线 mock curl 注入失败"
+    );
     let script = scripts.join("install-server.sh");
-    fs::write(&script, source)?;
+    fs::write(&script, patched)?;
     let curl = mocks.join("curl");
     fs::write(
         &curl,

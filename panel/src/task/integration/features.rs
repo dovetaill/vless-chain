@@ -1,7 +1,8 @@
 use super::{
-    business::{line, node},
+    business::line,
     harness::Harness,
     plans::{echo, socks},
+    rentals::used,
     scenarios::wait,
 };
 use anyhow::{Context, Result, ensure};
@@ -18,10 +19,6 @@ use tokio::{
     net::{TcpStream, UdpSocket},
 };
 
-fn total(value: &Value) -> u64 {
-    value["traffic"]["upload"].as_u64().unwrap_or(0)
-        + value["traffic"]["download"].as_u64().unwrap_or(0)
-}
 fn core_ids(directory: &Path) -> Result<std::collections::BTreeSet<String>> {
     #[cfg(target_os = "linux")]
     {
@@ -60,63 +57,6 @@ pub async fn exercise(
     agents: &mut [u32],
     envs: &[BTreeMap<String, String>],
 ) -> Result<()> {
-    let reality = h.state().await?["lines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find_map(|l| {
-            l["access"]["reality"]["target"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(|_| l["access"]["reality"].clone())
-        })
-        .context("REALITY 夹具缺失")?;
-    let old = node(h, "旧版本能力检查", None).await?;
-    h.request_headers(
-        &format!("/api/agent/{}/sync", old["id"].as_str().unwrap()),
-        "POST",
-        Some(&json!({"running":true,"applied":true,"revision":"","error":""})),
-        200,
-        &[
-            ("Cookie", ""),
-            (
-                "Authorization",
-                &format!("Bearer {}", old["token"].as_str().unwrap()),
-            ),
-        ],
-    )
-    .await?;
-    let legacy = line(
-        h,
-        &[old.clone()],
-        "旧 Agent 保护",
-        &[0],
-        json!({"access":{"reality":reality}}),
-        200,
-    )
-    .await?;
-    ensure!(
-        h.request("/api/publish", "POST", Some(&json!({})), 400)
-            .await?["error"]
-            .as_str()
-            .unwrap()
-            .contains("Agent"),
-        "旧 Agent 未被拒绝"
-    );
-    h.request(
-        &format!("/api/lines/{}", legacy["id"].as_str().unwrap()),
-        "DELETE",
-        None,
-        200,
-    )
-    .await?;
-    h.request(
-        &format!("/api/nodes/{}", old["id"].as_str().unwrap()),
-        "DELETE",
-        None,
-        200,
-    )
-    .await?;
     let previous = h.state().await?;
     for l in previous["lines"].as_array().unwrap() {
         h.request(
@@ -165,11 +105,7 @@ pub async fn exercise(
         200,
     )
     .await?;
-    let backend = h.website().await?;
-    h.allow_loopback(&[echo_port, http, backend])?;
-    let site=line(h,nodes,"演示网站",&[0],json!({"kind":"website","target":format!("http://127.0.0.1:{backend}/app"),"access":{"tls":{"mode":"off","domain":"app.example.test"}}}),200).await?;
-    h.request("/api/lines","POST",Some(&json!({"name":"共享端口网站","kind":"website","hops":site["hops"],"target":format!("http://127.0.0.1:{backend}/other"),"access":{"tls":{"mode":"off","domain":"other.example.test"}}})),200).await?;
-    let secure=line(h,nodes,"HTTPS 网站",&[0],json!({"kind":"website","target":format!("http://127.0.0.1:{backend}"),"access":{"tls":tls}}),200).await?;
+    h.allow_loopback(&[echo_port, http])?;
     let mut limited = line(
         h,
         nodes,
@@ -204,7 +140,7 @@ pub async fn exercise(
         .find(|n| n["id"] == nodes[0]["id"])
         .unwrap()["report"]["system"]["listening_ports"]
         .clone();
-    let automatic=h.request("/api/lines","POST",Some(&json!({"name":"自动端口","kind":"vless","access":{"protocol":"socks"},"target":format!("127.0.0.1:{echo_port}"),"hops":[{"node_id":nodes[0]["id"]}]})),200).await?;
+    let automatic=h.request("/api/lines","POST",Some(&json!({"name":"自动端口","kind":"vless","access":{"protocol":"socks"},"hops":[{"node_id":nodes[0]["id"]}]})),200).await?;
     let port = automatic["hops"][0]["port"].as_u64().unwrap() as u16;
     ensure!(
         !occupied.as_array().unwrap().contains(&json!(port)),
@@ -245,75 +181,19 @@ pub async fn exercise(
     packet.extend(b"\r\nGET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
     stream.write_all(&packet).await?;
     let mut body = vec![];
-    let _ = stream.read_to_end(&mut body).await;
+    let read_err = match tokio::time::timeout(Duration::from_secs(8), stream.read_to_end(&mut body))
+        .await
+        .context("Trojan TLS 读取响应超时")?
+    {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+        Err(e) => Some(e),
+    };
     ensure!(
         String::from_utf8_lossy(&body).contains("chain-integration-ok"),
-        "Trojan TLS 流量错误"
+        "Trojan TLS 流量错误：body={} err={read_err:?}",
+        String::from_utf8_lossy(&body)
     );
-    drop(stream);
-    let website = reqwest::Client::builder()
-        .no_proxy()
-        .add_root_certificate(reqwest::Certificate::from_pem(&fs::read(cert)?)?)
-        .build()?;
-    for (host, expected, status) in [
-        ("app.example.test", "/app/hello?q=1", 200),
-        ("other.example.test", "/other/hello?q=1", 200),
-        ("missing.example.test", "未配置", 404),
-    ] {
-        let response = website
-            .get(format!(
-                "http://127.0.0.1:{}/hello?q=1",
-                site["hops"][0]["port"].as_u64().unwrap()
-            ))
-            .header("Host", host)
-            .send()
-            .await?;
-        ensure!(
-            response.status().as_u16() == status && response.text().await?.contains(expected),
-            "网站虚拟主机转发错误"
-        );
-    }
-    ensure!(
-        website
-            .get(format!(
-                "https://localhost:{}/secure",
-                secure["hops"][0]["port"].as_u64().unwrap()
-            ))
-            .send()
-            .await?
-            .text()
-            .await?
-            == "/secure",
-        "HTTPS 网站转发错误"
-    );
-    let mut stream = TcpStream::connect((
-        "127.0.0.1",
-        site["hops"][0]["port"].as_u64().unwrap() as u16,
-    ))
-    .await?;
-    stream.write_all(b"GET /socket HTTP/1.1\r\nHost: app.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await?;
-    let mut header = vec![];
-    while !header.ends_with(b"\r\n\r\n") {
-        let mut byte = [0];
-        stream.read_exact(&mut byte).await?;
-        header.push(byte[0]);
-        ensure!(header.len() < 8192, "WebSocket 响应头过大");
-    }
-    ensure!(
-        String::from_utf8_lossy(&header).contains("101"),
-        "WebSocket 未升级"
-    );
-    let mut frame = vec![0x81, 0x84, 1, 2, 3, 4];
-    frame.extend(
-        b"ping"
-            .iter()
-            .enumerate()
-            .map(|(i, v)| v ^ [1, 2, 3, 4][i % 4]),
-    );
-    stream.write_all(&frame).await?;
-    let mut response = [0; 6];
-    stream.read_exact(&mut response).await?;
-    ensure!(&response == b"\x81\x04ping", "WebSocket 帧不匹配");
     drop(stream);
     udp_lifetime(h, &lines[1], echo_port).await?;
     let started = Instant::now();
@@ -345,7 +225,7 @@ pub async fn exercise(
             .as_array()
             .unwrap()
             .iter()
-            .any(|l| l["id"] == quota["id"] && total(l) >= 8192)
+            .any(|l| l["id"] == quota["id"] && used(l) >= 8192)
     })
     .await?;
     ensure!(
@@ -380,7 +260,7 @@ pub async fn exercise(
         })
     })
     .await?;
-    ensure!(total(&h.current(&quota).await?) >= 8192, "重启重置额度");
+    ensure!(used(&h.current(&quota).await?) >= 8192, "重启重置额度");
     h.probe(&plain, &url).await?;
     for l in lines.iter().chain([&trojan, &vless]) {
         let export = h

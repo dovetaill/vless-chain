@@ -127,7 +127,6 @@ pub async fn main(args: Vec<String>) -> Result<()> {
         }
         "status" => release::status(&args).await,
         "build" => release::build(&args).await,
-        "cores" => release::build_cores(&args).await,
         "check" => delivery::check(&args).await,
         "validate" => delivery::validate(&args),
         "assemble" => delivery::assemble(&args),
@@ -139,22 +138,19 @@ pub async fn main(args: Vec<String>) -> Result<()> {
         "openrc-test" => integration::openrc(&args).await,
         "release" => release::wizard(false).await,
         "push" => release::wizard(true).await,
-        "draft" | "publish" => release::github(&args).await,
         "ops" => {
-            let work = workspace::Workspace::new(&args.parent())?;
-            let mut command = strings(&["sh"]);
-            command.push(
-                repository()
-                    .join("scripts/install-server.sh")
-                    .display()
-                    .to_string(),
-            );
-            command.extend(args.trailing);
-            work.run(&repository(), &command).await
+            let status = std::process::Command::new("sh")
+                .arg(repository().join("scripts/install-server.sh"))
+                .args(&args.trailing)
+                .current_dir(repository())
+                .status()
+                .context("无法启动本机安装运维脚本")?;
+            ensure!(status.success(), "本机安装运维未成功（{status}）");
+            Ok(())
         }
         "--help" | "-h" | "help" => {
             println!(
-                "Chain Rust 构建发布工具\nversion [--set X.Y.Z] | status | build/cores [--work-parent DIR --output DIR]\ncheck [--full --browser] | verify --xray PATH --work-parent DIR [--browser]\nsmoke --input DIR | integration --case CASE [--profiles NAME ... --stages NAME ...]\nvalidate --tag vX.Y.Z | assemble --input DIR --output DIR --tag TAG --commit SHA\npublish-ci --input DIR --repo OWNER/REPO --tag TAG --commit SHA\ndraft/publish --repo OWNER/REPO [--directory DIR] | release | push | ops -- ARGS"
+                "Chain Rust 构建发布工具\nversion [--set X.Y.Z] | status | build [--work-parent DIR --output DIR]\ncheck [--full --browser] | verify --xray PATH --work-parent DIR [--browser]\nsmoke --input DIR | integration --case CASE [--profiles NAME ... --stages NAME ...]\nvalidate --tag vX.Y.Z | assemble --input DIR --output DIR --tag TAG --commit SHA\npublish-ci --input DIR --repo OWNER/REPO --tag TAG --commit SHA\nrelease | push | ops -- ARGS"
             );
             Ok(())
         }

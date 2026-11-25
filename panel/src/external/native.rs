@@ -13,7 +13,11 @@ fn typed(value: &Value, ty: &str, path: &str) -> Result<()> {
         let valid = match ty {
             "string" | "C.DNSPrefer" => value.is_string(),
             "bool" => value.is_boolean(),
-            "int" | "int64" | "uint64" | "uint32" | "uint16" | "uint8" => value.as_u64().is_some(),
+            "int" | "int64" => value.as_i64().is_some(),
+            "uint64" => value.as_u64().is_some(),
+            "uint32" => value.as_u64().is_some_and(|n| n <= u32::MAX as u64),
+            "uint16" => value.as_u64().is_some_and(|n| n <= u16::MAX as u64),
+            "uint8" => value.as_u64().is_some_and(|n| n <= u8::MAX as u64),
             "float64" => value.as_f64().is_some_and(f64::is_finite),
             "any" | "interface{}" => true,
             _ => { fields(value, ty, path)?; true },
@@ -30,7 +34,6 @@ fn fields(value: &Value, ty: &str, path: &str) -> Result<()> {
         ensure!(!matches!(key.as_str(), "dialer-proxy" | "interface-name" | "routing-mark" | "certificate" | "private-key") || key == "private-key" && ty == "WireGuardOption", "不允许节点参数 {path}.{key}");
         let kind = schema.get(key).and_then(Value::as_str).with_context(|| format!("不支持参数 {path}.{key}"))?;
         typed(value, kind, &format!("{path}.{key}"))?;
-        if key == "skip-cert-verify" { ensure!(value == false, "不支持跳过证书验证"); }
     }
     Ok(())
 }
@@ -102,23 +105,31 @@ pub(super) fn share_node(link: &str) -> Result<Option<Value>> {
     }
     let Ok(mut url) = Url::parse(link) else { return Ok(None); };
     let scheme = url.scheme().to_owned();
-    let q: std::collections::BTreeMap<String,String> = url.query_pairs().into_owned().collect();
-    let allowed = match scheme.as_str() {
-        "ss" => "type tfo udp plugin",
-        "hy2" | "hysteria2" => "sni alpn insecure allowInsecure udp obfs obfs-password mport ports hop-interval up down udp-mtu handshake-timeout",
-        "tuic" => "sni alpn insecure allowInsecure udp congestion_control udp_relay_mode",
-        "trojan" | "vless" => "security type encryption flow sni fp alpn insecure allowInsecure pbk sid pqv spx path host mode extra serviceName tfo udp",
-        "https" => "sni fp alpn insecure allowInsecure tfo udp",
-        "http" | "socks" | "socks5" => "tfo udp",
-        _ => return Ok(None),
-    };
-    ensure!(url.query_pairs().count() == q.len(), "{scheme} 存在重复参数");
-    for key in q.keys() { ensure!(allowed.split_whitespace().any(|k|k==key), "{scheme} 不支持参数 {key}"); }
+    if !matches!(scheme.as_str(), "ss" | "hy2" | "hysteria2" | "tuic" | "trojan" | "vless" | "https" | "http" | "socks" | "socks5") {
+        return Ok(None);
+    }
+    let mut q = std::collections::BTreeMap::new();
+    for (key, value) in url.query_pairs() {
+        if key == "headerType" && (value.is_empty() || value == "none") {
+            continue;
+        }
+        if matches!(key.as_ref(), "authority" | "ed") {
+            continue;
+        }
+        ensure!(q.insert(key.into_owned(), value.into_owned()).is_none(), "{scheme} 存在重复参数");
+    }
     let network = q.get("type").map(String::as_str).unwrap_or("tcp");
     let extended = scheme == "ss" && q.contains_key("plugin")
         || matches!(scheme.as_str(),"hy2"|"hysteria2") && q.keys().any(|k| ["obfs","obfs-password","mport","ports","hop-interval","up","down","udp-mtu","handshake-timeout"].contains(&k.as_str()))
         || matches!(scheme.as_str(),"trojan"|"vless") && matches!(network,"ws"|"grpc"|"h2"|"http");
     if !extended { return Ok(None); }
+    let allowed = match scheme.as_str() {
+        "ss" => "type tfo udp plugin",
+        "hy2" | "hysteria2" => "sni fp alpn insecure allowInsecure udp obfs obfs-password mport ports hop-interval up down udp-mtu handshake-timeout",
+        "trojan" | "vless" => "security type encryption flow sni fp alpn insecure allowInsecure pbk sid pqv spx path host mode extra serviceName tfo udp",
+        _ => unreachable!(),
+    };
+    for key in q.keys() { ensure!(allowed.split_whitespace().any(|k|k==key), "{scheme} 不支持参数 {key}"); }
     let extensions = ["plugin","obfs","obfs-password","mport","ports","hop-interval","up","down","udp-mtu","handshake-timeout","path","host","serviceName"];
     url.set_query(None);
     for (key,value) in &q {
@@ -181,9 +192,20 @@ mod tests {
             assert!(crate::compiler::needs_mihomo(&external_outbound(&link,"test").unwrap()));
             let mut invalid=node.clone(); invalid["unknown-option"]=json!(true);
             assert!(super::super::import(&invalid.to_string()).is_err());
-            invalid=node.clone(); invalid["skip-cert-verify"]=json!(true);
+            invalid=node.clone(); invalid["skip-cert-verify"]=json!("invalid");
             assert!(super::super::import(&invalid.to_string()).is_err());
         }
+    }
+    #[test]
+    fn reality_extended_links_and_mihomo_self_signed_round_trip() {
+        let link = "vless://00000000-0000-4000-8000-000000000001@proxy.example:443?security=reality&type=grpc&serviceName=proxy&sni=cover.example&pbk=test-pbk&sid=0102&headerType=none";
+        let (stored, name) = super::super::import(link).unwrap();
+        let exported = super::super::mihomo(&stored, &name).unwrap();
+        assert_eq!(exported["network"], "grpc");
+        assert_eq!(exported["reality-opts"]["public-key"], "test-pbk");
+        let self_signed = "{name: hy2-self, type: hysteria2, server: proxy.example, port: 443, password: test, sni: example.com, skip-cert-verify: true, ports: '443,8443'}";
+        let (hy_link, hy_name) = super::super::import(self_signed).unwrap();
+        assert_eq!(super::super::mihomo(&hy_link, &hy_name).unwrap()["skip-cert-verify"], true);
     }
     #[test]
     fn extended_links_round_trip() {

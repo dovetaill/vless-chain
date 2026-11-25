@@ -3,7 +3,6 @@ pub mod https;
 pub mod ingress;
 pub mod install;
 pub mod lifecycle;
-pub mod legacy;
 pub mod maintenance;
 pub mod migration;
 pub mod nginx;

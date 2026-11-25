@@ -62,23 +62,6 @@ pub struct Source {
     pub active: Option<Rules>,
     pub pending: Option<Rules>,
 }
-/// First publication must not silently drop restrictions on an older Agent.
-pub fn requires_capability(policy: &serde_json::Value) -> bool {
-    policy["restricted"] == true
-        || policy["max_connections"].is_number()
-        || policy["denied_ports"].as_array().is_some_and(|ports| !ports.is_empty())
-        || matches!(policy["udp"].as_str(), Some("deny" | "ports"))
-}
-
-pub fn check_agent_connection_limit(limit: Option<u64>, system: &serde_json::Value) -> Result<()> {
-    let supported = system["max_proxy_connections"].as_u64().unwrap_or(1024);
-    ensure!(
-        limit.is_none_or(|n| n <= supported),
-        "当前 Agent 的线路并发上限为 {supported}，请先升级该 Agent 并等待新心跳"
-    );
-    Ok(())
-}
-
 pub fn domain(text: &str) -> Result<String> {
     let text = text.trim().trim_end_matches('.');
     ensure!(
@@ -89,15 +72,7 @@ pub fn domain(text: &str) -> Result<String> {
         url::Host::Domain(d) => d,
         _ => anyhow::bail!("此处需要域名，不能填写 IP"),
     };
-    ensure!(
-        value.contains('.')
-            && value.split('.').all(|s| !s.is_empty()
-                && s.len() <= 63
-                && !s.starts_with('-')
-                && !s.ends_with('-')
-                && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')),
-        "域名格式无效"
-    );
+    ensure!(crate::compiler::domain_valid(&value), "域名格式无效");
     Ok(value)
 }
 pub fn parse(text: &str) -> Result<Rules> {
@@ -374,42 +349,29 @@ pub fn presets() -> Vec<Source> {
     for (category, items) in groups {
         for item in items.split('|') {
             let (name, key) = item.split_once(':').unwrap();
-            let url = match key {
-                "Hotstar" => format!(
-                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/hotstar.yaml"
-                ),
-                "MyTVSuper" => format!(
-                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/mytvsuper.yaml"
-                ),
-                "U-NEXT" => format!(
-                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/unext.yaml"
-                ),
-                "NHK" => format!(
-                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/nhk.yaml"
-                ),
-                "DAnime" => String::new(),
-                "Radiko" => format!(
-                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/radiko.yaml"
-                ),
-                "GooglePlay" => format!(
-                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/google-play.yaml"
-                ),
-                "Getchu" => String::new(),
-                "ErogameScape" => String::new(),
-                "MGStage" => String::new(),
-                "DLsite" => format!(
-                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/dlsite.yaml"
-                ),
-                "Mora" => String::new(),
-                "MusicJP" => String::new(),
-                "DAM" => String::new(),
-                "JoySound" => String::new(),
-                _ => format!(
-                    "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/{key}/{key}.yaml"
-                ),
-            };
             let builtin = builtin_rules(key);
-            let url = if builtin.is_some() { String::new() } else { url };
+            let url = if builtin.is_some() {
+                String::new()
+            } else {
+                let meta = match key {
+                    "Hotstar" => Some("hotstar"),
+                    "MyTVSuper" => Some("mytvsuper"),
+                    "U-NEXT" => Some("unext"),
+                    "NHK" => Some("nhk"),
+                    "Radiko" => Some("radiko"),
+                    "GooglePlay" => Some("google-play"),
+                    "DLsite" => Some("dlsite"),
+                    _ => None,
+                };
+                match meta {
+                    Some(slug) => format!(
+                        "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/{slug}.yaml"
+                    ),
+                    None => format!(
+                        "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/{key}/{key}.yaml"
+                    ),
+                }
+            };
             result.push(Source {
                 id: format!("preset-{}", key.to_ascii_lowercase()),
                 name: name.into(),
@@ -437,19 +399,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connection_limits_validate_the_policy_and_the_target_agent() {
+    fn connection_limits_validate_policy_bounds() {
         let mut doc = crate::model::Document::default();
         for (value, valid) in [(None, true), (Some(1), true), (Some(1024), true),
             (Some(20_480), true), (Some(0), false), (Some(20_481), false)] {
             doc.access_policies.entry("line".into()).or_default().max_connections = value;
             assert_eq!(compile(&doc, "line").is_ok(), valid);
         }
-        let old = serde_json::json!({"sharing_version": 1});
-        let current = serde_json::json!({"max_proxy_connections": MAX_PROXY_CONNECTIONS});
-        assert!(check_agent_connection_limit(None, &old).is_ok());
-        assert!(check_agent_connection_limit(Some(1024), &old).is_ok());
-        assert!(check_agent_connection_limit(Some(1025), &old).is_err());
-        assert!(check_agent_connection_limit(Some(20_480), &current).is_ok());
     }
     #[test]
     fn strict_rules_do_not_accept_keywords_or_processes() {
@@ -464,17 +420,6 @@ mod tests {
         assert!(!p.allows_domain("notexample.com"));
         assert!(!p.allows_domain("example.com.attacker.net"));
         assert!(!public_ip("::ffff:127.0.0.1".parse().unwrap()));
-    }
-    #[test]
-    fn every_enforced_policy_requires_a_capable_agent() {
-        use serde_json::json;
-        for policy in [json!({"restricted":true}), json!({"max_connections":2}),
-            json!({"denied_ports":[25]}), json!({"udp":"deny"}),
-            json!({"udp":"ports","udp_ports":[53]}), json!({"udp":"ports"})] {
-            assert!(requires_capability(&policy), "{policy}");
-        }
-        assert!(!requires_capability(&json!(Policy::default())));
-        assert!(!requires_capability(&json!({"udp":"allow","udp_ports":[53]})));
     }
     #[test]
     fn complete_preset_catalog() {

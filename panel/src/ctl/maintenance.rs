@@ -1,6 +1,6 @@
 use super::{
     package,
-    upgrade::{Manager, OWNER, atomic, output},
+    upgrade::{Manager, OWNER, atomic},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,6 @@ impl Request {
             );
         }
         let request: Self = serde_json::from_value(value)?;
-        ensure!(request.keep_agent_on_failure.is_none() || (matches!(request.action.as_str(), "core-upgrade" | "core-reject") && request.keep_agent_on_failure == Some(true)), "仅内核升级或验收失败可指定 keep_agent_on_failure");
         ensure!(
             uuid::Uuid::parse_str(&request.id)?.to_string() == request.id,
             "任务 ID 无效"
@@ -72,7 +71,6 @@ impl Request {
                     | "network-tune"
                     | "core-status"
                     | "core-upgrade"
-                    | "core-rollback"
                     | "core-confirm"
                     | "core-reject"
             ),
@@ -91,23 +89,10 @@ impl Request {
             ensure!(request.xray_channel.is_none(), "只有升级操作可选择内核来源");
         }
         if request.action == "network-tune" {
-            let cc = request.congestion_control.as_deref().unwrap_or("");
-            ensure!(
-                !cc.is_empty()
-                    && cc.len() <= 32
-                    && cc.starts_with(|c: char| c.is_ascii_lowercase())
-                    && cc
-                        .bytes()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'),
-                "拥塞算法无效"
-            );
-            ensure!(
-                matches!(
-                    request.qdisc.as_deref(),
-                    Some("fq" | "fq_codel" | "fq_pie" | "cake" | "pfifo_fast")
-                ),
-                "队列无效"
-            );
+            super::tuning::validate(
+                request.congestion_control.as_deref().unwrap_or(""),
+                request.qdisc.as_deref().unwrap_or(""),
+            )?;
         } else {
             ensure!(
                 request.congestion_control.is_none() && request.qdisc.is_none(),
@@ -141,6 +126,29 @@ fn write(path: &Path, value: &Value) -> Result<()> {
     atomic(path, &serde_json::to_vec(value)?, 0o600)
 }
 
+fn load_job(path: &Path, expected_id: &str) -> Result<Value> {
+    let info = fs::symlink_metadata(path)?;
+    ensure!(
+        info.is_file() && info.uid() == unsafe { libc::geteuid() } && info.len() <= 65536,
+        "任务文件归属、类型或大小无效"
+    );
+    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(value["id"] == expected_id, "任务文件与 ID 不匹配");
+    Ok(value)
+}
+
+fn read_job(directory: &Path, id: &str) -> Result<Option<(PathBuf, Value)>> {
+    let path = directory.join(format!("{id}.json"));
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+        Ok(_) => {
+            let value = load_job(&path, id)?;
+            Ok(Some((path, value)))
+        }
+    }
+}
+
 fn jobs(directory: &Path) -> Result<Vec<(PathBuf, Value)>> {
     let mut jobs = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -149,38 +157,37 @@ fn jobs(directory: &Path) -> Result<Vec<(PathBuf, Value)>> {
         if path.extension().is_none_or(|s| s != "json") {
             continue;
         }
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .context("任务文件名无效")?;
-        ensure!(
-            uuid::Uuid::parse_str(id)?.to_string() == id,
-            "任务文件名无效"
-        );
-        let info = fs::symlink_metadata(&path)?;
-        ensure!(
-            info.is_file() && info.uid() == unsafe { libc::geteuid() } && info.len() <= 65536,
-            "任务文件归属、类型或大小无效"
-        );
-        let value: Value = serde_json::from_slice(&fs::read(&path)?)?;
-        ensure!(value["id"] == id, "任务文件与 ID 不匹配");
-        jobs.push((path, value));
+        let parsed: Result<Value> = (|| {
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .context("任务文件名无效")?;
+            ensure!(
+                uuid::Uuid::parse_str(id)?.to_string() == id,
+                "任务文件名无效"
+            );
+            load_job(&path, id)
+        })();
+        match parsed {
+            Ok(value) => jobs.push((path, value)),
+            Err(error) => eprintln!("忽略异常历史任务文件 {}：{error:#}", path.display()),
+        }
     }
     Ok(jobs)
 }
 
 fn receipt(directory: &Path, request: &Request) -> Result<(Value, bool)> {
-    let mut existing = jobs(directory)?;
-    if let Some((_, job)) = existing.iter().find(|(_, job)| job["id"] == request.id) {
+    if let Some((_, job)) = read_job(directory, &request.id)? {
         ensure!(
-            request.action == "status" || request.same(job),
+            request.action == "status" || request.same(&job),
             "任务 ID 已用于其他操作"
         );
-        return Ok((job.clone(), false));
+        return Ok((job, false));
     }
     if request.action == "status" {
         return Ok((json!({"id":request.id,"state":"not_found"}), false));
     }
+    let mut existing = jobs(directory)?;
     if matches!(request.action.as_str(), "core-confirm" | "core-reject") {
         if let Some((_, job)) = existing.iter().find(|(_, job)| request.same(job)
             && matches!(job["state"].as_str(), Some("queued" | "running" | "succeeded"))) {
@@ -241,22 +248,6 @@ fn versions(manager: &Manager) -> Result<Value> {
     ))
 }
 
-fn https_service(manager: &Manager) -> Result<Option<&'static str>> {
-    let path = manager.unit_path("panel-https");
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-        Ok(info) => {
-            ensure!(
-                info.is_file()
-                    && fs::read_to_string(path)?.contains("# chain-panel HTTPS managed site v1\n"),
-                "独立 HTTPS 服务归属不匹配"
-            );
-            Ok(Some("chain-panel-https"))
-        }
-    }
-}
-
 async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result<()> {
     let before = versions(manager)?;
     ensure!(
@@ -269,11 +260,6 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
     let path = directory.join(format!("{}.json", job["id"].as_str().unwrap()));
     write(&path, job)?;
     let action = job["action"].as_str().unwrap().to_owned();
-    let https = if matches!(action.as_str(), "upgrade" | "restart-all") {
-        https_service(manager)?
-    } else {
-        None
-    };
     if action.starts_with("core-") {
         let result = super::cores::operate(manager, job, directory).await?;
         for (key, value) in result.as_object().context("内核结果无效")? {
@@ -296,9 +282,6 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
         let (archive, _) = package::download(temporary.path(), Some(&version)).await?;
         manager.update_archive(&archive, Some(&version),
             (job["xray_channel"] == "latest").then_some(temporary.path()), None).await?;
-        if let Some(service) = https {
-            super::platform::related(manager, "restart", service).await?;
-        }
         let after = versions(manager)?;
         for role in before.as_object().unwrap().keys() {
             ensure!(after[role] == version, "{role} 版本未达到目标");
@@ -341,17 +324,17 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
             manager.service("restart", role).await?;
             manager.healthy(role.clone()).await?;
         }
-        if let Some(service) = https {
-            super::platform::related(manager, "restart", service).await?;
+        if action == "restart-all" {
+            let https_unit = match manager.kind() {
+                "systemd" => manager.path("/etc/systemd/system/chain-panel-https.service"),
+                "openrc" => manager.path("/etc/init.d/chain-panel-https"),
+                _ => manager.path("/Library/LaunchDaemons/org.vless-chain.chain-panel-https.plist"),
+            };
+            super::upgrade::ordinary(&https_unit)?;
+            if https_unit.exists() && fs::read_to_string(&https_unit)?.contains(super::https::OWNER) {
+                super::platform::related(manager, "restart", "chain-panel-https").await?;
+            }
         }
-    }
-    if let Some(service) = https {
-        let check = if manager.kind() == "openrc" {
-            output("rc-service", &[service, "status"], 15).await?
-        } else {
-            output("systemctl", &["is-active", "--quiet", service], 15).await?
-        };
-        ensure!(check.status.success(), "独立 HTTPS 服务未运行");
     }
     job["after"] = versions(manager)?;
     if job["detail"].is_null() {
@@ -361,31 +344,9 @@ async fn execute(manager: &Manager, directory: &Path, job: &mut Value) -> Result
 }
 
 fn redacted(error: &str) -> String {
-    error
-        .lines()
-        .map(|line| {
-            let lower = line.to_ascii_lowercase();
-            if [
-                "://",
-                "token",
-                "password",
-                "passwd",
-                "secret",
-                "authorization",
-                "api_key",
-                "api-key",
-            ]
-            .iter()
-            .any(|v| lower.contains(v))
-            {
-                "[可能包含地址或凭据的错误行已隐藏]".into()
-            } else {
-                line.chars().filter(|c| !c.is_control()).collect::<String>()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    crate::diagnostics::redact(error)
         .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
         .take(4096)
         .collect()
 }
@@ -421,17 +382,16 @@ pub async fn serve() -> Result<()> {
             job["error"] = json!("执行组件中断，请检查当前版本后重新创建任务");
             write(&path, &job)?;
         }
-        let prefix = format!("work-{}-", job["id"].as_str().unwrap());
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                let info = fs::symlink_metadata(entry.path())?;
-                ensure!(
-                    info.is_dir() && info.uid() == 0,
-                    "维护临时目录归属不匹配，未清理"
-                );
-                fs::remove_dir_all(entry.path())?;
-            }
+    }
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("work-") {
+            let info = fs::symlink_metadata(entry.path())?;
+            ensure!(
+                info.is_dir() && info.uid() == 0,
+                "维护临时目录归属不匹配，未清理"
+            );
+            fs::remove_dir_all(entry.path())?;
         }
     }
     let user = unsafe { libc::getpwnam(c"chain-panel".as_ptr()) };
@@ -585,7 +545,7 @@ mod tests {
     fn repeated_verification_reuses_the_accepted_decision() {
         let directory = tempfile::tempdir().unwrap();
         let original = uuid::Uuid::new_v4().to_string();
-        let first = json!({"id":uuid::Uuid::new_v4().to_string(),"action":"core-reject","core":"mihomo","task_id":original,"keep_agent_on_failure":true});
+        let first = json!({"id":uuid::Uuid::new_v4().to_string(),"action":"core-reject","core":"mihomo","task_id":original});
         let (receipt1, start) = receipt(directory.path(), &Request::parse(first.clone()).unwrap()).unwrap();
         assert!(start);
         let mut repeated = first;
@@ -593,8 +553,6 @@ mod tests {
         let (receipt2, start) = receipt(directory.path(), &Request::parse(repeated.clone()).unwrap()).unwrap();
         assert!(!start);
         assert_eq!(receipt1, receipt2);
-        repeated["action"] = json!("core-confirm");
-        assert!(Request::parse(repeated).is_err());
     }
     #[test]
     fn network_tuning_validates_choices_and_receipt_identity() {
@@ -666,11 +624,13 @@ mod tests {
     #[test]
     fn error_receipts_do_not_expose_credentials() {
         let text = redacted(
-            "connection failed\nhttps://user:secret@example.test/?token=secret\nAuthorization: Bearer secret\npassword=secret\nsecret-token: value",
+            "connection failed: https://github.com/XTLS/Xray-core/releases/tag/v26.10.31: HTTP 502\nhttps://user:mysecret@example.test/?token=toksecret\nAuthorization: Bearer bearersecret\npassword=pwsecret\napi_key: keysecret",
         );
         assert!(text.contains("connection failed"));
-        for secret in ["secret", "example.test", "Bearer", "value"] {
-            assert!(!text.contains(secret));
+        assert!(text.contains("https://github.com/XTLS/Xray-core/releases/tag/v26.10.31: HTTP 502"));
+        assert!(text.contains("example.test"));
+        for secret in ["mysecret", "toksecret", "bearersecret", "pwsecret", "keysecret"] {
+            assert!(!text.contains(secret), "leaked {secret} in {text}");
         }
     }
 }

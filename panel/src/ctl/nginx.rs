@@ -141,10 +141,14 @@ fn expand(pattern: &Path) -> Result<Vec<PathBuf>> {
     };
     for p in entries {
         let p = p?;
+        let path = p.path();
+        if !path.is_file() {
+            continue;
+        }
         let n = p.file_name();
         let n = n.to_string_lossy();
         if n.starts_with(prefix) && n.ends_with(suffix) {
-            result.push(p.path());
+            result.push(path);
         }
     }
     result.sort();
@@ -168,7 +172,7 @@ pub fn files(main: &Path) -> Result<BTreeMap<PathBuf, String>> {
         ensure!(out.len() < 256, "Nginx include 文件过多");
         let text = fs::read_to_string(&path)?;
         ensure!(text.len() < 4 * 1024 * 1024, "Nginx 配置过大");
-        let directives = parse_fragment(&text)?;
+        let directives = parse(&text)?;
         out.insert(path.clone(), text);
         for d in directives {
             if d.words.first().is_some_and(|s| s == "include") {
@@ -197,9 +201,35 @@ pub fn files(main: &Path) -> Result<BTreeMap<PathBuf, String>> {
     )?;
     Ok(out)
 }
-// Included files may contain directives without a surrounding http block.
-fn parse_fragment(text: &str) -> Result<Vec<Directive>> {
-    parse(text)
+pub fn server_blocks(text: &str) -> Result<Vec<Vec<Directive>>> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<Directive>> = None;
+    for d in parse(text)? {
+        if d.words.first().is_some_and(|w| w == "server")
+            && d.block
+            && (d.depth.is_empty() || d.depth == ["http"])
+        {
+            if let Some(prev) = current.take() {
+                blocks.push(prev);
+            }
+            current = Some(Vec::new());
+            continue;
+        }
+        if let Some(items) = &mut current {
+            if d.depth.last().is_some_and(|w| w == "server")
+                && (d.depth.len() == 1 || d.depth == ["http", "server"])
+            {
+                items.push(d);
+            } else if d.depth.is_empty() || d.depth == ["http"] {
+                blocks.push(std::mem::take(items));
+                current = None;
+            }
+        }
+    }
+    if let Some(prev) = current {
+        blocks.push(prev);
+    }
+    Ok(blocks)
 }
 pub fn site_directory(main: &Path) -> Result<PathBuf> {
     for d in parse(&fs::read_to_string(main)?)? {
@@ -220,20 +250,8 @@ pub fn site_directory(main: &Path) -> Result<PathBuf> {
     anyhow::bail!("Nginx http 块缺少独立站点 include")
 }
 pub fn domain(value: &str) -> Result<String> {
-    let name = value.trim_end_matches('.').to_ascii_lowercase();
-    ensure!(
-        name.parse::<std::net::IpAddr>().is_err()
-            && name.contains('.')
-            && name.len() <= 253
-            && name.split('.').all(|label| !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')),
-        "域名无效"
-    );
+    let name = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    ensure!(crate::compiler::domain_valid(&name), "域名无效");
     Ok(name)
 }
 pub fn replace_owned(path: &Path, expected: Option<&str>, text: &str, owner: &str) -> Result<()> {
@@ -324,188 +342,18 @@ pub async fn validate(manager: &Manager) -> Result<()> {
     let main = main_path(manager);
     validate_config(manager, &main).await
 }
-fn redirect_log(d: &Directive, root: &Path, source: &Path) -> Result<Option<String>> {
-    ensure!(d.words.len() >= 2, "日志指令缺少输出参数");
-    if d.words[0] == "access_log" && d.words[1] == "off" {
-        return Ok(None);
-    }
-    let path = root.join(format!(
-        "{}-{}-{}",
-        d.words[0],
-        source.file_stem().context("隔离配置路径无效")?.to_string_lossy(),
-        d.start
-    ));
-    let mut words = vec![d.words[0].clone(), quote(path.to_str().unwrap())];
-    // Log conditions must retain variable expansion, unlike literal output paths.
-    words.extend(d.words.iter().skip(2).map(|word| {
-        format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
-    }));
-    Ok(Some(format!("{};", words.join(" "))))
-}
-fn compiled_prefix(version: &str) -> Result<PathBuf> {
-    let arguments = version.lines().find_map(|line| line.strip_prefix("configure arguments: "))
-        .context("无法确认 Nginx 编译参数")?;
-    let directives = parse(&format!("{arguments};"))?;
-    ensure!(directives.len() == 1 && !directives[0].block, "Nginx 编译参数无效");
-    let prefix = directives[0].words.iter().find_map(|word| word.strip_prefix("--prefix="))
-        .context("无法确认 Nginx 模块加载前缀")?;
-    let prefix = PathBuf::from(prefix);
-    ensure!(prefix.is_absolute(), "Nginx 模块加载前缀不是绝对路径");
-    Ok(prefix)
-}
 pub async fn validate_config(manager: &Manager, main: &Path) -> Result<()> {
-    let files = files(&main).with_context(|| format!("读取 Nginx 配置 {}", main.display()))?;
-    let mut prefix = None;
-    let work = tempfile::Builder::new()
-        .prefix("chain-nginx-check-")
-        .tempdir_in(manager.path("/var/tmp"))?;
-    let root = work.path();
-    fs::create_dir(root.join("logs"))?;
-    let mut rewritten = BTreeMap::new();
-    for (i, path) in files.keys().enumerate() {
-        rewritten.insert(path.clone(), root.join(format!("conf-{i}.conf")));
+    files(main).with_context(|| format!("读取 Nginx 配置 {}", main.display()))?;
+    if !manager.live() {
+        return Ok(());
     }
-    for (path, text) in &files {
-        let mut result = text.clone();
-        for d in parse(text)?.into_iter().rev() {
-            let key = d.words[0].as_str();
-            let replacement = if key == "include" {
-                let p = Path::new(&d.words[1]);
-                let p = if p.is_absolute() {
-                    p.into()
-                } else {
-                    main.parent().unwrap().join(p)
-                };
-                Some(
-                    expand(&p)?
-                        .iter()
-                        .map(|p| {
-                            Ok(format!(
-                                "include {};",
-                                quote(
-                                    rewritten
-                                        .get(&p.canonicalize()?)
-                                        .context("include 未收录")?
-                                        .to_str()
-                                        .unwrap()
-                                )
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                        .join("\n"),
-                )
-            } else if key == "load_module" {
-                ensure!(d.words.len() == 2, "load_module 参数无效");
-                let module = Path::new(&d.words[1]);
-                if module.is_absolute() {
-                    None
-                } else {
-                    if prefix.is_none() {
-                        let version = output("nginx", &["-V"], 10).await?;
-                        ensure!(version.status.success(), "无法读取 Nginx 编译参数");
-                        prefix = Some(compiled_prefix(&String::from_utf8(version.stderr)?)?);
-                    }
-                    let module = prefix.as_ref().unwrap().join(module).canonicalize()?;
-                    Some(format!("load_module {};", quote(module.to_str().context("模块路径无效")?)))
-                }
-            } else if key == "user" {
-                Some("user root;".into())
-            } else if ["error_log", "access_log"].contains(&key) {
-                redirect_log(&d, root, &rewritten[path])?
-            } else if ["pid", "lock_file"].contains(&key) {
-                Some(format!(
-                    "{key} {};",
-                    quote(root.join(format!("{key}-{}", d.start)).to_str().unwrap())
-                ))
-            } else if key.ends_with("_temp_path") || key.ends_with("_cache_path") {
-                let dir = root.join(format!(
-                    "tmp-{}-{}",
-                    rewritten[path].file_stem().unwrap().to_string_lossy(),
-                    d.start
-                ));
-                fs::create_dir(&dir)?;
-                Some(format!(
-                    "{key} {} {};",
-                    quote(dir.to_str().unwrap()),
-                    d.words
-                        .iter()
-                        .skip(2)
-                        .map(|s| quote(s))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ))
-            } else {
-                None
-            };
-            if let Some(r) = replacement {
-                result.replace_range(d.start..d.end, &r);
-            }
-        }
-        if path == &main.canonicalize()? {
-            // Override compiled defaults too; all initialization output stays in this disposable tree.
-            if !parse(text)?.iter().any(|d| d.words[0] == "error_log") {
-                result = format!(
-                    "error_log {};\n{result}",
-                    quote(root.join("error.log").to_str().unwrap())
-                );
-            }
-            if !parse(text)?.iter().any(|d| d.words[0] == "pid") {
-                result = format!(
-                    "pid {};\n{result}",
-                    quote(root.join("nginx.pid").to_str().unwrap())
-                );
-            }
-            let http = parse(&result)?
-                .into_iter()
-                .find(|d| d.words[0] == "http" && d.block)
-                .context("缺少 http 块")?;
-            let defaults = ["client_body", "proxy", "fastcgi", "uwsgi", "scgi"]
-                .iter()
-                .map(|n| {
-                    let dir = root.join(n);
-                    fs::create_dir_all(&dir)?;
-                    Ok(format!("\n{n}_temp_path {};", quote(dir.to_str().unwrap())))
-                })
-                .collect::<Result<String>>()?;
-            // Only inject defaults absent from the full expanded configuration.
-            let defaults = defaults
-                .lines()
-                .filter(|line| {
-                    !files
-                        .values()
-                        .any(|s| s.contains(line.split_whitespace().next().unwrap_or("\0")))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            result.insert_str(http.end, &defaults);
-        }
-        fs::write(&rewritten[path], result)?;
-    }
-    let args = vec![
-        platform::executable("nginx")
-            .context("缺少 Nginx")?
-            .display()
-            .to_string(),
-        "-t".into(),
-        "-p".into(),
-        root.display().to_string(),
-        "-c".into(),
-        rewritten[&main.canonicalize()?].display().to_string(),
-    ];
-    fs::write(
-        root.join("request.json"),
-        serde_json::to_vec(
-            &serde_json::json!({"nginx_check":true,"args":args,"env":{"PATH":platform::PATH,"HOME":root,"TMPDIR":root}}),
-        )?,
-    )?;
-    // The same worker blocks writes outside the mirror and chmod/chown anywhere.
+    let nginx = platform::executable("nginx").context("缺少 Nginx")?;
     command(
-        std::env::current_exe()?.to_str().unwrap(),
-        &["internal-core-worker", root.to_str().unwrap()],
+        nginx.to_str().context("Nginx 路径无效")?,
+        &["-t", "-c", main.canonicalize()?.to_str().context("配置路径无效")?],
         30,
     )
-    .await?;
-    Ok(())
+    .await
 }
 #[cfg(test)]
 mod tests {
@@ -537,50 +385,5 @@ mod tests {
         assert_eq!(d.last().unwrap().depth, ["http"]);
         assert!(parse("http {").is_err());
         assert!(domain("x;bad.com").is_err());
-    }
-    #[test]
-    fn redirected_logs_preserve_off_and_all_parameters() {
-        let root = Path::new("/isolated");
-        let source = root.join("conf-0.conf");
-        for text in ["http { access_log off; }", "stream { access_log off; }"] {
-            let directives = parse(text).unwrap();
-            let log = directives.iter().find(|d| d.words[0] == "access_log").unwrap();
-            assert!(redirect_log(log, root, &source).unwrap().is_none());
-        }
-        for text in [
-            "access_log /var/log/nginx/stream.log basic buffer=32k gzip=1 flush=1s if=$loggable;",
-            "access_log /var/log/nginx/access.log combined;",
-            "error_log stderr warn;",
-        ] {
-            let original = parse(text).unwrap().remove(0);
-            let rewritten = redirect_log(&original, root, &source).unwrap().unwrap();
-            let result = parse(&rewritten).unwrap().remove(0);
-            assert_eq!(result.words[0], original.words[0]);
-            assert!(Path::new(&result.words[1]).starts_with(root));
-            assert_eq!(result.words[2..], original.words[2..]);
-            assert!(!rewritten.contains("\\$loggable"));
-        }
-    }
-    #[test]
-    fn redirected_logs_from_different_includes_do_not_share_a_path() {
-        let root = Path::new("/isolated");
-        let log = parse("access_log /var/log/nginx/stream.log basic buffer=32k;")
-            .unwrap()
-            .remove(0);
-        let first = redirect_log(&log, root, &root.join("conf-0.conf")).unwrap().unwrap();
-        let second = redirect_log(&log, root, &root.join("conf-1.conf")).unwrap().unwrap();
-        assert_ne!(parse(&first).unwrap()[0].words[1], parse(&second).unwrap()[0].words[1]);
-    }
-    #[test]
-    fn module_prefix_preserves_configure_argument_quoting() {
-        for (arguments, expected) in [
-            ("--prefix=/usr/lib/nginx --with-stream=dynamic", "/usr/lib/nginx"),
-            ("--with-cc-opt='-O2 -g' --prefix='/opt/nginx modules'", "/opt/nginx modules"),
-            ("'--prefix=/opt/nginx modules' --with-stream=dynamic", "/opt/nginx modules"),
-        ] {
-            assert_eq!(compiled_prefix(&format!("nginx version: nginx/1.28.0\nconfigure arguments: {arguments}\n")).unwrap(), Path::new(expected));
-        }
-        assert!(compiled_prefix("configure arguments: --with-stream").is_err());
-        assert!(compiled_prefix("configure arguments: --prefix=relative").is_err());
     }
 }

@@ -88,13 +88,13 @@ fn fingerprints(config: &str) -> Result<Vec<Option<String>>> {
     .iter()
     .any(|prefix| config.starts_with(prefix))
     {
-        return Ok(vec![
-            chain_panel::external::mihomo(config, "")
-                .and_then(|node| fingerprint(&node))
-                .ok(),
-        ]);
+        let node = chain_panel::external::mihomo(config, "")?;
+        return Ok(vec![Some(fingerprint(&node)?)]);
     }
-    let mut value: Value = serde_yaml_ng::from_str(config)?;
+    let mut value: Value = serde_yaml_ng::from_str(config).context("YAML/JSON 配置语法无效")?;
+    if value.get("proxies").is_none() && value.get("proxy-providers").is_some() {
+        anyhow::bail!("不支持远程 proxy-providers 订阅地址，请粘贴包含具体代理节点的配置");
+    }
     if let Some(proxies) = value.get_mut("proxies") {
         value = proxies.take();
     }
@@ -108,7 +108,28 @@ fn fingerprints(config: &str) -> Result<Vec<Option<String>>> {
         !nodes.is_empty() && nodes.len() <= MAX_PROXIES,
         "单次最多查询 100 个代理"
     );
-    Ok(nodes.iter().map(|node| fingerprint(node).ok()).collect())
+    if nodes.len() == 1 {
+        return Ok(vec![Some(fingerprint(&nodes[0])?)]);
+    }
+    let mut first_err = None;
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        match fingerprint(node) {
+            Ok(fp) => out.push(Some(fp)),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                out.push(None);
+            }
+        }
+    }
+    if out.iter().all(Option::is_none)
+        && let Some(err) = first_err
+    {
+        return Err(err);
+    }
+    Ok(out)
 }
 
 fn matched<'a>(doc: &'a Document, supplied: &[Option<String>]) -> (Vec<&'a Line>, Vec<String>) {
@@ -151,12 +172,8 @@ fn matched<'a>(doc: &'a Document, supplied: &[Option<String>]) -> (Vec<&'a Line>
 fn lookup_result(doc: &Document, input: Lookup, at: u64) -> ApiResult<Value> {
     let (lines, unmatched) = match (input.config, input.token) {
         (Some(config), None) => {
-            let supplied = fingerprints(&config).map_err(|_| {
-                error(
-                    StatusCode::BAD_REQUEST,
-                    "配置格式无效；单次最多查询 100 个代理",
-                )
-            })?;
+            let supplied = fingerprints(&config)
+                .map_err(|e| error(StatusCode::BAD_REQUEST, &format!("{e:#}")))?;
             matched(doc, &supplied)
         }
         (None, Some(token))
@@ -218,22 +235,7 @@ fn lookup_result(doc: &Document, input: Lookup, at: u64) -> ApiResult<Value> {
 
 pub async fn lookup(State(app): State<App>, request: Request) -> ApiResult<Json<Value>> {
     let at = now();
-    let peer = request
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|peer| peer.0.ip())
-        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into());
-    // Only a local reverse proxy may supply the client address; remote headers are untrusted.
-    let peer = if peer.is_loopback() {
-        request
-            .headers()
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(peer)
-    } else {
-        peer
-    };
+    let peer = client_ip_from_request(&request);
     {
         let mut requests = REQUESTS.lock().unwrap();
         requests.retain(|_, (since, _)| at.saturating_sub(*since) < 60);
@@ -400,11 +402,8 @@ mod tests {
             );
         }
         let provider = r#"{"proxy-providers":{"private":{"url":"https://127.0.0.1/secret"}}}"#;
-        assert_eq!(fingerprints(provider).unwrap(), vec![None]);
-        assert_eq!(
-            fingerprints("https://127.0.0.1/private").unwrap(),
-            vec![None]
-        );
+        assert!(fingerprints(provider).is_err());
+        assert!(fingerprints("https://127.0.0.1/private").is_err());
         assert!(fingerprints(&json!(vec![node("trojan"); MAX_PROXIES + 1]).to_string()).is_err());
     }
 

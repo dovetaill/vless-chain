@@ -58,7 +58,7 @@ async fn run() -> Result<()> {
     let token = std::fs::read_to_string(token_path)?;
     ensure!(token.trim().len() >= 32, "Agent token 无效");
     let binary = PathBuf::from(std::env::var("CHAIN_XRAY_BIN").unwrap_or_else(|_| "xray".into()));
-    let core_versions = reported_cores(&binary);
+    let mut core_cache = CoreVersionCache::default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
@@ -87,59 +87,84 @@ async fn run() -> Result<()> {
     let diagnostic_url = format!("{}/api/agent/{}/diagnostics", panel.trim_end_matches('/'), node);
     let diagnostics = tokio::spawn(async move {
         let mut reply = serde_json::json!({});
+        let mut last_log = std::time::Instant::now() - Duration::from_secs(60);
         loop {
-            if let Ok(response) = diagnostic_client.post(&diagnostic_url).bearer_auth(&diagnostic_token).json(&reply).send().await {
-                if response.status().is_success() {
-                    if let Ok(value) = response.json::<serde_json::Value>().await {
-                        reply = serde_json::json!({});
-                        if let Some(id) = value["id"].as_str() {
-                            let task = &value["request"];
-                            let result = match task["operation"].as_str() {
-                                Some("path" | "reality" | "reality-preflight") if blocked =>
-                                    Err(anyhow::anyhow!("代理内核已隔离，请通过维护入口修复")),
-                                Some("logs") => {
-                                    match serde_json::from_value::<chain_panel::diagnostics::LogRequest>(task["request"].clone()) {
-                                        Ok(request) if request.source != "panel" => {
-                                            let path = diagnostic_dir.clone();
-                                            match tokio::task::spawn_blocking(move || chain_panel::diagnostics::read(&path, &request)).await {
-                                                Ok(result) => result,
-                                                Err(e) => Err(anyhow::anyhow!("日志读取失败: {e}")),
-                                            }
+            match diagnostic_client.post(&diagnostic_url).bearer_auth(&diagnostic_token).json(&reply).send().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<serde_json::Value>().await {
+                        Ok(value) => {
+                            reply = serde_json::json!({});
+                            if let Some(id) = value["id"].as_str() {
+                                let task = &value["request"];
+                                let result = match task["operation"].as_str() {
+                                    Some("path" | "reality" | "reality-preflight") if blocked =>
+                                        Err(anyhow::anyhow!("代理内核已隔离，请通过维护入口修复")),
+                                    Some("logs") => {
+                                        match serde_json::from_value::<chain_panel::diagnostics::LogRequest>(task["request"].clone()) {
+                                            Ok(request) if request.source != "panel" => {
+                                                let path = diagnostic_dir.clone();
+                                                match tokio::task::spawn_blocking(move || chain_panel::diagnostics::read(&path, &request)).await {
+                                                    Ok(result) => result,
+                                                    Err(e) => Err(anyhow::anyhow!("日志读取失败: {e}")),
+                                                }
+                                            },
+                                            _ => Err(anyhow::anyhow!("日志来源无效")),
+                                        }
+                                    },
+                                    Some("path") => {
+                                        match tokio::time::timeout(Duration::from_secs(35), chain_panel::runtime::diagnose_path(&diagnostic_binary, &diagnostic_dir, task["request"]["line_id"].as_str().unwrap_or(""), task["request"]["url"].as_str().unwrap_or(""))).await {
+                                            Ok(result) => result,
+                                            Err(_) => Err(anyhow::anyhow!("出口诊断超时；隔离进程已停止")),
+                                        }
+                                    },
+                                    Some("reality-candidates") => match tokio::time::timeout(Duration::from_secs(45), chain_panel::reality_candidates::recommend()).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(anyhow::anyhow!("目标推荐超时；未填入默认域名，请稍后重试")),
+                                    },
+                                    Some("reality-preflight") => match serde_json::from_value::<RealityTarget>(task["request"].clone()) {
+                                        Ok(input) => match tokio::time::timeout(Duration::from_secs(60), chain_panel::reality_candidates::preflight(&diagnostic_binary, &input)).await {
+                                            Ok(result) => result,
+                                            Err(_) => Err(anyhow::anyhow!("REALITY 检查超时；请稍后重试")),
                                         },
-                                        _ => Err(anyhow::anyhow!("日志来源无效")),
-                                    }
-                                },
-                                Some("path") => {
-                                    match tokio::time::timeout(Duration::from_secs(35), chain_panel::runtime::diagnose_path(&diagnostic_binary, &diagnostic_dir, task["request"]["line_id"].as_str().unwrap_or(""), task["request"]["url"].as_str().unwrap_or(""))).await {
-                                        Ok(result) => result,
-                                        Err(_) => Err(anyhow::anyhow!("出口诊断超时；隔离进程已停止")),
-                                    }
-                                },
-                                Some("reality-candidates") => match tokio::time::timeout(Duration::from_secs(45), chain_panel::reality_candidates::recommend()).await {
-                                    Ok(result) => result,
-                                    Err(_) => Err(anyhow::anyhow!("目标推荐超时；未填入默认域名，请稍后重试")),
-                                },
-                                Some("reality-preflight") => match serde_json::from_value::<RealityTarget>(task["request"].clone()) {
-                                    Ok(input) => match tokio::time::timeout(Duration::from_secs(60), chain_panel::reality_candidates::preflight(&diagnostic_binary, &input)).await {
-                                        Ok(result) => result,
-                                        Err(_) => Err(anyhow::anyhow!("REALITY 发布检查超时，已阻止发布；请稍后重试")),
+                                        Err(e) => Err(e.into()),
                                     },
-                                    Err(e) => Err(e.into()),
-                                },
-                                Some("reality") => match serde_json::from_value::<RealityTarget>(task["request"].clone()) {
-                                    Ok(input) => match tokio::time::timeout(Duration::from_secs(45), chain_panel::diagnostics::reality(&diagnostic_binary, &input)).await {
-                                        Ok(result) => result,
-                                        Err(_) => Ok(serde_json::json!({"ok":false,"status":"unverified","detail":"隔离 REALITY 检测超时，临时进程已终止；没有修改运行中的代理"})),
+                                    Some("reality") => match serde_json::from_value::<RealityTarget>(task["request"].clone()) {
+                                        Ok(input) => match tokio::time::timeout(Duration::from_secs(45), chain_panel::diagnostics::reality(&diagnostic_binary, &input)).await {
+                                            Ok(result) => result,
+                                            Err(_) => Ok(serde_json::json!({"ok":false,"status":"unverified","detail":"隔离 REALITY 检测超时，临时进程已终止；没有修改运行中的代理"})),
+                                        },
+                                        Err(e) => Err(e.into()),
                                     },
-                                    Err(e) => Err(e.into()),
-                                },
-                                _ => Err(anyhow::anyhow!("诊断操作无效")),
-                            };
-                            let mut result = result.unwrap_or_else(|e| serde_json::json!({"error":chain_panel::diagnostics::redact(&format!("{e:#}"))}));
-                            result["clock"] = diagnostic_clock.lock().unwrap().clone();
-                            reply = serde_json::json!({"id":id,"result":result});
-                            continue;
+                                    _ => Err(anyhow::anyhow!("诊断操作无效")),
+                                };
+                                let mut result = result.unwrap_or_else(|e| serde_json::json!({"error":chain_panel::diagnostics::redact(&format!("{e:#}"))}));
+                                result["clock"] = diagnostic_clock.lock().unwrap().clone();
+                                reply = serde_json::json!({"id":id,"result":result});
+                                continue;
+                            }
                         }
+                        Err(e) => {
+                            if last_log.elapsed() >= Duration::from_secs(30) {
+                                eprintln!("诊断轮询响应解析失败: {e}");
+                                last_log = std::time::Instant::now();
+                            }
+                        }
+                    }
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_client_error() && reply.get("id").is_some() {
+                        eprintln!("诊断回执被控制台拒绝（HTTP {status}），丢弃异常回执以恢复轮询");
+                        reply = serde_json::json!({});
+                    } else if last_log.elapsed() >= Duration::from_secs(30) {
+                        eprintln!("诊断轮询返回 HTTP {status}");
+                        last_log = std::time::Instant::now();
+                    }
+                }
+                Err(e) => {
+                    if last_log.elapsed() >= Duration::from_secs(30) {
+                        eprintln!("诊断轮询连接异常: {}", e.without_url());
+                        last_log = std::time::Instant::now();
                     }
                 }
             }
@@ -190,10 +215,7 @@ async fn run() -> Result<()> {
                 certificate_checked = now();
             }
             report.system["clock"] = clock.lock().unwrap().clone();
-            report.system["diagnostics_version"] = serde_json::json!(1);
-            report.system["reality_candidates_version"] = serde_json::json!(1);
-            report.system["reality_preflight_version"] = serde_json::json!(1);
-            report.system["cores"] = core_versions.clone();
+            report.system["cores"] = core_cache.refresh(&runtime.binary);
             report.system["certificate_expiry"] = certificate_expiry.clone();
             let ingress_status = std::env::var_os("CHAIN_INGRESS_STATUS")
                 .map(PathBuf::from)
@@ -280,24 +302,76 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn reported_cores(xray: &std::path::Path) -> serde_json::Value {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
+#[derive(Default)]
+struct CoreVersionCache {
+    fingerprint: Option<(Option<PathBuf>, Option<std::time::SystemTime>, Option<PathBuf>, Option<std::time::SystemTime>)>,
+    versions: serde_json::Value,
+}
+
+impl CoreVersionCache {
+    fn refresh(&mut self, xray: &std::path::Path) -> serde_json::Value {
+        let mihomo = std::env::var_os("CHAIN_MIHOMO_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| xray.with_file_name("mihomo"));
+        let stat = |p: &std::path::Path| {
+            (p.canonicalize().ok(), std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        };
+        let (xp, xm) = stat(xray);
+        let (mp, mm) = stat(&mihomo);
+        let fp = (xp, xm, mp, mm);
+        if self.fingerprint.as_ref() != Some(&fp) {
+            self.versions = detect_core_versions(xray, &mihomo);
+            self.fingerprint = Some(fp);
+        }
+        self.versions.clone()
+    }
+}
+
+fn detect_core_versions(xray: &std::path::Path, mihomo: &std::path::Path) -> serde_json::Value {
     let mut result = serde_json::json!({});
-    let Some(root) = xray.canonicalize().ok().and_then(|p| p.parent()?.parent().map(std::path::Path::to_path_buf)) else { return result; };
-    let Some(manifest) = std::fs::read(root.join("release.json")).ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return result; };
-    for core in ["xray", "mihomo"] {
-        let path = if core == "mihomo" { std::env::var_os("CHAIN_MIHOMO_BIN").map(PathBuf::from).unwrap_or_else(|| xray.with_file_name("mihomo")) } else { xray.to_path_buf() };
-        let checked = (|| -> Result<String> {
-            let mut file = std::fs::File::open(path)?;
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 65536];
-            loop { let n = file.read(&mut buffer)?; if n == 0 { break; } hash.update(&buffer[..n]); }
-            ensure!(hex::encode(hash.finalize()) == manifest["files"][format!("bin/{core}")]["sha256"].as_str().unwrap_or(""), "内核摘要与发行记录不一致");
-            Ok(manifest[core].as_str().context("缺少内核版本")?.into())
-        })();
-        if let Ok(version) = checked { result[core] = serde_json::json!(version); }
+    for (core, path, flag) in [("xray", xray, "version"), ("mihomo", mihomo, "-v")] {
+        let manifest = path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent()?.parent().map(std::path::Path::to_path_buf))
+            .and_then(|root| std::fs::read(root.join("release.json")).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        if let Some(version) = manifest.as_ref().and_then(|m| m[core].as_str()).filter(|v| !v.is_empty())
+            && path.is_file()
+        {
+            result[core] = serde_json::json!(version);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        match std::process::Command::new(path).arg(flag).output() {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if let Some(version) = parse_core_version(core, &text) {
+                    result[core] = serde_json::json!(version);
+                }
+            }
+            Ok(output) => {
+                eprintln!("读取 {core} 版本返回非零状态: {}", output.status);
+            }
+            Err(e) => {
+                eprintln!("读取 {core} 版本失败 ({}): {e}", path.display());
+            }
+        }
     }
     result
+}
+
+fn parse_core_version(core: &str, text: &str) -> Option<String> {
+    let line = text.lines().next()?.trim();
+    let tokens: Vec<_> = line.split_whitespace().collect();
+    let raw = if core == "xray" {
+        // "Xray 26.2.6 (Xray, Penetrates Everything.) ..."
+        tokens.get(1).copied()
+    } else {
+        // "Mihomo Meta v1.19.33 linux amd64 ..."
+        tokens.iter().copied().find(|t| t.strip_prefix('v').unwrap_or(t).chars().next().is_some_and(|c| c.is_ascii_digit()))
+    }?;
+    Some(raw.trim_start_matches('v').to_string())
 }

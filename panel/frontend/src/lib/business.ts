@@ -1,3 +1,5 @@
+import type { Line, PanelState, Term } from "../types";
+
 export const beijingTime = (timestamp: number | null | undefined) => timestamp
   ? new Date(timestamp * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })
   : "尚未开通";
@@ -25,7 +27,6 @@ export function recentDays(now: number, values: Record<string, [number, number]>
     return { date, upload, download };
   });
 }
-import type { Line, PanelState, Term } from "../types";
 
 export const terms: { id: Term; name: string; months: number }[] = [
   { id: "monthly", name: "月付", months: 1 },
@@ -33,25 +34,24 @@ export const terms: { id: Term; name: string; months: number }[] = [
   { id: "yearly", name: "年付", months: 12 },
 ];
 
-
 export const endpoint = (host: string, port: number | string) =>
   `${host.includes(":") && !host.startsWith("[") ? `[${host}]` : host}:${port}`;
 
 export function lineEndpoint({ access, hops }: Line, nodes: PanelState["nodes"]) {
   const entry = hops[0];
   const tls = access.tls;
-  const host = access.host || access.public_host ||
+  const host = access.host ||
     (tls?.mode === "auto" || tls?.mode === "manual"
       ? tls.domain
       : nodes?.find(node => node.id === entry?.node_id)?.host);
-  const port = access.public_port ?? entry?.port;
+  const port = entry?.port;
   if (!port) return host || "—";
   return host ? endpoint(host, port) : `端口 ${port}`;
 }
 
 export function parseExternalSummary(raw: string): { protocol: string; target: string } {
   const link = raw.trim();
-  const scheme = /^(vmess|mihomo|ss|vless|trojan|socks5?|https?|hy2|hysteria2|tuic):\/\//i.exec(link)?.[1].toLowerCase();
+  const scheme = /^(vmess|mihomo|ssr?|vless|trojan|socks5?|https?|hy2|hysteria2|tuic):\/\//i.exec(link)?.[1].toLowerCase();
   const unknown = "地址未知";
   let protocol = scheme?.toUpperCase() || "NODE";
   const address = (host: unknown, port: unknown) => {
@@ -59,9 +59,11 @@ export function parseExternalSummary(raw: string): { protocol: string; target: s
     if (!/^\d{1,5}$/.test(String(port)) || Number(port) < 1 || Number(port) > 65535) return "";
     return endpoint(host.replace(/^\[|\]$/g, ""), Number(port));
   };
-  const decode = (payload: string) => new TextDecoder().decode(
-    Uint8Array.from(atob(payload.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)),
-  );
+  const decode = (payload: string) => {
+    const clean = payload.split(/[?#]/, 1)[0].replace(/\/$/, "").replace(/-/g, "+").replace(/_/g, "/");
+    const padded = clean + "=".repeat((4 - (clean.length % 4)) % 4);
+    return new TextDecoder().decode(Uint8Array.from(atob(padded), c => c.charCodeAt(0)));
+  };
   const nativeProtocol = (type: unknown) =>
     typeof type === "string" && /^(vless|vmess|trojan|ss|ssr|snell|wireguard|shadowquic|http|socks5|hysteria2?|tuic|anytls)$/.test(type)
       ? type.toUpperCase() : "MIHOMO";
@@ -76,6 +78,19 @@ export function parseExternalSummary(raw: string): { protocol: string; target: s
       const target = servers.map(peer => address(peer?.server, peer?.port)).filter(Boolean).join("、");
       return { protocol, target: target || unknown };
     }
+    if (scheme === "ssr") {
+      const decoded = decode(payload);
+      const lastColon = decoded.lastIndexOf(":");
+      const portSep = lastColon > 0 ? decoded.lastIndexOf(":", lastColon - 1) : -1;
+      const parts = decoded.split(":");
+      if (parts.length >= 6) {
+        const host = parts.slice(0, parts.length - 5).join(":");
+        const port = parts[parts.length - 5];
+        return { protocol, target: address(host, port) || unknown };
+      }
+      if (portSep > 0) return { protocol, target: unknown };
+      return { protocol, target: unknown };
+    }
     if (scheme) {
       const mainPart = payload.split(/[?#]/, 1)[0].replace(/\/$/, "");
       const legacySS = scheme === "ss" && !mainPart.includes("@");
@@ -89,7 +104,9 @@ export function parseExternalSummary(raw: string): { protocol: string; target: s
       const port = link.match(/\bport["']?\s*:\s*["']?(\d+)/i)?.[1];
       return { protocol, target: address(host, port) || unknown };
     }
-  } catch {}
+  } catch {
+    return { protocol, target: unknown };
+  }
   return { protocol, target: unknown };
 }
 
@@ -104,8 +121,8 @@ export function matchesLine(
     const node = state.nodes?.find(node => node.id === hop.node_id);
     return `${node?.name || ""} ${node?.host || ""} ${hop.port}`;
   });
-  const fields = [extra, line.name, customer?.name, ...nodes, lineEndpoint(line, state.nodes), line.access.host, line.access.public_host,
-    line.access.public_port, line.access.tls?.domain].join(" ").toLowerCase();
+  const fields = [extra, line.name, customer?.name, ...nodes, lineEndpoint(line, state.nodes), line.access.host,
+    line.access.tls?.domain].join(" ").toLowerCase();
   return search.toLowerCase().trim().split(/\s+/).every(word => fields.includes(word));
 }
 

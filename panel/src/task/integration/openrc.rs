@@ -211,35 +211,36 @@ pub async fn run(args: &Options) -> Result<()> {
     fs::create_dir("/etc/native-test-cert")?;
     let cert = Path::new("/etc/native-test-cert/cert.pem");
     let key = Path::new("/etc/native-test-cert/key.pem");
-    work.run(
-        &work.root,
-        &strings(&[
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:prime256v1",
-            "-nodes",
-            "-days",
-            "90",
-            "-subj",
-            "/CN=panel.test",
-            "-addext",
-            "subjectAltName=DNS:panel.test",
-            "-addext",
-            "basicConstraints=critical,CA:FALSE",
-            "-out",
-            cert.to_str().unwrap(),
-            "-keyout",
-            key.to_str().unwrap(),
-        ]),
-    )
-    .await?;
     if core_repair {
         fs::copy("/controller/cert.pem", &cert)?;
         fs::copy("/controller/key.pem", &key)?;
+    } else {
+        work.run(
+            &work.root,
+            &strings(&[
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-days",
+                "90",
+                "-subj",
+                "/CN=panel.test",
+                "-addext",
+                "subjectAltName=DNS:panel.test",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-out",
+                cert.to_str().unwrap(),
+                "-keyout",
+                key.to_str().unwrap(),
+            ]),
+        )
+        .await?;
     }
     writeln!(
         fs::OpenOptions::new().append(true).open("/etc/hosts")?,
@@ -465,9 +466,12 @@ pub async fn run(args: &Options) -> Result<()> {
         }).await?;
         let invite = api(&client, &base, "fleet/invite", Some(&json!({})), &mut cookie).await?;
         let remote = api(&client, controller_base, "fleet/connect", Some(&json!({"name":"old-vps","code":invite["code"],"url":base})), &mut controller_cookie).await?["id"].clone();
+        wait("总控远端快照就绪", async || {
+            let fleet = api(&client, controller_base, "fleet", None, &mut controller_cookie).await?;
+            Ok(!fleet["remotes"][0]["snapshot"].is_null())
+        }).await?;
         for (core, version) in [("xray", "26.10.31"), ("mihomo", "1.19.33")] {
             let id = uuid::Uuid::new_v4().to_string();
-            tokio::time::sleep(Duration::from_secs(12)).await;
             api(&client, controller_base, "fleet/batch", Some(&json!({"id":id,"action":"core-upgrade","targets":[remote],"core":core,"version":version,"security_update":true,"rollback_safe":false})), &mut controller_cookie).await?;
             let deadline = std::time::Instant::now() + Duration::from_secs(180);
             loop {
@@ -617,14 +621,37 @@ async fn core_task(client: &reqwest::Client, base: &str, cookie: &mut String, mu
     value["id"] = json!(id);
     api(client, base, "federation/task", Some(&value), cookie).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let mut last_error;
     loop {
         let job = match api(client, base, &format!("federation/task?id={id}"), None, cookie).await {
             Ok(job) => job,
-            Err(_) if value["action"] == "upgrade" => {
+            Err(error) if value["action"] == "upgrade" => {
+                let text = format!("{error:#}");
+                if text.starts_with("API 400")
+                    || text.starts_with("API 403")
+                    || text.starts_with("API 404")
+                    || text.starts_with("API 422")
+                {
+                    return Err(error);
+                }
+                last_error = text;
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 cookie.clear();
-                let _ = api(client, base, "login", Some(&json!({"token":fs::read_to_string("/var/lib/chain-panel/admin-token")?.trim()})), cookie).await;
-                ensure!(std::time::Instant::now() < deadline, "程序升级后管理连接未恢复");
+                if let Err(login_err) = api(
+                    client,
+                    base,
+                    "login",
+                    Some(&json!({"token":fs::read_to_string("/var/lib/chain-panel/admin-token")?.trim()})),
+                    cookie,
+                )
+                .await
+                {
+                    last_error = format!("{last_error}；重登失败：{login_err:#}");
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "程序升级后管理连接未恢复：{last_error}"
+                );
                 continue;
             }
             Err(error) => return Err(error),

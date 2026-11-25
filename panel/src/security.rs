@@ -54,9 +54,8 @@ impl Role {
             ("POST", ["api", "customer-plans", id, "query-link"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok(),
             ("POST", ["api", "customer-plans", id, "members", member, "query-link"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok() && uuid::Uuid::parse_str(member).is_ok(),
             ("POST", ["api", "customers"] | ["api", "rentals", "renew" | "contact" | "orders" | "adjustments"]) => self == Self::Finance,
-            ("GET", ["api", "rentals", "context"]) => self == Self::Finance,
             ("GET", ["api", "rentals", "orders" | "adjustments", "by-request", id]) => self == Self::Finance && !id.is_empty(),
-            ("DELETE", ["api", "customers", id]) | ("POST", ["api", "rentals", id] | ["api", "rentals", id, "query-link"] | ["api", "rentals", "orders", id, "confirm" | "cancel"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok(),
+            ("DELETE", ["api", "customers" | "customer-plans", id]) | ("POST", ["api", "rentals", id] | ["api", "rentals", id, "query-link"] | ["api", "rentals", "orders", id, "confirm" | "cancel"]) => self == Self::Finance && uuid::Uuid::parse_str(id).is_ok(),
             _ => false,
         }
     }
@@ -82,17 +81,24 @@ pub fn state_for(value: serde_json::Value, actor: &Actor) -> serde_json::Value {
         n["host"] = if actor.role == Role::Ops { node["host"].clone() } else { json!("") };
         n["target"] = json!(""); n["server_name"] = json!("");
         n["report"] = fields(&node["report"], &["running", "applied", "revision", "traffic"]);
-        n["report"]["error"] = json!(if node["report"]["error"].as_str().is_some_and(|s| !s.is_empty()) { "节点运行异常，请联系管理员" } else { "" });
+        let raw_err = node["report"]["error"].as_str().unwrap_or("");
+        n["report"]["error"] = json!(if raw_err.is_empty() {
+            String::new()
+        } else if actor.role == Role::Ops {
+            crate::diagnostics::redact(raw_err)
+        } else {
+            "节点运行异常，请联系管理员".into()
+        });
         n["report"]["system"] = fields(&node["report"]["system"], &["memory_total", "memory_used", "load_1m", "network_rx", "network_tx", "sampled_at", "cpu_percent", "disk_total", "disk_used", "network_rx_bps", "network_tx_bps", "agent_version"]);
         n
     }).collect::<Vec<_>>());
     out["lines"] = json!(value["lines"].as_array().into_iter().flatten().map(|line| {
-        let mut l = fields(line, &["id", "name", "kind", "enabled", "published", "limits", "traffic", "rental_status", "sync_status", "multiplier", "network"]);
+        let mut l = fields(line, &["id", "name", "kind", "enabled", "published", "limits", "traffic", "rental_status", "sync_status", "multiplier"]);
         l["hops"] = json!(line["hops"].as_array().into_iter().flatten().map(|h| fields(h, &["node_id", "port"])).collect::<Vec<_>>());
         l["access"] = json!(crate::model::Access::default());
         l["access"]["protocol"] = line["access"]["protocol"].clone();
-        l["share"] = Value::Null; l["external_id"] = Value::Null; l["target"] = json!(""); l["chain"] = json!([]);
-        l["rental"] = if actor.role == Role::Finance { fields(&line["rental"], &["customer_id", "prices", "started_at", "expires_at", "paid_months", "next_reset_at", "query_link_exists", "permanent"]) } else { Value::Null };
+        l["share"] = Value::Null; l["chain"] = json!([]);
+        l["rental"] = if actor.role == Role::Finance { fields(&line["rental"], &["customer_id", "prices", "started_at", "expires_at", "next_reset_at", "query_link_exists", "permanent"]) } else { Value::Null };
         if line["rental"].is_null() { l["rental"] = Value::Null; }
         if actor.role == Role::Finance {
             l["customer_plan_id"] = line["customer_plan_id"].clone();
@@ -100,10 +106,40 @@ pub fn state_for(value: serde_json::Value, actor: &Actor) -> serde_json::Value {
         }
         l
     }).collect::<Vec<_>>());
-    for key in ["externals", "legacy_configs", "pending_imports", "subscriptions", "resources", "alerts"] { out[key] = json!([]); }
-    out["checks"] = json!({});
+    for key in ["externals", "legacy_configs", "pending_imports", "subscriptions", "resources"] { out[key] = json!([]); }
+    out["alerts"] = if actor.role == Role::Ops {
+        json!(value["alerts"].as_array().into_iter().flatten().map(|a| {
+            let mut item = fields(a, &["id", "level"]);
+            item["message"] = json!(crate::diagnostics::redact(a["message"].as_str().unwrap_or("")));
+            item
+        }).collect::<Vec<_>>())
+    } else {
+        json!([])
+    };
+    out["checks"] = if actor.role == Role::Ops {
+        Value::Object(value["checks"].as_object().into_iter().flatten().map(|(k, v)| {
+            let mut item = fields(v, &["ok", "checked_at", "stage"]);
+            if let Some(detail) = v["detail"].as_str() {
+                item["detail"] = json!(crate::diagnostics::redact(detail));
+            }
+            (k.clone(), item)
+        }).collect())
+    } else {
+        json!({})
+    };
     out["jobs"] = json!(value["jobs"].as_array().into_iter().flatten().map(|job| {
-        let mut j = fields(job, &["id", "state", "started", "actor"]); j["events"] = json!([]); j
+        let mut j = fields(job, &["id", "state", "started", "actor"]);
+        j["events"] = if actor.role == Role::Ops {
+            json!(job["events"].as_array().into_iter().flatten().map(|ev| {
+                json!({
+                    "at": ev["at"],
+                    "message": crate::diagnostics::redact(ev["message"].as_str().unwrap_or("")),
+                })
+            }).collect::<Vec<_>>())
+        } else {
+            json!([])
+        };
+        j
     }).collect::<Vec<_>>());
     out["security"] = json!({"totp_enabled":false,"recovery_remaining":0,"origin":"","passkeys":[]});
     for key in ["customers", "payments", "rental_orders", "payment_adjustments", "customer_plans"] {
@@ -158,7 +194,7 @@ pub fn second_factor(security: &mut Security, code: &str) -> Result<()> {
     }
     anyhow::bail!("请输入未使用的动态验证码或恢复码")
 }
-pub fn engine(origin: &str) -> Result<Webauthn> {
+pub fn engine(origin: &str) -> Result<(Webauthn, String)> {
     let url = url::Url::parse(origin).context("请输入完整 HTTPS 控制台地址")?;
     let host = url.host_str().context("控制台地址缺少域名")?;
     ensure!(
@@ -177,9 +213,13 @@ pub fn engine(origin: &str) -> Result<Webauthn> {
         matches!(url.host(), Some(url::Host::Domain(_))),
         "Passkey 请使用稳定的域名"
     );
-    Ok(WebauthnBuilder::new(host, &url)?
-        .rp_name("Chain Panel")
-        .build()?)
+    let normalized = url.origin().ascii_serialization();
+    Ok((
+        WebauthnBuilder::new(host, &url)?
+            .rp_name("Chain Panel")
+            .build()?,
+        normalized,
+    ))
 }
 pub enum Challenge {
     Register {
@@ -201,25 +241,65 @@ impl Challenge {
             Self::Register { expires, .. } | Self::Login { expires, .. } => *expires,
         }
     }
+    fn is_register(&self) -> bool {
+        matches!(self, Self::Register { .. })
+    }
 }
 #[derive(Default)]
 pub struct AuthState {
     pub challenges: Mutex<HashMap<String, Challenge>>,
     pub enroll: Mutex<HashMap<String, (String, u64)>>,
-    pub failures: Mutex<Vec<u64>>,
+    pub failures: Mutex<HashMap<String, Vec<u64>>>,
 }
 impl AuthState {
-    pub fn rate_limit(&self) -> Result<()> {
-        let mut recent = self.failures.lock().unwrap();
-        recent.retain(|t| now().saturating_sub(*t) < 60);
-        ensure!(recent.len() < 30, "登录尝试过于频繁，请一分钟后重试");
-        recent.push(now());
+    pub fn check_rate_limit(&self, bucket: &str) -> Result<()> {
+        let at = now();
+        let mut map = self.failures.lock().unwrap();
+        map.retain(|_, list| {
+            list.retain(|t| at.saturating_sub(*t) < 60);
+            !list.is_empty()
+        });
+        if let Some(recent) = map.get(bucket) {
+            ensure!(recent.len() < 30, "验证尝试过于频繁，请一分钟后重试");
+        }
+        ensure!(
+            map.len() < 4096 || map.contains_key(bucket),
+            "认证请求繁忙，请稍后重试"
+        );
+        Ok(())
+    }
+    pub fn record_failure(&self, bucket: &str) {
+        let at = now();
+        let mut map = self.failures.lock().unwrap();
+        if map.len() >= 4096 && !map.contains_key(bucket) {
+            map.retain(|_, list| {
+                list.retain(|t| at.saturating_sub(*t) < 60);
+                !list.is_empty()
+            });
+            if map.len() >= 4096
+                && let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, list)| list.last().copied().unwrap_or(0))
+                    .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.entry(bucket.into()).or_default().push(at);
+    }
+    pub fn rate_limit(&self, bucket: &str) -> Result<()> {
+        self.check_rate_limit(bucket)?;
+        self.record_failure(bucket);
         Ok(())
     }
     pub fn insert(&self, id: String, challenge: Challenge) -> Result<()> {
+        let at = now();
         let mut pending = self.challenges.lock().unwrap();
-        pending.retain(|_, v| v.expires() > now());
-        ensure!(pending.len() < 100, "验证请求过多，请稍后重试");
+        pending.retain(|_, v| v.expires() > at);
+        let is_reg = challenge.is_register();
+        let count = pending.values().filter(|v| v.is_register() == is_reg).count();
+        let limit = if is_reg { 32 } else { 100 };
+        ensure!(count < limit, "验证请求过多，请稍后重试");
         pending.insert(id, challenge);
         Ok(())
     }
@@ -292,20 +372,31 @@ mod tests {
     fn finance_state_excludes_credentials_and_other_members_cannot_read_billing() {
         use serde_json::json;
         let raw = json!({"nodes":[{"id":"node","host":"192.0.2.1","target":"secret-marker","report":{
-            "error":"secret-marker","running":true,"traffic":{},"system":{"private_key":"secret-marker","cpu_percent":10}}}],
+            "error":"连接超时 vless://secret-marker@192.0.2.1:443","running":true,"traffic":{},"system":{"private_key":"secret-marker","cpu_percent":10}}}],
             "lines":[{"id":"line","name":"线路","hops":[{"node_id":"node","port":443,"uuid":"secret-marker"}],
                 "share":"secret-marker","access":{"protocol":"vless","password":"secret-marker","tls":{"key":"secret-marker"}},
-                "chain":["secret-marker"],"target":"secret-marker","rental":{"customer_id":"customer","prices":{"monthly":2000},"query_token_hash":"secret-marker"},
+                "chain":["secret-marker"],"rental":{"customer_id":"customer","prices":{"monthly":2000},"query_token_hash":"secret-marker"},
                 "customer_plan_id":"plan","plan_eligible":false}],
             "customers":[{"id":"customer","name":"客户","contact":"private-contact"}],"payments":[{"amount_fen":2000}],
             "externals":[{"url":"secret-marker"}],"subscriptions":[{"token":"secret-marker"}],"legacy_configs":[{"config":"secret-marker"}],
-            "security":{"totp_secret":"secret-marker"},"jobs":[{"id":"job","state":"failed","events":[{"message":"secret-marker"}]}],
-            "checks":{"line":{"detail":"secret-marker"}},"unknown_future_secret":"secret-marker","customer_query_tokens":{"plan":"secret-marker"},"customer_plans":[{"id":"plan"}]});
+            "alerts":[{"id":"node-1","level":"error","message":"启动失败 password=secret-marker"}],
+            "security":{"totp_secret":"secret-marker"},"jobs":[{"id":"job","state":"failed","events":[{"at":1,"message":"下发失败 token=secret-marker"}]}],
+            "checks":{"line":{"ok":false,"checked_at":1,"detail":"探测失败 vless://secret-marker@192.0.2.1:443"}},"unknown_future_secret":"secret-marker","customer_query_tokens":{"plan":"secret-marker"},"customer_plans":[{"id":"plan"}]});
         for role in [Role::Ops, Role::Finance, Role::Viewer] {
             let actor = Actor { id: "member".into(), name: "成员".into(), role };
             let view = state_for(raw.clone(), &actor);
             assert!(!view.to_string().contains("secret-marker"), "{role:?}");
             assert_eq!(view["viewer"]["role"], json!(role));
+            if role == Role::Ops {
+                assert!(view["nodes"][0]["report"]["error"].as_str().unwrap().contains("连接超时"));
+                assert!(view["checks"]["line"]["detail"].as_str().unwrap().contains("探测失败"));
+                assert!(view["jobs"][0]["events"][0]["message"].as_str().unwrap().contains("下发失败"));
+                assert!(view["alerts"][0]["message"].as_str().unwrap().contains("启动失败"));
+            } else {
+                assert_eq!(view["checks"], json!({}));
+                assert_eq!(view["jobs"][0]["events"], json!([]));
+                assert_eq!(view["alerts"], json!([]));
+            }
             if role == Role::Finance {
                 assert_eq!(view["customers"][0]["contact"], "private-contact");
                 assert_eq!(view["payments"][0]["amount_fen"], 2000);

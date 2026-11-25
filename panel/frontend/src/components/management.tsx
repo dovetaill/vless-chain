@@ -87,9 +87,11 @@ export const defaultPolicy: Policy = {
 export function PolicyFields({
   value,
   change,
+  compact = false,
 }: {
   value: Policy;
   change: (value: Policy) => void;
+  compact?: boolean;
 }) {
   return (
     <div className="space-y-4">
@@ -107,8 +109,14 @@ export function PolicyFields({
         </InfoTip>
       </div>
 
-      <div className="grid items-end gap-3.5 md:grid-cols-2 lg:grid-cols-3">
-        <div className="md:col-span-2 lg:col-span-3">
+      <div
+        className={
+          compact
+            ? "grid items-end gap-3.5 sm:grid-cols-2"
+            : "grid items-end gap-3.5 md:grid-cols-2 lg:grid-cols-3"
+        }
+      >
+        <div className={compact ? "sm:col-span-2" : "md:col-span-2 lg:col-span-3"}>
           <Field label="检测目标（HTTP / HTTPS）">
             <Input
               value={value.url}
@@ -154,20 +162,22 @@ export function PolicyFields({
             }
           />
         </Field>
-        <Field label="到期提醒天数（0 表示到期当天）">
-          <Input
-            defaultValue={value.expiry_days.join(",")}
-            onChange={(e) =>
-              change({
-                ...value,
-                expiry_days: e.target.value
-                  .split(",")
-                  .filter((v) => v.trim())
-                  .map(Number),
-              })
-            }
-          />
-        </Field>
+        <div className={compact ? "sm:col-span-2" : ""}>
+          <Field label="到期提醒天数（0 表示到期当天）">
+            <Input
+              defaultValue={value.expiry_days.join(",")}
+              onChange={(e) =>
+                change({
+                  ...value,
+                  expiry_days: e.target.value
+                    .split(",")
+                    .filter((v) => v.trim())
+                    .map(Number),
+                })
+              }
+            />
+          </Field>
+        </div>
       </div>
     </div>
   );
@@ -1000,5 +1010,3 @@ export function Monitoring({
     </div>
   );
 }
-
-export { Fleet } from "./fleet";

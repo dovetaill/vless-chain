@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, Request, State},
@@ -21,6 +21,20 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
+
+macro_rules! ensure {
+    ($condition:expr $(,)?) => {
+        if !($condition) {
+            return Err(anyhow::anyhow!(concat!("Condition failed: `", stringify!($condition), "`")).into());
+        }
+    };
+    ($condition:expr, $($message:tt)+) => {
+        if !($condition) {
+            return Err(anyhow::anyhow!($($message)+).into());
+        }
+    };
+}
+
 #[path = "../delivery_api.rs"]
 mod delivery_api;
 #[path = "../rental_api.rs"]
@@ -46,8 +60,12 @@ struct Store {
 }
 fn open_panel_database(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY,body TEXT NOT NULL);")?;
-    install_state_write_guard(&conn)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+         CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY,body TEXT NOT NULL);
+         DROP TRIGGER IF EXISTS state_preserve_operations_insert;
+         DROP TRIGGER IF EXISTS state_preserve_operations_update;",
+    )?;
     Ok(conn)
 }
 impl Store {
@@ -55,43 +73,6 @@ impl Store {
         self.conn.execute("INSERT INTO state(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body",[serde_json::to_string(&self.doc)?])?;
         Ok(())
     }
-}
-const PROTECTED_STATE_FIELDS: [&str; 7] = [
-    "rental_orders", "payment_adjustments", "customer_plans", "customer_ledgers",
-    "customer_query_tokens", "operator_members", "operator_audit",
-];
-fn install_state_write_guard(conn: &Connection) -> Result<()> {
-    let any_present = |expr: &str| {
-        PROTECTED_STATE_FIELDS
-            .map(|key| format!("json_type({expr}, '$.{key}') IS NOT NULL"))
-            .join(" OR ")
-    };
-    let any_missing = PROTECTED_STATE_FIELDS
-        .map(|key| format!("json_type(NEW.body, '$.{key}') IS NULL"))
-        .join(" OR ");
-    // Persist the boundary in SQLite so a previous binary cannot silently discard new fields.
-    for (name, event, has_previous) in [
-        (
-            "insert",
-            "INSERT",
-            format!("COALESCE((SELECT ({}) FROM state WHERE id=NEW.id), 0)", any_present("body")),
-        ),
-        (
-            "update",
-            "UPDATE OF body",
-            format!("({})", any_present("OLD.body")),
-        ),
-    ] {
-        conn.execute_batch(&format!(
-            "DROP TRIGGER IF EXISTS state_preserve_operations_{name};
-             CREATE TRIGGER state_preserve_operations_{name}
-             BEFORE {event} ON state
-             WHEN {has_previous}
-              AND ({any_missing})
-             BEGIN SELECT RAISE(ABORT, '数据库含新版业务字段，拒绝旧程序覆盖；请恢复兼容版本，勿回退数据库'); END;"
-        ))?;
-    }
-    Ok(())
 }
 #[derive(Clone)]
 struct App {
@@ -141,6 +122,68 @@ fn error(status: StatusCode, s: &str) -> ApiError {
     ApiError(status, s.into())
 }
 
+fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>) -> std::net::IpAddr {
+    let peer = peer.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into());
+    if peer.is_loopback() {
+        headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| {
+                headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.split(',').next())
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(peer)
+    } else {
+        peer
+    }
+}
+
+fn client_ip_from_request(request: &Request) -> std::net::IpAddr {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    client_ip(request.headers(), peer)
+}
+
+fn origin_matches(origin: &str, headers: &HeaderMap, loopback_proxy: bool) -> bool {
+    let Ok(origin_url) = url::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(origin_url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(origin_host) = origin_url.host_str() else {
+        return false;
+    };
+    let origin_port = origin_url.port_or_known_default();
+    let matches_header = |raw: &str| -> bool {
+        let candidate = raw.split(',').next().unwrap_or("").trim();
+        if candidate.is_empty() {
+            return false;
+        }
+        url::Url::parse(&format!("{}://{candidate}", origin_url.scheme()))
+            .ok()
+            .is_some_and(|u| {
+                u.host_str() == Some(origin_host) && u.port_or_known_default() == origin_port
+            })
+    };
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if matches_header(host) {
+        return true;
+    }
+    if loopback_proxy
+        && let Some(forwarded) = headers.get("x-forwarded-host").and_then(|v| v.to_str().ok())
+    {
+        return matches_header(forwarded);
+    }
+    false
+}
+
 async fn guard(State(app): State<App>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     let mut audit = None;
@@ -166,14 +209,11 @@ async fn guard(State(app): State<App>, mut request: Request, next: Next) -> Resp
                 .get("origin")
                 .and_then(|v| v.to_str().ok())
             {
-                let host = request
-                    .headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                if ![format!("http://{host}"), format!("https://{host}")]
-                    .contains(&origin.to_string())
-                {
+                let loopback = request
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .is_some_and(|c| c.0.ip().is_loopback());
+                if !origin_matches(origin, request.headers(), loopback) {
                     return error(StatusCode::FORBIDDEN, "请求来源与控制台不匹配").into_response();
                 }
             }
@@ -209,19 +249,23 @@ async fn guard(State(app): State<App>, mut request: Request, next: Next) -> Resp
                 return error(StatusCode::FORBIDDEN, "当前成员无权执行此操作").into_response();
             }
             if request.method() != axum::http::Method::GET && interactive {
-                match begin_operator_audit(&app, &actor, request.method().as_str(), &path) {
-                    Ok(id) => { request.extensions_mut().insert(AuditContext(id.clone())); audit = Some(id); }
-                    Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "无法保存操作审计，尚未执行操作").into_response(),
-                }
+                let slot = AuditContext::default();
+                request.extensions_mut().insert(slot.clone());
+                audit = Some((actor.clone(), request.method().as_str().to_string(), path.clone(), slot));
             }
             request.extensions_mut().insert(actor);
         }
     }
     let mut response = next.run(request).await;
-    if let Some(id) = audit {
-        if finish_operator_audit(&app, &id, response.status().as_u16()).is_err() {
-            response = error(StatusCode::SERVICE_UNAVAILABLE, "操作结果未能写入审计，业务可能已完成；请先查询原任务或订单，不要重复提交").into_response();
-        }
+    if let Some((actor, method, path, slot)) = audit {
+        record_operator_audit(
+            &app,
+            actor,
+            method,
+            path,
+            slot.0.lock().unwrap().clone(),
+            response.status().as_u16(),
+        );
     }
     response.headers_mut().insert(
         "x-content-type-options",
@@ -237,26 +281,42 @@ async fn guard(State(app): State<App>, mut request: Request, next: Next) -> Resp
     response
 }
 
-#[derive(Clone)]
-struct AuditContext(String);
+#[derive(Clone, Default)]
+struct AuditContext(Arc<Mutex<Option<String>>>);
 
-fn begin_operator_audit(app: &App, actor: &Actor, method: &str, path: &str) -> Result<String> {
-    let mut store = app.store.lock().unwrap();
-    let id = id();
-    store.doc.operator_audit.push(OperatorAudit { id: id.clone(), at: now(), actor: actor.clone(), method: method.into(), path: path.into(), target: None, response_status: None });
-    if let Err(e) = store.save() { store.doc.operator_audit.pop(); return Err(e); }
-    Ok(id)
-}
+const MAX_OPERATOR_AUDIT: usize = 500;
 
-fn finish_operator_audit(app: &App, id: &str, status: u16) -> Result<()> {
+fn record_operator_audit(
+    app: &App,
+    actor: Actor,
+    method: String,
+    path: String,
+    target: Option<String>,
+    status: u16,
+) {
     let mut store = app.store.lock().unwrap();
-    let event = store.doc.operator_audit.iter_mut().find(|e| e.id == id).context("操作审计不存在")?;
-    event.response_status = Some(status);
-    if let Err(e) = store.save() {
-        store.doc.operator_audit.iter_mut().find(|e| e.id == id).unwrap().response_status = None;
-        return Err(e);
+    store.doc.operator_audit.push(OperatorAudit {
+        id: id(),
+        at: now(),
+        actor,
+        method,
+        path,
+        target,
+        response_status: Some(status),
+    });
+    let excess = store.doc.operator_audit.len().saturating_sub(MAX_OPERATOR_AUDIT);
+    if excess > 0 {
+        store.doc.operator_audit.drain(..excess);
     }
-    Ok(())
+    if let Err(e) = store.save() {
+        eprintln!("记录操作审计失败: {e}");
+        if let Some(dir) = app.token_file.parent() {
+            let _ = chain_panel::diagnostics::append(
+                &dir.join("diagnostics.log"),
+                &format!("记录操作审计失败: {e}"),
+            );
+        }
+    }
 }
 fn cookie(headers: &HeaderMap) -> String {
     headers
@@ -274,21 +334,31 @@ struct Login {
     #[serde(default)]
     code: String,
 }
-async fn login(State(app): State<App>, Json(input): Json<Login>) -> ApiResult<Response> {
-    app.auth.rate_limit()?;
+async fn login(
+    State(app): State<App>,
+    headers: HeaderMap,
+    connect: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    Json(input): Json<Login>,
+) -> ApiResult<Response> {
+    let bucket = format!("login:{}", client_ip(&headers, connect.map(|Extension(c)| c.0.ip())));
+    app.auth.check_rate_limit(&bucket)?;
     let hash = digest(&input.token);
     if !equal(&hash, &app.admin_hash.lock().unwrap()) {
         let member = app.store.lock().unwrap().doc.operator_members.iter()
             .find(|m| m.revoked_at == 0 && m.role != Role::Admin && equal(&hash, &m.token_hash))
             .map(|m| Actor { id: m.id.clone(), name: m.name.clone(), role: m.role });
         if let Some(actor) = member { return Ok(member_session_response(&app, actor, false)); }
+        app.auth.record_failure(&bucket);
         tokio::time::sleep(Duration::from_millis(400)).await;
         return Err(error(StatusCode::UNAUTHORIZED, "管理令牌不正确"));
     }
     {
         let mut store = app.store.lock().unwrap();
-        chain_panel::security::second_factor(&mut store.doc.security, &input.code)
-            .map_err(|_| error(StatusCode::UNAUTHORIZED, "动态验证码或恢复码不正确"))?;
+        if chain_panel::security::second_factor(&mut store.doc.security, &input.code).is_err() {
+            drop(store);
+            app.auth.record_failure(&bucket);
+            return Err(error(StatusCode::UNAUTHORIZED, "动态验证码或恢复码不正确"));
+        }
         store.save()?;
     }
     Ok(session_response(&app))
@@ -305,9 +375,14 @@ fn member_session_response(app: &App, actor: Actor, delegated: bool) -> Response
     {
         let mut sessions = app.sessions.lock().unwrap();
         sessions.retain(|_, session| session.expires > now());
-        if sessions.len() > 100 {
-            sessions.clear();
-            app.delegated_sessions.lock().unwrap().clear();
+        if sessions.len() >= 100
+            && let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, s)| s.expires)
+                .map(|(k, _)| k.clone())
+        {
+            sessions.remove(&oldest);
+            app.delegated_sessions.lock().unwrap().remove(&oldest);
         }
         sessions.insert(digest(&token), Session { expires: now() + 28800, actor });
         if delegated { app.delegated_sessions.lock().unwrap().insert(digest(&token)); }
@@ -365,7 +440,7 @@ fn snapshot(doc: &Document) -> Value {
         .map(|l| {
             let mut v = serde_json::to_value(l).unwrap();
             v["share"] = json!(share(l, doc).ok());
-            v["plan_eligible"] = json!(!doc.rentals.contains_key(&l.id) && !doc.applied_lines.iter().any(|old| old.id == l.id) && chain_panel::plans::for_line(doc, &l.id).is_none());
+            v["plan_eligible"] = json!(chain_panel::plans::lease(doc, &l.id).is_none());
             let rental = chain_panel::rental::view(doc, l, now());
             for (key, value) in rental.as_object().unwrap() {
                 v[key] = value.clone();
@@ -380,11 +455,7 @@ fn snapshot(doc: &Document) -> Value {
                 })
                 .unwrap_or(false);
             v["published"] = json!(
-                resources_match
-                    && doc
-                        .applied_lines
-                        .iter()
-                        .any(|old| serde_json::to_value(old).ok() == serde_json::to_value(l).ok())
+                resources_match && doc.applied_lines.iter().any(|old| old == l)
             );
             v
         })
@@ -690,30 +761,27 @@ struct ExternalInput {
     name: String,
     url: String,
 }
+fn normalize_external(raw_name: &str, raw_url: &str) -> Result<(String, String)> {
+    let (url, imported_name) = chain_panel::external::import(raw_url)?;
+    let name = if !raw_name.trim().is_empty() {
+        raw_name.trim().to_owned()
+    } else if !imported_name.trim().is_empty() {
+        imported_name.trim().to_owned()
+    } else {
+        url::Url::parse(&url)?
+            .host_str()
+            .unwrap_or("外部代理")
+            .to_owned()
+    };
+    ensure!(!name.is_empty() && name.len() <= 120, "名称无效");
+    Ok((name, url))
+}
 async fn add_external(
     State(app): State<App>,
-    Json(mut input): Json<ExternalInput>,
+    Json(input): Json<ExternalInput>,
 ) -> ApiResult<Json<Value>> {
-    let (url, name) = chain_panel::external::import(&input.url)?;
-    input.url = url;
-    if input.name.trim().is_empty() {
-        input.name = if name.is_empty() {
-            url::Url::parse(&input.url)?
-                .host_str()
-                .unwrap_or("代理")
-                .to_owned()
-        } else {
-            name
-        };
-    }
-    if input.name.trim().is_empty() || input.name.len() > 120 {
-        return Err(error(StatusCode::BAD_REQUEST, "名称无效"));
-    }
-    let item = External {
-        id: id(),
-        name: input.name,
-        url: input.url,
-    };
+    let (name, url) = normalize_external(&input.name, &input.url)?;
+    let item = External { id: id(), name, url };
     edit(&app, |d| {
         d.externals.push(item.clone());
         Ok(())
@@ -726,9 +794,7 @@ async fn batch_external(State(app):State<App>,Json(input):Json<BatchExternalInpu
     if input.urls.is_empty() || input.urls.len()>500 {return Err(error(StatusCode::BAD_REQUEST,"一次导入 1–500 条链接"));}
     let mut values=Vec::new();
     for value in input.urls {
-        let (url,name)=chain_panel::external::import(&value)?;
-        let name=if name.is_empty(){url::Url::parse(&url)?.host_str().unwrap_or("外部代理").to_owned()}else{name};
-        if name.trim().is_empty() || name.len()>120 {return Err(error(StatusCode::BAD_REQUEST,"名称无效"));}
+        let (name, url) = normalize_external("", &value)?;
         values.push(External{id:id(),name,url});
     }
     edit(&app,|doc|{doc.externals.extend(values.clone());Ok(())})?;
@@ -750,9 +816,7 @@ async fn remove_external(State(app): State<App>, Path(id): Path<String>) -> ApiR
     Ok(Json(json!({"ok":true})))
 }
 async fn update_external(State(app): State<App>, Path(id): Path<String>, Json(input): Json<ExternalInput>) -> ApiResult<Json<Value>> {
-    let (url, imported_name) = chain_panel::external::import(&input.url)?;
-    let name = if input.name.trim().is_empty() { imported_name } else { input.name };
-    if name.trim().is_empty() || name.len() > 120 { return Err(error(StatusCode::BAD_REQUEST, "名称无效")); }
+    let (name, url) = normalize_external(&input.name, &input.url)?;
     let item = edit(&app, |d| {
         let external = d.externals.iter_mut().find(|e| e.id == id).context("外部代理不存在")?;
         external.name = name; external.url = url;
@@ -777,25 +841,19 @@ struct LineInput {
     #[serde(default)]
     id: Option<String>,
     name: String,
+    #[serde(default)]
     kind: Kind,
     hops: Vec<HopInput>,
     #[serde(default)]
     external_id: Option<String>,
     #[serde(default)]
     chain: Vec<String>,
-    #[serde(default)]
-    target: String,
-    #[serde(default = "tcp")]
-    network: String,
     #[serde(default = "yes")]
     enabled: bool,
     #[serde(default)]
     access: Option<Access>,
     #[serde(default)]
     limits: Option<Limits>,
-}
-fn tcp() -> String {
-    "tcp".into()
 }
 fn yes() -> bool {
     true
@@ -833,17 +891,6 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         ensure!(d.pending_imports.iter().any(|p| &p.id == id), "待配置项目不存在");
         d.pending_imports.retain(|p| &p.id != id);
     }
-    ensure!(
-        input.kind != Kind::Forward,
-        "仅支持创建代理，端口转发已移除"
-    );
-    ensure!(
-        !input
-            .access
-            .as_ref()
-            .is_some_and(|a| !a.public_host.is_empty() || a.public_port.is_some()),
-        "购买中转入口功能已移除"
-    );
     let existing = input
         .id
         .as_ref()
@@ -851,7 +898,7 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         .cloned();
     ensure!(input.id.is_none() || existing.is_some(), "线路不存在");
     let mut access = input.access.or_else(|| existing.as_ref().map(|l| l.access.clone())).unwrap_or_default();
-    let reality = input.kind == Kind::Vless && access.protocol == Protocol::Vless
+    let reality = access.protocol == Protocol::Vless
         && !matches!(access.tls.mode.as_str(), "auto" | "manual");
     if existing.is_none() && reality {
         let cover = access.reality.as_ref().context("新建 REALITY 必须明确选择目标与 SNI")?;
@@ -859,7 +906,6 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         ensure!(host_valid(&cover.server_name), "REALITY SNI 无效");
     }
     let line_id = existing.as_ref().map(|l| l.id.clone()).unwrap_or_else(id);
-    ensure!(chain_panel::plans::for_line(d, &line_id).is_none() || input.kind == Kind::Vless, "客户套餐线路须保留代理类型");
     let mut used: BTreeSet<(String, u16)> = d
         .lines
         .iter()
@@ -907,15 +953,18 @@ fn put_line(d: &mut Document, input: LineInput) -> Result<Line> {
         if access.method.is_empty() { access.method = old.method.clone(); }
     }
     chain_panel::access::fill_credentials(&mut access);
+    let mut chain = input.chain;
+    if chain.is_empty()
+        && let Some(ext) = input.external_id.filter(|s| !s.is_empty())
+    {
+        chain.push(format!("external:{ext}"));
+    }
     let line = Line {
         id: line_id.clone(),
         name: input.name,
         kind: input.kind,
         hops,
-        external_id: input.external_id.filter(|s| !s.is_empty()),
-        chain: input.chain,
-        target: input.target,
-        network: input.network,
+        chain,
         enabled: input.enabled,
         access,
         limits: input
@@ -1046,31 +1095,7 @@ async fn check_reality(
     Ok(Json(chain_panel::runtime::check_reality(&input).await?))
 }
 async fn remove_line(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let proxy = app
-        .store
-        .lock()
-        .unwrap()
-        .doc
-        .lines
-        .iter()
-        .any(|l| l.id == id && l.kind == Kind::Vless);
-    if proxy {
-        return rental_api::delete_one(State(app), Path(id)).await;
-    }
-    edit(&app, |d| {
-        ensure!(d.lines.iter().any(|l| l.id == id), "线路不存在");
-        ensure!(
-            !d.lines
-                .iter()
-                .chain(d.applied_lines.iter())
-                .any(|l| l.id != id && l.proxy_chain().contains(&format!("line:{id}"))),
-            "该代理仍被链式代理引用，请先移除引用并应用"
-        );
-        d.lines.retain(|l| l.id != id);
-        d.checks.remove(&id);
-        Ok(())
-    })?;
-    Ok(Json(json!({"ok":true})))
+    rental_api::delete_one(State(app), Path(id)).await
 }
 fn changed(doc: &Document, configs: &BTreeMap<String, Value>) -> BTreeSet<String> {
     doc.nodes
@@ -1135,9 +1160,6 @@ fn publication_preview(doc: &Document) -> Result<Value> {
         .filter(|p| restarting.contains(&p.node_id)).map(|p| p.name.clone()).collect();
     Ok(json!({"nodes":nodes,"affected_lines":lines,"affected_line_ids":affected_ids,"affected_legacy_configs":legacy,"message":if restarting.is_empty(){"流量和限速设置会在线更新，无需重启线路。"}else{"应用会重启受影响服务器上由本平台管理的实例；共享该实例的线路会短暂重连。"}}))
 }
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublishOptions {}
 fn authorize_publication(doc: &Document, role: Role) -> Result<()> {
     if role == Role::Ops {
         let leased: BTreeSet<_> = doc.lines.iter().chain(&doc.applied_lines).filter(|l| chain_panel::plans::lease(doc, &l.id).is_some()).map(|l| &l.id).collect();
@@ -1149,44 +1171,24 @@ fn authorize_publication(doc: &Document, role: Role) -> Result<()> {
     }
     Ok(())
 }
-async fn publish(State(app): State<App>, Extension(actor): Extension<Actor>, _input: Option<Json<PublishOptions>>) -> ApiResult<Json<Value>> {
+async fn publish(State(app): State<App>, Extension(actor): Extension<Actor>) -> ApiResult<Json<Value>> {
     let _probe_guard = app
         .probe_lock
         .try_lock()
         .map_err(|_| error(StatusCode::CONFLICT, "正在执行整链探测，请完成后发布"))?;
-    let checked = diagnostics_api::preflight(&app).await?;
     let job = edit(&app, |d| {
         authorize_publication(d, actor.role)?;
         let configs = compile(d)?;
-        ensure!(configs == checked, "检测期间配置已改变，请重新预览并下发");
         let affected = changed(d, &configs);
         for node in d.nodes.iter().filter(|n| affected.contains(&n.id)) {
-            if configs[&node.id]["_legacy"]
-                .as_array()
-                .is_some_and(|s| !s.is_empty())
+            if node.seen > 0
+                && configs[&node.id]["_chain"]
+                    .as_array()
+                    .is_some_and(|s| !s.is_empty())
             {
                 ensure!(
-                    node.report.system["legacy_config_version"] == 1,
-                    "{} 的 Agent 不支持完整配置迁移，请先升级 Agent",
-                    node.name
-                );
-            }
-            if let Some(specs) = configs[&node.id]["_chain"].as_array().filter(|s| !s.is_empty()) {
-                for spec in specs {
-                    chain_panel::rules::check_agent_connection_limit(
-                        spec["access_policy"]["policy"]["max_connections"].as_u64(),
-                        &node.report.system,
-                    )?;
-                }
-                if specs.iter().any(|s| s["resource_ids"].as_array().is_some_and(|ids| ids.iter().any(|id| id.as_str().is_some_and(chain_panel::plans::is_budget)))) {
-                    ensure!(node.report.system["customer_plan_version"] == 1, "{} 的 Agent 不支持客户共享套餐，请先升级并等待心跳", node.name);
-                }
-                if specs.iter().any(|s|s["multiplier"].as_u64().unwrap_or(1)>1 || s["resource_ids"].as_array().is_some_and(|p|!p.is_empty()) || chain_panel::rules::requires_capability(&s["access_policy"]["policy"])) {
-                    ensure!(node.report.system["sharing_version"]==1,"请先升级 Agent 以支持倍率和访问控制");
-                }
-                ensure!(
-                    node.report.system["gateway_version"] == 2,
-                    "{} 的 Agent 尚未就绪或版本过旧，请先更新 Agent 并等待心跳后再应用",
+                    node.report.system["gateway_version"].as_u64().unwrap_or(0) >= 2,
+                    "{} 的 Agent 版本过旧，请先更新 Agent 后再应用",
                     node.name
                 );
             }
@@ -1418,8 +1420,9 @@ async fn traffic_page(
     State(app): State<App>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(page): Json<Page>,
+    bytes: axum::body::Bytes,
 ) -> ApiResult<StatusCode> {
+    let page: Page = serde_json::from_slice(&bytes)?;
     let mut s = app.store.lock().unwrap();
     let node = reporting_node(&s.doc, &id, &headers)?;
     let mut uploads = app.traffic_uploads.lock().unwrap();
@@ -1427,7 +1430,7 @@ async fn traffic_page(
         .get_mut(&id)
         .ok_or_else(|| error(StatusCode::CONFLICT, "请先发送节点心跳"))?;
     let rows = upload
-        .receive(page)
+        .receive(page, bytes.len())
         .map_err(|e| error(StatusCode::CONFLICT, &e.to_string()))?;
     if let Some(rows) = rows {
         let changed = durable_traffic_changed(&s.doc.nodes[node].report.traffic, &rows);
@@ -1621,7 +1624,6 @@ mod web_tests {
         assert!(put_line(&mut doc,serde_json::from_value(input.clone()).unwrap()).is_err());
         let mut missing = input; missing["access"] = json!({});
         assert!(put_line(&mut doc,serde_json::from_value(missing).unwrap()).is_err());
-        assert!(serde_json::from_value::<PublishOptions>(json!({"allow_unverified_reality":true})).is_err());
     }
 
     #[test]
@@ -1688,50 +1690,6 @@ mod web_tests {
         let conn = open_panel_database(&dir.path().join("panel.db")).unwrap();
         assert_eq!(conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
-    }
-    #[test]
-    fn state_write_guard_preserves_new_data_against_previous_writers() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE state(id INTEGER PRIMARY KEY,body TEXT NOT NULL)").unwrap();
-        let mut legacy = serde_json::to_value(Document::default()).unwrap();
-        for key in PROTECTED_STATE_FIELDS { legacy.as_object_mut().unwrap().remove(key); }
-        let legacy_body = legacy.to_string();
-        conn.execute("INSERT INTO state VALUES(1,?1)", [&legacy_body]).unwrap();
-        install_state_write_guard(&conn).unwrap();
-        install_state_write_guard(&conn).unwrap();
-        let read_body = |conn: &Connection| conn.query_row("SELECT body FROM state WHERE id=1", [], |row| row.get::<_, String>(0)).unwrap();
-        assert_eq!(read_body(&conn), legacy_body, "打开旧库不得改写业务记录");
-        let old_writes = [
-            "INSERT INTO state(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
-            "UPDATE state SET body=?1 WHERE id=1",
-        ];
-        legacy["renewal_contact"] = json!("旧程序仍可写入尚未迁移的文档");
-        for sql in old_writes { conn.execute(sql, [legacy.to_string()]).unwrap(); }
-        let mut store = Store { doc: serde_json::from_str(&read_body(&conn)).unwrap(), conn };
-        store.doc.operator_members.push(OperatorMember { id:"member".into(), name:"财务".into(), role:Role::Finance,
-            token_hash:digest("fixture-member"), created_at:1, revoked_at:0 });
-        store.doc.rental_orders.push(RentalOrder { id:"order".into(), request_id:"request".into(), request_hash:"hash".into(),
-            created:1, confirmed_at:0, cancelled_at:0, term:"monthly".into(), amounts:BTreeMap::new(), note:"新订单".into(), items:vec![],
-            created_session:String::new(), confirmed_session:String::new(), cancelled_session:String::new(),
-            created_by:Some(Actor::admin()), confirmed_by:None, cancelled_by:None });
-        store.save().unwrap();
-        let saved = read_body(&store.conn);
-        for sql in old_writes {
-            let error = store.conn.execute(sql, [legacy.to_string()]).unwrap_err();
-            assert!(error.to_string().contains("拒绝旧程序覆盖"));
-            assert_eq!(read_body(&store.conn), saved, "旧程序写入失败后数据库须逐字不变");
-            for field in PROTECTED_STATE_FIELDS {
-                let mut incomplete: Value = serde_json::from_str(&saved).unwrap();
-                incomplete.as_object_mut().unwrap().remove(field);
-                assert!(store.conn.execute(sql, [incomplete.to_string()]).is_err(), "{field}");
-                assert_eq!(read_body(&store.conn), saved, "{field}");
-            }
-        }
-        store.doc.rental_orders[0].note = "新版继续保存".into();
-        store.save().unwrap();
-        let loaded: Document = serde_json::from_str(&read_body(&store.conn)).unwrap();
-        assert_eq!(loaded.rental_orders[0].note, "新版继续保存");
-        assert_eq!(loaded.operator_members[0].id, "member");
     }
 
     #[test]
@@ -1950,7 +1908,6 @@ async fn run() -> Result<()> {
         .route("/api/customers", post(rental_api::save_customer))
         .route("/api/customers/{id}", delete(rental_api::delete_customer))
         .route("/api/rentals/renew", post(rental_api::renew))
-        .route("/api/rentals/context", get(rental_api::context))
         .route("/api/rentals/orders", post(rental_api::create_order))
         .route("/api/rentals/orders/by-request/{id}", get(rental_api::order_by_request))
         .route("/api/rentals/orders/{id}/confirm", post(rental_api::confirm_order))

@@ -46,17 +46,47 @@ pub fn migrate(text: &str, port: u16) -> Result<String> {
     }
     Ok(result)
 }
-fn wildcard(name: &str, pattern: &str) -> bool {
+pub(super) fn domain_matches(name: &str, pattern: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
     if pattern.starts_with('~') {
-        return true;
+        return false;
     }
     if let Some(tail) = pattern.strip_prefix('.') {
-        return name == tail || name.ends_with(pattern);
+        return name == tail || name.ends_with(&pattern);
     }
     if let Some((a, b)) = pattern.split_once('*') {
         return name.starts_with(a) && name.ends_with(b);
     }
     name == pattern
+}
+pub(super) fn server_names_on_ports(
+    text: &str,
+    ports: &[&str],
+    require_ssl: bool,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for block in nginx::server_blocks(text)? {
+        let matches_port = block.iter().any(|d| {
+            d.words.first().is_some_and(|w| w == "listen")
+                && d.words.get(1).is_some_and(|addr| {
+                    let port = addr.rsplit(':').next().unwrap_or(addr.as_str());
+                    ports.contains(&port)
+                })
+                && (!require_ssl || d.words.iter().any(|w| w == "ssl"))
+                && !d.words.iter().any(|w| w == "quic" || w == "udp")
+        });
+        if matches_port {
+            for d in block {
+                if d.words.first().is_some_and(|w| w == "server_name") {
+                    for n in d.words.into_iter().skip(1).filter(|n| n != "_") {
+                        names.insert(n.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    Ok(names)
 }
 pub fn routes(value: &Value, blocked: &Value) -> Result<String> {
     let routes = value.as_array().context("路由不是列表")?;
@@ -78,7 +108,7 @@ pub fn routes(value: &Value, blocked: &Value) -> Result<String> {
         );
         for p in blocked.as_array().context("站点冲突列表无效")? {
             ensure!(
-                !wildcard(&name, p.as_str().context("站点名称无效")?),
+                !domain_matches(&name, p.as_str().context("站点名称无效")?),
                 "SNI 与现有网站冲突：{name}"
             );
         }
@@ -159,7 +189,7 @@ pub async fn operate(m: &Manager, action: &str) -> Result<()> {
         _ => anyhow::bail!("统一入口操作无效"),
     }
 }
-pub async fn units(m: &Manager) -> Result<()> {
+async fn units(m: &Manager) -> Result<()> {
     let binary = m
         .base
         .join("current-agent/bin/chainctl")
@@ -279,13 +309,7 @@ async fn enable(m: &Manager) -> Result<()> {
     for (path, text) in &sources {
         let changed = migrate(text, port)?;
         if changed != *text {
-            for d in nginx::parse(text)? {
-                if d.words[0] == "server_name" {
-                    for n in d.words.iter().skip(1).filter(|n| n.as_str() != "_") {
-                        blocked.insert(n.to_ascii_lowercase());
-                    }
-                }
-            }
+            blocked.extend(server_names_on_ports(text, &["443"], true)?);
             snapshots.insert(
                 path.display().to_string(),
                 json!({"before":text,"after":changed,"mode":fs::metadata(path)?.mode()&0o777}),
@@ -483,22 +507,31 @@ pub fn refresh_panel_site(m: &Manager, path: &Path, before: &str, after: &str) -
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(directory(m).join("process.lock"))?;
-    ensure!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "入口配置忙，请重试"
-    );
+    let mut locked = false;
+    for _ in 0..100 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            locked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    ensure!(locked, "入口配置忙，请重试");
     let mut s = state(m)?;
     let key = path.canonicalize()?.to_string_lossy().into_owned();
     s["files"][&key] =
         json!({"before":before,"after":after,"mode":fs::metadata(path)?.mode()&0o777});
     let mut blocked = std::collections::BTreeSet::new();
     for v in s["files"].as_object().context("入口快照无效")?.values() {
-        for d in nginx::parse(v["before"].as_str().context("入口快照缺少原文")?)? {
-            if d.words[0] == "server_name" {
-                blocked.extend(d.words.into_iter().skip(1).filter(|s| s != "_"));
-            }
-        }
+        blocked.extend(server_names_on_ports(
+            v["before"].as_str().context("入口快照缺少原文")?,
+            &["443"],
+            true,
+        )?);
     }
     s["blocked"] = json!(blocked);
     atomic(&state_path, &serde_json::to_vec(&s)?, 0o600)
@@ -562,10 +595,13 @@ pub async fn watch(m: &Manager) -> Result<()> {
     loop {
         let p = m.path("/var/lib/chain-agent/ingress-request.json");
         if p.exists() {
-            let digest = super::package::digest(&p)?;
-            if digest != previous {
-                let _ = operate(m, "apply").await;
-                previous = digest;
+            match super::package::digest(&p) {
+                Ok(digest) if digest != previous => match operate(m, "apply").await {
+                    Ok(()) => previous = digest,
+                    Err(error) => eprintln!("统一入口路由应用未完成：{error:#}"),
+                },
+                Ok(_) => (),
+                Err(error) => eprintln!("读取统一入口请求失败：{error:#}"),
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;

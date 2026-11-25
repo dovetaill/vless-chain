@@ -162,7 +162,7 @@ impl Manager {
         Ok(["panel", "agent"]
             .into_iter()
             .filter(|role| {
-                roles.contains_key(*role) && (component != Some("agent") || *role == "agent")
+                roles.contains_key(*role) && component.is_none_or(|c| c == *role)
             })
             .map(str::to_owned)
             .collect())
@@ -220,7 +220,9 @@ impl Manager {
         let manifest = package::extract(archive, &stage)?;
         package::compatible(&manifest)?;
         package::install_modes(&stage, &manifest)?;
-        super::cores::preserve(self, &stage)?;
+        super::cores::preserve(self, &stage, false)?;
+        let manifest: package::Manifest =
+            serde_json::from_slice(&fs::read(stage.join("release.json"))?)?;
         let (_, path) = self.publish_stage(&stage, &manifest)?;
         // Both component installs use this tree; keep it in use across the two role locks.
         let lease = File::open(&path)?;
@@ -242,6 +244,70 @@ impl Manager {
         }
         Ok(())
     }
+    async fn recover_pending_update(&self) -> Result<()> {
+        let journal = self.base.join(".update-pending.json");
+        match fs::symlink_metadata(&journal) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            res => {
+                res?;
+            }
+        }
+        ordinary(&journal)?;
+        let pending: Value = serde_json::from_slice(&fs::read(&journal)?)
+            .context("上次升级中断且 .update-pending.json 损坏，请先人工核对；未继续覆盖")?;
+        let before = pending
+            .get("before")
+            .filter(|v| v["owner"] == OWNER && v["roles"].is_object())
+            .context("上次升级中断且 .update-pending.json 缺少原状态，请先人工核对；未继续覆盖")?;
+        let roles: Vec<String> = serde_json::from_value(pending["roles"].clone())
+            .context("中断升级日志缺少角色列表")?;
+        let target = pending["target"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("中断升级日志缺少目标版本目录")?;
+        let current_state = self.state()?;
+        let committed = roles.iter().all(|role| {
+            current_state["roles"][role]["current"].as_str() == Some(target)
+                && fs::read_link(self.base.join(format!("current-{role}")))
+                    .is_ok_and(|p| p == Path::new("releases").join(target))
+        });
+        if committed {
+            fs::remove_file(&journal)?;
+            return Ok(());
+        }
+        let mut reloaded = false;
+        for item in pending["services"].as_array().into_iter().flatten() {
+            let path = Path::new(item["path"].as_str().context("中断服务路径无效")?);
+            let before_text = item["before"].as_str().context("中断服务原内容缺失")?;
+            let after_text = item["after"].as_str().context("中断服务目标内容缺失")?;
+            if before_text != after_text && fs::read_to_string(path)? != before_text {
+                super::ingress::write_existing(path, after_text, before_text)?;
+                reloaded = true;
+            }
+        }
+        if reloaded && self.live() && self.kind() == "systemd" {
+            command("systemctl", &["daemon-reload"], 30).await?;
+        }
+        for role in &roles {
+            let prev = before["roles"][role]["current"]
+                .as_str()
+                .context("中断日志缺少原发行目录")?;
+            ensure!(
+                self.base.join("releases").join(prev).is_dir(),
+                "原发行目录不存在，无法自动恢复中断升级"
+            );
+            self.link(role, prev)?;
+        }
+        let mut restored = before.clone();
+        if !current_state["core_blocked"].is_null() {
+            restored["core_blocked"] = current_state["core_blocked"].clone();
+        }
+        let state_path = self.base.join(".chain-install.json");
+        let mode = fs::metadata(&state_path)?.mode() & 0o777;
+        atomic(&state_path, &serde_json::to_vec_pretty(&restored)?, mode)?;
+        fs::remove_file(&journal)?;
+        Ok(())
+    }
     async fn update_checked<F, Fut>(
         &self,
         input: UpdateSource<'_>,
@@ -253,15 +319,22 @@ impl Manager {
         Fut: std::future::Future<Output = Result<()>>,
     {
         let _lock = self.lock()?;
+        self.recover_pending_update().await?;
         let journal = self.base.join(".update-pending.json");
-        ensure!(
-            fs::symlink_metadata(&journal).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-            "上次升级中断，请先核对 .update-pending.json 中的原版本与当前服务；未继续覆盖"
-        );
         let old = self.state()?;
-        ensure!(
-            !self.base.join(".core-pending.json").exists(),
-            "请先完成待验证的内核升级任务"
+        let core_pending_path = self.base.join(".core-pending.json");
+        ordinary(&core_pending_path)?;
+        let core_pending_old = if core_pending_path.exists() {
+            Some(fs::read(&core_pending_path)?)
+        } else {
+            None
+        };
+        let skip_xray = matches!(
+            input,
+            UpdateSource::Archive {
+                latest_xray_work: Some(_),
+                ..
+            }
         );
         let temporary = self.release_stage()?;
         let stage = temporary.path().join("release");
@@ -314,9 +387,12 @@ impl Manager {
             running.push(self.active(role).await?);
         }
         let services = super::lifecycle::ServiceMigration::prepare(self, &roles)?;
-        super::cores::preserve(self, &stage)?;
+        if roles.iter().any(|r| r == "agent") {
+            super::cores::preserve(self, &stage, skip_xray)?;
+        }
         let source = stage.as_path();
-        let manifest = package::verify(source, true)?;
+        let manifest: package::Manifest =
+            serde_json::from_slice(&fs::read(source.join("release.json"))?)?;
         let (id, _) = self.publish_stage(source, &manifest)?;
         let state_path = self.base.join(".chain-install.json");
         let old_bytes = fs::read(&state_path)?;
@@ -364,10 +440,22 @@ impl Manager {
                     services.applied(self, baseline)?;
                 }
             }
+            if roles.iter().any(|r| r == "agent") {
+                if let Some(raw) = &core_pending_old {
+                    let mut pending: Value = serde_json::from_slice(raw)?;
+                    let old_agent = &old["roles"]["agent"]["current"];
+                    if &pending["target"] == old_agent {
+                        pending["target"] = json!(id);
+                    } else if &pending["before"]["current"] == old_agent {
+                        pending["before"]["current"] = json!(id);
+                        pending["before"]["version"] = json!(manifest.version);
+                    }
+                    atomic(&core_pending_path, &serde_json::to_vec(&pending)?, 0o600)?;
+                }
+            }
             let mut state = old.clone();
             for role in &roles {
                 state["roles"][role]["current"] = json!(id);
-                state["roles"][role]["previous"] = Value::Null;
                 state["roles"][role]["version"] = json!(manifest.version);
             }
             atomic(
@@ -409,6 +497,9 @@ impl Manager {
                 }
             }
             if failures.is_empty() {
+                if let Some(raw) = &core_pending_old {
+                    atomic(&core_pending_path, raw, 0o600)?;
+                }
                 atomic(&state_path, &old_bytes, metadata.mode() & 0o777)?;
                 fs::remove_file(&journal)?;
                 bail!("升级失败，已恢复原程序链接和服务运行状态，业务数据未回滚：{error:#}");
@@ -529,15 +620,27 @@ impl Manager {
         let mut result = std::collections::BTreeMap::new();
         for line in fs::read_to_string(path)?
             .lines()
+            .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
         {
-            let (name, value) = line.split_once('=').context("环境文件格式无效")?;
+            let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+            let (name, raw) = line.split_once('=').context("环境文件格式无效")?;
+            let name = name.trim();
+            let raw = raw.trim();
             ensure!(
-                name.starts_with("CHAIN_")
-                    && name.bytes().all(|c| c.is_ascii_uppercase() || c == b'_'),
+                !name.is_empty()
+                    && name.bytes().enumerate().all(|(i, c)| {
+                        c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                    }),
                 "环境变量名无效"
             );
-            let value: String = serde_json::from_str(value)?;
+            let value = if raw.starts_with('"') {
+                serde_json::from_str::<String>(raw)?
+            } else if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+                raw[1..raw.len() - 1].to_owned()
+            } else {
+                raw.to_owned()
+            };
             ensure!(
                 !value.contains(['\r', '\n', '\0']) && result.insert(name.into(), value).is_none(),
                 "环境变量重复或包含控制字符"
@@ -610,7 +713,7 @@ impl Manager {
                     }
                 }
                 active_count += 1;
-                if role == "agent" && active_count >= 41 {
+                if role == "agent" && active_count >= 6 {
                     return Ok(());
                 }
                 if role == "panel" {
@@ -660,7 +763,7 @@ impl Manager {
             !self.base.join(".update-pending.json").exists(),
             "升级尚未完成，未清理历史版本"
         );
-        let mut state = self.state()?;
+        let state = self.state()?;
         let mut keep = BTreeSet::new();
         for item in state["roles"].as_object().unwrap().values() {
             keep.insert(item["current"].as_str().unwrap().to_string());
@@ -703,10 +806,10 @@ impl Manager {
                         && owner.len() == STAGE_OWNER.len() as u64 && fs::read(marker)? == STAGE_OWNER.as_bytes(),
                         "未确认临时目录归属");
                 } else {
-                    let manifest = package::verify(&directory, false)?;
-                    let expected = format!("{}-{}-{}-{}", manifest.version, manifest.os, manifest.arch,
-                        &package::digest(&directory.join("release.json"))?[..12]);
-                    ensure!(entry.file_name() == std::ffi::OsStr::new(&expected), "发行目录名称与清单不匹配");
+                    release_name(&entry.file_name().to_string_lossy())?;
+                    let manifest = directory.join("release.json");
+                    let meta = fs::symlink_metadata(&manifest)?;
+                    ensure!(meta.is_file() && meta.len() <= 1024 * 1024, "非受管发行目录");
                 }
                 ensure!(
                     !in_use(&directory).await?,
@@ -729,16 +832,6 @@ impl Manager {
             .await;
             if let Err(error) = result {
                 eprintln!("保留 {}：{error:#}", directory.display());
-            }
-        }
-        // Free space before rewriting legacy rollback records on an already full disk.
-        if let Some(history) = state["core_history"].as_object_mut() {
-            let before = history.len();
-            history.retain(|_, item| item["safe"] == true
-                && item["release"].as_str().is_some_and(|id| keep.contains(id)));
-            if history.len() != before {
-                let path = self.base.join(".chain-install.json");
-                atomic(&path, &serde_json::to_vec_pretty(&state)?, fs::metadata(&path)?.mode() & 0o777)?;
             }
         }
         Ok(())
@@ -898,7 +991,7 @@ mod tests {
             let unit = manager.unit_path(role);
             fs::create_dir_all(unit.parent().unwrap()).unwrap();
             fs::write(unit, format!("# {OWNER}\n[Service]\nEnvironmentFile=\"{}\"\nExecStart=\"{}/current-{role}/bin/chain-{role}\"\n", root.join(format!("etc/chain-{role}/{role}.env")).display(), base.display())).unwrap();
-            roles.insert(role.into(), json!({"current":"old","version":"0.2.48","previous":null,"setup_complete":true,"panel_only":false,"custom":"preserve"}));
+            roles.insert(role.into(), json!({"current":"old","version":"0.2.48","setup_complete":true,"panel_only":false,"custom":"preserve"}));
         }
         fs::write(
             base.join(".chain-install.json"),
@@ -948,7 +1041,6 @@ mod tests {
         for role in ["panel", "agent"] {
             assert_eq!(state["roles"][role]["version"], "0.3.0");
             assert_eq!(state["roles"][role]["custom"], "preserve");
-            assert!(state["roles"][role]["previous"].is_null());
         }
         let after = fs::metadata(env).unwrap();
         assert_eq!(
@@ -996,6 +1088,47 @@ mod tests {
                 assert_eq!(after["roles"][role]["version"], if fail { "0.2.48" } else { "0.3.0" });
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pending_core_verification_allows_program_repair_and_tracks_target() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = installed(root.path());
+        let source = root.path().join("source");
+        fixture(&source);
+        let pending_path = manager.base.join(".core-pending.json");
+        fs::write(
+            &pending_path,
+            serde_json::to_vec(&json!({
+                "task_id": "pending-1",
+                "core": "xray",
+                "before": {"current": "prev", "version": "0.2.48"},
+                "target": "old",
+                "rollback_allowed": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        manager
+            .update_checked(UpdateSource::Directory(&source), Some("panel"), |role| async move {
+                assert_eq!(role, "panel");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(manager.state().unwrap()["roles"]["panel"]["version"], "0.3.0");
+        assert_eq!(manager.state().unwrap()["roles"]["agent"]["version"], "0.2.48");
+        manager
+            .update_checked(UpdateSource::Directory(&source), Some("agent"), |role| async move {
+                assert_eq!(role, "agent");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let state = manager.state().unwrap();
+        let pending: Value = serde_json::from_slice(&fs::read(&pending_path).unwrap()).unwrap();
+        assert_eq!(pending["target"], state["roles"]["agent"]["current"]);
+        assert_eq!(pending["before"]["current"], "prev");
     }
 
     #[cfg(target_os = "linux")]
@@ -1103,6 +1236,32 @@ mod tests {
         let guard = manager.lock().unwrap();
         assert!(manager.update(&source, None).await.is_err());
         drop(guard);
+        let pending_before = manager.state().unwrap();
+        std::os::unix::fs::symlink(
+            "releases/interrupted-target",
+            manager.base.join("current-panel.tmp"),
+        )
+        .unwrap();
+        fs::rename(
+            manager.base.join("current-panel.tmp"),
+            manager.base.join("current-panel"),
+        )
+        .unwrap();
+        fs::write(
+            manager.base.join(".update-pending.json"),
+            serde_json::to_vec(&json!({
+                "before": pending_before,
+                "target": "interrupted-target",
+                "roles": ["panel", "agent"],
+                "running": [false, false],
+                "services": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        manager.update(&source, None).await.unwrap();
+        assert!(!manager.base.join(".update-pending.json").exists());
+        assert_eq!(manager.state().unwrap()["roles"]["panel"]["version"], "0.3.0");
         fs::write(manager.base.join(".update-pending.json"), "{}").unwrap();
         assert!(
             manager
@@ -1113,6 +1272,7 @@ mod tests {
                 .contains("上次升级中断")
         );
         fs::remove_file(manager.base.join(".update-pending.json")).unwrap();
+        let installed_link = fs::read_link(manager.base.join("current-panel")).unwrap();
         fs::write(manager.unit_path("panel"), "foreign").unwrap();
         assert!(
             manager
@@ -1124,7 +1284,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_link(manager.base.join("current-panel")).unwrap(),
-            Path::new("releases/old")
+            installed_link
         );
     }
 }

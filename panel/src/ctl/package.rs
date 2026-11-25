@@ -169,9 +169,9 @@ pub fn checksum(archive: &Path) -> Result<()> {
         fs::metadata(archive)?.len() <= MAX_ARCHIVE,
         "发行附件大小超限"
     );
-    let sums = archive.with_file_name("SHA256SUMS");
-    ensure!(fs::metadata(&sums)?.len() <= 65536, "校验清单过大");
-    let sums = fs::read_to_string(sums).context("请将 SHA256SUMS 与发行包放在同一目录")?;
+    let sums_path = archive.with_file_name("SHA256SUMS");
+    let sums = fs::read_to_string(&sums_path).context("请将 SHA256SUMS 与发行包放在同一目录")?;
+    ensure!(sums.len() <= 65536, "校验清单过大");
     let name = archive
         .file_name()
         .and_then(|s| s.to_str())
@@ -180,7 +180,7 @@ pub fn checksum(archive: &Path) -> Result<()> {
         .lines()
         .filter_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            (fields.len() == 2 && fields[1] == name).then(|| fields[0])
+            (fields.len() == 2 && fields[1].trim_start_matches('*') == name).then_some(fields[0])
         })
         .collect::<Vec<_>>();
     ensure!(
@@ -283,7 +283,6 @@ pub(super) fn copy_release(source: &Path, destination: &Path, manifest: &Manifes
         copy_file(&source.join(name), &path, mode, share && name != "release.json")?;
     }
     install_modes(destination, manifest)?;
-    verify(destination, true)?;
     Ok(())
 }
 
@@ -402,58 +401,23 @@ pub async fn download(
 
 fn xray_asset(releases: &serde_json::Value) -> Result<(String, String, String, bool)> {
     let releases = releases.as_array().context("Xray 发行信息无效")?;
-    let release = releases
+    let (parsed_version, release) = releases
         .iter()
         .filter(|r| r["draft"] == false)
         .filter_map(|r| {
             r["tag_name"]
                 .as_str()
                 .and_then(|s| s.strip_prefix('v'))
-                .and_then(|v| version(v).ok())
-                .map(|v| (v, r))
+                .and_then(|v| version(v).ok().map(|parsed| (parsed, v, r)))
         })
-        .max_by_key(|(v, _)| *v)
-        .context("未找到官方 Xray 发行版本")?
-        .1;
-    let tag = release["tag_name"].as_str().unwrap();
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "64",
-        "aarch64" => "arm64-v8a",
-        _ => anyhow::bail!("Xray 不支持本机架构"),
-    };
-    let name = format!("Xray-{os}-{arch}.zip");
-    let matches = release["assets"]
-        .as_array()
-        .context("Xray 附件缺失")?
-        .iter()
-        .filter(|a| a["name"] == name)
-        .collect::<Vec<_>>();
-    ensure!(matches.len() == 1, "Xray 本机架构附件缺失或重复");
-    let url = format!("https://github.com/XTLS/Xray-core/releases/download/{tag}/{name}");
-    ensure!(
-        matches[0]["browser_download_url"] == url,
-        "Xray 附件来源不匹配"
-    );
-    let digest = matches[0]["digest"]
-        .as_str()
-        .and_then(|s| s.strip_prefix("sha256:"))
-        .context("Xray 附件缺少 SHA256")?;
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "Xray 附件 SHA256 无效"
-    );
+        .max_by_key(|(parsed, _, _)| *parsed)
+        .map(|(_, v, r)| (v, r))
+        .context("未找到官方 Xray 发行版本")?;
+    let (url, digest, _) = super::cores::asset("xray", parsed_version, release, true)?;
     Ok((
-        tag[1..].into(),
+        parsed_version.into(),
         url,
-        digest.into(),
+        digest,
         release["prerelease"] == true,
     ))
 }
@@ -486,7 +450,6 @@ pub(super) fn xray_files(archive: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 pub async fn latest_xray(stage: &Path, directory: &Path) -> Result<()> {
-    verify(stage, true)?;
     let client = reqwest::Client::builder()
         .https_only(true)
         .user_agent("chainctl")
@@ -510,34 +473,23 @@ pub async fn latest_xray(stage: &Path, directory: &Path) -> Result<()> {
         "Xray 下载校验失败，未替换内核"
     );
     let (binary, license) = xray_files(&archive)?;
-    let mut manifest: serde_json::Value =
-        serde_json::from_reader(File::open(stage.join("release.json"))?)?;
-    ensure!(
-        manifest["files"]["share/Xray-LICENSE"].is_object(),
-        "原发行包缺少 Xray 许可证"
-    );
-    for (name, bytes) in [("bin/xray", binary), ("share/Xray-LICENSE", license)] {
-        fs::write(stage.join(name), bytes)?;
-        manifest["files"][name]["sha256"] = serde_json::json!(digest(&stage.join(name))?);
-    }
-    let provenance = stage.join("share/Xray-PATCHES.txt");
-    if provenance.exists() {
-        fs::remove_file(provenance)?;
-    }
-    manifest["files"]
-        .as_object_mut()
-        .unwrap()
-        .remove("share/Xray-PATCHES.txt");
-    manifest["xray"] = serde_json::json!(version);
-    manifest["xray_channel"] = serde_json::json!("latest");
-    manifest["xray_prerelease"] = serde_json::json!(prerelease);
-    manifest["xray_source"] = serde_json::json!(url);
-    manifest["xray_archive_sha256"] = serde_json::json!(expected);
-    fs::write(
-        stage.join("release.json"),
-        serde_json::to_vec_pretty(&manifest)?,
+    let extracted = directory.join("xray-extracted");
+    fs::create_dir_all(extracted.join("bin"))?;
+    fs::create_dir_all(extracted.join("share"))?;
+    fs::write(extracted.join("bin/xray"), binary)?;
+    fs::write(extracted.join("share/Xray-LICENSE"), license)?;
+    super::cores::replace(
+        stage,
+        "xray",
+        &extracted,
+        &serde_json::json!({
+            "version": version,
+            "channel": "latest",
+            "prerelease": prerelease,
+            "source": url,
+            "archive_sha256": expected,
+        }),
     )?;
-    verify(stage, true)?;
     println!(
         "主动选择官方最新版 Xray {version}{}；可能要求更新客户端",
         if prerelease { "（预发布）" } else { "" }

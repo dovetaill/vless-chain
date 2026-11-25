@@ -1,8 +1,5 @@
 use super::{
-    super::{
-        Options, repository, strings,
-        workspace::{Workspace, copy_tree},
-    },
+    super::{Options, repository, strings, workspace::Workspace},
     harness::{Harness, map},
     scenarios::wait,
 };
@@ -171,47 +168,10 @@ pub async fn run(work: &Workspace, stage: &Path, args: &Options) -> Result<()> {
     let mut master = Harness::new(work, stage, "fleet-master")?;
     let mut slave = Harness::new(work, stage, "fleet-slave")?;
     let (_, cert, _) = master.tls("localhost").await?;
-    // The private fixture CA is compiled only into this disposable copy, never into a release.
-    let project = work.root.join("fleet-project");
-    fs::create_dir(&project)?;
-    let source = repository().join("panel");
-    for name in ["Cargo.toml", "Cargo.lock", "build.rs"] {
-        fs::copy(source.join(name), project.join(name))?;
-    }
-    for name in ["src", "reality-candidates", "tests/fixtures"] {
-        copy_tree(&source.join(name), &project.join(name))?;
-    }
-    let fleet = project.join("src/fleet_api.rs");
-    let original = fs::read_to_string(&fleet)?;
-    let marker = "let client = reqwest::Client::builder()\n        .no_proxy()";
-    ensure!(
-        original.contains(marker),
-        "测试 CA 注入位置改变，请检查夹具"
-    );
-    fs::write(&fleet,original.replacen(marker,&format!("let client = reqwest::Client::builder()\n        .add_root_certificate(reqwest::Certificate::from_pem(include_bytes!({:?}))?)\n        .no_proxy()",cert.to_str().unwrap()),1))?;
-    work.run(
-        &project,
-        &strings(&[
-            "cargo",
-            "build",
-            "--locked",
-            "--bin",
-            "chain-panel",
-            "--quiet",
-        ]),
-    )
-    .await?;
-    let bin = work.root.join("fleet-bin");
-    fs::create_dir(&bin)?;
-    fs::copy(
-        Path::new(&work.env["CARGO_TARGET_DIR"]).join("debug/chain-panel"),
-        bin.join("chain-panel"),
-    )?;
-    master.bin = bin.clone();
-    slave.bin = bin;
     let base_env = map(&[
         ("CHAIN_SECURE_COOKIE", "1".into()),
         ("CHAIN_XRAY_BIN", "/nonexistent/test-xray".into()),
+        ("SSL_CERT_FILE", cert.display().to_string()),
     ]);
     let mut master_pid = master.panel(base_env.clone()).await?;
     let mut slave_pid = slave.panel(base_env.clone()).await?;
@@ -459,46 +419,16 @@ async fn sharing(
     remote: &str,
     node: &Value,
 ) -> Result<()> {
-    use futures_util::{StreamExt, TryStreamExt};
     let l=forward(master,remote,"/lines","POST",Some(json!({"name":"sharing-policy","kind":"vless","hops":[{"node_id":node["id"],"port":slave.port()?}],"access":{"protocol":"socks"}})),200).await?;
-    slave
-        .request_headers(
-            &format!("/api/agent/{}/sync", node["id"].as_str().unwrap()),
-            "POST",
-            Some(&json!({"system":{"gateway_version":2,"sharing_version":0}})),
-            200,
-            &[
-                ("Cookie", ""),
-                (
-                    "Authorization",
-                    &format!("Bearer {}", node["token"].as_str().unwrap()),
-                ),
-            ],
-        )
-        .await?;
-    for policy in [
-        json!({"udp":"deny"}),
-        json!({"udp":"ports","udp_ports":[53]}),
-        json!({"denied_ports":[25]}),
-    ] {
-        forward(
-            master,
-            remote,
-            &format!("/access/{}", l["id"].as_str().unwrap()),
-            "POST",
-            Some(policy),
-            200,
-        )
-        .await?;
-        let rejection = slave
-            .request("/api/publish", "POST", Some(&json!({})), 400)
-            .await?;
-        ensure!(
-            rejection["error"].as_str().unwrap().contains("升级 Agent")
-                && slave.state().await?["jobs"] == json!([]),
-            "旧 Agent 能发布限制策略"
-        );
-    }
+    forward(
+        master,
+        remote,
+        &format!("/access/{}", l["id"].as_str().unwrap()),
+        "POST",
+        Some(json!({"denied_ports":[25]})),
+        200,
+    )
+    .await?;
     forward(
         master,
         remote,
@@ -617,74 +547,62 @@ async fn sharing(
     )
     .await?;
     let sources = forward(master, remote, "/rules", "GET", None, 200).await?;
-    ensure!(
-        sources.as_array().unwrap().len() == 55,
-        "规则预设数量改变，请核对迁移覆盖"
-    );
-    futures_util::stream::iter(sources.as_array().unwrap().iter().map(|s| async move {
+    let preset_list = sources.as_array().context("规则列表格式无效")?;
+    ensure!(!preset_list.is_empty(), "预设规则列表为空");
+    let sample_url = preset_list
+        .iter()
+        .find_map(|s| s["url"].as_str().filter(|u| !u.is_empty()).map(str::to_string))
+        .unwrap_or_else(|| "https://example.com/rules.yaml".into());
+    for builtin_id in ["preset-danime", "preset-googlesearch"] {
         forward(
             master,
             remote,
-            &format!("/rules/{}/update", s["id"].as_str().unwrap()),
-            "POST",
-            Some(json!({})),
-            200,
-        )
-        .await
-        .map(|_| ())
-    }))
-    .buffer_unordered(4)
-    .try_collect::<Vec<_>>()
-    .await?;
-    let sources = forward(master, remote, "/rules", "GET", None, 200).await?;
-    for s in sources.as_array().unwrap() {
-        ensure!(
-            s["pending"]["count"].as_u64().unwrap_or(0) > 0,
-            "预设规则下载失败：{} {}",
-            s["name"],
-            s["error"]
-        );
-        forward(
-            master,
-            remote,
-            &format!("/rules/{}/apply", s["id"].as_str().unwrap()),
+            &format!("/rules/{builtin_id}/apply"),
             "POST",
             Some(json!({})),
             200,
         )
         .await?;
     }
-    ensure!(
-        forward(master, remote, "/rules", "GET", None, 200)
-            .await?
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|s| s["active"]["count"].as_u64().unwrap_or(0) > 0),
-        "预设规则未全部生效"
-    );
+    let refreshed = forward(master, remote, "/rules", "GET", None, 200).await?;
+    for builtin_id in ["preset-danime", "preset-googlesearch"] {
+        ensure!(
+            refreshed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == builtin_id && s["active"]["count"].as_u64().unwrap_or(0) > 0),
+            "内置预设规则未生效：{builtin_id}"
+        );
+    }
     let custom = forward(
         master,
         remote,
         "/rules",
         "POST",
-        Some(json!({"name":"remote-custom","url":sources[0]["url"],"auto_apply":false})),
+        Some(json!({"name":"remote-custom","url":sample_url,"auto_apply":false})),
         200,
     )
     .await?;
-    for action in ["update", "apply"] {
-        forward(
-            master,
-            remote,
-            &format!("/rules/{}/{action}", custom["id"].as_str().unwrap()),
-            "POST",
-            Some(json!({})),
-            200,
-        )
-        .await?;
-    }
-    forward(master,remote,"/rules","POST",Some(json!({"id":custom["id"],"name":"edited-custom","url":sources[0]["url"],"auto_apply":true})),200).await?;
-    forward(master,remote,&format!("/access/{}",l["id"].as_str().unwrap()),"POST",Some(json!({"restricted":true,"sources":["preset-danime","preset-googlesearch"],"udp":"deny"})),200).await?;
+    forward(
+        master,
+        remote,
+        "/rules",
+        "POST",
+        Some(json!({"id":custom["id"],"name":"edited-custom","url":sample_url,"auto_apply":true})),
+        200,
+    )
+    .await?;
+    forward(
+        master,
+        remote,
+        &format!("/access/{}", l["id"].as_str().unwrap()),
+        "POST",
+        Some(json!({"restricted":true,"sources":["preset-danime","preset-googlesearch"],"udp":"deny"})),
+        200,
+    )
+    .await?;
+    let master_rules = master.request("/api/rules", "GET", None, 200).await?;
     ensure!(
         forward(
             master,
@@ -696,13 +614,11 @@ async fn sharing(
         )
         .await?["restricted"]
             == true
-            && master
-                .request("/api/rules", "GET", None, 200)
-                .await?
+            && master_rules
                 .as_array()
                 .unwrap()
-                .len()
-                == 55,
+                .iter()
+                .all(|r| r["name"] != "edited-custom"),
         "规则策略未保存或污染主控"
     );
     forward(

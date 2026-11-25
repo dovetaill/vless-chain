@@ -14,7 +14,7 @@ pub struct Identity {
     pub token: String,
 }
 
-pub fn identity(dir: &Path) -> Result<Option<Identity>> {
+fn identity(dir: &Path) -> Result<Option<Identity>> {
     let path = dir.join("local-agent.json");
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -24,10 +24,17 @@ pub fn identity(dir: &Path) -> Result<Option<Identity>> {
 }
 
 pub fn node_id(dir: &Path) -> Option<String> {
-    std::fs::read_to_string(dir.join("local-system-node"))
+    let system_path = dir.join("local-system-node");
+    if system_path.exists() {
+        return std::fs::read_to_string(system_path)
+            .ok()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok());
+    }
+    identity(dir)
         .ok()
-        .map(|id| id.trim().to_owned())
-        .or_else(|| identity(dir).ok().flatten().map(|i| i.id))
+        .flatten()
+        .map(|i| i.id)
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 

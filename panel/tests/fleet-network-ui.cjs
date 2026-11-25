@@ -6,9 +6,7 @@ const { chromium } = require(process.env.CHAIN_TEST_BROWSER);
 const assets = path.resolve(process.argv[2]);
 const screenshots = process.env.CHAIN_TEST_SCREENSHOTS;
 (async () => {
-  const server = await chromium.launchServer({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
-  console.log(`BROWSER pid=${server.process().pid} endpoint=${server.wsEndpoint()}`);
-  const browser = await chromium.connect(server.wsEndpoint());
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHAIN_TEST_CHROMIUM });
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN' });
     page.setDefaultTimeout(10000);
@@ -19,7 +17,7 @@ const screenshots = process.env.CHAIN_TEST_SCREENSHOTS;
     const state = { viewer: { id: 'administrator', name: '模拟管理员', role: 'admin' }, version: '0.2.60', agent_version: '0.2.60', maintenance: true, maintenance_actions: ['network-tune'], nodes: [], lines: [], externals: [], checks: {}, jobs: [], busy: false, time: now, subscriptions: [], security: { totp_enabled: false, passkeys: [] }, alerts: [], customers: [], customer_plans: [], payments: [], renewal_contact: '', pending_imports: [] };
     const network = { congestion_control: 'cubic', qdisc: 'fq_codel', kernel: 'fixture', algorithms: ['bbr', 'cubic'], queues: ['fq'], interfaces: [{ dev: 'eth0', kind: 'fq_codel', parent: 'root' }], warning: '' };
     let localJob;
-    const line = { id: 'same-line-id', name: '代理', kind: 'vless', hops: [{ node_id: 'local', port: 1443 }], enabled: true, published: true, chain: [], target: '',
+    const line = { id: 'same-line-id', name: '代理', kind: 'vless', hops: [{ node_id: 'local', port: 1443 }], enabled: true, published: true, chain: [],
       access: { host: '192.0.2.1', protocol: 'vless', transport: { network: 'tcp' }, tls: { mode: 'off' } }, limits: { monthly_gib: 100 }, rental_status: 'active', sync_status: 'synced' };
     const fleet = { controller: '', policy: null, tasks: {}, remotes: ['a', 'b'].map(id => ({ id, name: `VPS ${id}`, url: `https://${id}.example`, seen: now, error: '', snapshot: { ...state, version: '1.2.3', agent_version: '1.2.3', maintenance: true, maintenance_actions: ['network-tune'], local_node_id: 'local', lines: [structuredClone(line)],
       nodes: [{ id: 'local', name: '本机', host: '192.0.2.1', online: true, seen: now, report: { running: true, applied: true, error: '', revision: '', system: { sampled_at: now } } }] } })) };
@@ -29,13 +27,15 @@ const screenshots = process.env.CHAIN_TEST_SCREENSHOTS;
       if (url.hostname !== 'chain.test') return route.abort();
       if (!url.pathname.startsWith('/api/')) {
         const file = path.join(assets, url.pathname === '/admin' ? 'index.html' : url.pathname);
-        return route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' });
+        return fs.existsSync(file) ? route.fulfill({ body: fs.readFileSync(file), contentType: { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }[path.extname(file)] || 'application/octet-stream' }) : route.fulfill({ status: 404 });
       }
       const body = req.method() === 'GET' ? null : req.postDataJSON();
       requests.push({ path: url.pathname, body });
-      if (state.viewer.role !== 'admin' && (url.pathname === '/api/fleet' || url.pathname === '/api/fleet/batch'
-          || (url.pathname === '/api/federation/task' && body?.action?.startsWith('network-')))) {
-        return route.fulfill({ status: 403, json: { error: '运维成员仅能执行升级或重启' } });
+      if (state.viewer.role !== 'admin' && (url.pathname === '/api/fleet' || url.pathname === '/api/fleet/batch')) {
+        return route.fulfill({ status: 403, json: { error: '总控仅管理员可操作' } });
+      }
+      if (!['admin', 'ops'].includes(state.viewer.role) && url.pathname === '/api/federation/task') {
+        return route.fulfill({ status: 403, json: { error: '当前身份无权执行维护操作' } });
       }
       let result;
       if (url.pathname === '/api/state') result = state;
@@ -131,7 +131,6 @@ const screenshots = process.env.CHAIN_TEST_SCREENSHOTS;
     assert.equal(await dialog().getByRole('button', { name: '确认执行', exact: true }).count(), 0); await close();
     await go('VPS');
     assert.equal(await button('网络设置 / BBR').isDisabled(), true);
-    assert.equal(await button('本机网络算法 / BBR').count(), 0);
     for (const id of ['a', 'b']) await page.getByLabel(`选择 VPS VPS ${id}`, { exact: true }).check();
     await capture('02-admin-batch-entry');
     await button('网络设置 / BBR').click();
@@ -188,14 +187,14 @@ const screenshots = process.env.CHAIN_TEST_SCREENSHOTS;
     await page.evaluate(() => localStorage.removeItem('chain-maintenance-task'));
     for (const role of ['ops', 'finance', 'viewer']) {
       state.viewer = { id: role, name: { ops: '模拟运维成员', finance: '模拟财务成员', viewer: '模拟只读成员' }[role], role };
+      state.maintenance = role === 'ops';
+      state.maintenance_actions = role === 'ops' ? ['network-tune'] : [];
       const start = requests.length;
       await page.goto('http://chain.test/admin#settings');
       await page.reload();
       await page.getByLabel('当前身份', { exact: true }).filter({ hasText: state.viewer.name }).waitFor();
       if (role === 'ops') {
-        await page.getByText('其他维护', { exact: true }).click();
-        assert.equal(await button('网络设置 / BBR').isDisabled(), true);
-        await page.getByText('网络算法设置仅管理员可操作。', { exact: true }).waitFor();
+        assert.equal(await button('网络设置 / BBR').isDisabled(), false);
         await button('网络设置 / BBR').scrollIntoViewIfNeeded();
         await capture('07-ops-permissions');
       } else {
@@ -206,10 +205,11 @@ const screenshots = process.env.CHAIN_TEST_SCREENSHOTS;
       await page.goto('http://chain.test/admin#fleet');
       await page.getByLabel('当前身份', { exact: true }).waitFor();
       await page.getByRole('alert').filter({ hasText: '当前身份无权访问此页面' }).waitFor();
-      assert.equal(await button('本机网络算法 / BBR').count(), 0);
       assert(!requests.slice(start).some(r => r.path === '/api/fleet' || r.body?.action?.startsWith('network-')));
     }
     state.viewer = { id: 'administrator', name: '模拟管理员', role: 'admin' };
+    state.maintenance = true;
+    state.maintenance_actions = ['network-tune'];
     fleet.remotes[1].snapshot.maintenance_actions = [];
     await page.goto('http://chain.test/admin#fleet'); await page.reload(); await go('VPS');
     await page.getByLabel('选择 VPS VPS b', { exact: true }).check();
@@ -222,8 +222,6 @@ const screenshots = process.env.CHAIN_TEST_SCREENSHOTS;
     console.log('PASS admin/ops/finance/viewer, desktop/mobile, local lost response, queue warning, mixed batch, partial failure, no restarts');
   } finally {
     await browser.close();
-    await server.close();
-    assert(server.process().exitCode !== null || server.process().signalCode !== null);
     console.log('CLEANUP browser stopped');
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

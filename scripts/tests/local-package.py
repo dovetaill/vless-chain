@@ -34,9 +34,8 @@ printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\nfixture 8388
     script = root / 'scripts' / 'install-server.sh'
     script.parent.mkdir()
     script_body = source.read_text().replace('PATH=/opt', 'PATH=' + str(mocks) + ':/opt', 1)
-    candidates = 'in "${TMPDIR:-/tmp}" /var/tmp; do'
-    assert script_body.count(candidates) == 1
-    script.write_text(script_body.replace(candidates, 'in "${TMPDIR:-/tmp}" "' + str(fallback) + '"; do'))
+    assert script_body != source.read_text()
+    script.write_text(script_body)
     # A bundled stale executable must not override an explicitly supplied package.
     (root / 'bin').mkdir()
     (root / 'bin/chainctl').write_text('#!/bin/sh\nexit 98\n')
@@ -69,7 +68,7 @@ exit "${TEST_NATIVE_EXIT:-0}"
     sums = packages / 'SHA256SUMS'
     sums.write_text(hashlib.sha256(bundle.read_bytes()).hexdigest() + '  ' + bundle.name + '\n')
     native_tmp = root / 'native-tmp'
-    env = dict(os.environ, TMPDIR=str(root), TEST_FALLBACK=str(fallback), TEST_NATIVE_TMPFILE=str(native_tmp))
+    env = dict(os.environ, TMPDIR=str(root), TEST_FALLBACK=str(fallback), CHAIN_BOOTSTRAP_FALLBACK=str(fallback), TEST_NATIVE_TMPFILE=str(native_tmp))
     def cleaned():
         assert not list(root.rglob('chain-bootstrap-*')), 'temporary bootstrap leaked'
         if native_tmp.exists():
@@ -115,7 +114,8 @@ for arg in "$@"; do
 done
 case "$url" in
   */releases/latest) printf '%s' 'https://github.com/dovetaill/vless-chain/releases/tag/v0.2.70';;
-  *) file="$TEST_PACKAGE_DIR/${url##*/}"
+  *) url_path=${url%%[?#]*}
+     file="$TEST_PACKAGE_DIR/${url_path##*/}"
      [ -f "$file" ] || exit 22
      [ "$(wc -c < "$file")" -le "$limit" ] || exit 63
      cp "$file" "$output";;
@@ -126,7 +126,7 @@ esac
     remote_url = 'https://download.example/releases/v0.2.70/' + bundle.name
     (root / 'bin/chainctl').write_text('#!/bin/sh\nexit 98\n')
     (root / 'bin/chainctl').chmod(0o700)
-    remote = call(['update', '--package', remote_url, '--non-interactive'])
+    remote = call(['update', '--package', remote_url + '?token=signed-cdn#dl', '--non-interactive'])
     assert remote.returncode == 0, remote.stderr
     forwarded = remote.stdout.splitlines()
     assert forwarded[:2] == ['update', '--package']

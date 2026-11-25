@@ -2,8 +2,8 @@ use super::{
     super::workspace::Workspace,
     business::{line, node},
     harness::{Harness, map},
-    plans::{echo, socks},
-    rentals::{blocked, closed, operate},
+    plans::{echo, socks, stored},
+    rentals::{blocked, closed, operate, traffic_sum as period},
     scenarios::wait,
 };
 use anyhow::{Context, Result, ensure};
@@ -20,9 +20,6 @@ fn now() -> u64 {
 }
 fn total(t: &Value) -> u64 {
     t["total_upload"].as_u64().unwrap_or(0) + t["total_download"].as_u64().unwrap_or(0)
-}
-fn period(t: &Value) -> u64 {
-    t["upload"].as_u64().unwrap_or(0) + t["download"].as_u64().unwrap_or(0)
 }
 fn read(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
@@ -469,10 +466,7 @@ pub async fn run(work: &Workspace, stage: &Path) -> Result<()> {
             db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))? == "ok",
             "面板 SQLite 损坏"
         );
-        let doc: Value =
-            serde_json::from_str(&db.query_row("SELECT body FROM state WHERE id=1", [], |r| {
-                r.get::<_, String>(0)
-            })?)?;
+        let doc = stored(&h)?;
         ensure!(
             doc["payments"] == before["payments"] && doc["customers"] == before["customers"],
             "面板退出丢失业务数据"
@@ -721,11 +715,8 @@ fn install_boundaries(
         }
         day -= 1;
     };
+    let mut doc = stored(h)?;
     let db = rusqlite::Connection::open(h.root.join("control/panel.db"))?;
-    let mut doc: Value =
-        serde_json::from_str(&db.query_row("SELECT body FROM state WHERE id=1", [], |r| {
-            r.get::<_, String>(0)
-        })?)?;
     let desired = doc["nodes"]
         .as_array_mut()
         .unwrap()
@@ -761,7 +752,6 @@ fn install_boundaries(
         let rental = &mut doc["rentals"][l["id"].as_str().unwrap()];
         rental["started_at"] = json!(start);
         rental["expires_at"] = json!(end);
-        rental["paid_months"] = json!(0);
     }
     for collection in ["lines", "applied_lines"] {
         doc[collection]
