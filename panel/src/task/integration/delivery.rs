@@ -389,6 +389,7 @@ async fn bootstrap(work: &Workspace) -> Result<()> {
         ),
         ("RUNNER_TEMP".into(), repo.root.display().to_string()),
         ("GITHUB_ACTIONS".into(), "false".into()),
+        ("CARGO_TARGET_DIR".into(), String::new()),
         (
             "CARGO_HOME".into(),
             repo.root.join("empty-cargo").display().to_string(),
