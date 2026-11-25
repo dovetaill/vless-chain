@@ -1,6 +1,6 @@
 use super::{
     install::{self, Options, owned_dir, owned_write},
-    platform,
+    package, platform,
     upgrade::{Manager, OWNER, atomic, command, ordinary},
 };
 use anyhow::{Context, Result, ensure};
@@ -762,7 +762,23 @@ pub fn handoff(manager: &Manager) -> Result<()> {
         })
         .context("已安装组件未提供 Rust chainctl")?;
     let target = manager.base.join(format!("current-{role}/bin/chainctl"));
-    ordinary(&target.canonicalize()?)?;
+    let installed = target.canonicalize()?;
+    ordinary(&installed)?;
+    let manifest_path = installed
+        .parent()
+        .and_then(Path::parent)
+        .context("发行目录无效")?
+        .join("release.json");
+    ordinary(&manifest_path)?;
+    let manifest: package::Manifest = serde_json::from_reader(fs::File::open(manifest_path)?)?;
+    let entry = manifest
+        .files
+        .get("bin/chainctl")
+        .context("发行包未提供 Rust chainctl")?;
+    ensure!(
+        package::digest(&installed)? == entry.sha256,
+        "发行文件校验失败：bin/chainctl"
+    );
     let wrapper = manager.path("/usr/local/bin/chainctl");
     ordinary(wrapper.parent().unwrap())?;
     if let Ok(info) = fs::symlink_metadata(&wrapper) {

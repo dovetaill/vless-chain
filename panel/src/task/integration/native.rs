@@ -273,14 +273,16 @@ pub async fn exercise(work: &Workspace, stage: &Path) -> Result<()> {
     );
     legacy.unchanged()?;
     let installed = wrapper.canonicalize()?;
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&installed)?
-        .write_all(b"tamper")?;
     let manager = Manager {
         root: legacy.root.clone(),
         base: legacy.base.clone(),
     };
+    fs::write(installed.parent().unwrap().join("xray"), "damaged core")?;
+    crate::ctl::lifecycle::handoff(&manager).context("受损内核阻断了管理入口接管")?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&installed)?
+        .write_all(b"tamper")?;
     ensure!(
         crate::ctl::lifecycle::handoff(&manager)
             .unwrap_err()
