@@ -464,6 +464,7 @@ pub async fn run(args: &Options) -> Result<()> {
             ("CHAIN_DATA_DIR", controller_data.display().to_string()),
             ("CHAIN_LISTEN", "127.0.0.1:37244".into()),
             ("CHAIN_SECURE_COOKIE", "0".into()),
+            ("SSL_CERT_FILE", "/controller/cert.pem".into()),
         ]), &work.root.join("controller.log"))?;
         wait("总控令牌", async || Ok(controller_data.join("admin-token").exists())).await?;
         let mut controller_cookie = String::new();
@@ -627,7 +628,9 @@ pub async fn run(args: &Options) -> Result<()> {
 async fn core_task(client: &reqwest::Client, base: &str, cookie: &mut String, mut value: Value) -> Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
     value["id"] = json!(id);
-    api(client, base, "federation/task", Some(&value), cookie).await?;
+    api(client, base, "federation/task", Some(&value), cookie)
+        .await
+        .context("提交维护任务")?;
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     let mut last_error;
     loop {
@@ -635,12 +638,15 @@ async fn core_task(client: &reqwest::Client, base: &str, cookie: &mut String, mu
             Ok(job) => job,
             Err(error) => {
                 let text = format!("{error:#}");
-                if text.starts_with("API 400")
+                let reconnecting = text.starts_with("API 400")
+                    && text.contains("远程维护组件")
+                    && (text.contains("Connection refused") || text.contains("No such file or directory"));
+                if text.starts_with("API 400") && !reconnecting
                     || text.starts_with("API 403")
                     || text.starts_with("API 404")
                     || text.starts_with("API 422")
                 {
-                    return Err(error);
+                    return Err(error).context("查询原维护任务");
                 }
                 last_error = text;
                 tokio::time::sleep(Duration::from_secs(5)).await;
