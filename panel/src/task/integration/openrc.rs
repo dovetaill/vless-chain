@@ -445,7 +445,15 @@ pub async fn run(args: &Options) -> Result<()> {
                 json!({"action":"core-upgrade","core":core,"version":version,"prerelease":false,"security_update":true,"rollback_safe":false})).await?;
             ensure!(job["state"] == "succeeded" && job["verification"]["state"] == "succeeded", "真实 Web 内核自动验收失败：{job}");
             wait("新内核心跳", async || {
-                let state = api(&client, &base, "state", None, &mut cookie).await?;
+                let state = match api(&client, &base, "state", None, &mut cookie).await {
+                    Ok(state) => state,
+                    Err(error) if format!("{error:#}").starts_with("API 401") => {
+                        cookie.clear();
+                        api(&client, &base, "login", Some(&json!({"token":String::from_utf8_lossy(&admin).trim()})), &mut cookie).await?;
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
                 Ok(state["agent_version"] == after["roles"]["agent"]["version"]
                     && state["core_maintenance"]["versions"][core] == version
                     && state["agent_seen"].as_u64().unwrap_or(0) >= job["started"].as_u64().unwrap_or(u64::MAX))
@@ -625,7 +633,7 @@ async fn core_task(client: &reqwest::Client, base: &str, cookie: &mut String, mu
     loop {
         let job = match api(client, base, &format!("federation/task?id={id}"), None, cookie).await {
             Ok(job) => job,
-            Err(error) if value["action"] == "upgrade" => {
+            Err(error) => {
                 let text = format!("{error:#}");
                 if text.starts_with("API 400")
                     || text.starts_with("API 403")
@@ -650,11 +658,10 @@ async fn core_task(client: &reqwest::Client, base: &str, cookie: &mut String, mu
                 }
                 ensure!(
                     std::time::Instant::now() < deadline,
-                    "程序升级后管理连接未恢复：{last_error}"
+                    "维护任务期间管理连接未恢复：{last_error}"
                 );
                 continue;
             }
-            Err(error) => return Err(error),
         };
         let verifying = value["action"] == "core-upgrade" && (job["state"] == "awaiting_verification"
             && job["verification"]["state"] != "manual" || job["state"] == "succeeded" && job["verification"]["state"] != "succeeded");
