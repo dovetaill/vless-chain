@@ -150,11 +150,13 @@ fn existing_certificate(manager: &Manager, domain: &str) -> bool {
 }
 pub(crate) async fn check_http_challenge(
     url: &str,
+    domain: &str,
     marker: &str,
     budget: Duration,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .no_proxy()
+        .resolve(domain, ([127, 0, 0, 1], 0).into())
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(0)
         .timeout(budget)
@@ -235,6 +237,7 @@ pub async fn activate(
             atomic(&challenge, marker.as_bytes(), 0o644)?;
             let checked = check_http_challenge(
                 &format!("http://{domain}/.well-known/acme-challenge/{marker}"),
+                &domain,
                 &marker,
                 Duration::from_secs(15),
             )
@@ -408,14 +411,20 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn http_challenge_waits_for_reload_but_rejects_real_failures() {
-        use axum::{Router, http::StatusCode, routing::get};
+        use axum::{Router, http::{HeaderMap, StatusCode}, routing::get};
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let domain = "panel.invalid";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_host = format!("{domain}:{}", address.port());
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();
         let app = Router::new()
-            .route("/ready", get(move || {
+            .route("/ready", get(move |headers: HeaderMap| {
                 let count = count.clone();
+                let expected_host = expected_host.clone();
                 async move {
+                    assert_eq!(headers["host"], expected_host);
                     if count.fetch_add(1, Ordering::SeqCst) < 2 {
                         (StatusCode::NOT_FOUND, "old worker")
                     } else {
@@ -429,16 +438,14 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 "owned-marker"
             }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        check_http_challenge(&format!("http://{address}/ready"), "owned-marker", Duration::from_secs(3))
+        check_http_challenge(&format!("http://{domain}:{}/ready", address.port()), domain, "owned-marker", Duration::from_secs(3))
             .await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 3);
         for (path, detail) in [("missing", "404"), ("wrong", "内容不匹配"), ("slow", "超时")] {
-            let url = format!("http://{address}/{path}");
+            let url = format!("http://{domain}:{}/{path}", address.port());
             let start = std::time::Instant::now();
-            let error = check_http_challenge(&url, "owned-marker", Duration::from_millis(300))
+            let error = check_http_challenge(&url, domain, "owned-marker", Duration::from_millis(300))
                 .await.unwrap_err();
             let error = format!("{error:#}");
             assert!(error.contains(&url) && error.contains(detail), "{error}");

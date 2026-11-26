@@ -305,6 +305,7 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
             webroot.to_str().unwrap(),
         )
         .replace("panel.test", "localhost")
+        .replace("server_name localhost;", "server_name localhost panel.invalid;")
         .replace("listen 80;", &format!("listen 127.0.0.1:{http};"))
         .replace("listen 443 ssl;", &format!("listen 127.0.0.1:{https} ssl;"));
     let mut body = format!(
@@ -353,7 +354,8 @@ pub async fn https(work: &Workspace, stage: &Path) -> Result<()> {
     }).await?;
     fs::write(sites.join("chain-panel.conf"), site)?;
     ensure!(unsafe { libc::kill(nginx as i32, libc::SIGHUP) } == 0, "测试 Nginx 重载失败");
-    crate::ctl::https::check_http_challenge(&probe, "owned-challenge", Duration::from_secs(15)).await?;
+    let local_probe = format!("http://panel.invalid:{http}/.well-known/acme-challenge/probe");
+    crate::ctl::https::check_http_challenge(&local_probe, "panel.invalid", "owned-challenge", Duration::from_secs(15)).await?;
     for endpoint in [format!("http://localhost:{http}"), base.clone()] {
         ensure!(client.get(endpoint).header("Host", "existing.test").send().await?
             .error_for_status()?.text().await? == "existing-site", "已有域名站点被改变");
